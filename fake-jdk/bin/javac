@@ -1,0 +1,133 @@
+#!/bin/bash
+# Wrapper script that makes genesis look like javac for jtreg
+# This translates javac invocations to genesis, filtering unsupported options
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+GENESIS="$SCRIPT_DIR/../../genesis"
+
+# Verify JAVA_HOME is set to Java 21+
+if [ -z "$JAVA_HOME" ]; then
+    echo "Error: JAVA_HOME is not set. jtreg tests require Java 21+." >&2
+    exit 1
+fi
+
+JAVA_VERSION=$("$JAVA_HOME/bin/java" -version 2>&1 | head -1 | sed -E 's/.*"([0-9]+).*/\1/')
+if [ -z "$JAVA_VERSION" ] || [ "$JAVA_VERSION" -lt 21 ]; then
+    echo "Error: JAVA_HOME must point to Java 21+. Current: Java $JAVA_VERSION" >&2
+    echo "       JAVA_HOME=$JAVA_HOME" >&2
+    exit 1
+fi
+
+# Filter out options that genesis doesn't support and collect source files
+ARGS=()
+SOURCE_FILES=()
+SKIP_NEXT=false
+HAS_SOURCEPATH=false
+
+for arg in "$@"; do
+    if $SKIP_NEXT; then
+        SKIP_NEXT=false
+        continue
+    fi
+    
+    case "$arg" in
+        # Module system options (not supported)
+        --add-exports|--add-reads|--add-opens|--add-modules|--limit-modules|--module-path|--module-source-path|-p)
+            SKIP_NEXT=true
+            ;;
+        --add-exports=*|--add-reads=*|--add-opens=*|--add-modules=*|--limit-modules=*|--module-path=*|--module-source-path=*)
+            # Skip options with embedded values
+            ;;
+        --patch-module|--upgrade-module-path|--system)
+            SKIP_NEXT=true
+            ;;
+        --patch-module=*|--upgrade-module-path=*|--system=*)
+            ;;
+        # Annotation processing options (skip for now)
+        -processor|-processorpath|-proc:*)
+            SKIP_NEXT=true
+            ;;
+        -proc:none|-proc:only)
+            ;;
+        # Other unsupported options
+        -Xlint*|-Xdoclint*|-Xmaxerrs|-Xmaxwarns|-Xprefer:*)
+            ;;
+        -implicit:*)
+            ;;
+        -profile)
+            SKIP_NEXT=true
+            ;;
+        -encoding)
+            # Genesis handles encoding automatically via BOM detection
+            SKIP_NEXT=true
+            ;;
+        -parameters|-Xpkginfo:*)
+            ;;
+        -sourcepath)
+            HAS_SOURCEPATH=true
+            ARGS+=("$arg")
+            ;;
+        # Collect source files for sourcepath derivation
+        *.java)
+            SOURCE_FILES+=("$arg")
+            ARGS+=("$arg")
+            ;;
+        # Pass through everything else
+        *)
+            ARGS+=("$arg")
+            ;;
+    esac
+done
+
+# Derive sourcepath from source files if not explicitly provided
+# jtreg places test libraries in ../lib relative to the test directory
+if ! $HAS_SOURCEPATH && [ ${#SOURCE_FILES[@]} -gt 0 ]; then
+    SOURCEPATH=""
+    
+    for src in "${SOURCE_FILES[@]}"; do
+        # Check if this is a jtreg lib file (contains /lib/ in path)
+        if [[ "$src" == *"/lib/"* ]]; then
+            # Extract the lib root: everything up to and including /lib/
+            LIB_ROOT="${src%%/lib/*}/lib"
+            if [ -d "$LIB_ROOT" ] && [[ ":$SOURCEPATH:" != *":$LIB_ROOT:"* ]]; then
+                if [ -z "$SOURCEPATH" ]; then
+                    SOURCEPATH="$LIB_ROOT"
+                else
+                    SOURCEPATH="$SOURCEPATH:$LIB_ROOT"
+                fi
+            fi
+        fi
+    done
+    
+    # Add jdk test library paths relative to fake-jdk location
+    # fake-jdk is at cpkb/genesis/fake-jdk/bin, so ../../.. is cpkb
+    CPKB_ROOT="$SCRIPT_DIR/../../.."
+    
+    # jdk/test/lib contains jdk.test.lib.* and jdk.test.whitebox.* classes
+    JDK_TEST_LIB="$CPKB_ROOT/jdk/test/lib"
+    if [ -d "$JDK_TEST_LIB" ]; then
+        if [ -z "$SOURCEPATH" ]; then
+            SOURCEPATH="$JDK_TEST_LIB"
+        else
+            SOURCEPATH="$SOURCEPATH:$JDK_TEST_LIB"
+        fi
+    fi
+    
+    # jdk/test/jtreg-ext contains jtreg extension classes (VMProps, etc.)
+    JDK_JTREG_EXT="$CPKB_ROOT/jdk/test/jtreg-ext"
+    if [ -d "$JDK_JTREG_EXT" ]; then
+        SOURCEPATH="$SOURCEPATH:$JDK_JTREG_EXT"
+    fi
+    
+    if [ -n "$SOURCEPATH" ]; then
+        ARGS=("-sourcepath" "$SOURCEPATH" "${ARGS[@]}")
+    fi
+fi
+
+# Debug: log the command being executed
+if [ -n "$GENESIS_DEBUG" ]; then
+    echo "GENESIS: $GENESIS ${ARGS[@]}" >&2
+    echo "SOURCEPATH: $SOURCEPATH" >&2
+fi
+
+exec "$GENESIS" "${ARGS[@]}"

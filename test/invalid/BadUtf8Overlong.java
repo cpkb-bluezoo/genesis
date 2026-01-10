@@ -1,0 +1,1 @@
+public class BadUtf8Overlong { String s = "À€"; }

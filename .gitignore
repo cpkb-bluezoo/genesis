@@ -1,0 +1,17 @@
+# Build artifacts
+build/
+genesis
+*.class
+
+# Test build output
+test/build/
+
+# jtreg integration
+fake-jdk/bin/java
+jtreg-work/
+jtreg-report/
+
+# Editor files
+*.dSYM/
+.DS_Store
+

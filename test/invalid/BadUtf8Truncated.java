@@ -1,0 +1,1 @@
+public class BadUtf8Truncated { String s = "à€"; }

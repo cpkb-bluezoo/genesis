@@ -1,0 +1,115 @@
+CONTRIBUTING TO GENESIS
+=======================
+
+Coding Standards
+----------------
+
+1. BRACE STYLE FOR CONTROL STATEMENTS
+
+   All control statements (if, else, for, while, do, switch) must use braces,
+   even for single-statement bodies. The opening brace should be on the same
+   line as the control statement, and the body should be on subsequent lines.
+
+   Bad:
+       if (!ptr) return NULL;
+       if (x > 0) x--;
+
+   Good:
+       if (!ptr) {
+           return NULL;
+       }
+       if (x > 0) {
+           x--;
+       }
+
+   This rule improves readability and prevents errors when adding statements
+   to control blocks.
+
+2. INDENTATION
+
+   Use 4 spaces for indentation. Do not use tabs.
+
+3. LINE LENGTH
+
+   Prefer lines under 100 characters. Break long lines at logical points.
+
+4. NAMING CONVENTIONS
+
+   - Types: suffix with _t (e.g., token_t, ast_node_t)
+   - Functions: lowercase with underscores (e.g., parser_advance)
+   - Constants/Macros: uppercase with underscores (e.g., MOD_PUBLIC)
+   - Local variables: lowercase with underscores
+
+5. COMMENTS
+
+   - Use /* */ for all comments
+   - File headers should include copyright and license information
+   - Document non-obvious code with explanatory comments
+
+6. MEMORY MANAGEMENT
+
+   - Always check return values of malloc/calloc
+   - Free allocated memory in appropriate cleanup paths
+   - Use consistent patterns for resource acquisition and release
+
+
+Testing
+-------
+
+1. NAMING CONVENTION
+
+   Test files must follow this naming convention:
+   - Test files: *Test.java (e.g., ArrayTest.java, HelloWorldTest.java)
+   - Support classes: Any other .java file (e.g., Helper.java, Parent.java)
+   
+   The test framework automatically discovers all *Test.java files that contain
+   a main method. Support classes are compiled when referenced by tests.
+
+2. TEST REQUIREMENTS
+
+   Every new feature implementation should include a corresponding test file
+   in test/src/. The test file must:
+   - End with Test.java (e.g., MyFeatureTest.java)
+   - Contain a public class matching the filename
+   - Have a public static void main(String[] args) method
+
+3. WRITING TESTS
+
+   Example test file (test/src/MyFeatureTest.java):
+
+       public class MyFeatureTest {
+           public static void main(String[] args) {
+               // Test the feature
+               int result = someOperation();
+               if (result != expected) {
+                   System.out.println("FAILED: expected " + expected);
+                   System.exit(1);
+               }
+               System.out.println("MyFeatureTest passed!");
+           }
+       }
+
+   If your test needs helper classes, create them as separate .java files
+   without the Test suffix (e.g., Helper.java, ParentClass.java).
+
+4. RUNNING TESTS
+
+   make test              - Run all tests
+   make test-one TEST=X   - Run single test X with verbose output
+   make test-list         - List all tests (active and excluded)
+   make test-clean        - Clean test build directory
+
+5. TEST EXCLUSIONS
+
+   Tests for features not yet implemented can be added to TEST_EXCLUDE in the
+   Makefile. When you implement a feature, remove the corresponding test from
+   the exclusion list so it gets picked up by the test suite.
+
+6. TEST GUIDELINES
+
+   - Tests should be self-contained (no external dependencies)
+   - Tests should complete quickly (no long-running operations)
+   - Tests should print clear output indicating what was tested
+   - If a test fails, it should exit with non-zero status or throw an exception
+   - Use descriptive test names that indicate what feature is being tested
+

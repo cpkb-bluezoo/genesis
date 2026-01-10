@@ -1,0 +1,1 @@
+public class BadUtf8 { String s = "testÿ"; }
