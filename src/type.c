@@ -315,7 +315,9 @@ char *type_to_string(type_t *type)
 }
 
 /* Helper to normalize class names for comparison.
- * Handles simple name vs java.lang.* fully qualified name. */
+ * Handles simple name vs java.lang.* fully qualified name.
+ * Also handles nested class names where '.' and '$' are equivalent separators.
+ * e.g., "Outer.Inner.InnerInner" should equal "Outer$Inner$InnerInner" */
 static bool class_names_equal(const char *name1, const char *name2)
 {
     if (!name1 || !name2) {
@@ -327,9 +329,41 @@ static bool class_names_equal(const char *name1, const char *name2)
         return true;
     }
     
+    /* Try comparing with $ and . treated as equivalent.
+     * First, find where the package ends and class name begins.
+     * Package uses only '.', nested classes use either '.' or '$'.
+     * We need to normalize nested class separators. */
+    size_t len1 = strlen(name1);
+    size_t len2 = strlen(name2);
+    
+    if (len1 == len2) {
+        /* Same length - check if they differ only in $ vs . for inner classes */
+        bool match = true;
+        for (size_t i = 0; i < len1; i++) {
+            char c1 = name1[i];
+            char c2 = name2[i];
+            if (c1 != c2) {
+                /* Allow $ and . to be equivalent separators */
+                if ((c1 == '$' || c1 == '.') && (c2 == '$' || c2 == '.')) {
+                    continue;
+                }
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return true;
+        }
+    }
+    
     /* Check if one is java.lang.X and other is just X */
     const char *simple1 = strrchr(name1, '.');
+    const char *dollar1 = strrchr(name1, '$');
+    if (dollar1 > simple1) simple1 = dollar1;
+    
     const char *simple2 = strrchr(name2, '.');
+    const char *dollar2 = strrchr(name2, '$');
+    if (dollar2 > simple2) simple2 = dollar2;
     
     if (simple1) simple1++; else simple1 = name1;
     if (simple2) simple2++; else simple2 = name2;

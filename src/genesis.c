@@ -26,6 +26,8 @@
 #include "encoding.h"
 #include "jarwriter.h"
 
+#include <sys/stat.h>  /* For mkdir() */
+
 /* ========================================================================
  * Compiler options
  * ======================================================================== */
@@ -206,6 +208,11 @@ static bool init_classpath(compiler_options_t *opts)
         classpath_add_path(g_classpath, opts->classpath, false);
     }
     
+    /* Add output directory to classpath (for multi-file compilation) */
+    if (opts->output_dir) {
+        classpath_add(g_classpath, opts->output_dir);
+    }
+    
     /* Add current directory to classpath */
     classpath_add(g_classpath, ".");
     
@@ -348,6 +355,155 @@ bool compile_dependency(const char *source_path)
     return result == 0;
 }
 
+/* Forward declarations for recursive processing */
+static void process_nested_classes(semantic_t *sem, class_gen_t *outer_cg, 
+                                   symbol_t *outer_sym, compiler_options_t *opts,
+                                   int target_major);
+static void process_local_classes(semantic_t *sem, class_gen_t *outer_cg,
+                                  compiler_options_t *opts, int target_major);
+static void process_anonymous_classes(semantic_t *sem, class_gen_t *outer_cg,
+                                      compiler_options_t *opts, int target_major);
+
+/**
+ * Recursively process nested classes (nested classes of nested classes, etc.)
+ */
+static void process_nested_classes(semantic_t *sem, class_gen_t *outer_cg, 
+                                   symbol_t *outer_sym, compiler_options_t *opts,
+                                   int target_major)
+{
+    for (slist_t *nested = outer_cg->nested_classes; nested; nested = nested->next) {
+        ast_node_t *nested_decl = (ast_node_t *)nested->data;
+        const char *nested_name = nested_decl->data.node.name;
+        
+        /* Look up nested class symbol in outer class's members */
+        symbol_t *nested_sym = scope_lookup_local(
+            outer_sym->data.class_data.members, nested_name);
+        if (!nested_sym) {
+            fprintf(stderr, "error: cannot find nested class symbol: %s\n", nested_name);
+            continue;
+        }
+        
+        /* Create class generator for nested class */
+        class_gen_t *nested_cg = class_gen_new(sem, nested_sym);
+        if (!nested_cg) {
+            fprintf(stderr, "error: failed to create class generator for nested class\n");
+            continue;
+        }
+        class_gen_set_target_version(nested_cg, target_major);
+        
+        /* Generate bytecode for nested class */
+        if (codegen_class(nested_cg, nested_decl)) {
+            if (!output_class(nested_cg, nested_sym->qualified_name, opts)) {
+                fprintf(stderr, "error: failed to write nested class: %s\n", 
+                        nested_sym->qualified_name);
+            }
+            
+            /* Recursively process this nested class's own nested classes */
+            process_nested_classes(sem, nested_cg, nested_sym, opts, target_major);
+            
+            /* Process local classes inside this nested class's methods */
+            process_local_classes(sem, nested_cg, opts, target_major);
+            
+            /* Process anonymous classes inside this nested class's methods */
+            process_anonymous_classes(sem, nested_cg, opts, target_major);
+        } else {
+            fprintf(stderr, "error: code generation failed for nested class: %s\n", nested_name);
+        }
+        
+        class_gen_free(nested_cg);
+    }
+}
+
+/**
+ * Recursively process local classes (classes defined inside method bodies).
+ * Handles local classes inside local classes (e.g., Local3 inside Local2.test2()).
+ */
+static void process_local_classes(semantic_t *sem, class_gen_t *outer_cg,
+                                  compiler_options_t *opts, int target_major)
+{
+    for (slist_t *local = outer_cg->local_classes; local; local = local->next) {
+        ast_node_t *local_decl = (ast_node_t *)local->data;
+        const char *local_name = local_decl->data.node.name;
+        
+        /* Get symbol from AST node - set during semantic analysis */
+        symbol_t *local_sym = local_decl->sem_symbol;
+        
+        if (!local_sym) {
+            fprintf(stderr, "error: cannot find local class symbol: %s\n", local_name);
+            continue;
+        }
+        
+        /* Create class generator for local class */
+        class_gen_t *local_cg = class_gen_new(sem, local_sym);
+        if (!local_cg) {
+            fprintf(stderr, "error: failed to create class generator for local class\n");
+            continue;
+        }
+        class_gen_set_target_version(local_cg, target_major);
+        
+        /* Generate bytecode for local class */
+        if (codegen_class(local_cg, local_decl)) {
+            if (!output_class(local_cg, local_sym->qualified_name, opts)) {
+                fprintf(stderr, "error: failed to write local class: %s\n",
+                        local_sym->qualified_name);
+            }
+            
+            /* Recursively process local classes inside this local class's methods */
+            process_local_classes(sem, local_cg, opts, target_major);
+            
+            /* Process anonymous classes inside this local class's methods */
+            process_anonymous_classes(sem, local_cg, opts, target_major);
+        } else {
+            fprintf(stderr, "error: code generation failed for local class: %s\n", local_name);
+        }
+        
+        class_gen_free(local_cg);
+    }
+}
+
+/**
+ * Process anonymous classes.
+ */
+static void process_anonymous_classes(semantic_t *sem, class_gen_t *outer_cg,
+                                      compiler_options_t *opts, int target_major)
+{
+    for (slist_t *anon = outer_cg->anonymous_classes; anon; anon = anon->next) {
+        symbol_t *anon_sym = (symbol_t *)anon->data;
+        
+        if (!anon_sym || !anon_sym->data.class_data.anonymous_body) {
+            fprintf(stderr, "error: invalid anonymous class symbol\n");
+            continue;
+        }
+        
+        /* Create class generator for anonymous class */
+        class_gen_t *anon_cg = class_gen_new(sem, anon_sym);
+        if (!anon_cg) {
+            fprintf(stderr, "error: failed to create class generator for anonymous class\n");
+            continue;
+        }
+        class_gen_set_target_version(anon_cg, target_major);
+        
+        /* Generate bytecode for anonymous class */
+        if (codegen_anonymous_class(anon_cg, anon_sym)) {
+            if (!output_class(anon_cg, anon_sym->qualified_name, opts)) {
+                fprintf(stderr, "error: failed to write anonymous class: %s\n",
+                        anon_sym->qualified_name);
+            }
+            
+            /* Process local classes inside anonymous class methods */
+            process_local_classes(sem, anon_cg, opts, target_major);
+            
+            /* Recursively process anonymous classes inside anonymous class methods */
+            process_anonymous_classes(sem, anon_cg, opts, target_major);
+        } else {
+            fprintf(stderr, "error: code generation failed for anonymous class: %s\n", 
+                    anon_sym->qualified_name);
+        }
+        
+        class_gen_free(anon_cg);
+    }
+}
+
 /**
  * Compile a single source file.
  */
@@ -456,8 +612,107 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
     
     /* Code generation */
     if (ast->type == AST_COMPILATION_UNIT) {
+        /* Check if this is a package-info.java file */
+        bool is_package_info = false;
+        const char *base_name = strrchr(src->filename, '/');
+        base_name = base_name ? base_name + 1 : src->filename;
+        if (strcmp(base_name, "package-info.java") == 0) {
+            is_package_info = true;
+        }
+        
         /* Find class/module declarations and generate bytecode */
         slist_t *children = ast->data.node.children;
+        
+        /* For package-info.java, look for package declaration with annotations */
+        if (is_package_info) {
+            ast_node_t *package_decl = NULL;
+            for (slist_t *c = children; c; c = c->next) {
+                ast_node_t *child = (ast_node_t *)c->data;
+                if (child && child->type == AST_PACKAGE_DECL) {
+                    package_decl = child;
+                    break;
+                }
+            }
+            
+            if (package_decl) {
+                int target_major = classfile_version_from_string(opts->target_version);
+                size_t size;
+                uint8_t *bytes = codegen_package_info(package_decl, NULL, sem, target_major, &size);
+                if (bytes) {
+                    bool success = false;
+                    const char *pkg_name = package_decl->data.node.name;
+                    
+                    /* Build qualified class name: com.example -> com/example/package-info */
+                    size_t name_len = pkg_name ? strlen(pkg_name) : 0;
+                    char *qname = malloc(name_len + 20);
+                    if (pkg_name) {
+                        strcpy(qname, pkg_name);
+                        for (char *p = qname; *p; p++) {
+                            if (*p == '.') *p = '/';
+                        }
+                        strcat(qname, "/package-info");
+                    } else {
+                        strcpy(qname, "package-info");
+                    }
+                    
+                    if (g_jar_writer) {
+                        /* JAR output mode */
+                        success = jar_writer_add_class(g_jar_writer, qname, bytes, size);
+                        if (success && opts->verbose) {
+                            printf("Added to JAR: %s.class\n", qname);
+                        }
+                    } else {
+                        /* Directory output mode */
+                        const char *output_dir = opts->output_dir ? opts->output_dir : ".";
+                        char output_path[1024];
+                        snprintf(output_path, sizeof(output_path), "%s/%s.class", output_dir, qname);
+                        
+                        /* Create subdirectories if needed */
+                        char *dir_path = strdup(output_path);
+                        char *last_slash = strrchr(dir_path, '/');
+                        if (last_slash) {
+                            *last_slash = '\0';
+                            char *p = dir_path;
+                            while (*p) {
+                                if (*p == '/') {
+                                    *p = '\0';
+                                    mkdir(dir_path, 0755);
+                                    *p = '/';
+                                }
+                                p++;
+                            }
+                            mkdir(dir_path, 0755);
+                        }
+                        free(dir_path);
+                        
+                        FILE *fp = fopen(output_path, "wb");
+                        if (fp) {
+                            if (fwrite(bytes, 1, size, fp) == size) {
+                                success = true;
+                                if (opts->verbose) {
+                                    printf("Generated: %s\n", output_path);
+                                }
+                            }
+                            fclose(fp);
+                        }
+                    }
+                    
+                    if (!success) {
+                        fprintf(stderr, "error: failed to write package-info.class\n");
+                    }
+                    free(bytes);
+                    free(qname);
+                } else {
+                    fprintf(stderr, "error: failed to generate package-info.class\n");
+                }
+            }
+            
+            /* package-info.java files don't have type declarations */
+            semantic_free(sem);
+            ast_free(ast);
+            return 0;
+        }
+        
         while (children) {
             ast_node_t *child = (ast_node_t *)children->data;
             
@@ -546,104 +801,14 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
                         fprintf(stderr, "error: failed to write class file: %s\n", qname);
                     }
                     
-                    /* Process nested classes */
-                    for (slist_t *nested = cg->nested_classes; nested; nested = nested->next) {
-                        ast_node_t *nested_decl = (ast_node_t *)nested->data;
-                        const char *nested_name = nested_decl->data.node.name;
-                        
-                        /* Look up nested class symbol in outer class's members */
-                        symbol_t *nested_sym = scope_lookup_local(
-                            class_sym->data.class_data.members, nested_name);
-                        if (!nested_sym) {
-                            fprintf(stderr, "error: cannot find nested class symbol: %s\n", nested_name);
-                            continue;
-                        }
-                        
-                        /* Create class generator for nested class */
-                        class_gen_t *nested_cg = class_gen_new(sem, nested_sym);
-                        if (!nested_cg) {
-                            fprintf(stderr, "error: failed to create class generator for nested class\n");
-                            continue;
-                        }
-                        class_gen_set_target_version(nested_cg, target_major);
-                        
-                        /* Generate bytecode for nested class */
-                        if (codegen_class(nested_cg, nested_decl)) {
-                            if (!output_class(nested_cg, nested_sym->qualified_name, opts)) {
-                                fprintf(stderr, "error: failed to write nested class: %s\n", 
-                                        nested_sym->qualified_name);
-                            }
-                        } else {
-                            fprintf(stderr, "error: code generation failed for nested class: %s\n", nested_name);
-                        }
-                        
-                        class_gen_free(nested_cg);
-                    }
+                    /* Process nested classes recursively */
+                    process_nested_classes(sem, cg, class_sym, opts, target_major);
                     
-                    /* Process local classes (defined inside method bodies) */
-                    for (slist_t *local = cg->local_classes; local; local = local->next) {
-                        ast_node_t *local_decl = (ast_node_t *)local->data;
-                        const char *local_name = local_decl->data.node.name;
-                        
-                        /* Get symbol from AST node - set during semantic analysis */
-                        symbol_t *local_sym = local_decl->sem_symbol;
-                        
-                        if (!local_sym) {
-                            fprintf(stderr, "error: cannot find local class symbol: %s\n", local_name);
-                            continue;
-                        }
-                        
-                        /* Create class generator for local class */
-                        class_gen_t *local_cg = class_gen_new(sem, local_sym);
-                        if (!local_cg) {
-                            fprintf(stderr, "error: failed to create class generator for local class\n");
-                            continue;
-                        }
-                        class_gen_set_target_version(local_cg, target_major);
-                        
-                        /* Generate bytecode for local class */
-                        if (codegen_class(local_cg, local_decl)) {
-                            if (!output_class(local_cg, local_sym->qualified_name, opts)) {
-                                fprintf(stderr, "error: failed to write local class: %s\n",
-                                        local_sym->qualified_name);
-                            }
-                        } else {
-                            fprintf(stderr, "error: code generation failed for local class: %s\n", local_name);
-                        }
-                        
-                        class_gen_free(local_cg);
-                    }
+                    /* Process local classes (defined inside method bodies) - recursively */
+                    process_local_classes(sem, cg, opts, target_major);
                     
-                    /* Process anonymous classes */
-                    for (slist_t *anon = cg->anonymous_classes; anon; anon = anon->next) {
-                        symbol_t *anon_sym = (symbol_t *)anon->data;
-                        
-                        if (!anon_sym || !anon_sym->data.class_data.anonymous_body) {
-                            fprintf(stderr, "error: invalid anonymous class symbol\n");
-                            continue;
-                        }
-                        
-                        /* Create class generator for anonymous class */
-                        class_gen_t *anon_cg = class_gen_new(sem, anon_sym);
-                        if (!anon_cg) {
-                            fprintf(stderr, "error: failed to create class generator for anonymous class\n");
-                            continue;
-                        }
-                        class_gen_set_target_version(anon_cg, target_major);
-                        
-                        /* Generate bytecode for anonymous class */
-                        if (codegen_anonymous_class(anon_cg, anon_sym)) {
-                            if (!output_class(anon_cg, anon_sym->qualified_name, opts)) {
-                                fprintf(stderr, "error: failed to write anonymous class: %s\n",
-                                        anon_sym->qualified_name);
-                            }
-                        } else {
-                            fprintf(stderr, "error: code generation failed for anonymous class: %s\n", 
-                                    anon_sym->qualified_name);
-                        }
-                        
-                        class_gen_free(anon_cg);
-                    }
+                    /* Process anonymous classes - recursively */
+                    process_anonymous_classes(sem, cg, opts, target_major);
                 } else {
                     fprintf(stderr, "error: code generation failed for: %s\n", class_name);
                 }

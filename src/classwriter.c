@@ -1032,6 +1032,8 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     uint16_t smt_attr_name = cp_add_utf8(cg->cp, "StackMapTable");
     uint16_t bsm_attr_name = cg->uses_invokedynamic ? cp_add_utf8(cg->cp, "BootstrapMethods") : 0;
     uint16_t ps_attr_name = cg->permitted_subclasses ? cp_add_utf8(cg->cp, "PermittedSubclasses") : 0;
+    uint16_t nm_attr_name = cg->nest_members ? cp_add_utf8(cg->cp, "NestMembers") : 0;
+    uint16_t nh_attr_name = cg->nest_host ? cp_add_utf8(cg->cp, "NestHost") : 0;
     /* Pre-add RuntimeVisibleTypeAnnotations for local variable type annotations */
     cp_add_utf8(cg->cp, "RuntimeVisibleTypeAnnotations");
     
@@ -1484,6 +1486,8 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     if (cg->signature) class_attr_count++;
     if (cg->bootstrap_methods && cg->bootstrap_methods->count > 0) class_attr_count++;
     if (cg->permitted_subclasses) class_attr_count++;
+    if (cg->nest_members) class_attr_count++;  /* NestMembers (Java 11+) */
+    if (cg->nest_host) class_attr_count++;     /* NestHost (Java 11+) */
     
     /* Check for class-level annotations with RUNTIME retention */
     int runtime_annot_count = 0;
@@ -1583,6 +1587,39 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
             uint16_t *class_idx = (uint16_t *)node->data;
             write_be_u2(&p, *class_idx);
         }
+    }
+    
+    /* NestMembers attribute (Java 11+) - for nest host class */
+    if (cg->nest_members && nm_attr_name) {
+        write_be_u2(&p, nm_attr_name);
+        
+        /* Count nest members */
+        uint16_t nm_count = 0;
+        for (slist_t *node = cg->nest_members; node; node = node->next) {
+            nm_count++;
+        }
+        
+        /* Attribute length: 2 (number_of_classes) + 2 * nm_count */
+        uint32_t nm_attr_len = 2 + 2 * nm_count;
+        write_be_u4(&p, nm_attr_len);
+        
+        write_be_u2(&p, nm_count);
+        
+        /* Write each nest member class_info index */
+        for (slist_t *node = cg->nest_members; node; node = node->next) {
+            uint16_t *class_idx = (uint16_t *)node->data;
+            write_be_u2(&p, *class_idx);
+        }
+    }
+    
+    /* NestHost attribute (Java 11+) - for nested classes */
+    if (cg->nest_host && nh_attr_name) {
+        write_be_u2(&p, nh_attr_name);
+        
+        /* Attribute length: 2 (host_class_info index) */
+        write_be_u4(&p, 2);
+        
+        write_be_u2(&p, cg->nest_host);
     }
     
     *size = p - buffer;

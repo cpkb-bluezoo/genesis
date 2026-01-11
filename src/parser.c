@@ -1126,29 +1126,52 @@ static ast_node_t *parse_primary(parser_t *parser)
                 
                 /* Check if this looks like a cast: (Type) expr */
                 /* Cast if followed by primitive type, or identifier followed by ) and primary */
+                /* But (int x) -> is a lambda, not a cast! */
                 if (is_primitive_type(parser_current_type(parser))) {
-                    /* Definitely a cast: (int), (long), etc. */
-                    ast_node_t *type_node = parse_type(parser);
-                    if (!type_node) {
-                        return NULL;
+                    /* Lookahead to distinguish cast (int)x from lambda (int x) -> */
+                    lexer_pos_t prim_save = lexer_save_pos(parser->lexer);
+                    parser_advance(parser);  /* consume primitive type */
+                    
+                    /* Check for array dimensions after type: (int[])x vs (int[] x) -> */
+                    while (parser_check(parser, TOK_LBRACKET)) {
+                        parser_advance(parser);
+                        if (!parser_check(parser, TOK_RBRACKET)) {
+                            /* Expression in brackets - not a type */
+                            lexer_restore_pos(parser->lexer, prim_save);
+                            goto check_lambda_params;  /* Parse as lambda */
+                        }
+                        parser_advance(parser);  /* consume ] */
                     }
                     
-                    if (!parser_expect(parser, TOK_RPAREN)) {
-                        ast_free(type_node);
-                        return NULL;
+                    if (parser_check(parser, TOK_RPAREN)) {
+                        /* It's a cast: (int) or (int[]) */
+                        lexer_restore_pos(parser->lexer, prim_save);
+                        ast_node_t *type_node = parse_type(parser);
+                        if (!type_node) {
+                            return NULL;
+                        }
+                        
+                        if (!parser_expect(parser, TOK_RPAREN)) {
+                            ast_free(type_node);
+                            return NULL;
+                        }
+                        
+                        /* Parse the expression being cast */
+                        ast_node_t *operand = parse_unary(parser);
+                        if (!operand) {
+                            ast_free(type_node);
+                            return NULL;
+                        }
+                        
+                        ast_node_t *cast = ast_new(AST_CAST_EXPR, line, col);
+                        ast_add_child(cast, type_node);
+                        ast_add_child(cast, operand);
+                        return cast;
+                    } else {
+                        /* It's a lambda with typed params: (int x) -> */
+                        lexer_restore_pos(parser->lexer, prim_save);
+                        goto check_lambda_params;
                     }
-                    
-                    /* Parse the expression being cast */
-                    ast_node_t *operand = parse_unary(parser);
-                    if (!operand) {
-                        ast_free(type_node);
-                        return NULL;
-                    }
-                    
-                    ast_node_t *cast = ast_new(AST_CAST_EXPR, line, col);
-                    ast_add_child(cast, type_node);
-                    ast_add_child(cast, operand);
-                    return cast;
                 }
                 
                 /* Check for reference type cast: (ClassName) expr */
@@ -1213,6 +1236,7 @@ static ast_node_t *parse_primary(parser_t *parser)
                  *   (Type id, Type id, ...) -> - typed parameters
                  *   (var id, var id, ...) ->   - var parameters (Java 11+)
                  */
+                check_lambda_params:;
                 lexer_pos_t lambda_check_pos = lexer_save_pos(parser->lexer);
                 bool looks_like_lambda_params = true;
                 bool typed_params = false;
@@ -1233,10 +1257,68 @@ static ast_node_t *parse_primary(parser_t *parser)
                         }
                         parser_advance(parser);  /* consume name */
                         param_count++;
+                        /* After primitive type param, check for ) or , */
+                        if (parser_check(parser, TOK_RPAREN)) {
+                            parser_advance(parser);
+                            if (parser_check(parser, TOK_ARROW)) {
+                                /* This IS a lambda with parameters */
+                                break;
+                            } else {
+                                looks_like_lambda_params = false;
+                            }
+                        } else if (parser_check(parser, TOK_COMMA)) {
+                            parser_advance(parser);
+                            /* Continue to next parameter */
+                        } else {
+                            looks_like_lambda_params = false;
+                        }
+                        continue;
                     } else if (tok == TOK_IDENTIFIER) {
-                        /* Could be untyped (x) or typed (Type x) */
+                        /* Could be untyped (x) or typed (Type x) or typed with generics (List<T> x)
+                         * or typed with qualified name (Map.Entry<K,V> x) */
                         parser_advance(parser);
-                        if (parser_check(parser, TOK_IDENTIFIER)) {
+                        
+                        /* Handle qualified type names: Outer.Inner or a.b.c.Type */
+                        while (parser_check(parser, TOK_DOT)) {
+                            parser_advance(parser);  /* consume . */
+                            if (parser_check(parser, TOK_IDENTIFIER)) {
+                                parser_advance(parser);  /* consume next part */
+                            } else {
+                                looks_like_lambda_params = false;
+                                break;
+                            }
+                        }
+                        if (!looks_like_lambda_params) break;
+                        
+                        /* Check for parameterized type: Type<...> or Outer.Inner<...> */
+                        if (parser_check(parser, TOK_LT)) {
+                            /* Skip over type arguments <...> - track nested angle brackets */
+                            int depth = 1;
+                            parser_advance(parser);  /* consume < */
+                            while (depth > 0 && !parser_check(parser, TOK_EOF)) {
+                                if (parser_check(parser, TOK_LT)) {
+                                    depth++;
+                                } else if (parser_check(parser, TOK_GT)) {
+                                    depth--;
+                                } else if (parser_check(parser, TOK_RSHIFT)) {
+                                    /* >> can close two levels of generics */
+                                    depth -= 2;
+                                }
+                                parser_advance(parser);
+                            }
+                            if (depth != 0) {
+                                looks_like_lambda_params = false;
+                                break;
+                            }
+                            /* After <...>, should have parameter name */
+                            if (parser_check(parser, TOK_IDENTIFIER)) {
+                                typed_params = true;
+                                parser_advance(parser);  /* consume name */
+                            } else {
+                                looks_like_lambda_params = false;
+                                break;
+                            }
+                        } else if (parser_check(parser, TOK_IDENTIFIER)) {
                             /* Two identifiers = typed: Type name */
                             typed_params = true;
                             parser_advance(parser);  /* consume name */
@@ -2446,6 +2528,15 @@ static ast_node_t *parse_statement(parser_t *parser)
                         /* Could be a type - peek ahead */
                         lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
                         parser_advance(parser);
+                        /* Skip qualified name parts (e.g., Map.Entry) */
+                        while (parser_check(parser, TOK_DOT)) {
+                            parser_advance(parser);
+                            if (parser_check(parser, TOK_IDENTIFIER)) {
+                                parser_advance(parser);
+                            } else {
+                                break;
+                            }
+                        }
                         /* Skip generic params if present */
                         if (parser_check(parser, TOK_LT)) {
                             int depth = 1;
@@ -3407,7 +3498,11 @@ static uint32_t parse_modifiers_with_annotations(parser_t *parser, slist_t **ann
         }
         
         if (is_modifier(parser_current_type(parser))) {
-            flags |= modifier_flag(parser_current_type(parser));
+            uint32_t new_flag = modifier_flag(parser_current_type(parser));
+            if (flags & new_flag) {
+                parser_error(parser, "repeated modifier");
+            }
+            flags |= new_flag;
             parser_advance(parser);
             continue;
         }
@@ -4301,13 +4396,29 @@ ast_node_t *parser_parse(parser_t *parser)
         return unit;
     }
     
-    /* Package declaration */
+    /* Package declaration (may have annotations before it, e.g. @Deprecated package foo;) */
+    slist_t *pkg_annotations = NULL;
+    if (parser_check(parser, TOK_AT)) {
+        /* Parse annotations - these may be package annotations or type annotations */
+        uint32_t pkg_mods = parse_modifiers_with_annotations(parser, &pkg_annotations);
+        (void)pkg_mods;  /* Package declarations don't have modifiers */
+    }
+    
     if (parser_check(parser, TOK_PACKAGE)) {
         int line = parser_current_line(parser);
         int col = parser_current_column(parser);
         parser_advance(parser);
         
         ast_node_t *pkg = ast_new(AST_PACKAGE_DECL, line, col);
+        
+        /* Attach annotations to package declaration */
+        if (pkg_annotations) {
+            for (slist_t *node = pkg_annotations; node; node = node->next) {
+                ast_add_child(pkg, (ast_node_t *)node->data);
+            }
+            slist_free(pkg_annotations);  /* Don't free the nodes, they're now children */
+            pkg_annotations = NULL;
+        }
         
         /* Parse package name - contextual keywords like 'requires', 'exports' etc. 
          * can be used as package name components */
@@ -4330,6 +4441,15 @@ ast_node_t *parser_parse(parser_t *parser)
         pkg->data.node.name = string_free(name, false);
         parser_expect(parser, TOK_SEMICOLON);
         ast_add_child(unit, pkg);
+    } else if (pkg_annotations) {
+        /* Annotations were parsed but no package follows - these are type annotations */
+        /* They'll be handled in the type declaration parsing below, but we need to 
+         * put them back somehow. For now, we just skip them as this is unusual. */
+        for (slist_t *node = pkg_annotations; node; node = node->next) {
+            ast_free((ast_node_t *)node->data);
+        }
+        slist_free(pkg_annotations);
+        pkg_annotations = NULL;
     }
     
     /* Import declarations */

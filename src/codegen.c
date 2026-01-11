@@ -1853,16 +1853,33 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
             }
         }
         
-        /* For any nested class (static or inner), add InnerClasses entry for itself */
+        /* For any nested class (static or inner), add InnerClasses entry for itself.
+         * For local classes, outer_class_info = 0 (per JVM spec - local classes
+         * are not members of their enclosing class in the InnerClasses sense). */
         if (enclosing) {
             inner_class_entry_t *entry = calloc(1, sizeof(inner_class_entry_t));
             entry->inner_class_info = cg->this_class;
-            entry->outer_class_info = cp_add_class(cg->cp, cg->outer_class_internal ? 
-                cg->outer_class_internal : class_to_internal_name(enclosing->qualified_name));
+            
+            /* Local classes have outer_class_info = 0 in InnerClasses attribute */
+            if (class_sym->data.class_data.is_local_class) {
+                entry->outer_class_info = 0;
+            } else {
+                entry->outer_class_info = cp_add_class(cg->cp, cg->outer_class_internal ? 
+                    cg->outer_class_internal : class_to_internal_name(enclosing->qualified_name));
+            }
             entry->inner_name = cp_add_utf8(cg->cp, class_sym->name);
             entry->access_flags = class_sym->modifiers & 0x001F;  /* ACC_PUBLIC | ACC_PRIVATE | ACC_PROTECTED | ACC_STATIC | ACC_FINAL */
             
             cg->inner_class_entries = slist_new(entry);
+            
+            /* NestHost attribute (Java 11+): Find the top-level enclosing class */
+            symbol_t *nest_host = enclosing;
+            while (nest_host->data.class_data.enclosing_class) {
+                nest_host = nest_host->data.class_data.enclosing_class;
+            }
+            char *nest_host_internal = class_to_internal_name(nest_host->qualified_name);
+            cg->nest_host = cp_add_class(cg->cp, nest_host_internal);
+            free(nest_host_internal);
         }
     }
     
@@ -1921,6 +1938,12 @@ void class_gen_free(class_gen_t *cg)
         free(node->data);
     }
     slist_free(cg->inner_class_entries);
+    
+    /* Free nest members */
+    for (slist_t *node = cg->nest_members; node; node = node->next) {
+        free(node->data);
+    }
+    slist_free(cg->nest_members);
     
     slist_free(cg->nested_classes);
     slist_free(cg->local_classes);
@@ -2767,6 +2790,251 @@ static bool codegen_bridge_method(class_gen_t *cg, symbol_t *method_sym)
     return true;
 }
 
+/**
+ * Generate bridge methods for generic superclass inheritance.
+ * When B extends A<String> and A<T> has f(T), B needs f(Object) -> super.f(Object).
+ * This is needed when:
+ * - Class extends a generic superclass with concrete type arguments
+ * - Superclass has methods with type parameters in signature
+ * - Class doesn't override those methods
+ */
+static void generate_superclass_bridges(class_gen_t *cg)
+{
+    if (!cg || !cg->class_sym) {
+        return;
+    }
+    
+    symbol_t *class_sym = cg->class_sym;
+    symbol_t *super_sym = class_sym->data.class_data.superclass;
+    
+    if (!super_sym || !super_sym->data.class_data.members) {
+        return;
+    }
+    
+    /* Check if superclass has methods that need bridges.
+     * A method needs a bridge if:
+     * 1. It has type variable parameters that erase to Object
+     * 2. The current class doesn't define a method with the erased signature
+     */
+    scope_t *super_members = super_sym->data.class_data.members;
+    if (!super_members || !super_members->symbols) {
+        return;
+    }
+    
+    hashtable_t *ht = super_members->symbols;
+    for (size_t i = 0; i < ht->size; i++) {
+        hashtable_entry_t *entry = ht->buckets[i];
+        while (entry) {
+            symbol_t *method = (symbol_t *)entry->value;
+            if (method && method->kind == SYM_METHOD &&
+                !(method->modifiers & MOD_STATIC) &&
+                !(method->modifiers & MOD_PRIVATE)) {
+                
+                /* Check if this method has type variable parameters */
+                bool has_type_var_param = false;
+                slist_t *params = method->data.method_data.parameters;
+                for (slist_t *p = params; p; p = p->next) {
+                    symbol_t *param = (symbol_t *)p->data;
+                    if (param && param->type && param->type->kind == TYPE_TYPEVAR) {
+                        has_type_var_param = true;
+                        break;
+                    }
+                }
+                
+                /* Also check for type variable return type */
+                if (method->type && method->type->kind == TYPE_TYPEVAR) {
+                    has_type_var_param = true;
+                }
+                
+                if (!has_type_var_param) {
+                    entry = entry->next;
+                    continue;
+                }
+                
+                /* Check if current class already has this method */
+                bool has_override = false;
+                if (class_sym->data.class_data.members && 
+                    class_sym->data.class_data.members->symbols) {
+                    hashtable_t *class_methods = class_sym->data.class_data.members->symbols;
+                    for (size_t j = 0; j < class_methods->size && !has_override; j++) {
+                        hashtable_entry_t *class_entry = class_methods->buckets[j];
+                        while (class_entry && !has_override) {
+                            symbol_t *class_method = (symbol_t *)class_entry->value;
+                            if (class_method && class_method->kind == SYM_METHOD &&
+                                class_method->name && method->name &&
+                                strcmp(class_method->name, method->name) == 0) {
+                                /* Count parameters to match signature */
+                                int class_param_count = 0;
+                                int super_param_count = 0;
+                                for (slist_t *cp = class_method->data.method_data.parameters; cp; cp = cp->next)
+                                    class_param_count++;
+                                for (slist_t *sp = method->data.method_data.parameters; sp; sp = sp->next)
+                                    super_param_count++;
+                                if (class_param_count == super_param_count) {
+                                    has_override = true;
+                                }
+                            }
+                            class_entry = class_entry->next;
+                        }
+                    }
+                }
+                
+                if (has_override) {
+                    entry = entry->next;
+                    continue;
+                }
+                
+                /* Generate bridge method:
+                 * public synthetic bridge void f(Object arg) {
+                 *     super.f(arg);  // invokespecial
+                 * }
+                 */
+                method_info_gen_t *mi = calloc(1, sizeof(method_info_gen_t));
+                if (!mi) {
+                    entry = entry->next;
+                    continue;
+                }
+                
+                /* Bridge flags: public, synthetic, bridge */
+                mi->access_flags = ACC_PUBLIC | ACC_SYNTHETIC | ACC_BRIDGE;
+                mi->name_index = cp_add_utf8(cg->cp, method->name);
+                
+                /* Build descriptor with erased types (type vars -> Object) */
+                string_t *desc = string_new("(");
+                int slot = 1;  /* Start after 'this' */
+                for (slist_t *p = params; p; p = p->next) {
+                    symbol_t *param = (symbol_t *)p->data;
+                    if (param && param->type) {
+                        if (param->type->kind == TYPE_TYPEVAR) {
+                            string_append(desc, "Ljava/lang/Object;");
+                        } else {
+                            char *param_desc = type_to_descriptor(param->type);
+                            string_append(desc, param_desc);
+                            free(param_desc);
+                        }
+                        /* Count slots for parameter loading */
+                        if (param->type->kind == TYPE_LONG || param->type->kind == TYPE_DOUBLE) {
+                            slot += 2;
+                        } else {
+                            slot++;
+                        }
+                    }
+                }
+                string_append(desc, ")");
+                
+                /* Return type */
+                if (method->type) {
+                    if (method->type->kind == TYPE_TYPEVAR) {
+                        string_append(desc, "Ljava/lang/Object;");
+                    } else {
+                        char *ret_desc = type_to_descriptor(method->type);
+                        string_append(desc, ret_desc);
+                        free(ret_desc);
+                    }
+                } else {
+                    string_append(desc, "V");
+                }
+                
+                mi->descriptor_index = cp_add_utf8(cg->cp, desc->str);
+                char *desc_str = strdup(desc->str);
+                string_free(desc, true);
+                
+                /* Generate bridge method body */
+                bytecode_t *code = bytecode_new();
+                int max_stack = 0;
+                
+                /* aload_0 (this) */
+                bc_emit(code, OP_ALOAD_0);
+                max_stack++;
+                
+                /* Load all parameters */
+                slot = 1;
+                for (slist_t *p = params; p; p = p->next) {
+                    symbol_t *param = (symbol_t *)p->data;
+                    type_kind_t kind = TYPE_CLASS;  /* Default for type vars */
+                    if (param && param->type && param->type->kind != TYPE_TYPEVAR) {
+                        kind = param->type->kind;
+                    }
+                    
+                    switch (kind) {
+                        case TYPE_LONG:
+                            bc_emit(code, slot <= 3 ? OP_LLOAD_0 + slot : OP_LLOAD);
+                            if (slot > 3) bc_emit_u1(code, slot);
+                            max_stack += 2;
+                            slot += 2;
+                            break;
+                        case TYPE_DOUBLE:
+                            bc_emit(code, slot <= 3 ? OP_DLOAD_0 + slot : OP_DLOAD);
+                            if (slot > 3) bc_emit_u1(code, slot);
+                            max_stack += 2;
+                            slot += 2;
+                            break;
+                        case TYPE_FLOAT:
+                            bc_emit(code, slot <= 3 ? OP_FLOAD_0 + slot : OP_FLOAD);
+                            if (slot > 3) bc_emit_u1(code, slot);
+                            max_stack++;
+                            slot++;
+                            break;
+                        case TYPE_BOOLEAN:
+                        case TYPE_BYTE:
+                        case TYPE_CHAR:
+                        case TYPE_SHORT:
+                        case TYPE_INT:
+                            bc_emit(code, slot <= 3 ? OP_ILOAD_0 + slot : OP_ILOAD);
+                            if (slot > 3) bc_emit_u1(code, slot);
+                            max_stack++;
+                            slot++;
+                            break;
+                        default:  /* CLASS, ARRAY, TYPEVAR -> aload */
+                            bc_emit(code, slot <= 3 ? OP_ALOAD_0 + slot : OP_ALOAD);
+                            if (slot > 3) bc_emit_u1(code, slot);
+                            max_stack++;
+                            slot++;
+                            break;
+                    }
+                }
+                
+                /* invokespecial super.method(desc) */
+                uint16_t methodref = cp_add_methodref(cg->cp, cg->superclass, method->name, desc_str);
+                bc_emit(code, OP_INVOKESPECIAL);
+                bc_emit_u2(code, methodref);
+                
+                /* Return */
+                type_kind_t ret_kind = TYPE_VOID;
+                if (method->type) {
+                    ret_kind = method->type->kind;
+                    if (ret_kind == TYPE_TYPEVAR) ret_kind = TYPE_CLASS;
+                }
+                
+                switch (ret_kind) {
+                    case TYPE_VOID:   bc_emit(code, OP_RETURN); break;
+                    case TYPE_LONG:   bc_emit(code, OP_LRETURN); break;
+                    case TYPE_DOUBLE: bc_emit(code, OP_DRETURN); break;
+                    case TYPE_FLOAT:  bc_emit(code, OP_FRETURN); break;
+                    case TYPE_CLASS:
+                    case TYPE_ARRAY:  bc_emit(code, OP_ARETURN); break;
+                    default:          bc_emit(code, OP_IRETURN); break;
+                }
+                
+                code->max_stack = max_stack;
+                code->max_locals = slot;
+                
+                mi->code = code;
+                
+                free(desc_str);
+                
+                /* Add to methods list */
+                if (!cg->methods) {
+                    cg->methods = slist_new(mi);
+                } else {
+                    slist_append(cg->methods, mi);
+                }
+            }
+            entry = entry->next;
+        }
+    }
+}
+
 /* ========================================================================
  * Class Code Generation
  * ======================================================================== */
@@ -3018,14 +3286,26 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         return false;
                     }
                     
-                    /* Generate bridge method if this is a covariant override */
+                    /* Generate bridge method if this is a covariant override.
+                     * Methods are stored with keys like "call(0)" so we need to
+                     * iterate through symbols to find by name. */
                     const char *method_name = member->data.node.name;
                     if (cg->class_sym && cg->class_sym->data.class_data.members) {
-                        symbol_t *method_sym = scope_lookup_local(
-                            cg->class_sym->data.class_data.members, method_name);
-                        if (method_sym && method_sym->kind == SYM_METHOD &&
-                            method_sym->data.method_data.overridden_method) {
-                            codegen_bridge_method(cg, method_sym);
+                        scope_t *members = cg->class_sym->data.class_data.members;
+                        if (members && members->symbols) {
+                            hashtable_t *ht = members->symbols;
+                            for (size_t i = 0; i < ht->size; i++) {
+                                hashtable_entry_t *entry = ht->buckets[i];
+                                while (entry) {
+                                    symbol_t *method_sym = (symbol_t *)entry->value;
+                                    if (method_sym && method_sym->kind == SYM_METHOD &&
+                                        method_sym->name && strcmp(method_sym->name, method_name) == 0 &&
+                                        method_sym->data.method_data.overridden_method) {
+                                        codegen_bridge_method(cg, method_sym);
+                                    }
+                                    entry = entry->next;
+                                }
+                            }
                         }
                     }
                 }
@@ -3149,7 +3429,8 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         char *nested_internal = class_to_internal_name(nested_qname);
                         
                         inner_class_entry_t *entry = calloc(1, sizeof(inner_class_entry_t));
-                        entry->inner_class_info = cp_add_class(cg->cp, nested_internal);
+                        uint16_t nested_class_idx = cp_add_class(cg->cp, nested_internal);
+                        entry->inner_class_info = nested_class_idx;
                         entry->outer_class_info = cg->this_class;
                         entry->inner_name = cp_add_utf8(cg->cp, nested_name);
                         /* Convert MOD_ flags to ACC_ flags for inner class access */
@@ -3159,6 +3440,18 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                             cg->inner_class_entries = slist_new(entry);
                         } else {
                             slist_append(cg->inner_class_entries, entry);
+                        }
+                        
+                        /* NestMembers attribute (Java 11+): Add this nested class as a nest member
+                         * Only if the current class is the nest host (not itself a nested class) */
+                        if (cg->nest_host == 0) {
+                            uint16_t *nest_member_idx = malloc(sizeof(uint16_t));
+                            *nest_member_idx = nested_class_idx;
+                            if (!cg->nest_members) {
+                                cg->nest_members = slist_new(nest_member_idx);
+                            } else {
+                                slist_append(cg->nest_members, nest_member_idx);
+                            }
                         }
                         
                         free(nested_internal);
@@ -3191,6 +3484,12 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             }
             children_iter = children_iter->next;
         }
+    }
+    
+    /* Generate bridge methods for generic superclass inheritance.
+     * When B extends A<String> and A<T> has f(T), B needs f(Object) -> super.f(Object). */
+    if (!is_interface && !is_annotation) {
+        generate_superclass_bridges(cg);
     }
     
     /* Generate default constructor if class has no explicit constructors
@@ -4921,12 +5220,33 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         
         /* Build constructor descriptor */
         string_t *desc = string_new("(");
+        string_t *super_desc = string_new("(");  /* For calling super() */
         
         /* For anonymous classes (like inner classes), take outer instance as parameter */
         if (cg->is_inner_class && cg->outer_class_internal) {
             string_append(desc, "L");
             string_append(desc, cg->outer_class_internal);
             string_append(desc, ";");
+        }
+        
+        /* Add superclass constructor argument types (for anonymous classes) */
+        slist_t *super_ctor_args = NULL;
+        if (cg->class_sym && cg->class_sym->data.class_data.super_ctor_args) {
+            super_ctor_args = cg->class_sym->data.class_data.super_ctor_args;
+            for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
+                ast_node_t *arg_node = (ast_node_t *)arg->data;
+                /* Use sem_type if available, otherwise try to get expression type */
+                type_t *arg_type = arg_node ? arg_node->sem_type : NULL;
+                if (!arg_type && arg_node && cg->sem) {
+                    arg_type = get_expression_type(cg->sem, arg_node);
+                }
+                if (arg_type) {
+                    char *arg_desc = type_to_descriptor(arg_type);
+                    string_append(desc, arg_desc);
+                    string_append(super_desc, arg_desc);
+                    free(arg_desc);
+                }
+            }
         }
         
         /* Add captured variable types */
@@ -4942,6 +5262,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         }
         
         string_append(desc, ")V");
+        string_append(super_desc, ")V");
         init->descriptor_index = cp_add_utf8(cg->cp, desc->str);
         string_free(desc, true);
         
@@ -4965,6 +5286,24 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         if (cg->is_inner_class) {
             mg->next_slot = 2;  /* outer instance in slot 1 */
             mg->max_locals = 2;
+        }
+        
+        /* Account for superclass constructor arguments */
+        uint16_t super_arg_start_slot = mg->next_slot;
+        if (super_ctor_args) {
+            for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
+                ast_node_t *arg_node = (ast_node_t *)arg->data;
+                type_t *arg_type = arg_node ? arg_node->sem_type : NULL;
+                if (!arg_type && arg_node && cg->sem) {
+                    arg_type = get_expression_type(cg->sem, arg_node);
+                }
+                if (arg_type) {
+                    int size = (arg_type->kind == TYPE_LONG ||
+                               arg_type->kind == TYPE_DOUBLE) ? 2 : 1;
+                    mg->next_slot += size;
+                    mg->max_locals = mg->next_slot;
+                }
+            }
         }
         
         /* Account for captured variables */
@@ -5064,11 +5403,79 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         bc_emit(mg->code, OP_ALOAD_0);
         mg_push(mg, 1);
         
-        /* invokespecial superclass.<init>:()V */
-        uint16_t super_init = cp_add_methodref(cg->cp, cg->superclass, "<init>", "()V");
+        /* Load superclass constructor arguments */
+        int super_arg_count = 0;
+        if (super_ctor_args) {
+            uint16_t slot = super_arg_start_slot;
+            for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
+                ast_node_t *arg_node = (ast_node_t *)arg->data;
+                type_t *arg_type = arg_node ? arg_node->sem_type : NULL;
+                if (!arg_type && arg_node && cg->sem) {
+                    arg_type = get_expression_type(cg->sem, arg_node);
+                }
+                if (arg_type) {
+                    type_kind_t kind = arg_type->kind;
+                    if (kind == TYPE_LONG) {
+                        if (slot <= 3) {
+                            bc_emit(mg->code, OP_LLOAD_0 + slot);
+                        } else {
+                            bc_emit(mg->code, OP_LLOAD);
+                            bc_emit_u1(mg->code, (uint8_t)slot);
+                        }
+                        mg_push(mg, 2);
+                        slot += 2;
+                    } else if (kind == TYPE_DOUBLE) {
+                        if (slot <= 3) {
+                            bc_emit(mg->code, OP_DLOAD_0 + slot);
+                        } else {
+                            bc_emit(mg->code, OP_DLOAD);
+                            bc_emit_u1(mg->code, (uint8_t)slot);
+                        }
+                        mg_push(mg, 2);
+                        slot += 2;
+                    } else if (kind == TYPE_FLOAT) {
+                        if (slot <= 3) {
+                            bc_emit(mg->code, OP_FLOAD_0 + slot);
+                        } else {
+                            bc_emit(mg->code, OP_FLOAD);
+                            bc_emit_u1(mg->code, (uint8_t)slot);
+                        }
+                        mg_push(mg, 1);
+                        slot++;
+                    } else if (kind == TYPE_BOOLEAN || kind == TYPE_BYTE ||
+                               kind == TYPE_CHAR || kind == TYPE_SHORT ||
+                               kind == TYPE_INT) {
+                        if (slot <= 3) {
+                            bc_emit(mg->code, OP_ILOAD_0 + slot);
+                        } else {
+                            bc_emit(mg->code, OP_ILOAD);
+                            bc_emit_u1(mg->code, (uint8_t)slot);
+                        }
+                        mg_push(mg, 1);
+                        slot++;
+                    } else {
+                        /* Reference type */
+                        if (slot <= 3) {
+                            bc_emit(mg->code, OP_ALOAD_0 + slot);
+                        } else {
+                            bc_emit(mg->code, OP_ALOAD);
+                            bc_emit_u1(mg->code, (uint8_t)slot);
+                        }
+                        mg_push(mg, 1);
+                        slot++;
+                    }
+                    super_arg_count++;
+                }
+            }
+        }
+        
+        /* invokespecial superclass.<init> with proper descriptor */
+        uint16_t super_init = cp_add_methodref(cg->cp, cg->superclass, "<init>", super_desc->str);
         bc_emit(mg->code, OP_INVOKESPECIAL);
         bc_emit_u2(mg->code, super_init);
-        mg_pop(mg, 1);
+        mg_pop(mg, 1 + super_arg_count);
+        
+        string_free(super_desc, true);
         
         /* Inject instance field initializers */
         for (slist_t *node = cg->instance_field_inits; node; node = node->next) {
@@ -5706,6 +6113,320 @@ uint8_t *codegen_module(ast_node_t *module_decl, size_t *size_out)
     slist_free(opens_list);
     slist_free(uses_list);
     slist_free(provides_list);
+    
+    *size_out = p - bytes;
+    return bytes;
+}
+
+/**
+ * Generate package-info.class from a package declaration AST.
+ * 
+ * This is called for package-info.java files which contain
+ * package-level annotations like: @Deprecated package com.example;
+ * 
+ * The generated class file is a synthetic interface named "package-info"
+ * with ACC_INTERFACE | ACC_ABSTRACT | ACC_SYNTHETIC flags.
+ * 
+ * @param package_decl   The AST_PACKAGE_DECL node
+ * @param annotations    List of annotation AST nodes, or NULL
+ * @param sem            Semantic analyzer for annotation resolution
+ * @param target_version Target class file version
+ * @param size_out       Output parameter for the size of the generated bytes
+ * @return               Allocated byte array containing the class file, or NULL on error
+ */
+uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
+                              semantic_t *sem, int target_version, size_t *size_out)
+{
+    if (!package_decl || package_decl->type != AST_PACKAGE_DECL || !size_out) {
+        return NULL;
+    }
+    
+    const char *package_name = package_decl->data.node.name;
+    if (!package_name) {
+        return NULL;
+    }
+    
+    /* Create constant pool */
+    const_pool_t *cp = const_pool_new();
+    
+    /* Convert package name to internal form: com.example -> com/example/package-info */
+    size_t pkg_len = strlen(package_name);
+    char *internal_name = malloc(pkg_len + 20);  /* room for /package-info */
+    strcpy(internal_name, package_name);
+    for (char *p = internal_name; *p; p++) {
+        if (*p == '.') *p = '/';
+    }
+    strcat(internal_name, "/package-info");
+    
+    /* Add class entries */
+    uint16_t this_class = cp_add_class(cp, internal_name);
+    uint16_t super_class = cp_add_class(cp, "java/lang/Object");
+    
+    /* Add SourceFile attribute */
+    uint16_t source_file_attr = cp_add_utf8(cp, "SourceFile");
+    uint16_t source_file_name = cp_add_utf8(cp, "package-info.java");
+    
+    /* Process annotations from package declaration children */
+    slist_t *all_annotations = NULL;
+    
+    /* Collect annotations from package_decl's children */
+    for (slist_t *child = package_decl->data.node.children; child; child = child->next) {
+        ast_node_t *annot = (ast_node_t *)child->data;
+        if (annot && annot->type == AST_ANNOTATION) {
+            if (!all_annotations) all_annotations = slist_new(annot);
+            else slist_append(all_annotations, annot);
+        }
+    }
+    
+    /* Also include any standalone annotations passed in */
+    for (slist_t *node = annotations; node; node = node->next) {
+        ast_node_t *annot = (ast_node_t *)node->data;
+        if (annot && annot->type == AST_ANNOTATION) {
+            if (!all_annotations) all_annotations = slist_new(annot);
+            else slist_append(all_annotations, annot);
+        }
+    }
+    
+    /* Build RuntimeVisibleAnnotations attribute if we have annotations */
+    uint8_t *annotations_bytes = NULL;
+    size_t annotations_size = 0;
+    uint16_t annotations_attr_name = 0;
+    
+    if (all_annotations) {
+        annotations_attr_name = cp_add_utf8(cp, "RuntimeVisibleAnnotations");
+        
+        /* Count annotations */
+        int annot_count = slist_length(all_annotations);
+        
+        /* Build annotations data:
+         * u2 num_annotations
+         * annotation[num_annotations]
+         *   annotation {
+         *     u2 type_index
+         *     u2 num_element_value_pairs
+         *     element_value_pair[num_element_value_pairs]
+         *   }
+         */
+        
+        /* Calculate size and allocate */
+        size_t data_size = 2;  /* num_annotations */
+        for (slist_t *node = all_annotations; node; node = node->next) {
+            ast_node_t *annot = (ast_node_t *)node->data;
+            if (annot && annot->type == AST_ANNOTATION) {
+                data_size += 2 + 2;  /* type_index + num_element_value_pairs (0 for now) */
+            }
+        }
+        
+        annotations_bytes = malloc(data_size);
+        uint8_t *p = annotations_bytes;
+        
+        /* num_annotations */
+        *p++ = (annot_count >> 8) & 0xFF;
+        *p++ = annot_count & 0xFF;
+        
+        /* annotation entries */
+        for (slist_t *node = all_annotations; node; node = node->next) {
+            ast_node_t *annot = (ast_node_t *)node->data;
+            if (annot && annot->type == AST_ANNOTATION) {
+                /* Get annotation type name */
+                const char *annot_name = annot->data.node.name;
+                if (!annot_name) continue;
+                
+                /* Resolve to fully qualified name if needed */
+                const char *full_name = annot_name;
+                if (sem && strchr(annot_name, '.') == NULL) {
+                    /* Try to resolve from imports */
+                    for (slist_t *imp = sem->imports; imp; imp = imp->next) {
+                        ast_node_t *import = (ast_node_t *)imp->data;
+                        if (import && import->data.node.name) {
+                            const char *imp_name = import->data.node.name;
+                            /* Check if import ends with this annotation name */
+                            size_t imp_len = strlen(imp_name);
+                            size_t ann_len = strlen(annot_name);
+                            if (imp_len > ann_len && 
+                                strcmp(imp_name + imp_len - ann_len, annot_name) == 0 &&
+                                imp_name[imp_len - ann_len - 1] == '.') {
+                                full_name = imp_name;
+                                break;
+                            }
+                        }
+                    }
+                    /* Default to java.lang if common */
+                    if (strcmp(full_name, annot_name) == 0) {
+                        if (strcmp(annot_name, "Deprecated") == 0 ||
+                            strcmp(annot_name, "Override") == 0 ||
+                            strcmp(annot_name, "SuppressWarnings") == 0 ||
+                            strcmp(annot_name, "SafeVarargs") == 0 ||
+                            strcmp(annot_name, "FunctionalInterface") == 0) {
+                            char *buf = malloc(strlen(annot_name) + 12);
+                            sprintf(buf, "java.lang.%s", annot_name);
+                            full_name = buf;  /* Will leak, but small */
+                        }
+                    }
+                }
+                
+                /* Convert to descriptor form: java.lang.Deprecated -> Ljava/lang/Deprecated; */
+                size_t name_len = strlen(full_name);
+                char *desc = malloc(name_len + 3);
+                desc[0] = 'L';
+                strcpy(desc + 1, full_name);
+                for (char *c = desc + 1; *c; c++) {
+                    if (*c == '.') *c = '/';
+                }
+                strcat(desc, ";");
+                
+                uint16_t type_idx = cp_add_utf8(cp, desc);
+                free(desc);
+                
+                *p++ = (type_idx >> 8) & 0xFF;
+                *p++ = type_idx & 0xFF;
+                
+                /* num_element_value_pairs = 0 (simplified - no annotation values) */
+                *p++ = 0x00;
+                *p++ = 0x00;
+            }
+        }
+        
+        annotations_size = p - annotations_bytes;
+    }
+    
+    slist_free(all_annotations);
+    
+    /* Calculate total size */
+    size_t total_size = 4;      /* magic */
+    total_size += 2 + 2;        /* version */
+    total_size += 2;            /* constant pool count */
+    
+    /* Constant pool */
+    for (uint16_t i = 1; i < cp->count; i++) {
+        const_pool_entry_t *e = &cp->entries[i];
+        total_size += 1;  /* tag */
+        switch (e->type) {
+            case CONST_UTF8:
+                total_size += 2 + strlen(e->data.utf8);
+                break;
+            case CONST_CLASS:
+                total_size += 2;
+                break;
+            default:
+                break;
+        }
+    }
+    
+    total_size += 2;            /* access flags */
+    total_size += 2;            /* this_class */
+    total_size += 2;            /* super_class */
+    total_size += 2;            /* interfaces_count (0) */
+    total_size += 2;            /* fields_count (0) */
+    total_size += 2;            /* methods_count (0) */
+    total_size += 2;            /* attributes_count */
+    
+    /* SourceFile attribute: name_idx(2) + length(4) + sourcefile_idx(2) */
+    total_size += 2 + 4 + 2;
+    
+    /* RuntimeVisibleAnnotations attribute if present */
+    if (annotations_bytes) {
+        total_size += 2 + 4 + annotations_size;
+    }
+    
+    /* Allocate and write class file */
+    uint8_t *bytes = malloc(total_size);
+    if (!bytes) {
+        const_pool_free(cp);
+        free(internal_name);
+        free(annotations_bytes);
+        return NULL;
+    }
+    
+    uint8_t *p = bytes;
+    
+    /* Magic number */
+    *p++ = 0xCA; *p++ = 0xFE; *p++ = 0xBA; *p++ = 0xBE;
+    
+    /* Version */
+    *p++ = 0x00; *p++ = 0x00;  /* minor */
+    int major = target_version > 0 ? target_version : 61;  /* default to Java 17 */
+    *p++ = (major >> 8) & 0xFF;
+    *p++ = major & 0xFF;
+    
+    /* Constant pool count */
+    *p++ = (cp->count >> 8) & 0xFF;
+    *p++ = cp->count & 0xFF;
+    
+    /* Constant pool entries */
+    for (uint16_t i = 1; i < cp->count; i++) {
+        const_pool_entry_t *e = &cp->entries[i];
+        *p++ = e->type;
+        switch (e->type) {
+            case CONST_UTF8:
+                {
+                    uint16_t len = strlen(e->data.utf8);
+                    *p++ = (len >> 8) & 0xFF;
+                    *p++ = len & 0xFF;
+                    memcpy(p, e->data.utf8, len);
+                    p += len;
+                }
+                break;
+            case CONST_CLASS:
+                *p++ = (e->data.class_index >> 8) & 0xFF;
+                *p++ = e->data.class_index & 0xFF;
+                break;
+            default:
+                break;
+        }
+    }
+    
+    /* Access flags: ACC_INTERFACE | ACC_ABSTRACT | ACC_SYNTHETIC */
+    uint16_t access_flags = ACC_INTERFACE | ACC_ABSTRACT | ACC_SYNTHETIC;
+    *p++ = (access_flags >> 8) & 0xFF;
+    *p++ = access_flags & 0xFF;
+    
+    /* this_class */
+    *p++ = (this_class >> 8) & 0xFF;
+    *p++ = this_class & 0xFF;
+    
+    /* super_class */
+    *p++ = (super_class >> 8) & 0xFF;
+    *p++ = super_class & 0xFF;
+    
+    /* interfaces_count */
+    *p++ = 0x00; *p++ = 0x00;
+    
+    /* fields_count */
+    *p++ = 0x00; *p++ = 0x00;
+    
+    /* methods_count */
+    *p++ = 0x00; *p++ = 0x00;
+    
+    /* attributes_count */
+    int attr_count = 1;  /* SourceFile */
+    if (annotations_bytes) attr_count++;
+    *p++ = (attr_count >> 8) & 0xFF;
+    *p++ = attr_count & 0xFF;
+    
+    /* SourceFile attribute */
+    *p++ = (source_file_attr >> 8) & 0xFF;
+    *p++ = source_file_attr & 0xFF;
+    *p++ = 0x00; *p++ = 0x00; *p++ = 0x00; *p++ = 0x02;  /* length = 2 */
+    *p++ = (source_file_name >> 8) & 0xFF;
+    *p++ = source_file_name & 0xFF;
+    
+    /* RuntimeVisibleAnnotations attribute if present */
+    if (annotations_bytes) {
+        *p++ = (annotations_attr_name >> 8) & 0xFF;
+        *p++ = annotations_attr_name & 0xFF;
+        *p++ = (annotations_size >> 24) & 0xFF;
+        *p++ = (annotations_size >> 16) & 0xFF;
+        *p++ = (annotations_size >> 8) & 0xFF;
+        *p++ = annotations_size & 0xFF;
+        memcpy(p, annotations_bytes, annotations_size);
+        p += annotations_size;
+    }
+    
+    /* Clean up */
+    const_pool_free(cp);
+    free(internal_name);
+    free(annotations_bytes);
     
     *size_out = p - bytes;
     return bytes;

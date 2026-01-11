@@ -526,6 +526,10 @@ struct class_gen
     /* InnerClasses attribute entries */
     slist_t *inner_class_entries;   /* List of inner_class_entry_t* for InnerClasses attribute */
     
+    /* Nest-based access control (Java 11+) */
+    slist_t *nest_members;          /* List of uint16_t* class CP indices (for nest host) */
+    uint16_t nest_host;             /* CP class index of nest host (for nested classes), 0 if host */
+    
     /* Generic signature (if class has type parameters) */
     char *signature;
     
@@ -612,6 +616,10 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym);
 
 /* Generate module-info.class from module declaration */
 uint8_t *codegen_module(ast_node_t *module_decl, size_t *size_out);
+
+/* Generate bytecode for package-info.class */
+uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
+                              semantic_t *sem, int target_version, size_t *size_out);
 
 /* Generate bytecode for a method */
 bool codegen_method(class_gen_t *cg, ast_node_t *method_decl);

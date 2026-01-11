@@ -5,18 +5,8 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 GENESIS="$SCRIPT_DIR/../../genesis"
 
-# Verify JAVA_HOME is set to Java 21+
-if [ -z "$JAVA_HOME" ]; then
-    echo "Error: JAVA_HOME is not set. jtreg tests require Java 21+." >&2
-    exit 1
-fi
-
-JAVA_VERSION=$("$JAVA_HOME/bin/java" -version 2>&1 | head -1 | sed -E 's/.*"([0-9]+).*/\1/')
-if [ -z "$JAVA_VERSION" ] || [ "$JAVA_VERSION" -lt 21 ]; then
-    echo "Error: JAVA_HOME must point to Java 21+. Current: Java $JAVA_VERSION" >&2
-    echo "       JAVA_HOME=$JAVA_HOME" >&2
-    exit 1
-fi
+# Note: JAVA_HOME check removed - jtreg runs in minimal environment
+# Genesis doesn't need JAVA_HOME to compile
 
 # Filter out options that genesis doesn't support and collect source files
 ARGS=()

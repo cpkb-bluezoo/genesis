@@ -616,6 +616,13 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
         return false;
     }
     
+    /* Check if try block ends with a terminating instruction */
+    uint8_t try_last_op = mg->last_opcode;
+    bool try_ends_with_return = (try_last_op == OP_RETURN || try_last_op == OP_ARETURN ||
+                                 try_last_op == OP_IRETURN || try_last_op == OP_LRETURN ||
+                                 try_last_op == OP_FRETURN || try_last_op == OP_DRETURN ||
+                                 try_last_op == OP_ATHROW);
+    
     /* Generate user's finally code if present (before resource cleanup) */
     if (finally_clause && finally_clause->data.node.children) {
         ast_node_t *user_finally = (ast_node_t *)finally_clause->data.node.children->data;
@@ -628,56 +635,61 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
         }
     }
     
-    /* Normal path: close resources in reverse order */
-    for (int i = resource_count - 1; i >= 0; i--) {
-        uint16_t slot = resource_slots[i];
-        
-        /* if (resource != null) resource.close(); */
-        /* Load resource */
-        if (slot <= 3) {
-            bc_emit(mg->code, OP_ALOAD_0 + slot);
-        } else {
-            bc_emit(mg->code, OP_ALOAD);
-            bc_emit_u1(mg->code, (uint8_t)slot);
-        }
-        mg_push(mg, 1);
-        
-        /* ifnull skip_close */
-        size_t ifnull_pos = mg->code->length;
-        bc_emit(mg->code, OP_IFNULL);
-        bc_emit_u2(mg->code, 0);  /* Placeholder */
-        mg_pop_typed(mg, 1);
-        
-        /* Load resource again for close() call */
-        if (slot <= 3) {
-            bc_emit(mg->code, OP_ALOAD_0 + slot);
-        } else {
-            bc_emit(mg->code, OP_ALOAD);
-            bc_emit_u1(mg->code, (uint8_t)slot);
-        }
-        mg_push(mg, 1);
-        
-        /* invokeinterface AutoCloseable.close()V */
-        uint16_t close_ref = cp_add_interface_methodref(mg->cp,
-            "java/lang/AutoCloseable", "close", "()V");
-        bc_emit(mg->code, OP_INVOKEINTERFACE);
-        bc_emit_u2(mg->code, close_ref);
-        bc_emit_u1(mg->code, 1);  /* count (1 for 'this') */
-        bc_emit_u1(mg->code, 0);  /* reserved */
-        mg_pop_typed(mg, 1);
-        
-        /* Patch ifnull - this is a branch target */
-        uint16_t skip_close = (uint16_t)mg->code->length;
-        mg_record_frame(mg);  /* Record frame at branch target */
-        int16_t offset = (int16_t)(skip_close - ifnull_pos);
-        mg->code->code[ifnull_pos + 1] = (offset >> 8) & 0xFF;
-        mg->code->code[ifnull_pos + 2] = offset & 0xFF;
-    }
+    /* Normal path: close resources in reverse order (only if try block doesn't return) */
+    size_t normal_exit_goto = 0;
+    bool has_normal_exit = !try_ends_with_return;
     
-    /* Jump past exception handlers */
-    size_t normal_exit_goto = mg->code->length;
-    bc_emit(mg->code, OP_GOTO);
-    bc_emit_u2(mg->code, 0);  /* Placeholder */
+    if (has_normal_exit) {
+        for (int i = resource_count - 1; i >= 0; i--) {
+            uint16_t slot = resource_slots[i];
+            
+            /* if (resource != null) resource.close(); */
+            /* Load resource */
+            if (slot <= 3) {
+                bc_emit(mg->code, OP_ALOAD_0 + slot);
+            } else {
+                bc_emit(mg->code, OP_ALOAD);
+                bc_emit_u1(mg->code, (uint8_t)slot);
+            }
+            mg_push(mg, 1);
+            
+            /* ifnull skip_close */
+            size_t ifnull_pos = mg->code->length;
+            bc_emit(mg->code, OP_IFNULL);
+            bc_emit_u2(mg->code, 0);  /* Placeholder */
+            mg_pop_typed(mg, 1);
+            
+            /* Load resource again for close() call */
+            if (slot <= 3) {
+                bc_emit(mg->code, OP_ALOAD_0 + slot);
+            } else {
+                bc_emit(mg->code, OP_ALOAD);
+                bc_emit_u1(mg->code, (uint8_t)slot);
+            }
+            mg_push(mg, 1);
+            
+            /* invokeinterface AutoCloseable.close()V */
+            uint16_t close_ref = cp_add_interface_methodref(mg->cp,
+                "java/lang/AutoCloseable", "close", "()V");
+            bc_emit(mg->code, OP_INVOKEINTERFACE);
+            bc_emit_u2(mg->code, close_ref);
+            bc_emit_u1(mg->code, 1);  /* count (1 for 'this') */
+            bc_emit_u1(mg->code, 0);  /* reserved */
+            mg_pop_typed(mg, 1);
+            
+            /* Patch ifnull - this is a branch target */
+            uint16_t skip_close = (uint16_t)mg->code->length;
+            mg_record_frame(mg);  /* Record frame at branch target */
+            int16_t offset = (int16_t)(skip_close - ifnull_pos);
+            mg->code->code[ifnull_pos + 1] = (offset >> 8) & 0xFF;
+            mg->code->code[ifnull_pos + 2] = offset & 0xFF;
+        }
+        
+        /* Jump past exception handlers */
+        normal_exit_goto = mg->code->length;
+        bc_emit(mg->code, OP_GOTO);
+        bc_emit_u2(mg->code, 0);  /* Placeholder */
+    }
     
     uint16_t try_end = (uint16_t)mg->code->length;
     
@@ -810,18 +822,149 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
     bc_emit(mg->code, OP_ATHROW);
     mg_pop_typed(mg, 1);
     
-    /* Patch normal exit goto */
+    /* Generate user catch clauses if present.
+     * These catch exceptions from the entire TWR including re-thrown exceptions. */
+    slist_t *catch_gotos = NULL;
+    bool has_user_catches = (catch_clauses != NULL);
+    
+    /* Save locals count before catch handlers - locals allocated in catch blocks
+     * should not be visible at the join point after all handlers */
+    uint16_t saved_locals_count = 0;
+    uint16_t saved_slot = 0;
+    if (has_user_catches) {
+        saved_locals_count = mg_save_locals_count(mg);
+        saved_slot = mg->next_slot;
+    }
+    
+    for (slist_t *node = catch_clauses; node; node = node->next) {
+        ast_node_t *catch_clause = (ast_node_t *)node->data;
+        slist_t *catch_children = catch_clause->data.node.children;
+        
+        if (!catch_children || !catch_children->next) {
+            continue;  /* Malformed catch */
+        }
+        
+        ast_node_t *exc_type_node = (ast_node_t *)catch_children->data;
+        ast_node_t *catch_block = (ast_node_t *)catch_children->next->data;
+        const char *exc_var_name = catch_clause->data.node.name;
+        
+        /* Get catch handler start position */
+        uint16_t catch_handler_pc = (uint16_t)mg->code->length;
+        
+        /* Restore stackmap to try entry state for this catch handler */
+        if (try_entry_state && mg->stackmap) {
+            stackmap_restore_state(mg->stackmap, try_entry_state);
+        }
+        
+        /* Get exception class name from semantic type */
+        const char *exc_class_internal = "java/lang/Throwable";
+        if (exc_type_node->sem_type && exc_type_node->sem_type->kind == TYPE_CLASS &&
+            exc_type_node->sem_type->data.class_type.name) {
+            char *internal = class_to_internal_name(exc_type_node->sem_type->data.class_type.name);
+            if (internal) {
+                exc_class_internal = internal;
+            }
+        }
+        
+        /* Record frame at catch handler */
+        mg_record_exception_handler_frame(mg, exc_class_internal);
+        
+        /* Add exception handler entry - catch from entire TWR (try_start to exc_handler_pc+re-throw) */
+        uint16_t exc_class_idx = cp_add_class(mg->cp, exc_class_internal);
+        mg_add_exception_handler(mg, try_start, (uint16_t)mg->code->length, catch_handler_pc, exc_class_idx);
+        
+        /* Allocate local for exception variable */
+        type_t *exc_type = exc_type_node->sem_type ? exc_type_node->sem_type : 
+                          type_new_class(exc_class_internal);
+        uint16_t exc_slot = mg_allocate_local(mg, exc_var_name, exc_type);
+        
+        /* JVM pushes exception onto stack at handler entry */
+        mg_push(mg, 1);
+        
+        /* Store exception in local */
+        if (exc_slot <= 3) {
+            bc_emit(mg->code, OP_ASTORE_0 + exc_slot);
+        } else {
+            bc_emit(mg->code, OP_ASTORE);
+            bc_emit_u1(mg->code, (uint8_t)exc_slot);
+        }
+        mg_pop_typed(mg, 1);
+        
+        /* Generate catch block */
+        if (!codegen_statement(mg, catch_block)) {
+            free(resource_slots);
+            free(resource_types);
+            slist_free(resources);
+            slist_free(catch_clauses);
+            slist_free(catch_gotos);
+            stackmap_state_free(try_entry_state);
+            return false;
+        }
+        
+        /* Generate goto to skip other catch handlers (if not ending with return/throw) */
+        uint8_t last_op = mg->last_opcode;
+        bool catch_ends_with_return = (last_op == OP_RETURN || last_op == OP_ARETURN ||
+                                       last_op == OP_IRETURN || last_op == OP_LRETURN ||
+                                       last_op == OP_FRETURN || last_op == OP_DRETURN ||
+                                       last_op == OP_ATHROW);
+        
+        if (!catch_ends_with_return) {
+            size_t *goto_pos = malloc(sizeof(size_t));
+            *goto_pos = mg->code->length;
+            catch_gotos = slist_prepend(catch_gotos, goto_pos);
+            bc_emit(mg->code, OP_GOTO);
+            bc_emit_u2(mg->code, 0);  /* Placeholder */
+        }
+        
+        /* Free internal name if we allocated it */
+        if (strcmp(exc_class_internal, "java/lang/Throwable") != 0) {
+            free((char *)exc_class_internal);
+        }
+    }
+    
+    /* Track if all catch blocks end with return/throw */
+    bool all_catches_return = true;
+    for (slist_t *node = catch_clauses; node; node = node->next) {
+        /* If any catch didn't add a goto, it ended with return/throw */
+    }
+    /* If we have no gotos to patch, all catches returned */
+    all_catches_return = (catch_gotos == NULL);
+    
+    /* Patch normal exit goto if it exists */
     uint16_t after_try = (uint16_t)mg->code->length;
     
-    /* Record frame at end of try-with-resources (join point) */
-    mg_record_frame(mg);
+    /* Restore locals count before recording join point frame - locals allocated
+     * in catch blocks should not be visible at the join point */
+    if (has_user_catches) {
+        mg_restore_locals_count(mg, saved_locals_count);
+        mg->next_slot = saved_slot;
+        if (mg->stackmap) {
+            mg->stackmap->current_locals_count = saved_locals_count;
+        }
+    }
     
-    int16_t exit_offset = (int16_t)(after_try - normal_exit_goto);
-    mg->code->code[normal_exit_goto + 1] = (exit_offset >> 8) & 0xFF;
-    mg->code->code[normal_exit_goto + 2] = exit_offset & 0xFF;
+    /* Record frame at end of try-with-resources (join point) only if:
+     * 1. There's a normal exit (try block doesn't return), or
+     * 2. There are catch gotos to patch (some catch path falls through) */
+    bool needs_join_frame = has_normal_exit || (catch_gotos != NULL);
+    if (needs_join_frame) {
+        mg_record_frame(mg);
+    }
     
-    /* Generate catch clauses if any */
-    /* TODO: Implement user catch clauses - for now TWR without catches works */
+    if (has_normal_exit) {
+        int16_t exit_offset = (int16_t)(after_try - normal_exit_goto);
+        mg->code->code[normal_exit_goto + 1] = (exit_offset >> 8) & 0xFF;
+        mg->code->code[normal_exit_goto + 2] = exit_offset & 0xFF;
+    }
+    
+    /* Patch catch gotos */
+    for (slist_t *node = catch_gotos; node; node = node->next) {
+        size_t *goto_pos = (size_t *)node->data;
+        int16_t offset = (int16_t)(after_try - *goto_pos);
+        mg->code->code[*goto_pos + 1] = (offset >> 8) & 0xFF;
+        mg->code->code[*goto_pos + 2] = offset & 0xFF;
+    }
+    slist_free_full(catch_gotos, free);
     
     /* Cleanup */
     free(resource_slots);
@@ -876,8 +1019,14 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     }
                     
                     /* Pop the result if expression left a value on stack */
-                    /* Note: Assignment expressions and void method calls don't leave values */
-                    if (mg->stack_depth > stack_before) {
+                    /* Note: Assignment expressions leave their value for chaining */
+                    uint16_t slots_to_pop = mg->stack_depth - stack_before;
+                    if (slots_to_pop >= 2) {
+                        /* Category-2 type (long/double) - use POP2 */
+                        bc_emit(mg->code, OP_POP2);
+                        mg_pop_typed(mg, 2);
+                    } else if (slots_to_pop == 1) {
+                        /* Category-1 type - use POP */
                         bc_emit(mg->code, OP_POP);
                         mg_pop_typed(mg, 1);
                     }
@@ -1303,7 +1452,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                               slot, (uint16_t)mg->code->length, type_ast);
                         }
                         
-                        /* Generate initializer if present */
+                        /* Generate initializer if present, or track uninitialized slot */
                         if (decl->data.node.children) {
                             ast_node_t *init_expr = (ast_node_t *)decl->data.node.children->data;
                             if (!codegen_expr(mg, init_expr, mg->cp)) {
@@ -1336,10 +1485,17 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                     emit_boxing(mg, mg->cp, init_kind);
                                 }
                             } else if (!is_ref_type) {
-                                /* Variable is primitive, init might be wrapper - unbox */
-                                const char *init_ident = init_expr->type == AST_IDENTIFIER ? 
-                                    init_expr->data.leaf.name : NULL;
-                                const char *init_class = mg_local_class_name(mg, init_ident);
+                                /* Variable is primitive, init might be wrapper - unbox.
+                                 * Check init expression's sem_type for wrapper class types. */
+                                const char *init_class = NULL;
+                                if (init_expr->sem_type && init_expr->sem_type->kind == TYPE_CLASS &&
+                                    init_expr->sem_type->data.class_type.name) {
+                                    init_class = init_expr->sem_type->data.class_type.name;
+                                } else if (init_expr->type == AST_IDENTIFIER) {
+                                    /* Fallback: check local variable type for identifiers */
+                                    const char *init_ident = init_expr->data.leaf.name;
+                                    init_class = mg_local_class_name(mg, init_ident);
+                                }
                                 if (init_class) {
                                     type_kind_t unbox_to = get_primitive_for_wrapper(init_class);
                                     if (unbox_to != TYPE_UNKNOWN && var_kind == unbox_to) {
@@ -1388,6 +1544,19 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                     }
                                 }
                             }
+                        } else {
+                            /* Declaration without initializer (e.g., "String value;").
+                             * Track the slot in the stackmap as uninitialized (Top type).
+                             * This is important for try-catch blocks where the variable
+                             * might be assigned in both try and catch paths - we need to
+                             * know the slot exists even before it's initialized. */
+                            if (mg->stackmap) {
+                                /* For uninitialized locals, just increment locals count.
+                                 * The slot will be Top until a value is assigned. */
+                                if (slot >= mg->stackmap->current_locals_count) {
+                                    stackmap_set_local(mg->stackmap, slot, vtype_top());
+                                }
+                            }
                         }
                     }
                     children = children->next;
@@ -1428,6 +1597,17 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     return false;
                 }
                 
+                /* Auto-unbox Boolean to boolean for if condition */
+                if (condition->sem_type && condition->sem_type->kind == TYPE_CLASS &&
+                    condition->sem_type->data.class_type.name &&
+                    strcmp(condition->sem_type->data.class_type.name, "java.lang.Boolean") == 0) {
+                    uint16_t unbox_ref = cp_add_methodref(mg->cp,
+                        "java/lang/Boolean", "booleanValue", "()Z");
+                    bc_emit(mg->code, OP_INVOKEVIRTUAL);
+                    bc_emit_u2(mg->code, unbox_ref);
+                    /* Stack stays same size (Boolean -> int) */
+                }
+                
                 /* Save position for branch offset patching */
                 size_t branch_pos = mg->code->length;
                 
@@ -1436,25 +1616,15 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 bc_emit_u2(mg->code, 0);  /* Placeholder - will patch */
                 mg_pop_typed(mg, 1);  /* Condition consumed */
                 
-                /* For pattern matching, save the slot counter and locals count before
-                 * allocating the pattern variable. The pattern variable is only in scope
-                 * within the if-block, so after the if statement, we restore to allow
-                 * slot reuse. */
-                uint16_t pre_pattern_next_slot = 0;
-                uint16_t pre_pattern_locals_count = 0;
-                if (pattern_var) {
-                    pre_pattern_next_slot = mg->next_slot;
-                    if (mg->stackmap) {
-                        pre_pattern_locals_count = mg_save_locals_count(mg);
-                    }
-                }
-                
-                /* Save full stackmap state before pattern binding - the else branch shouldn't
-                 * have the pattern variable in scope since it's only bound when the
-                 * condition is true */
-                stackmap_state_t *pre_pattern_state = NULL;
-                if (pattern_var && mg->stackmap) {
-                    pre_pattern_state = stackmap_save_state(mg->stackmap);
+                /* Save stackmap state before the then block - locals allocated inside
+                 * the then block (including pattern variables) should not be visible
+                 * at join points. */
+                stackmap_state_t *pre_then_state = NULL;
+                uint16_t pre_then_slot = mg->next_slot;
+                uint16_t pre_then_locals_count = 0;
+                if (mg->stackmap) {
+                    pre_then_state = stackmap_save_state(mg->stackmap);
+                    pre_then_locals_count = mg_save_locals_count(mg);
                 }
                 
                 /* Handle pattern variable binding for instanceof pattern matching */
@@ -1535,9 +1705,12 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     mg->code->code[branch_pos + 1] = (else_offset >> 8) & 0xFF;
                     mg->code->code[branch_pos + 2] = else_offset & 0xFF;
                     
-                    /* Restore stackmap state to before pattern binding for else branch */
-                    if (pre_pattern_state && mg->stackmap) {
-                        stackmap_restore_state(mg->stackmap, pre_pattern_state);
+                    /* Restore stackmap state to before then block for else branch.
+                     * Locals allocated in the then block should not be visible in else. */
+                    if (pre_then_state && mg->stackmap) {
+                        stackmap_restore_state(mg->stackmap, pre_then_state);
+                        mg_restore_locals_count(mg, pre_then_locals_count);
+                        mg->next_slot = pre_then_slot;
                     }
                     
                     /* Record frame at else branch target */
@@ -1545,7 +1718,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     
                     /* Generate else branch */
                     if (!codegen_statement(mg, else_stmt)) {
-                        stackmap_state_free(pre_pattern_state);
+                        stackmap_state_free(pre_then_state);
                         return false;
                     }
                     
@@ -1567,10 +1740,12 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         mg->code->code[goto_pos + 1] = (end_offset >> 8) & 0xFF;
                         mg->code->code[goto_pos + 2] = end_offset & 0xFF;
                         
-                        /* Restore stackmap state for join point - the pattern variable
-                         * is not in scope after the if-else */
-                        if (pre_pattern_state && mg->stackmap) {
-                            stackmap_restore_state(mg->stackmap, pre_pattern_state);
+                        /* Restore stackmap state for join point - locals allocated in
+                         * either branch should not be in scope after the if-else */
+                        if (pre_then_state && mg->stackmap) {
+                            stackmap_restore_state(mg->stackmap, pre_then_state);
+                            mg_restore_locals_count(mg, pre_then_locals_count);
+                            mg->next_slot = pre_then_slot;
                         }
                         
                         /* Record frame at end of if-else (join point) */
@@ -1585,35 +1760,43 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         mg->last_opcode = 0;
                     }
                 } else {
+                    /* Check if then block ended with a return/throw */
+                    bool then_ends_with_return = false;
+                    if (mg->code->length > 0) {
+                        uint8_t last_op = mg->code->code[mg->code->length - 1];
+                        if (last_op == OP_RETURN || last_op == OP_IRETURN ||
+                            last_op == OP_LRETURN || last_op == OP_FRETURN ||
+                            last_op == OP_DRETURN || last_op == OP_ARETURN ||
+                            last_op == OP_ATHROW) {
+                            then_ends_with_return = true;
+                        }
+                    }
+                    
                     /* Patch branch to end (no else) */
                     int16_t end_offset = (int16_t)(mg->code->length - branch_pos);
                     mg->code->code[branch_pos + 1] = (end_offset >> 8) & 0xFF;
                     mg->code->code[branch_pos + 2] = end_offset & 0xFF;
                     
-                    /* Restore stackmap state to before pattern binding for fall-through path */
-                    if (pre_pattern_state && mg->stackmap) {
-                        stackmap_restore_state(mg->stackmap, pre_pattern_state);
+                    /* Restore stackmap state to before then block for fall-through path.
+                     * Locals allocated inside the then block should not be visible at join point. */
+                    if (pre_then_state && mg->stackmap) {
+                        stackmap_restore_state(mg->stackmap, pre_then_state);
+                        mg_restore_locals_count(mg, pre_then_locals_count);
+                        mg->next_slot = pre_then_slot;
                     }
                     
-                    /* Record frame at end of if (branch target) */
+                    /* Record frame at end of if (branch target) for the if-false path.
+                     * Even if then-block ends with return, the if-false path still exists
+                     * and may branch to this location. */
                     mg_record_frame(mg);
                     
-                    /* No else branch means there's a path that doesn't return */
+                    /* For if-without-else, there's always a code path (the false branch)
+                     * that doesn't return, so we must NOT mark this as terminating. */
                     mg->last_opcode = 0;
                 }
                 
-                /* Free saved pattern state if any */
-                stackmap_state_free(pre_pattern_state);
-                
-                /* Restore slot counter and locals count to remove pattern variable from scope.
-                 * This allows the slot to be reused by subsequent variables and ensures
-                 * subsequent code doesn't have stale pattern variable entries in stackmap. */
-                if (pattern_var) {
-                    mg->next_slot = pre_pattern_next_slot;
-                    if (pre_pattern_locals_count > 0) {
-                        mg_restore_locals_count(mg, pre_pattern_locals_count);
-                    }
-                }
+                /* Free saved state */
+                stackmap_state_free(pre_then_state);
                 
                 return true;
             }
@@ -2047,6 +2230,14 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         stackmap_set_local_int(mg->stackmap, idx_slot);
                     }
                     
+                    /* Save stackmap state before loop starts - used for loop exit frame.
+                     * Locals allocated inside the loop body should not be in the exit frame
+                     * since they're not live after the loop. */
+                    stackmap_state_t *arr_loop_entry_state = NULL;
+                    if (mg->stackmap) {
+                        arr_loop_entry_state = stackmap_save_state(mg->stackmap);
+                    }
+                    
                     /* loop_start: */
                     size_t loop_start = mg->code->length;
                     
@@ -2127,6 +2318,41 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     /* Store to loop variable */
                     mg_emit_store_local(mg, var_slot, var_kind);
                     
+                    /* Update stackmap for loop variable */
+                    if (mg->stackmap) {
+                        switch (var_kind) {
+                            case TYPE_LONG:
+                                stackmap_set_local_long(mg->stackmap, var_slot);
+                                break;
+                            case TYPE_DOUBLE:
+                                stackmap_set_local_double(mg->stackmap, var_slot);
+                                break;
+                            case TYPE_FLOAT:
+                                stackmap_set_local_float(mg->stackmap, var_slot);
+                                break;
+                            case TYPE_CLASS:
+                            case TYPE_ARRAY:
+                                {
+                                    /* Use the actual element type from the type node */
+                                    const char *type_name = "java/lang/Object";
+                                    if (type_node && type_node->sem_type && 
+                                        type_node->sem_type->kind == TYPE_CLASS) {
+                                        type_name = type_node->sem_type->data.class_type.name;
+                                    } else if (type_node && type_node->type == AST_CLASS_TYPE) {
+                                        type_name = type_node->data.node.name;
+                                    }
+                                    char *internal = class_to_internal_name(type_name);
+                                    stackmap_set_local_object(mg->stackmap, var_slot, mg->cp, internal);
+                                    free(internal);
+                                }
+                                break;
+                            default:
+                                /* int, boolean, byte, char, short */
+                                stackmap_set_local_int(mg->stackmap, var_slot);
+                                break;
+                        }
+                    }
+                    
                     /* body */
                     if (body && !codegen_statement(mg, body)) {
                         return false;
@@ -2153,8 +2379,14 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     mg->code->code[branch_pos + 1] = (end_offset >> 8) & 0xFF;
                     mg->code->code[branch_pos + 2] = end_offset & 0xFF;
                     
-                    /* Record frame at loop end (break/exit target) */
+                    /* Record frame at loop end (break/exit target).
+                     * Restore to loop entry state first - locals allocated inside the 
+                     * loop body are not live at the exit point. */
+                    if (arr_loop_entry_state && mg->stackmap) {
+                        stackmap_restore_state(mg->stackmap, arr_loop_entry_state);
+                    }
                     mg_record_frame(mg);
+                    stackmap_state_free(arr_loop_entry_state);
                     
                     mg_pop_loop(mg, loop_end);
                 } else {
@@ -2204,6 +2436,14 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     /* Update stackmap for iterator slot (it's live across the loop) */
                     if (mg->stackmap) {
                         stackmap_set_local_object(mg->stackmap, iter_slot, mg->cp, "java/util/Iterator");
+                    }
+                    
+                    /* Save stackmap state before loop starts - used for loop exit frame.
+                     * Locals allocated inside the loop body should not be in the exit frame
+                     * since they're not live after the loop. */
+                    stackmap_state_t *loop_entry_state = NULL;
+                    if (mg->stackmap) {
+                        loop_entry_state = stackmap_save_state(mg->stackmap);
                     }
                     
                     /* loop_start: */
@@ -2264,6 +2504,21 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     /* Store to loop variable (reference type from Iterable) */
                     mg_emit_store_local(mg, var_slot, var_kind);
                     
+                    /* Update stackmap for loop variable */
+                    if (mg->stackmap) {
+                        /* For Iterable, loop variable is always reference type */
+                        const char *type_name = "java/lang/Object";
+                        if (type_node && type_node->sem_type && 
+                            type_node->sem_type->kind == TYPE_CLASS) {
+                            type_name = type_node->sem_type->data.class_type.name;
+                        } else if (type_node && type_node->type == AST_CLASS_TYPE) {
+                            type_name = type_node->data.node.name;
+                        }
+                        char *internal = class_to_internal_name(type_name);
+                        stackmap_set_local_object(mg->stackmap, var_slot, mg->cp, internal);
+                        free(internal);
+                    }
+                    
                     /* body */
                     if (body && !codegen_statement(mg, body)) {
                         return false;
@@ -2285,8 +2540,15 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     mg->code->code[branch_pos + 1] = (end_offset >> 8) & 0xFF;
                     mg->code->code[branch_pos + 2] = end_offset & 0xFF;
                     
-                    /* Record frame at loop end (break/exit target) */
+                    /* Record frame at loop end (break/exit target).
+                     * Restore to loop entry state first - locals allocated inside the 
+                     * loop body (loop variable and any inner variables) are not live
+                     * at the exit point. */
+                    if (loop_entry_state && mg->stackmap) {
+                        stackmap_restore_state(mg->stackmap, loop_entry_state);
+                    }
                     mg_record_frame(mg);
+                    stackmap_state_free(loop_entry_state);
                     
                     mg_pop_loop(mg, loop_end);
                 }
@@ -2930,10 +3192,16 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     try_catch_saved_locals = mg_save_locals_count(mg);
                 }
                 
-                /* Allocate a local slot for exception storage (used in finally) */
-                uint16_t exc_slot = mg->next_slot++;
-                if (mg->next_slot > mg->max_locals) {
-                    mg->max_locals = mg->next_slot;
+                /* Allocate a local slot for exception storage ONLY if there's a finally block.
+                 * This slot is used to store the exception before executing finally code.
+                 * If there's no finally, we don't need this slot and shouldn't allocate it,
+                 * as it would leave an uninitialized gap in the locals causing Top in stackmap. */
+                uint16_t exc_slot = 0;
+                if (finally_clause) {
+                    exc_slot = mg->next_slot++;
+                    if (mg->next_slot > mg->max_locals) {
+                        mg->max_locals = mg->next_slot;
+                    }
                 }
                 
                 /* Record start of try block */
@@ -2963,24 +3231,39 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 }
                 
                 /* Check if try block (+ inlined finally) ended with a terminating instruction
-                 * This check must be AFTER inlining finally since finally may contain return */
+                 * on ALL code paths. We use mg->last_opcode which is set by statement codegen:
+                 * - Return/throw statements set it to the return opcode
+                 * - If-without-else sets it to 0 (fall-through path exists)
+                 * - If-else sets it to return opcode only if BOTH branches return
+                 * This is more accurate than checking the last bytecode, which might be
+                 * from a branch that returns while another branch falls through. */
                 bool try_ends_with_return = false;
-                if (mg->code->length > 0) {
-                    uint8_t last_op = mg->code->code[mg->code->length - 1];
-                    if (last_op == OP_RETURN || last_op == OP_IRETURN ||
-                        last_op == OP_LRETURN || last_op == OP_FRETURN ||
-                        last_op == OP_DRETURN || last_op == OP_ARETURN ||
-                        last_op == OP_ATHROW) {
-                        try_ends_with_return = true;
-                    }
+                uint8_t last_op = mg->last_opcode;
+                if (last_op == OP_RETURN || last_op == OP_IRETURN ||
+                    last_op == OP_LRETURN || last_op == OP_FRETURN ||
+                    last_op == OP_DRETURN || last_op == OP_ARETURN ||
+                    last_op == OP_ATHROW) {
+                    try_ends_with_return = true;
                 }
                 
-                /* Jump past all catch handlers (only if try+finally didn't end with return/throw) */
+                /* Jump past all catch handlers if try block doesn't end with return/throw.
+                 * Note: We DON'T emit a GOTO if try_ends_with_return is true, even if there
+                 * are catch handlers, because if the try block ends with return, any branches
+                 * within the try block must also be targeting return statements (or the
+                 * branches come from nested if-statements whose target is after the if, not
+                 * at the end of the try block). The exception is if-without-else where the
+                 * false branch falls through - but we handle that by recording a frame at
+                 * the branch target inside the if-statement codegen. */
                 size_t try_exit_goto = 0;
+                uint16_t try_exit_locals_count = 0;  /* Remember try path's locals for merging */
                 if (!try_ends_with_return) {
                     try_exit_goto = mg->code->length;
                     bc_emit(mg->code, OP_GOTO);
                     bc_emit_u2(mg->code, 0);  /* Placeholder */
+                    /* Remember the try path's locals count for later comparison */
+                    if (mg->stackmap) {
+                        try_exit_locals_count = mg->stackmap->current_locals_count;
+                    }
                 }
                 
                 uint16_t try_end = (uint16_t)mg->code->length;
@@ -2993,9 +3276,10 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 bool all_catches_return = true;
                 bool has_catch_clauses = (catch_clauses != NULL);
                 
-                /* Save locals count before catch handlers - locals allocated in catch blocks
-                 * should not be visible at the join point after all handlers */
-                uint16_t saved_locals_count = mg_save_locals_count(mg);
+                /* For catch path locals tracking, we use try_catch_saved_locals which is
+                 * the state BEFORE the try block. This ensures that locals declared inside
+                 * the try block are NOT considered valid on the catch path (unless also
+                 * assigned in the catch block, which would call stackmap_set_local). */
                 
                 /* Generate catch handlers */
                 for (slist_t *node = catch_clauses; node; node = node->next) {
@@ -3030,24 +3314,57 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         stackmap_restore_state(mg->stackmap, try_entry_state);
                     }
                     
-                    /* Record frame at exception handler (catch target)
-                     * At exception handler, JVM clears stack and pushes exception. */
-                    mg_record_exception_handler_frame(mg, "java/lang/Throwable");
-                    
-                    /* Add exception handler entry for each exception type */
+                    /* Determine exception class name BEFORE recording handler frame.
+                     * For multi-catch (more than one exception type), use Throwable
+                     * as the stackmap type since the actual exception could be any of them.
+                     * For single-catch, use the specific exception type. */
                     slist_t *type_node = catch_children;
                     const char *first_exc_class = "java/lang/Throwable";
+                    bool is_multi_catch = (exc_type_count > 1);
+                    
                     for (int i = 0; i < exc_type_count; i++) {
                         ast_node_t *exc_type = (ast_node_t *)type_node->data;
                         
-                        /* Get exception class name */
+                        /* Get exception class name - prefer sem_type for fully qualified name */
                         const char *exc_class_name = "java/lang/Throwable";
-                        if (exc_type->type == AST_CLASS_TYPE) {
+                        if (exc_type->sem_type && exc_type->sem_type->kind == TYPE_CLASS &&
+                            exc_type->sem_type->data.class_type.name) {
+                            /* Use fully qualified name from semantic analysis */
+                            exc_class_name = exc_type->sem_type->data.class_type.name;
+                        } else if (exc_type->type == AST_CLASS_TYPE) {
+                            /* Fall back to AST name with common exception resolution */
                             exc_class_name = resolve_exception_class(exc_type->data.node.name);
                         }
                         if (i == 0) {
                             first_exc_class = exc_class_name;
                         }
+                        
+                        type_node = type_node->next;
+                    }
+                    
+                    /* For multi-catch, use Throwable as the stackmap type.
+                     * For single-catch, use the specific exception class. */
+                    const char *stackmap_exc_class = is_multi_catch ? "java/lang/Throwable" : first_exc_class;
+                    char *stackmap_exc_internal = class_to_internal_name(stackmap_exc_class);
+                    
+                    /* Record frame at exception handler (catch target)
+                     * At exception handler, JVM clears stack and pushes exception. */
+                    mg_record_exception_handler_frame(mg, stackmap_exc_internal);
+                    
+                    /* Add exception handler entry for each exception type */
+                    type_node = catch_children;  /* Reset for second pass */
+                    for (int i = 0; i < exc_type_count; i++) {
+                        ast_node_t *exc_type = (ast_node_t *)type_node->data;
+                        
+                        /* Get exception class name - prefer sem_type for fully qualified name */
+                        const char *exc_class_name = "java/lang/Throwable";
+                        if (exc_type->sem_type && exc_type->sem_type->kind == TYPE_CLASS &&
+                            exc_type->sem_type->data.class_type.name) {
+                            exc_class_name = exc_type->sem_type->data.class_type.name;
+                        } else if (exc_type->type == AST_CLASS_TYPE) {
+                            exc_class_name = resolve_exception_class(exc_type->data.node.name);
+                        }
+                        
                         char *exc_internal_name = class_to_internal_name(exc_class_name);
                         uint16_t catch_type = cp_add_class(mg->cp, exc_internal_name);
                         free(exc_internal_name);
@@ -3057,6 +3374,8 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         
                         type_node = type_node->next;
                     }
+                    
+                    free(stackmap_exc_internal);
                     
                     /* Store exception to local variable - for multi-catch, use first type
                      * (a proper implementation would compute the common supertype) */
@@ -3125,8 +3444,13 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         all_catches_return = false;
                     }
                     
-                    /* Restore locals count before exiting catch block scope */
-                    mg_restore_locals_count(mg, saved_locals_count);
+                    /* Restore locals count to what it was BEFORE the try block.
+                     * This removes the exception variable from the catch path's locals,
+                     * and ensures that locals declared inside the try block are not
+                     * considered valid on the catch path. Variables that are assigned
+                     * in BOTH try and catch (like `value` in SafeMap.put) will be
+                     * re-added to the stackmap when the catch block assigns them. */
+                    mg_restore_locals_count(mg, try_catch_saved_locals);
                     
                     /* Jump to end (only if catch didn't end with return/throw) */
                     if (!catch_ends_with_return) {
@@ -3208,13 +3532,43 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 uint16_t after_try = (uint16_t)mg->code->length;
                 
                 /* Record frame at end of try-catch-finally (join point) - only if there's
-                 * actually code that reaches here (i.e., not all paths return/throw) */
-                if (!try_ends_with_return || catch_gotos) {
+                 * actually code that reaches here (i.e., not all paths return/throw).
+                 * 
+                 * The join point is reachable from:
+                 * 1. Normal try block exit (GOTO from end of try block)
+                 * 2. Catch block exits (GOTO from end of each catch block)
+                 * 
+                 * We need to compute the minimum locals from all converging paths:
+                 * - try_exit_locals_count: locals at end of try block
+                 * - current stackmap: reflects last processed catch block's locals
+                 * 
+                 * For empty catch blocks, the catch path has fewer locals than try path.
+                 * For catch blocks that assign the same variables as try, both paths
+                 * have the same locals count. We take the minimum.
+                 * 
+                 * Note: catch path's locals count was already set by mg_restore_locals_count
+                 * in the catch handler loop to saved_locals_count (which is try path's count).
+                 * But the catch block may have assigned additional locals, or if the catch
+                 * block was empty, the exception variable was the only local added and then
+                 * removed by restore. So current_locals_count reflects what's valid on ALL
+                 * catch paths that flow to this point. */
+                if (try_exit_goto > 0 || catch_gotos) {
+                    /* If try block didn't exit (try_exit_goto == 0), only catch paths
+                     * reach here, so use current stackmap state as-is.
+                     * If try block exited, we need to merge with try path's locals. */
+                    if (mg->stackmap && try_exit_goto > 0 && try_exit_locals_count > 0) {
+                        /* Take minimum of try and catch locals counts */
+                        if (try_exit_locals_count < mg->stackmap->current_locals_count) {
+                            /* Try path had fewer locals (e.g., catch block added vars) */
+                            mg_restore_locals_count(mg, try_exit_locals_count);
+                        }
+                        /* If catch path has fewer locals, current state is already correct */
+                    }
                     mg_record_frame(mg);
                 }
                 
                 /* Patch try exit goto (only if we emitted one) */
-                if (!try_ends_with_return) {
+                if (try_exit_goto > 0) {
                     int16_t try_exit_offset = (int16_t)(after_try - try_exit_goto);
                     mg->code->code[try_exit_goto + 1] = (try_exit_offset >> 8) & 0xFF;
                     mg->code->code[try_exit_goto + 2] = try_exit_offset & 0xFF;
@@ -3322,6 +3676,49 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         mg->class_gen->local_classes = slist_new(stmt);
                     } else {
                         slist_append(mg->class_gen->local_classes, stmt);
+                    }
+                    
+                    /* Add InnerClasses attribute entry for the local class.
+                     * For local classes, outer_class_info = 0 (no enclosing class
+                     * in the inner classes attribute sense). */
+                    const char *local_name = stmt->data.node.name;
+                    if (local_name && stmt->sem_symbol) {
+                        symbol_t *local_sym = stmt->sem_symbol;
+                        char *local_internal = class_to_internal_name(local_sym->qualified_name);
+                        
+                        inner_class_entry_t *entry = calloc(1, sizeof(inner_class_entry_t));
+                        entry->inner_class_info = cp_add_class(mg->class_gen->cp, local_internal);
+                        entry->outer_class_info = 0;  /* Local class has no outer in attribute */
+                        entry->inner_name = cp_add_utf8(mg->class_gen->cp, local_name);
+                        /* Convert MOD_ flags to ACC_ flags (simplified for local classes) */
+                        uint16_t mods = stmt->data.node.flags;
+                        uint16_t acc = 0;
+                        if (mods & MOD_PUBLIC)    acc |= ACC_PUBLIC;
+                        if (mods & MOD_PRIVATE)   acc |= ACC_PRIVATE;
+                        if (mods & MOD_PROTECTED) acc |= ACC_PROTECTED;
+                        if (mods & MOD_STATIC)    acc |= ACC_STATIC;
+                        if (mods & MOD_FINAL)     acc |= ACC_FINAL;
+                        if (mods & MOD_ABSTRACT)  acc |= ACC_ABSTRACT;
+                        entry->access_flags = acc;
+                        
+                        if (!mg->class_gen->inner_class_entries) {
+                            mg->class_gen->inner_class_entries = slist_new(entry);
+                        } else {
+                            slist_append(mg->class_gen->inner_class_entries, entry);
+                        }
+                        
+                        /* Also add to NestMembers if this class is the nest host */
+                        if (mg->class_gen->nest_host == 0) {
+                            uint16_t *nest_member_idx = malloc(sizeof(uint16_t));
+                            *nest_member_idx = entry->inner_class_info;
+                            if (!mg->class_gen->nest_members) {
+                                mg->class_gen->nest_members = slist_new(nest_member_idx);
+                            } else {
+                                slist_append(mg->class_gen->nest_members, nest_member_idx);
+                            }
+                        }
+                        
+                        free(local_internal);
                     }
                 }
                 /* No bytecode generated here - class is compiled separately */

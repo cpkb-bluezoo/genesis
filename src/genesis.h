@@ -587,9 +587,11 @@ struct symbol
             symbol_t *enclosing_method; /* Enclosing method for local classes */
             bool is_local_class;        /* True if this is a local class */
             bool is_anonymous_class;    /* True if this is an anonymous class */
-            int local_class_counter;    /* Counter for $1, $2, ... naming */
+            int local_class_counter;    /* Counter for $1, $2, ... naming (deprecated) */
+            hashtable_t *local_class_name_counts; /* name -> count for local class naming */
             slist_t *captured_vars;     /* Captured local variables (for local classes) */
             ast_node_t *anonymous_body; /* AST body for anonymous classes */
+            slist_t *super_ctor_args;   /* Constructor args to pass to superclass (anonymous classes) */
         } class_data;
         
         /* SYM_METHOD, SYM_CONSTRUCTOR */
@@ -699,6 +701,8 @@ typedef struct semantic
     bool werror;                /* Treat warnings as errors */
     
     int source_version;         /* Source version (e.g., 8, 11, 17, 21) */
+    int loop_depth;             /* Current loop nesting depth (for break/continue validation) */
+    int switch_depth;           /* Current switch nesting depth (for break validation) */
     
     source_file_t *source;      /* Current source file */
     struct classpath *classpath; /* Classpath for resolving external types */

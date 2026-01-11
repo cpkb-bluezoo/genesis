@@ -356,10 +356,36 @@ void stackmap_record_frame(stack_map_table_t *smt, uint16_t offset)
 {
     if (!smt) return;
     
-    /* Don't record duplicate frames at the same offset */
+    /* Check for existing frame at this offset */
     for (stack_map_frame_t *f = smt->frames; f; f = f->next) {
         if (f->offset == offset) {
-            return;  /* Already have a frame here */
+            /* Join point: update to use minimum locals count.
+             * This handles cases where multiple paths with different 
+             * numbers of locals converge at the same point.
+             * 
+             * We shrink if current_locals_count < existing locals.
+             * Note: current_locals_count == 0 is valid for static methods
+             * with no parameters, so we don't require > 0. */
+            if (smt->current_locals_count < f->num_locals) {
+                /* Shrink to minimum - locals declared in one path
+                   but not another should not be in the frame */
+                f->num_locals = smt->current_locals_count;
+                /* Reallocate locals array (or set to NULL if 0 locals) */
+                if (f->num_locals > 0) {
+                    verification_type_t *new_locals = malloc(f->num_locals * sizeof(verification_type_t));
+                    if (new_locals) {
+                        memcpy(new_locals, smt->current_locals,
+                               f->num_locals * sizeof(verification_type_t));
+                        free(f->locals);
+                        f->locals = new_locals;
+                    }
+                } else {
+                    /* 0 locals - free the array */
+                    free(f->locals);
+                    f->locals = NULL;
+                }
+            }
+            return;
         }
     }
     
