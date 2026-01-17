@@ -420,5 +420,26 @@ int classfile_version_from_string(const char *version);
 /* Get Java version number from major class version */
 int classfile_java_version(int major_version);
 
+/*
+ * InnerClasses attribute parsing
+ */
+
+/* Inner class info structure */
+typedef struct inner_class_info
+{
+    char *inner_class_name;         /* Fully qualified inner class name (binary form) */
+    char *outer_class_name;         /* Fully qualified outer class name (binary form), or NULL */
+    char *inner_name;               /* Simple name of inner class, or NULL for anonymous */
+    uint16_t access_flags;          /* Access flags for the inner class */
+    struct inner_class_info *next;  /* Linked list */
+} inner_class_info_t;
+
+/* Parse the InnerClasses attribute and return a linked list of inner class info.
+ * Returns NULL if attribute not found or empty. Caller must free with inner_class_info_free. */
+inner_class_info_t *classfile_get_inner_classes(classfile_t *cf);
+
+/* Free an inner class info list */
+void inner_class_info_free(inner_class_info_t *info);
+
 #endif /* CLASSFILE_H */
 

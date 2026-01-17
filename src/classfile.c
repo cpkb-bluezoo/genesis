@@ -1487,3 +1487,107 @@ char *generic_type_to_string(generic_type_t *type)
     }
 }
 
+/*
+ * InnerClasses attribute parsing
+ *
+ * InnerClasses_attribute {
+ *     u2 attribute_name_index;
+ *     u4 attribute_length;
+ *     u2 number_of_classes;
+ *     {   u2 inner_class_info_index;
+ *         u2 outer_class_info_index;
+ *         u2 inner_name_index;
+ *         u2 inner_class_access_flags;
+ *     } classes[number_of_classes];
+ * }
+ */
+
+void inner_class_info_free(inner_class_info_t *info)
+{
+    while (info) {
+        inner_class_info_t *next = info->next;
+        free(info->inner_class_name);
+        free(info->outer_class_name);
+        free(info->inner_name);
+        free(info);
+        info = next;
+    }
+}
+
+inner_class_info_t *classfile_get_inner_classes(classfile_t *cf)
+{
+    if (!cf || !cf->attributes) {
+        return NULL;
+    }
+    
+    /* Find the InnerClasses attribute */
+    attribute_info_t *inner_attr = NULL;
+    for (uint16_t i = 0; i < cf->attributes_count; i++) {
+        char *name = classfile_get_utf8(cf, cf->attributes[i].attribute_name_index);
+        if (name && strcmp(name, "InnerClasses") == 0) {
+            free(name);
+            inner_attr = &cf->attributes[i];
+            break;
+        }
+        free(name);
+    }
+    
+    if (!inner_attr || !inner_attr->info || inner_attr->attribute_length < 2) {
+        return NULL;
+    }
+    
+    /* Parse the attribute */
+    const uint8_t *data = inner_attr->info;
+    uint16_t number_of_classes = ((uint16_t)data[0] << 8) | data[1];
+    data += 2;
+    
+    /* Check we have enough data */
+    if (inner_attr->attribute_length < (size_t)(2 + number_of_classes * 8)) {
+        return NULL;
+    }
+    
+    inner_class_info_t *head = NULL;
+    inner_class_info_t *tail = NULL;
+    
+    for (uint16_t i = 0; i < number_of_classes; i++) {
+        uint16_t inner_class_info_index = ((uint16_t)data[0] << 8) | data[1];
+        uint16_t outer_class_info_index = ((uint16_t)data[2] << 8) | data[3];
+        uint16_t inner_name_index = ((uint16_t)data[4] << 8) | data[5];
+        uint16_t inner_class_access_flags = ((uint16_t)data[6] << 8) | data[7];
+        data += 8;
+        
+        /* Get the class names */
+        char *inner_class_name = inner_class_info_index ? 
+            classfile_get_class_name(cf, inner_class_info_index) : NULL;
+        char *outer_class_name = outer_class_info_index ?
+            classfile_get_class_name(cf, outer_class_info_index) : NULL;
+        char *inner_name = inner_name_index ?
+            classfile_get_utf8(cf, inner_name_index) : NULL;
+        
+        /* Only add if we have a valid inner class name */
+        if (inner_class_name) {
+            inner_class_info_t *info = calloc(1, sizeof(inner_class_info_t));
+            if (info) {
+                /* Convert from internal form (a/b/C) to binary form (a.b.C) */
+                info->inner_class_name = classname_to_binary(inner_class_name);
+                info->outer_class_name = outer_class_name ? 
+                    classname_to_binary(outer_class_name) : NULL;
+                info->inner_name = inner_name ? strdup(inner_name) : NULL;
+                info->access_flags = inner_class_access_flags;
+                info->next = NULL;
+                
+                if (tail) {
+                    tail->next = info;
+                    tail = info;
+                } else {
+                    head = tail = info;
+                }
+            }
+            free(inner_class_name);
+        }
+        free(outer_class_name);
+        free(inner_name);
+    }
+    
+    return head;
+}

@@ -1131,29 +1131,14 @@ void lexer_advance(lexer_t *lexer)
             return;
             
         case '>':
+            /* Note: We intentionally do NOT tokenize >>, >>>, >>=, or >>>= here.
+             * This simplifies generic type parsing (e.g., Map<String, List<String>>)
+             * by ensuring that >> is always two separate > tokens.
+             * The parser can still recognize >> as a right shift operator by seeing
+             * two consecutive > tokens. */
             if (lexer_peek(lexer) == '=') {
                 lexer_advance_char(lexer);
                 lexer_set_token_static(lexer, TOK_GE, ">=", start_line, start_column);
-                return;
-            }
-            if (lexer_peek(lexer) == '>') {
-                lexer_advance_char(lexer);
-                if (lexer_peek(lexer) == '>') {
-                    lexer_advance_char(lexer);
-                    if (lexer_peek(lexer) == '=') {
-                        lexer_advance_char(lexer);
-                        lexer_set_token_static(lexer, TOK_URSHIFT_ASSIGN, ">>>=", start_line, start_column);
-                        return;
-                    }
-                    lexer_set_token_static(lexer, TOK_URSHIFT, ">>>", start_line, start_column);
-                    return;
-                }
-                if (lexer_peek(lexer) == '=') {
-                    lexer_advance_char(lexer);
-                    lexer_set_token_static(lexer, TOK_RSHIFT_ASSIGN, ">>=", start_line, start_column);
-                    return;
-                }
-                lexer_set_token_static(lexer, TOK_RSHIFT, ">>", start_line, start_column);
                 return;
             }
             lexer_set_token_static(lexer, TOK_GT, ">", start_line, start_column);

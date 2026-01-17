@@ -338,6 +338,7 @@ typedef enum ast_node_type
     AST_TYPE_PARAMETER,
     AST_WILDCARD_TYPE,
     AST_VAR_TYPE,       /* var for type inference (Java 10+) */
+    AST_INTERSECTION_TYPE, /* Intersection type: Type1 & Type2 (Java 8+) */
     
     /* Parameters and variables */
     AST_PARAMETER,
@@ -580,6 +581,7 @@ struct symbol
         /* SYM_CLASS, SYM_INTERFACE */
         struct {
             symbol_t *superclass;       /* Superclass (NULL for Object) */
+            type_t *superclass_type;    /* Parameterized superclass type with type args */
             slist_t *interfaces;        /* Implemented/extended interfaces */
             scope_t *members;           /* Class member scope */
             slist_t *type_params;       /* Type parameters (generics) */
@@ -601,6 +603,7 @@ struct symbol
             scope_t *body_scope;        /* Method body scope */
             symbol_t *overridden_method; /* For covariant returns: method being overridden */
             char *descriptor;           /* JVM descriptor for classfile-loaded methods */
+            slist_t *type_params;       /* Method type parameters (generics, e.g. <T>) */
         } method_data;
         
         /* SYM_FIELD, SYM_LOCAL_VAR, SYM_PARAMETER */
@@ -608,6 +611,7 @@ struct symbol
             int slot;                   /* Local variable slot (for codegen) */
             bool initialized;           /* Has been assigned a value */
             bool is_enum_constant;      /* True if this is an enum constant */
+            int enum_ordinal;           /* Ordinal value (for enum constants) */
         } var_data;
     } data;
     
@@ -707,6 +711,7 @@ typedef struct semantic
     source_file_t *source;      /* Current source file */
     struct classpath *classpath; /* Classpath for resolving external types */
     slist_t *sourcepath;        /* Source path directories for finding .java files */
+    slist_t *source_dependencies; /* Source files loaded as dependencies (need compilation) */
 } semantic_t;
 
 /* Semantic analyzer API */
@@ -724,6 +729,15 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node);
 symbol_t *semantic_resolve_name(semantic_t *sem, const char *name);
 type_t *get_expression_type(semantic_t *sem, ast_node_t *expr);
 symbol_t *load_external_class(semantic_t *sem, const char *name);
+
+/* Early type resolution (post-parse) - resolves type names to qualified names */
+struct classpath;  /* Forward declaration */
+void resolve_types_in_compilation_unit(ast_node_t *ast, struct classpath *classpath, 
+                                       slist_t *sourcepath_list);
+
+/* Sourcepath parsing helpers (for use before semantic_t is created) */
+slist_t *sourcepath_parse(const char *sourcepath);
+void sourcepath_list_free(slist_t *list);
 
 /* External class loading (classfile_t defined in classfile.h) */
 struct classfile;

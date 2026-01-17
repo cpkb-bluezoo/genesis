@@ -174,6 +174,17 @@ void stackmap_set_local(stack_map_table_t *smt, uint16_t slot, verification_type
     if (!smt) return;
     
     ensure_locals_capacity(smt, slot);
+    
+    /* If we're setting a slot beyond current_locals_count, clear intermediate slots
+     * to TOP. This handles the case where locals were "shrunk" after exiting a scope
+     * (e.g., a for loop) and then a new local is allocated at a higher slot.
+     * Without this, stale values from the previous scope would be included in frames. */
+    if (slot > smt->current_locals_count) {
+        for (uint16_t i = smt->current_locals_count; i < slot; i++) {
+            smt->current_locals[i] = vtype_top();
+        }
+    }
+    
     smt->current_locals[slot] = type;
     
     /* Update locals count if needed */

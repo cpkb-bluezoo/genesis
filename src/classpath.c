@@ -907,6 +907,7 @@ bool classpath_setup_jdk(classpath_t *cp, jdk_info_t *jdk)
             "java.sql.jmod",        /* java.sql */
             "java.xml.jmod",        /* javax.xml */
             "java.management.jmod", /* java.lang.management */
+            "java.compiler.jmod",   /* javax.tools (JavaCompiler, etc.) */
             NULL
         };
         

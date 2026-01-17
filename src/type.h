@@ -48,6 +48,7 @@ typedef enum type_kind
     TYPE_ARRAY,             /* Array type */
     TYPE_TYPEVAR,           /* Type variable (generics) */
     TYPE_WILDCARD,          /* Wildcard type (?, ? extends T, ? super T) */
+    TYPE_INTERSECTION,      /* Intersection type: Type1 & Type2 (Java 8+) */
     TYPE_UNKNOWN,           /* Unresolved/error type */
 } type_kind_t;
 
@@ -85,6 +86,11 @@ struct type
             int bound_kind;         /* 0=unbounded, 1=extends, -1=super */
             type_t *bound;          /* Bound type (NULL if unbounded) */
         } wildcard;
+        
+        /* For TYPE_INTERSECTION */
+        struct {
+            slist_t *types;         /* List of component types (type_t*) */
+        } intersection;
     } data;
 };
 
@@ -113,6 +119,12 @@ type_t *type_new_array(type_t *element, int dimensions);
  * @param bound       The bound type (NULL for unbounded)
  */
 type_t *type_new_wildcard(int bound_kind, type_t *bound);
+
+/**
+ * Create a new intersection type.
+ * @param types  List of component types (at least 2)
+ */
+type_t *type_new_intersection(slist_t *types);
 
 /**
  * Free a type (careful with singletons - built-in types are not freed).
@@ -181,6 +193,12 @@ bool type_is_reference(type_t *type);
  * @return Fully qualified wrapper class name, or NULL if not a primitive
  */
 const char *get_wrapper_class(type_kind_t kind);
+
+/**
+ * Get the boxed (wrapper) type for a primitive type.
+ * Returns a new TYPE_CLASS for the wrapper, or the original type if not primitive.
+ */
+type_t *type_boxed(type_t *type);
 
 /**
  * Get the primitive type for a wrapper class.

@@ -230,6 +230,7 @@ const char *ast_type_name(ast_node_type_t type)
         case AST_TYPE_PARAMETER:     return "TypeParameter";
         case AST_WILDCARD_TYPE:      return "WildcardType";
         case AST_VAR_TYPE:           return "VarType";
+        case AST_INTERSECTION_TYPE:  return "IntersectionType";
         case AST_PARAMETER:          return "Parameter";
         case AST_VAR_DECL:           return "VarDecl";
         case AST_VAR_DECLARATOR:     return "VarDeclarator";
@@ -460,6 +461,11 @@ void parser_free(parser_t *parser)
  * Parser Helpers
  * ======================================================================== */
 
+static inline const char *parser_current_text(parser_t *parser);
+static inline int parser_current_line(parser_t *parser);
+static inline int parser_current_column(parser_t *parser);
+static void parser_advance(parser_t *parser);  /* Forward declaration for helper functions */
+
 /**
  * Get current token type.
  */
@@ -498,6 +504,7 @@ static inline int parser_current_column(parser_t *parser)
 /**
  * Get current token value.
  */
+__attribute__((unused))
 static inline token_value_t parser_current_value(parser_t *parser)
 {
     return lexer_value(parser->lexer);
@@ -513,6 +520,90 @@ static inline token_type_t parser_peek_type(parser_t *parser)
     token_type_t next_type = lexer_type(parser->lexer);
     lexer_restore_pos(parser->lexer, saved);
     return next_type;
+}
+
+/**
+ * Check if the current position has >> (two consecutive > tokens).
+ * Does not modify parser state.
+ */
+static bool parser_check_double_gt(parser_t *parser)
+{
+    if (parser_current_type(parser) != TOK_GT) {
+        return false;
+    }
+    return parser_peek_type(parser) == TOK_GT;
+}
+
+/**
+ * Check if the current position has >>> (three consecutive > tokens).
+ * Does not modify parser state.
+ */
+static bool parser_check_triple_gt(parser_t *parser)
+{
+    if (parser_current_type(parser) != TOK_GT) {
+        return false;
+    }
+    if (parser_peek_type(parser) != TOK_GT) {
+        return false;
+    }
+    /* Need to peek two tokens ahead - save state and check */
+    lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
+    lexer_advance(parser->lexer);  /* skip first > */
+    token_type_t peek2 = parser_peek_type(parser);
+    lexer_restore_pos(parser->lexer, save_pos);
+    return peek2 == TOK_GT;
+}
+
+/**
+ * Consume >> (two consecutive > tokens) and return TOK_RSHIFT.
+ * Caller must check parser_check_double_gt() first.
+ */
+static token_type_t parser_consume_double_gt(parser_t *parser)
+{
+    parser_advance(parser);  /* consume first > */
+    parser_advance(parser);  /* consume second > */
+    return TOK_RSHIFT;
+}
+
+/**
+ * Consume >>> (three consecutive > tokens) and return TOK_URSHIFT.
+ * Caller must check parser_check_triple_gt() first.
+ */
+static token_type_t parser_consume_triple_gt(parser_t *parser)
+{
+    parser_advance(parser);  /* consume first > */
+    parser_advance(parser);  /* consume second > */
+    parser_advance(parser);  /* consume third > */
+    return TOK_URSHIFT;
+}
+
+/**
+ * Check if a token can be used as an identifier in this context.
+ * Module keywords and some other contextual keywords can be used as identifiers
+ * outside of their specific contexts.
+ */
+static bool parser_check_identifier_or_contextual(parser_t *parser)
+{
+    token_type_t tok = parser_current_type(parser);
+    return tok == TOK_IDENTIFIER ||
+           /* Module keywords (contextual) */
+           tok == TOK_TO ||
+           tok == TOK_WITH ||
+           tok == TOK_OPEN ||
+           tok == TOK_TRANSITIVE ||
+           tok == TOK_PROVIDES ||
+           tok == TOK_REQUIRES ||
+           tok == TOK_EXPORTS ||
+           tok == TOK_OPENS ||
+           tok == TOK_USES ||
+           tok == TOK_PERMITS ||
+           /* Other contextual keywords */
+           tok == TOK_VAR ||
+           tok == TOK_YIELD ||
+           tok == TOK_SEALED ||
+           tok == TOK_NON_SEALED ||
+           tok == TOK_RECORD ||
+           tok == TOK_WHEN;
 }
 
 /**
@@ -773,6 +864,8 @@ typedef enum precedence
 
 /**
  * Get precedence of binary operator.
+ * Note: Since the lexer no longer produces >>, >>>, >>=, or >>>= tokens,
+ * we check for sequences of > tokens in the expression parser itself.
  */
 static precedence_t get_binary_precedence(token_type_t type)
 {
@@ -1049,6 +1142,23 @@ static ast_node_t *parse_primary(parser_t *parser)
             }
             
         case TOK_IDENTIFIER:
+        /* Contextual keywords can be used as identifiers in expression context */
+        case TOK_OPEN:
+        case TOK_OPENS:
+        case TOK_TO:
+        case TOK_WITH:
+        case TOK_TRANSITIVE:
+        case TOK_PROVIDES:
+        case TOK_REQUIRES:
+        case TOK_EXPORTS:
+        case TOK_USES:
+        case TOK_PERMITS:
+        case TOK_SEALED:
+        case TOK_NON_SEALED:
+        case TOK_RECORD:
+        case TOK_WHEN:
+        case TOK_VAR:
+        case TOK_YIELD:
             {
                 int line = parser_current_line(parser);
                 int col = parser_current_column(parser);
@@ -1182,7 +1292,32 @@ static ast_node_t *parse_primary(parser_t *parser)
                     /* Try parsing as a type */
                     ast_node_t *maybe_type = parse_type(parser);
                     
-                    if (maybe_type && parser_check(parser, TOK_RPAREN)) {
+                    if (maybe_type && (parser_check(parser, TOK_RPAREN) || 
+                                       parser_check(parser, TOK_BITAND))) {
+                        /* Check for intersection type: (Type1 & Type2 & ...) expr
+                         * Intersection types are only valid in cast expressions */
+                        if (parser_check(parser, TOK_BITAND)) {
+                            ast_node_t *intersection = ast_new(AST_INTERSECTION_TYPE,
+                                                               maybe_type->line, maybe_type->column);
+                            ast_add_child(intersection, maybe_type);
+                            
+                            while (parser_match(parser, TOK_BITAND)) {
+                                ast_node_t *next_type = parse_type(parser);
+                                if (!next_type) {
+                                    ast_free(intersection);
+                                    return NULL;
+                                }
+                                ast_add_child(intersection, next_type);
+                            }
+                            maybe_type = intersection;
+                        }
+                        
+                        if (!parser_check(parser, TOK_RPAREN)) {
+                            ast_free(maybe_type);
+                            lexer_restore_pos(parser->lexer, save_pos);
+                            goto not_a_cast;
+                        }
+                        
                         /* Look ahead: if followed by identifier, literal, (, !, ~, +, -, ++, --, new, this
                          * then it's a cast. Otherwise it's a parenthesized expression */
                         parser_advance(parser);  /* Move past ) to see what's next */
@@ -1224,6 +1359,7 @@ static ast_node_t *parse_primary(parser_t *parser)
                             return cast;
                         }
                     }
+                    not_a_cast:;
                     
                     /* Not a cast, restore position and parse as parenthesized expression */
                     ast_free(maybe_type);
@@ -1245,6 +1381,13 @@ static ast_node_t *parse_primary(parser_t *parser)
                 /* Try to parse as lambda parameter list */
                 while (looks_like_lambda_params) {
                     token_type_t tok = parser_current_type(parser);
+                    
+                    /* Skip 'final' modifier if present */
+                    if (tok == TOK_FINAL) {
+                        typed_params = true;  /* final requires type */
+                        parser_advance(parser);
+                        tok = parser_current_type(parser);  /* get actual type */
+                    }
                     
                     /* Check for typed parameter: Type name or var name */
                     if (tok == TOK_VAR || is_primitive_type(tok)) {
@@ -1355,6 +1498,12 @@ static ast_node_t *parse_primary(parser_t *parser)
                     
                     do {
                         ast_node_t *param_type = NULL;
+                        bool param_is_final = false;
+                        
+                        /* Check for 'final' modifier */
+                        if (parser_match(parser, TOK_FINAL)) {
+                            param_is_final = true;
+                        }
                         
                         if (typed_params) {
                             /* Parse type (var, primitive, or class type) */
@@ -1370,6 +1519,9 @@ static ast_node_t *parse_primary(parser_t *parser)
                         ast_node_t *param = ast_new(AST_PARAMETER, 
                                                     parser_current_line(parser),
                                                     parser_current_column(parser));
+                        if (param_is_final) {
+                            param->data.node.flags |= MOD_FINAL;
+                        }
                         param->data.node.name = strdup(parser_current_text(parser));
                         if (param_type) {
                             ast_add_child(param, param_type);
@@ -1776,6 +1928,100 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
         }
         
         switch (tok_type) {
+            case TOK_LT:
+                {
+                    /* Check if this is type arguments for a method reference (Type<Args>::new)
+                     * We need to lookahead to determine if < is type args or comparison */
+                    if (expr->type != AST_IDENTIFIER && expr->type != AST_FIELD_ACCESS) {
+                        /* Only identifiers/qualified names can have type args */
+                        goto done;
+                    }
+                    
+                    /* Save position and try to parse type arguments */
+                    lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
+                    parser_advance(parser);  /* consume < */
+                    
+                    /* Check what follows < to see if it looks like type arguments */
+                    token_type_t after_lt = parser_current_type(parser);
+                    bool looks_like_type_args = (after_lt == TOK_GT ||  /* diamond <> */
+                                                 after_lt == TOK_QUESTION ||  /* wildcard ? */
+                                                 after_lt == TOK_IDENTIFIER ||
+                                                 is_primitive_type(after_lt));
+                    
+                    if (!looks_like_type_args) {
+                        /* Not type arguments - restore and let pratt parser handle as < operator */
+                        lexer_restore_pos(parser->lexer, save_pos);
+                        goto done;
+                    }
+                    
+                    /* Try to skip over type arguments and see if :: follows */
+                    int depth = 1;
+                    while (depth > 0 && !parser_check(parser, TOK_EOF)) {
+                        if (parser_check(parser, TOK_LT)) {
+                            depth++;
+                        } else if (parser_check(parser, TOK_GT)) {
+                            depth--;
+                        } else if (parser_check(parser, TOK_RSHIFT)) {
+                            /* >> can close two levels */
+                            depth -= 2;
+                        }
+                        if (depth > 0) {
+                            parser_advance(parser);
+                        }
+                    }
+                    
+                    if (depth != 0) {
+                        /* Unbalanced - restore */
+                        lexer_restore_pos(parser->lexer, save_pos);
+                        goto done;
+                    }
+                    
+                    parser_advance(parser);  /* consume final > */
+                    
+                    /* Check if :: follows */
+                    if (!parser_check(parser, TOK_DOUBLE_COLON)) {
+                        /* Not a method reference - restore and let pratt parser handle */
+                        lexer_restore_pos(parser->lexer, save_pos);
+                        goto done;
+                    }
+                    
+                    /* This IS type arguments for a method reference. Restore and parse properly. */
+                    lexer_restore_pos(parser->lexer, save_pos);
+                    
+                    /* Convert identifier to class type node */
+                    int line = expr->line;
+                    int col = expr->column;
+                    ast_node_t *type_node = ast_new(AST_CLASS_TYPE, line, col);
+                    
+                    if (expr->type == AST_IDENTIFIER) {
+                        type_node->data.node.name = strdup(expr->data.leaf.name);
+                    } else if (expr->type == AST_FIELD_ACCESS) {
+                        /* Qualified name - reconstruct from AST_FIELD_ACCESS chain */
+                        /* For now, just use the field name (simple case) */
+                        type_node->data.node.name = strdup(expr->data.node.name);
+                    }
+                    ast_free(expr);
+                    
+                    /* Parse type arguments */
+                    parser_advance(parser);  /* consume < */
+                    
+                    do {
+                        ast_node_t *type_arg = parse_type(parser);
+                        if (type_arg) {
+                            ast_add_child(type_node, type_arg);
+                        }
+                    } while (parser_match(parser, TOK_COMMA));
+                    
+                    if (!parser_expect(parser, TOK_GT)) {
+                        ast_free(type_node);
+                        return NULL;
+                    }
+                    
+                    expr = type_node;
+                    /* Continue loop - next iteration will handle :: */
+                }
+                break;
+                
             case TOK_DOT:
                 {
                     parser_advance(parser);
@@ -1841,7 +2087,8 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                         break;
                     }
                     
-                    if (!parser_check(parser, TOK_IDENTIFIER)) {
+                    /* Accept identifiers and contextual keywords (like 'open', 'var', etc.) as member names */
+                    if (!parser_check_identifier_or_contextual(parser)) {
                         parser_error(parser, "Expected identifier after '.'");
                         ast_free(expr);
                         return NULL;
@@ -2074,6 +2321,56 @@ static ast_node_t *parse_expression_prec(parser_t *parser, precedence_t min_prec
             break;
         }
         
+        /* Check for >> or >>> sequences (since lexer no longer produces these tokens) */
+        if (tok_type == TOK_GT) {
+            if (parser_check_triple_gt(parser)) {
+                /* Check if followed by = for >>>= */
+                lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
+                parser_advance(parser);  /* skip first > */
+                parser_advance(parser);  /* skip second > */
+                parser_advance(parser);  /* skip third > */
+                if (parser_check(parser, TOK_ASSIGN)) {
+                    /* Have >>>= - treat as unsigned right shift assign if precedence allows */
+                    lexer_restore_pos(parser->lexer, save_pos);
+                    if (PREC_ASSIGNMENT >= min_prec) {
+                        tok_type = TOK_URSHIFT_ASSIGN;
+                    } else {
+                        break;  /* Precedence too low */
+                    }
+                } else {
+                    /* Just >>> */
+                    lexer_restore_pos(parser->lexer, save_pos);
+                    if (PREC_SHIFT >= min_prec) {
+                        tok_type = TOK_URSHIFT;
+                    } else {
+                        break;  /* Precedence too low, must be generic close */
+                    }
+                }
+            } else if (parser_check_double_gt(parser)) {
+                /* Check if followed by = for >>= */
+                lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
+                parser_advance(parser);  /* skip first > */
+                parser_advance(parser);  /* skip second > */
+                if (parser_check(parser, TOK_ASSIGN)) {
+                    /* Have >>= - treat as right shift assign if precedence allows */
+                    lexer_restore_pos(parser->lexer, save_pos);
+                    if (PREC_ASSIGNMENT >= min_prec) {
+                        tok_type = TOK_RSHIFT_ASSIGN;
+                    } else {
+                        break;  /* Precedence too low */
+                    }
+                } else {
+                    /* Just >> */
+                    lexer_restore_pos(parser->lexer, save_pos);
+                    if (PREC_SHIFT >= min_prec) {
+                        tok_type = TOK_RSHIFT;
+                    } else {
+                        break;  /* Precedence too low, must be generic close */
+                    }
+                }
+            }
+        }
+        
         precedence_t prec = get_binary_precedence(tok_type);
         if (prec == PREC_NONE || prec < min_prec) {
             break;
@@ -2145,7 +2442,21 @@ static ast_node_t *parse_expression_prec(parser_t *parser, precedence_t min_prec
         int col = parser_current_column(parser);
         token_type_t op = tok_type;
         const char *op_name = token_type_name(op);
-        parser_advance(parser);
+        
+        /* Consume the operator token(s) */
+        if (op == TOK_URSHIFT_ASSIGN) {
+            parser_consume_triple_gt(parser);  /* Consume >>> */
+            parser_advance(parser);  /* Consume = */
+        } else if (op == TOK_URSHIFT) {
+            parser_consume_triple_gt(parser);  /* Consume >>> */
+        } else if (op == TOK_RSHIFT_ASSIGN) {
+            parser_consume_double_gt(parser);  /* Consume >> */
+            parser_advance(parser);  /* Consume = */
+        } else if (op == TOK_RSHIFT) {
+            parser_consume_double_gt(parser);  /* Consume >> */
+        } else {
+            parser_advance(parser);  /* Regular single-token operator */
+        }
         
         /* For right-associative operators, use same precedence */
         /* For left-associative, use prec + 1 */
@@ -2227,6 +2538,13 @@ static slist_t *parse_type_annotations(parser_t *parser)
  */
 ast_node_t *parse_type(parser_t *parser)
 {
+    if (getenv("GENESIS_DEBUG_PARSER")) {
+        fprintf(stderr, "[PARSER] parse_type: entry, current_token=%d ('%s'), line=%d\n", 
+                parser_current_type(parser),
+                parser_current_type(parser) == TOK_IDENTIFIER ? parser_current_text(parser) : token_type_name(parser_current_type(parser)),
+                parser_current_line(parser));
+    }
+    
     /* Parse leading type annotations: @NonNull String */
     slist_t *type_annotations = parse_type_annotations(parser);
     
@@ -2274,6 +2592,13 @@ ast_node_t *parse_type(parser_t *parser)
         }
         
         type_node->data.node.name = string_free(name, false);
+        
+        if (getenv("GENESIS_DEBUG_PARSER")) {
+            fprintf(stderr, "[PARSER] parse_type: after parsing class name '%s', current_token=%d, line=%d\n", 
+                    type_node->data.node.name,
+                    parser_current_type(parser),
+                    parser_current_line(parser));
+        }
         
         /* Handle type arguments (<...>) or diamond operator (<>) */
         if (parser_check(parser, TOK_LT)) {
@@ -2388,6 +2713,13 @@ ast_node_t *parse_type(parser_t *parser)
         }
     }
     
+    if (getenv("GENESIS_DEBUG_PARSER")) {
+        fprintf(stderr, "[PARSER] parse_type: exit, returning %s, current_token=%d, line=%d\n", 
+                type_node ? "type" : "NULL",
+                parser_current_type(parser),
+                parser_current_line(parser));
+    }
+    
     return type_node;
 }
 
@@ -2496,6 +2828,9 @@ static ast_node_t *parse_statement(parser_t *parser)
             
         case TOK_FOR:
             {
+                if (getenv("GENESIS_DEBUG_PARSER")) {
+                    fprintf(stderr, "[PARSER] Parsing FOR statement at line %d\n", line);
+                }
                 parser_advance(parser);
                 
                 if (!parser_expect(parser, TOK_LPAREN)) {
@@ -2541,10 +2876,20 @@ static ast_node_t *parse_statement(parser_t *parser)
                         if (parser_check(parser, TOK_LT)) {
                             int depth = 1;
                             parser_advance(parser);
+                            if (getenv("GENESIS_DEBUG_PARSER")) {
+                                fprintf(stderr, "[PARSER] FOR lookahead: Skipping generics, depth=1\n");
+                            }
                             while (depth > 0 && !parser_check(parser, TOK_EOF)) {
+                                if (getenv("GENESIS_DEBUG_PARSER")) {
+                                    fprintf(stderr, "[PARSER] FOR lookahead: token=%d, depth=%d\n", 
+                                            parser_current_type(parser), depth);
+                                }
                                 if (parser_check(parser, TOK_LT)) depth++;
                                 else if (parser_check(parser, TOK_GT)) depth--;
                                 parser_advance(parser);
+                            }
+                            if (getenv("GENESIS_DEBUG_PARSER")) {
+                                fprintf(stderr, "[PARSER] FOR lookahead: Done with generics, depth=%d\n", depth);
                             }
                         }
                         /* Skip array brackets if present */
@@ -2558,14 +2903,27 @@ static ast_node_t *parse_statement(parser_t *parser)
                         /* If followed by identifier, it's a declaration */
                         if (parser_check(parser, TOK_IDENTIFIER)) {
                             is_var_decl = true;
+                        } else {
+                            if (getenv("GENESIS_DEBUG_PARSER")) {
+                                fprintf(stderr, "[PARSER] FOR lookahead: after type, NOT identifier, token=%d\n", 
+                                        parser_current_type(parser));
+                            }
                         }
                         /* Restore position */
                         lexer_restore_pos(parser->lexer, save_pos);
                     }
                     
                     if (is_var_decl) {
+                        if (getenv("GENESIS_DEBUG_PARSER")) {
+                            fprintf(stderr, "[PARSER] FOR: Detected var declaration\n");
+                        }
                         /* Parse type */
                         ast_node_t *type = parse_type(parser);
+                        
+                        if (getenv("GENESIS_DEBUG_PARSER")) {
+                            fprintf(stderr, "[PARSER] FOR: after parsing type, current_token=%d\n", 
+                                    parser_current_type(parser));
+                        }
                         
                         /* Check for enhanced for loop: for (Type var : iterable) */
                         if (parser_check(parser, TOK_IDENTIFIER)) {
@@ -2573,6 +2931,11 @@ static ast_node_t *parse_statement(parser_t *parser)
                             int var_line = parser_current_line(parser);
                             int var_col = parser_current_column(parser);
                             parser_advance(parser);
+                            
+                            if (getenv("GENESIS_DEBUG_PARSER")) {
+                                fprintf(stderr, "[PARSER] FOR: after var name '%s', checking for colon, current_token=%d\n", 
+                                        var_name, parser_current_type(parser));
+                            }
                             
                             if (parser_check(parser, TOK_COLON)) {
                                 /* Enhanced for loop */
@@ -2596,6 +2959,11 @@ static ast_node_t *parse_statement(parser_t *parser)
                                     ast_add_child(node, iterable);
                                 }
                                 
+                                if (getenv("GENESIS_DEBUG_PARSER")) {
+                                    fprintf(stderr, "[PARSER] Enhanced for: after parsing iterable, current_token=%d\n", 
+                                            parser_current_type(parser));
+                                }
+                                
                                 free(var_name);
                                 
                                 if (!parser_expect(parser, TOK_RPAREN)) {
@@ -2603,10 +2971,20 @@ static ast_node_t *parse_statement(parser_t *parser)
                                     return NULL;
                                 }
                                 
+                                if (getenv("GENESIS_DEBUG_PARSER")) {
+                                    fprintf(stderr, "[PARSER] Enhanced for: about to parse body, current_token=%d\n", 
+                                            parser_current_type(parser));
+                                }
+                                
                                 /* Parse body */
                                 ast_node_t *body = parse_statement(parser);
                                 if (body) {
                                     ast_add_child(node, body);
+                                }
+                                
+                                if (getenv("GENESIS_DEBUG_PARSER")) {
+                                    fprintf(stderr, "[PARSER] Enhanced for: after parsing body, current_token=%d\n", 
+                                            parser_current_type(parser));
                                 }
                                 
                                 return node;
@@ -2667,30 +3045,43 @@ static ast_node_t *parse_statement(parser_t *parser)
                             ast_add_child(node, init);
                         }
                     }
+                } else {
+                    /* Empty init - add placeholder */
+                    ast_add_child(node, ast_new(AST_EMPTY_STMT, line, col));
                 }
                 if (!parser_expect(parser, TOK_SEMICOLON)) {
                     ast_free(node);
                     return NULL;
                 }
                 
-                /* Condition */
+                /* Condition - if empty, add an empty statement node as placeholder */
                 if (!parser_check(parser, TOK_SEMICOLON)) {
                     ast_node_t *cond = parse_expression(parser);
                     if (cond) {
                         ast_add_child(node, cond);
+                    } else {
+                        ast_add_child(node, ast_new(AST_EMPTY_STMT, line, col));
                     }
+                } else {
+                    /* Empty condition - add placeholder */
+                    ast_add_child(node, ast_new(AST_EMPTY_STMT, line, col));
                 }
                 if (!parser_expect(parser, TOK_SEMICOLON)) {
                     ast_free(node);
                     return NULL;
                 }
                 
-                /* Update */
+                /* Update - if empty, add an empty statement node as placeholder */
                 if (!parser_check(parser, TOK_RPAREN)) {
                     ast_node_t *update = parse_expression(parser);
                     if (update) {
                         ast_add_child(node, update);
+                    } else {
+                        ast_add_child(node, ast_new(AST_EMPTY_STMT, line, col));
                     }
+                } else {
+                    /* Empty update - add placeholder */
+                    ast_add_child(node, ast_new(AST_EMPTY_STMT, line, col));
                 }
                 if (!parser_expect(parser, TOK_RPAREN)) {
                     ast_free(node);
@@ -3516,6 +3907,7 @@ static uint32_t parse_modifiers_with_annotations(parser_t *parser, slist_t **ann
 /**
  * Parse modifiers and annotations (legacy wrapper - skips annotations).
  */
+__attribute__((unused))
 static uint32_t parse_modifiers(parser_t *parser)
 {
     slist_t *annotations = NULL;
@@ -3556,7 +3948,7 @@ static ast_node_t *parse_method_decl(parser_t *parser, uint32_t modifiers,
             /* Varargs */
             bool varargs = parser_match(parser, TOK_ELLIPSIS);
             
-            if (!parser_check(parser, TOK_IDENTIFIER)) {
+            if (!parser_check_identifier_or_contextual(parser)) {
                 parser_error(parser, "Expected parameter name");
                 ast_free(method);
                 return NULL;
@@ -3721,13 +4113,45 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
     slist_t *annotations = NULL;
     uint32_t modifiers = parse_modifiers_with_annotations(parser, &annotations);
     
-    /* Nested class/interface/enum/record declaration */
+    if (getenv("GENESIS_DEBUG_PARSER")) {
+        fprintf(stderr, "[PARSER] parse_class_member: modifiers=0x%x, current_token=%d", 
+                modifiers, parser_current_type(parser));
+        if (parser_current_type(parser) == TOK_IDENTIFIER) {
+            fprintf(stderr, " (id='%s')", parser_current_text(parser));
+        }
+        fprintf(stderr, "\n");
+    }
+    
+    /* Nested class/interface/enum/record declaration.
+     * Note: TOK_AT could be @interface (annotation type declaration) OR
+     * just an annotation on a method/field. We need to lookahead to distinguish.
+     * If it's @interface, parse it as a type declaration.
+     * If it's just @SomeName (annotation), continue to parse as method/field. */
+    bool is_at_interface = false;
+    if (parser_check(parser, TOK_AT)) {
+        /* Lookahead to see if it's @interface */
+        lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
+        lexer_advance(parser->lexer);  /* consume @ in lexer */
+        is_at_interface = (lexer_type(parser->lexer) == TOK_INTERFACE);
+        lexer_restore_pos(parser->lexer, save_pos);  /* restore to @ */
+    }
+    
     if (parser_check(parser, TOK_CLASS) ||
         parser_check(parser, TOK_INTERFACE) ||
         parser_check(parser, TOK_ENUM) ||
         parser_check(parser, TOK_RECORD) ||
-        parser_check(parser, TOK_AT)) {  /* @interface */
-        return parse_type_decl_with_annotations(parser, modifiers, annotations);
+        is_at_interface) {  /* @interface only */
+        if (getenv("GENESIS_DEBUG_PARSER")) {
+            fprintf(stderr, "[PARSER] Detected nested type declaration! token=%d\n", parser_current_type(parser));
+        }
+        ast_node_t *nested = parse_type_decl_with_annotations(parser, modifiers, annotations);
+        if (getenv("GENESIS_DEBUG_PARSER")) {
+            fprintf(stderr, "[PARSER] After parsing nested type '%s', current token=%d (line %d)\n", 
+                    nested ? nested->data.node.name : "(null)",
+                    parser_current_type(parser),
+                    parser_current_line(parser));
+        }
+        return nested;
     }
     
     /* Static initializer */
@@ -3743,27 +4167,7 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
         return init;
     }
     
-    /* Constructor (name matches class name) */
-    if (parser_check(parser, TOK_IDENTIFIER) && class_name &&
-        strcmp(parser_current_text(parser), class_name) == 0) {
-        /* Check if followed by ( - then it's a constructor */
-        lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
-        int ctor_line = parser_current_line(parser);
-        int ctor_col = parser_current_column(parser);
-        parser_advance(parser);
-        
-        if (parser_check(parser, TOK_LPAREN)) {
-            ast_node_t *ctor = parse_method_decl(parser, modifiers, NULL, class_name,
-                                     ctor_line, ctor_col);
-            if (ctor) ctor->annotations = annotations;
-            return ctor;
-        }
-        
-        /* Restore - it's something else */
-        lexer_restore_pos(parser->lexer, save_pos);
-    }
-    
-    /* Generic method type parameters (e.g., public <T> T foo(...)) */
+    /* Generic method/constructor type parameters (e.g., public <T> T foo(...) or <T> Foo()) */
     slist_t *method_type_params = NULL;
     if (parser_check(parser, TOK_LT)) {
         parser_advance(parser);
@@ -3800,6 +4204,35 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
         parser_expect_gt(parser);
     }
     
+    /* Constructor (name matches class name) - check after type params for generic constructors */
+    if (parser_check(parser, TOK_IDENTIFIER) && class_name &&
+        strcmp(parser_current_text(parser), class_name) == 0) {
+        /* Check if followed by ( - then it's a constructor */
+        lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
+        int ctor_line = parser_current_line(parser);
+        int ctor_col = parser_current_column(parser);
+        parser_advance(parser);
+        
+        if (parser_check(parser, TOK_LPAREN)) {
+            ast_node_t *ctor = parse_method_decl(parser, modifiers, NULL, class_name,
+                                     ctor_line, ctor_col);
+            if (ctor) {
+                ctor->annotations = annotations;
+                /* Add type parameters as children for generic constructors */
+                if (method_type_params) {
+                    for (slist_t *node = method_type_params; node; node = node->next) {
+                        ast_add_child(ctor, (ast_node_t *)node->data);
+                    }
+                    slist_free(method_type_params);
+                }
+            }
+            return ctor;
+        }
+        
+        /* Restore - it's something else */
+        lexer_restore_pos(parser->lexer, save_pos);
+    }
+    
     /* Method or field - need to parse type and name first */
     if (!is_type_start(parser_current_type(parser))) {
         parser_error(parser, "Expected type or constructor");
@@ -3833,7 +4266,7 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
         return NULL;
     }
     
-    if (!parser_check(parser, TOK_IDENTIFIER)) {
+    if (!parser_check_identifier_or_contextual(parser)) {
         parser_error(parser, "Expected method or field name");
         ast_free(type_node);
         if (annotations) {
@@ -4182,11 +4615,31 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
     }
     
     /* Parse class members (methods, fields, constructors) */
+    if (getenv("GENESIS_DEBUG_PARSER")) {
+        fprintf(stderr, "[PARSER] Parsing class body for: %s (type=%d)\n", decl->data.node.name, type);
+    }
+    int member_count = 0;
     while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
+        if (getenv("GENESIS_DEBUG_PARSER")) {
+            fprintf(stderr, "[PARSER] [%s] Loop iteration %d: current_token=%d, line=%d, check_rbrace=%d, check_eof=%d\n", 
+                    decl->data.node.name, member_count, 
+                    parser_current_type(parser), parser_current_line(parser),
+                    parser_check(parser, TOK_RBRACE), parser_check(parser, TOK_EOF));
+        }
         ast_node_t *member = parse_class_member(parser, decl->data.node.name);
         if (member) {
+            if (getenv("GENESIS_DEBUG_PARSER")) {
+                fprintf(stderr, "[PARSER] [%s] Got member type=%d, name=%s. After adding, current_token=%d, line=%d\n", 
+                        decl->data.node.name, member->type, 
+                        member->data.node.name ? member->data.node.name : "(null)",
+                        parser_current_type(parser), parser_current_line(parser));
+            }
             ast_add_child(decl, member);
+            member_count++;
         } else if (parser->error_msg) {
+            if (getenv("GENESIS_DEBUG_PARSER")) {
+                fprintf(stderr, "[PARSER] Error parsing member: %s\n", parser->error_msg);
+            }
             /* Error recovery */
             while (!parser_check(parser, TOK_SEMICOLON) &&
                    !parser_check(parser, TOK_RBRACE) &&
@@ -4199,6 +4652,11 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
             free(parser->error_msg);
             parser->error_msg = NULL;
         }
+    }
+    
+    if (getenv("GENESIS_DEBUG_PARSER")) {
+        fprintf(stderr, "[PARSER] Finished parsing class body for: %s, member_count=%d, current_token=%d\n", 
+                decl->data.node.name, member_count, parser_current_type(parser));
     }
     
     parser_expect(parser, TOK_RBRACE);

@@ -169,7 +169,6 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
     string_case_info_t *cases = calloc(num_cases, sizeof(string_case_info_t));
     int case_idx = 0;
     int ast_idx = 0;
-    ast_node_t *default_label = NULL;
     
     for (slist_t *node = children->next; node; node = node->next, ast_idx++) {
         ast_node_t *case_label = (ast_node_t *)node->data;
@@ -177,7 +176,7 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
         
         if (case_label->data.node.name && 
             strcmp(case_label->data.node.name, "default") == 0) {
-            default_label = case_label;
+            /* Skip default label - handled separately */
             continue;
         }
         
@@ -553,8 +552,12 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
             ast_node_t *init_expr = (ast_node_t *)res_children->next->data;
             const char *var_name = res->data.node.name;
             
-            /* Resolve resource type */
-            type_t *res_type = semantic_resolve_type(mg->class_gen->sem, type_node);
+            /* Resolve resource type - prefer sem_type set during semantic analysis
+             * to ensure we get the fully qualified name with symbol reference */
+            type_t *res_type = type_node->sem_type;
+            if (!res_type) {
+                res_type = semantic_resolve_type(mg->class_gen->sem, type_node);
+            }
             resource_types[idx] = res_type;
             
             /* Generate initializer */
@@ -922,13 +925,8 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
         }
     }
     
-    /* Track if all catch blocks end with return/throw */
-    bool all_catches_return = true;
-    for (slist_t *node = catch_clauses; node; node = node->next) {
-        /* If any catch didn't add a goto, it ended with return/throw */
-    }
-    /* If we have no gotos to patch, all catches returned */
-    all_catches_return = (catch_gotos == NULL);
+    /* Note: If we have no gotos to patch, all catches ended with return/throw */
+    (void)catch_clauses;  /* Used in iteration above */
     
     /* Patch normal exit goto if it exists */
     uint16_t after_try = (uint16_t)mg->code->length;
@@ -1113,7 +1111,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                         enclosing->data.class_data.members, name);
                                     if (outer_field && outer_field->kind == SYM_FIELD && outer_field->type) {
                                         type_kind_t kind = outer_field->type->kind;
-                                        if (kind == TYPE_CLASS || kind == TYPE_ARRAY) {
+                                        if (kind == TYPE_CLASS || kind == TYPE_ARRAY || kind == TYPE_TYPEVAR) {
                                             return_op = OP_ARETURN;
                                         } else if (kind == TYPE_LONG) {
                                             return_op = OP_LRETURN;
@@ -1168,6 +1166,38 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     if (return_op == OP_IRETURN && mg->method && mg->method->type) {
                         type_kind_t ret_kind = mg->method->type->kind;
                         if (ret_kind == TYPE_CLASS || ret_kind == TYPE_ARRAY) {
+                            /* Check if we need to box a primitive to a wrapper type */
+                            if (ret_kind == TYPE_CLASS && mg->method->type->data.class_type.name) {
+                                const char *ret_class = mg->method->type->data.class_type.name;
+                                type_kind_t expr_kind = get_expr_type_kind(mg, return_expr);
+                                
+                                /* Check if return type is a wrapper and expression is corresponding primitive */
+                                if ((strcmp(ret_class, "java.lang.Integer") == 0 || strcmp(ret_class, "Integer") == 0) &&
+                                    (expr_kind == TYPE_INT || expr_kind == TYPE_BYTE || expr_kind == TYPE_SHORT || expr_kind == TYPE_CHAR)) {
+                                    emit_boxing(mg, mg->cp, TYPE_INT);
+                                } else if ((strcmp(ret_class, "java.lang.Long") == 0 || strcmp(ret_class, "Long") == 0) &&
+                                           expr_kind == TYPE_LONG) {
+                                    emit_boxing(mg, mg->cp, TYPE_LONG);
+                                } else if ((strcmp(ret_class, "java.lang.Float") == 0 || strcmp(ret_class, "Float") == 0) &&
+                                           expr_kind == TYPE_FLOAT) {
+                                    emit_boxing(mg, mg->cp, TYPE_FLOAT);
+                                } else if ((strcmp(ret_class, "java.lang.Double") == 0 || strcmp(ret_class, "Double") == 0) &&
+                                           expr_kind == TYPE_DOUBLE) {
+                                    emit_boxing(mg, mg->cp, TYPE_DOUBLE);
+                                } else if ((strcmp(ret_class, "java.lang.Boolean") == 0 || strcmp(ret_class, "Boolean") == 0) &&
+                                           expr_kind == TYPE_BOOLEAN) {
+                                    emit_boxing(mg, mg->cp, TYPE_BOOLEAN);
+                                } else if ((strcmp(ret_class, "java.lang.Byte") == 0 || strcmp(ret_class, "Byte") == 0) &&
+                                           expr_kind == TYPE_BYTE) {
+                                    emit_boxing(mg, mg->cp, TYPE_BYTE);
+                                } else if ((strcmp(ret_class, "java.lang.Short") == 0 || strcmp(ret_class, "Short") == 0) &&
+                                           expr_kind == TYPE_SHORT) {
+                                    emit_boxing(mg, mg->cp, TYPE_SHORT);
+                                } else if ((strcmp(ret_class, "java.lang.Character") == 0 || strcmp(ret_class, "Character") == 0) &&
+                                           expr_kind == TYPE_CHAR) {
+                                    emit_boxing(mg, mg->cp, TYPE_CHAR);
+                                }
+                            }
                             return_op = OP_ARETURN;
                         } else if (ret_kind == TYPE_LONG) {
                             return_op = OP_LRETURN;
@@ -1740,10 +1770,14 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         mg->code->code[goto_pos + 1] = (end_offset >> 8) & 0xFF;
                         mg->code->code[goto_pos + 2] = end_offset & 0xFF;
                         
-                        /* Restore stackmap state for join point - locals allocated in
-                         * either branch should not be in scope after the if-else */
+                        /* At join point, restore only the next_slot/locals_count to exclude
+                         * variables allocated inside the branches. But DO NOT restore the
+                         * stackmap local types - variables declared BEFORE the if that are
+                         * assigned inside BOTH branches should retain their assigned type,
+                         * not revert to Top. The else branch's final state is valid since
+                         * any variables declared inside else will go out of scope anyway. */
                         if (pre_then_state && mg->stackmap) {
-                            stackmap_restore_state(mg->stackmap, pre_then_state);
+                            /* Only restore the slot allocation, not the stackmap types */
                             mg_restore_locals_count(mg, pre_then_locals_count);
                             mg->next_slot = pre_then_slot;
                         }
@@ -1760,18 +1794,6 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         mg->last_opcode = 0;
                     }
                 } else {
-                    /* Check if then block ended with a return/throw */
-                    bool then_ends_with_return = false;
-                    if (mg->code->length > 0) {
-                        uint8_t last_op = mg->code->code[mg->code->length - 1];
-                        if (last_op == OP_RETURN || last_op == OP_IRETURN ||
-                            last_op == OP_LRETURN || last_op == OP_FRETURN ||
-                            last_op == OP_DRETURN || last_op == OP_ARETURN ||
-                            last_op == OP_ATHROW) {
-                            then_ends_with_return = true;
-                        }
-                    }
-                    
                     /* Patch branch to end (no else) */
                     int16_t end_offset = (int16_t)(mg->code->length - branch_pos);
                     mg->code->code[branch_pos + 1] = (end_offset >> 8) & 0xFF;
@@ -1842,14 +1864,27 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     return false;
                 }
                 
+                /* Check if body ended with an unconditional branch (break/continue/return/throw).
+                 * If so, the back-edge is unreachable and should be skipped. */
+                bool body_ends_with_jump = (mg->last_opcode == OP_GOTO ||
+                                           mg->last_opcode == OP_RETURN ||
+                                           mg->last_opcode == OP_ARETURN ||
+                                           mg->last_opcode == OP_IRETURN ||
+                                           mg->last_opcode == OP_LRETURN ||
+                                           mg->last_opcode == OP_FRETURN ||
+                                           mg->last_opcode == OP_DRETURN ||
+                                           mg->last_opcode == OP_ATHROW);
+                
                 /* Restore locals count before goto back to loop_start.
                  * This ensures the frame at loop_start doesn't include loop-local variables. */
                 mg_restore_locals_count(mg, saved_locals_count);
                 
-                /* goto loop_start */
-                int16_t back_offset = (int16_t)(loop_start - mg->code->length);
-                bc_emit(mg->code, OP_GOTO);
-                bc_emit_u2(mg->code, back_offset);
+                /* goto loop_start (back-edge) - only if body doesn't end with unconditional jump */
+                if (!body_ends_with_jump) {
+                    int16_t back_offset = (int16_t)(loop_start - mg->code->length);
+                    bc_emit(mg->code, OP_GOTO);
+                    bc_emit_u2(mg->code, back_offset);
+                }
                 
                 /* Patch forward branch to here (loop_end) */
                 size_t loop_end = mg->code->length;
@@ -1900,25 +1935,43 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     return false;
                 }
                 
+                /* Check if body ended with an unconditional branch */
+                bool body_ends_with_terminal = (mg->last_opcode == OP_RETURN ||
+                                                mg->last_opcode == OP_ARETURN ||
+                                                mg->last_opcode == OP_IRETURN ||
+                                                mg->last_opcode == OP_LRETURN ||
+                                                mg->last_opcode == OP_FRETURN ||
+                                                mg->last_opcode == OP_DRETURN ||
+                                                mg->last_opcode == OP_ATHROW);
+                bool body_ends_with_goto = (mg->last_opcode == OP_GOTO);
+                
                 /* Update continue target to condition check point */
                 if (mg->loop_stack) {
                     ((loop_context_t *)mg->loop_stack->data)->continue_target = mg->code->length;
                 }
                 
+                /* If body ended with goto (break/continue), record frame for continue target */
+                if (body_ends_with_goto) {
+                    mg_record_frame(mg);
+                }
+                
                 /* Restore locals count before condition check (which branches back to loop_start) */
                 mg_restore_locals_count(mg, saved_locals_count);
                 
-                /* Generate condition */
-                if (condition) {
-                    if (!codegen_expr(mg, condition, mg->cp)) {
-                        return false;
+                /* Skip condition if body ends with return/throw (condition is unreachable) */
+                if (!body_ends_with_terminal) {
+                    /* Generate condition */
+                    if (condition) {
+                        if (!codegen_expr(mg, condition, mg->cp)) {
+                            return false;
+                        }
+                        
+                        /* ifne loop_start (continue if condition true) */
+                        int16_t back_offset = (int16_t)(loop_start - mg->code->length);
+                        bc_emit(mg->code, OP_IFNE);
+                        bc_emit_u2(mg->code, back_offset);
+                        mg_pop_typed(mg, 1);
                     }
-                    
-                    /* ifne loop_start (continue if condition true) */
-                    int16_t back_offset = (int16_t)(loop_start - mg->code->length);
-                    bc_emit(mg->code, OP_IFNE);
-                    bc_emit_u2(mg->code, back_offset);
-                    mg_pop_typed(mg, 1);
                 }
                 
                 /* Record frame at loop end (break target) */
@@ -1958,8 +2011,8 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     children = children->next;
                 }
                 
-                /* Generate initializer */
-                if (init) {
+                /* Generate initializer (skip if empty placeholder) */
+                if (init && init->type != AST_EMPTY_STMT) {
                     if (init->type == AST_VAR_DECL) {
                         if (!codegen_statement(mg, init)) {
                             return false;
@@ -1986,7 +2039,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 mg_record_frame(mg);
                 
                 size_t branch_pos = 0;
-                if (condition) {
+                if (condition && condition->type != AST_EMPTY_STMT) {
                     /* Generate condition */
                     if (!codegen_expr(mg, condition, mg->cp)) {
                         return false;
@@ -2009,29 +2062,55 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     return false;
                 }
                 
+                /* Check if body ended with an unconditional branch.
+                 * If it's break/return/throw, the update and back-edge are unreachable.
+                 * If it's continue (goto to continue_target), the update/back-edge are still reachable
+                 * because continue_target is set below. But the fall-through is dead. */
+                bool body_ends_with_terminal = (mg->last_opcode == OP_RETURN ||
+                                                mg->last_opcode == OP_ARETURN ||
+                                                mg->last_opcode == OP_IRETURN ||
+                                                mg->last_opcode == OP_LRETURN ||
+                                                mg->last_opcode == OP_FRETURN ||
+                                                mg->last_opcode == OP_DRETURN ||
+                                                mg->last_opcode == OP_ATHROW);
+                /* Note: break ends with goto, which makes following code unreachable,
+                 * but we detect break specifically because it's a forward goto.
+                 * Continue is a backward goto which still makes the following code reachable
+                 * from the continue target. For simplicity, record a frame if body ends with goto. */
+                bool body_ends_with_goto = (mg->last_opcode == OP_GOTO);
+                
                 /* Update continue target to here (before update expression) */
                 if (mg->loop_stack) {
                     ((loop_context_t *)mg->loop_stack->data)->continue_target = mg->code->length;
                 }
                 
-                /* Generate update */
-                if (update) {
-                    if (!codegen_expr(mg, update, mg->cp)) {
-                        return false;
-                    }
-                    /* Pop update result */
-                    bc_emit(mg->code, OP_POP);
-                    mg_pop_typed(mg, 1);
+                /* If body ended with goto (break/continue), record frame for continue target
+                 * since the fall-through path is unreachable but continue still jumps here. */
+                if (body_ends_with_goto) {
+                    mg_record_frame(mg);
                 }
                 
-                /* Restore locals count before goto back to loop_start.
-                 * This ensures the frame at loop_start doesn't include body-local variables. */
-                mg_restore_locals_count(mg, saved_locals_count);
-                
-                /* goto loop_start */
-                int16_t back_offset = (int16_t)(loop_start - mg->code->length);
-                bc_emit(mg->code, OP_GOTO);
-                bc_emit_u2(mg->code, back_offset);
+                /* Skip update and back-edge if body ends with return/throw (truly unreachable) */
+                if (!body_ends_with_terminal) {
+                    /* Generate update (skip if empty placeholder) */
+                    if (update && update->type != AST_EMPTY_STMT) {
+                        if (!codegen_expr(mg, update, mg->cp)) {
+                            return false;
+                        }
+                        /* Pop update result */
+                        bc_emit(mg->code, OP_POP);
+                        mg_pop_typed(mg, 1);
+                    }
+                    
+                    /* Restore locals count before goto back to loop_start.
+                     * This ensures the frame at loop_start doesn't include body-local variables. */
+                    mg_restore_locals_count(mg, saved_locals_count);
+                    
+                    /* goto loop_start */
+                    int16_t back_offset = (int16_t)(loop_start - mg->code->length);
+                    bc_emit(mg->code, OP_GOTO);
+                    bc_emit_u2(mg->code, back_offset);
+                }
                 
                 /* loop_end: */
                 size_t loop_end = mg->code->length;
@@ -2083,6 +2162,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 size_t break_pos = mg->code->length;
                 bc_emit(mg->code, OP_GOTO);
                 bc_emit_u2(mg->code, 0);  /* Will be patched by mg_pop_loop */
+                mg->last_opcode = OP_GOTO;  /* Track for dead code detection */
                 
                 /* Register this break for patching */
                 mg_add_break_to_context(target_ctx, break_pos);
@@ -2524,15 +2604,28 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         return false;
                     }
                     
+                    /* Check if body ended with an unconditional jump */
+                    bool body_ends_with_jump = (mg->last_opcode == OP_GOTO ||
+                                               mg->last_opcode == OP_RETURN ||
+                                               mg->last_opcode == OP_ARETURN ||
+                                               mg->last_opcode == OP_IRETURN ||
+                                               mg->last_opcode == OP_LRETURN ||
+                                               mg->last_opcode == OP_FRETURN ||
+                                               mg->last_opcode == OP_DRETURN ||
+                                               mg->last_opcode == OP_ATHROW);
+                    
                     /* Update continue target */
                     if (mg->loop_stack) {
                         ((loop_context_t *)mg->loop_stack->data)->continue_target = mg->code->length;
                     }
                     
-                    /* goto loop_start */
-                    int16_t back_offset = (int16_t)(loop_start - mg->code->length);
-                    bc_emit(mg->code, OP_GOTO);
-                    bc_emit_u2(mg->code, back_offset);
+                    /* Only generate back-edge if body doesn't end with unconditional jump */
+                    if (!body_ends_with_jump) {
+                        /* goto loop_start */
+                        int16_t back_offset = (int16_t)(loop_start - mg->code->length);
+                        bc_emit(mg->code, OP_GOTO);
+                        bc_emit_u2(mg->code, back_offset);
+                    }
                     
                     /* loop_end: Patch branch */
                     size_t loop_end = mg->code->length;
@@ -2591,6 +2684,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 int16_t offset = (int16_t)(target_ctx->continue_target - mg->code->length);
                 bc_emit(mg->code, OP_GOTO);
                 bc_emit_u2(mg->code, offset);
+                mg->last_opcode = OP_GOTO;  /* Track for dead code detection */
                 
                 return true;
             }
@@ -2790,6 +2884,15 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 mg->code->code[default_offset_pos + 1] = (default_offset >> 16) & 0xFF;
                 mg->code->code[default_offset_pos + 2] = (default_offset >> 8) & 0xFF;
                 mg->code->code[default_offset_pos + 3] = default_offset & 0xFF;
+                
+                /* Record stackmap frame at switch end if there are break statements to patch.
+                 * Breaks jump to switch_end, so we need a frame there. */
+                if (mg->loop_stack) {
+                    loop_context_t *ctx = (loop_context_t *)mg->loop_stack->data;
+                    if (ctx->break_offsets) {
+                        mg_record_frame(mg);
+                    }
+                }
                 
                 /* Pop switch context and patch breaks */
                 mg_pop_loop(mg, switch_end);
@@ -3255,9 +3358,11 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * false branch falls through - but we handle that by recording a frame at
                  * the branch target inside the if-statement codegen. */
                 size_t try_exit_goto = 0;
+                bool has_try_exit_goto = false;  /* Track whether we emitted a try exit goto */
                 uint16_t try_exit_locals_count = 0;  /* Remember try path's locals for merging */
                 if (!try_ends_with_return) {
                     try_exit_goto = mg->code->length;
+                    has_try_exit_goto = true;
                     bc_emit(mg->code, OP_GOTO);
                     bc_emit_u2(mg->code, 0);  /* Placeholder */
                     /* Remember the try path's locals count for later comparison */
@@ -3552,11 +3657,11 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * block was empty, the exception variable was the only local added and then
                  * removed by restore. So current_locals_count reflects what's valid on ALL
                  * catch paths that flow to this point. */
-                if (try_exit_goto > 0 || catch_gotos) {
-                    /* If try block didn't exit (try_exit_goto == 0), only catch paths
+                if (has_try_exit_goto || catch_gotos) {
+                    /* If try block didn't exit (no try_exit_goto), only catch paths
                      * reach here, so use current stackmap state as-is.
                      * If try block exited, we need to merge with try path's locals. */
-                    if (mg->stackmap && try_exit_goto > 0 && try_exit_locals_count > 0) {
+                    if (mg->stackmap && has_try_exit_goto && try_exit_locals_count > 0) {
                         /* Take minimum of try and catch locals counts */
                         if (try_exit_locals_count < mg->stackmap->current_locals_count) {
                             /* Try path had fewer locals (e.g., catch block added vars) */
@@ -3568,7 +3673,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 }
                 
                 /* Patch try exit goto (only if we emitted one) */
-                if (try_exit_goto > 0) {
+                if (has_try_exit_goto) {
                     int16_t try_exit_offset = (int16_t)(after_try - try_exit_goto);
                     mg->code->code[try_exit_goto + 1] = (try_exit_offset >> 8) & 0xFF;
                     mg->code->code[try_exit_goto + 2] = try_exit_offset & 0xFF;

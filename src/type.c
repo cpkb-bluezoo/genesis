@@ -211,6 +211,17 @@ type_t *type_new_wildcard(int bound_kind, type_t *bound)
     return type;
 }
 
+type_t *type_new_intersection(slist_t *types)
+{
+    type_t *type = calloc(1, sizeof(type_t));
+    if (!type) {
+        return NULL;
+    }
+    type->kind = TYPE_INTERSECTION;
+    type->data.intersection.types = types;
+    return type;
+}
+
 void type_free(type_t *type)
 {
     if (!type) {
@@ -269,7 +280,39 @@ char *type_to_string(type_t *type)
         case TYPE_UNKNOWN:  return strdup("<unknown>");
         
         case TYPE_CLASS:
-            return strdup(type->data.class_type.name);
+            {
+                const char *name = type->data.class_type.name;
+                slist_t *type_args = type->data.class_type.type_args;
+                
+                if (!type_args) {
+                    return strdup(name);
+                }
+                
+                /* Build string like "List<String, Integer>" */
+                size_t total_len = strlen(name) + 2;  /* "Name<>" */
+                for (slist_t *a = type_args; a; a = a->next) {
+                    char *ts = type_to_string((type_t *)a->data);
+                    total_len += strlen(ts) + 2;  /* ", " separator */
+                    free(ts);
+                }
+                
+                char *result = malloc(total_len + 1);
+                strcpy(result, name);
+                strcat(result, "<");
+                
+                bool first = true;
+                for (slist_t *a = type_args; a; a = a->next) {
+                    if (!first) {
+                        strcat(result, ", ");
+                    }
+                    char *ts = type_to_string((type_t *)a->data);
+                    strcat(result, ts);
+                    free(ts);
+                    first = false;
+                }
+                strcat(result, ">");
+                return result;
+            }
         
         case TYPE_ARRAY:
             {
@@ -307,6 +350,38 @@ char *type_to_string(type_t *type)
                     return result;
                 }
                 return strdup("?");
+            }
+        
+        case TYPE_INTERSECTION:
+            {
+                /* Build string like "Type1 & Type2 & Type3" */
+                slist_t *types = type->data.intersection.types;
+                if (!types) {
+                    return strdup("<empty intersection>");
+                }
+                
+                /* Calculate total length needed */
+                size_t total_len = 0;
+                for (slist_t *t = types; t; t = t->next) {
+                    char *ts = type_to_string((type_t *)t->data);
+                    total_len += strlen(ts) + 3;  /* " & " separator */
+                    free(ts);
+                }
+                
+                char *result = malloc(total_len + 1);
+                result[0] = '\0';
+                
+                bool first = true;
+                for (slist_t *t = types; t; t = t->next) {
+                    if (!first) {
+                        strcat(result, " & ");
+                    }
+                    char *ts = type_to_string((type_t *)t->data);
+                    strcat(result, ts);
+                    free(ts);
+                    first = false;
+                }
+                return result;
             }
         
         default:
@@ -478,6 +553,22 @@ const char *get_wrapper_class(type_kind_t kind)
     }
 }
 
+/**
+ * Get the boxed (wrapper) type for a primitive type.
+ * Returns a new TYPE_CLASS for the wrapper, or the original type if not primitive.
+ */
+type_t *type_boxed(type_t *type)
+{
+    if (!type) return type;
+    
+    const char *wrapper = get_wrapper_class(type->kind);
+    if (wrapper) {
+        return type_new_class(wrapper);
+    }
+    
+    return type;
+}
+
 type_kind_t get_primitive_for_wrapper(const char *class_name)
 {
     if (!class_name) {
@@ -630,6 +721,7 @@ static bool symbol_implements_interface(symbol_t *sym, symbol_t *target_sym,
     
     /* Check direct interfaces of this symbol */
     slist_t *ifaces = symbol_get_interfaces(sym);
+    
     while (ifaces) {
         symbol_t *iface = (symbol_t *)ifaces->data;
         if (!iface) {
@@ -764,6 +856,56 @@ bool type_assignable(type_t *target, type_t *source)
         const char *target_name = target_sym ? symbol_get_qualified_name(target_sym) 
                                               : target->data.class_type.name;
         
+        /* Fallback: check by name when symbols aren't loaded.
+         * This handles wrapper classes like Double, Integer, Long which
+         * extend Number but may not have their symbols loaded. */
+        if (!source_sym && source->data.class_type.name && target_name) {
+            const char *source_name = source->data.class_type.name;
+            /* java.lang wrapper classes that extend Number */
+            if (strcmp(target_name, "java.lang.Number") == 0) {
+                if (strcmp(source_name, "java.lang.Double") == 0 ||
+                    strcmp(source_name, "java.lang.Float") == 0 ||
+                    strcmp(source_name, "java.lang.Integer") == 0 ||
+                    strcmp(source_name, "java.lang.Long") == 0 ||
+                    strcmp(source_name, "java.lang.Short") == 0 ||
+                    strcmp(source_name, "java.lang.Byte") == 0 ||
+                    strcmp(source_name, "java.math.BigInteger") == 0 ||
+                    strcmp(source_name, "java.math.BigDecimal") == 0) {
+                    return true;
+                }
+            }
+            /* Common wrapper/interface relationships */
+            if (strcmp(target_name, "java.lang.Comparable") == 0) {
+                /* All wrapper types implement Comparable */
+                if (strcmp(source_name, "java.lang.Double") == 0 ||
+                    strcmp(source_name, "java.lang.Float") == 0 ||
+                    strcmp(source_name, "java.lang.Integer") == 0 ||
+                    strcmp(source_name, "java.lang.Long") == 0 ||
+                    strcmp(source_name, "java.lang.Short") == 0 ||
+                    strcmp(source_name, "java.lang.Byte") == 0 ||
+                    strcmp(source_name, "java.lang.String") == 0 ||
+                    strcmp(source_name, "java.lang.Boolean") == 0 ||
+                    strcmp(source_name, "java.lang.Character") == 0) {
+                    return true;
+                }
+            }
+        }
+        
+        /* Try to load source symbol if not present */
+        if (!source_sym && source->data.class_type.name) {
+            /* Use the semantic analyzer's class loading if available */
+            extern symbol_t *load_external_class(void *sem, const char *name);
+            extern void *get_current_semantic(void);
+            void *sem = get_current_semantic();
+            if (sem) {
+                source_sym = load_external_class(sem, source->data.class_type.name);
+                if (source_sym) {
+                    /* Cache the symbol in the type for future use */
+                    source->data.class_type.symbol = source_sym;
+                }
+            }
+        }
+        
         /* Use recursive helper to check full interface/class hierarchy */
         if (source_sym && symbol_implements_interface(source_sym, target_sym, target_name, 0)) {
             return true;
@@ -794,6 +936,24 @@ bool type_assignable(type_t *target, type_t *source)
             if (type_is_reference(te) && type_is_reference(se)) {
                 return type_assignable(te, se);
             }
+        }
+        /* Multi-dimensional array to Object[]: T[][] is assignable to Object[]
+         * because T[] is assignable to Object */
+        else if (target->data.array_type.dimensions == 1 &&
+                 source->data.array_type.dimensions > 1) {
+            type_t *te = target->data.array_type.element_type;
+            /* Check if target element is Object */
+            if (te && te->kind == TYPE_CLASS && 
+                strcmp(te->data.class_type.name, "java.lang.Object") == 0) {
+                return true;  /* Any array[][] is assignable to Object[] */
+            }
+        }
+    }
+    
+    /* Any array is also assignable to Object (not just Object[]) */
+    if (target->kind == TYPE_CLASS && source->kind == TYPE_ARRAY) {
+        if (strcmp(target->data.class_type.name, "java.lang.Object") == 0) {
+            return true;
         }
     }
     
@@ -827,8 +987,14 @@ bool type_assignable(type_t *target, type_t *source)
         if (bound) {
             return type_assignable(bound, source);
         }
-        /* Unbounded type var accepts any reference type */
-        return type_is_reference(source);
+        /* Unbounded type var accepts any reference type.
+         * Also accept primitives since they will be autoboxed. */
+        if (type_is_reference(source)) {
+            return true;
+        }
+        /* Accept primitives that can be boxed */
+        const char *wrapper = get_wrapper_class(source->kind);
+        return wrapper != NULL;
     }
     
     /* Wildcard type handling:
@@ -864,6 +1030,37 @@ bool type_assignable(type_t *target, type_t *source)
         /* Unbounded or lower-bounded wildcard produces Object */
         type_t obj = { .kind = TYPE_CLASS, .data.class_type.name = "java.lang.Object" };
         return type_assignable(target, &obj);
+    }
+    
+    /* Intersection type handling:
+     * An intersection type T1 & T2 & ... is assignable to a target
+     * if ALL component types are assignable to target (typically just Object).
+     * Conversely, source is assignable TO intersection if assignable to ALL components. */
+    if (source->kind == TYPE_INTERSECTION) {
+        /* Intersection -> target: 
+         * The intersection is a subtype of each component,
+         * so it's assignable to target if ANY component is assignable to target */
+        slist_t *types = source->data.intersection.types;
+        for (slist_t *t = types; t; t = t->next) {
+            type_t *component = (type_t *)t->data;
+            if (type_assignable(target, component)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    
+    if (target->kind == TYPE_INTERSECTION) {
+        /* source -> Intersection:
+         * Source must be assignable to ALL components of the intersection */
+        slist_t *types = target->data.intersection.types;
+        for (slist_t *t = types; t; t = t->next) {
+            type_t *component = (type_t *)t->data;
+            if (!type_assignable(component, source)) {
+                return false;
+            }
+        }
+        return true;
     }
     
     return false;

@@ -595,6 +595,7 @@ void mg_push_float(method_gen_t *mg);    /* Push float type */
 void mg_push_double(method_gen_t *mg);   /* Push double type (2 slots) */
 void mg_push_null(method_gen_t *mg);     /* Push null reference */
 void mg_push_object(method_gen_t *mg, const char *class_name);  /* Push object reference */
+void mg_push_uninitialized(method_gen_t *mg, uint16_t new_offset);  /* Push uninitialized reference (from 'new' instruction) */
 void mg_pop_typed(method_gen_t *mg, int slots);  /* Pop from both runtime and stackmap */
 
 /* Line number and local variable recording */

@@ -8,9 +8,9 @@ public class RecordPatternTest {
     }
     
     static void testCase1() {
-        Object obj = new TestPoint(5, 12);
+        Object obj = new TestPoint2(5, 12);
         int distance = switch (obj) {
-            case TestPoint(int x, int y) -> x * x + y * y;
+            case TestPoint2(int x, int y) -> x * x + y * y;
             default -> 0;
         };
         System.out.println("Test 1: " + distance);
@@ -21,9 +21,9 @@ public class RecordPatternTest {
     }
     
     static void testCase2() {
-        Object obj = new TestPoint(3, 4);
+        Object obj = new TestPoint2(3, 4);
         String result = switch (obj) {
-            case TestPoint(int x, int y) -> "matched";
+            case TestPoint2(int x, int y) -> "matched";
             default -> "not matched";
         };
         System.out.println("Test 2: " + result);
@@ -36,7 +36,7 @@ public class RecordPatternTest {
     static void testCase3() {
         Object obj = "hello";
         String result = switch (obj) {
-            case TestPoint(int x, int y) -> "is point";
+            case TestPoint2(int x, int y) -> "is point";
             default -> "not point";
         };
         System.out.println("Test 3: " + result);

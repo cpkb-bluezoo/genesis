@@ -613,9 +613,13 @@ uint16_t mg_allocate_local(method_gen_t *mg, const char *name, type_t *type)
     if (type && (type->kind == TYPE_CLASS || type->kind == TYPE_ARRAY)) {
         info->is_ref = true;
         
-        /* Store the class name for class types */
+        /* Store the class name for class types - prefer qualified name from symbol */
         if (type->kind == TYPE_CLASS && type->data.class_type.name) {
-            info->class_name = class_to_internal_name(type->data.class_type.name);
+            const char *class_name = type->data.class_type.name;
+            if (type->data.class_type.symbol && type->data.class_type.symbol->qualified_name) {
+                class_name = type->data.class_type.symbol->qualified_name;
+            }
+            info->class_name = class_to_internal_name(class_name);
         }
     }
     
@@ -624,7 +628,12 @@ uint16_t mg_allocate_local(method_gen_t *mg, const char *name, type_t *type)
     /* Update StackMapTable local tracking */
     if (mg->stackmap) {
         if (type && type->kind == TYPE_CLASS && type->data.class_type.name) {
-            const char *internal = class_to_internal_name(type->data.class_type.name);
+            /* Prefer the symbol's qualified name if available */
+            const char *class_name = type->data.class_type.name;
+            if (type->data.class_type.symbol && type->data.class_type.symbol->qualified_name) {
+                class_name = type->data.class_type.symbol->qualified_name;
+            }
+            const char *internal = class_to_internal_name(class_name);
             stackmap_set_local_object(mg->stackmap, slot, mg->cp, internal);
         } else if (type && type->kind == TYPE_ARRAY) {
             /* Array types - use the proper array descriptor like [I, [Ljava/lang/String; */
@@ -754,6 +763,7 @@ void mg_emit_load_local(method_gen_t *mg, uint16_t slot, type_kind_t kind)
             
         case TYPE_CLASS:
         case TYPE_ARRAY:
+        case TYPE_TYPEVAR:  /* Type variables erase to Object (reference type) */
             if (slot <= 3) {
                 bc_emit(mg->code, OP_ALOAD_0 + slot);
             } else {
@@ -812,6 +822,7 @@ void mg_emit_store_local(method_gen_t *mg, uint16_t slot, type_kind_t kind)
             
         case TYPE_CLASS:
         case TYPE_ARRAY:
+        case TYPE_TYPEVAR:  /* Type variables erase to Object (reference type) */
             if (slot <= 3) {
                 bc_emit(mg->code, OP_ASTORE_0 + slot);
             } else {
@@ -885,6 +896,12 @@ void mg_push_object(method_gen_t *mg, const char *class_name)
     if (mg->stackmap && class_name) {
         stackmap_push_object(mg->stackmap, mg->cp, class_name);
     }
+}
+
+void mg_push_uninitialized(method_gen_t *mg, uint16_t new_offset)
+{
+    mg_push(mg, 1);
+    if (mg->stackmap) stackmap_push_uninitialized(mg->stackmap, new_offset);
 }
 
 void mg_pop_typed(method_gen_t *mg, int slots)
@@ -1041,6 +1058,25 @@ static char *type_to_signature(type_t *type)
             {
                 const char *name = type->data.class_type.name;
                 char *internal = class_to_internal_name(name);
+                
+                /* Check for type arguments */
+                if (type->data.class_type.type_args) {
+                    string_t *sig_str = string_new("L");
+                    string_append(sig_str, internal);
+                    string_append(sig_str, "<");
+                    
+                    for (slist_t *arg = type->data.class_type.type_args; arg; arg = arg->next) {
+                        type_t *arg_type = (type_t *)arg->data;
+                        char *arg_sig = type_to_signature(arg_type);
+                        string_append(sig_str, arg_sig);
+                        free(arg_sig);
+                    }
+                    
+                    string_append(sig_str, ">;");
+                    free(internal);
+                    return string_free(sig_str, false);
+                }
+                
                 size_t len = strlen(internal) + 3;
                 char *sig = malloc(len);
                 snprintf(sig, len, "L%s;", internal);
@@ -1190,10 +1226,10 @@ static char *generate_type_params_signature(slist_t *type_params)
 }
 
 /**
- * Generate class signature from class declaration AST.
- * Returns NULL if no signature is needed (non-generic class).
+ * Generate class signature from class declaration AST and symbol.
+ * Returns NULL if no signature is needed (non-generic class with non-generic superclass).
  */
-char *generate_class_signature(ast_node_t *class_decl)
+char *generate_class_signature(ast_node_t *class_decl, symbol_t *class_sym)
 {
     if (!class_decl) {
         return NULL;
@@ -1215,24 +1251,45 @@ char *generate_class_signature(ast_node_t *class_decl)
         }
     }
     
-    /* If no type parameters, no signature needed */
-    if (!type_params) {
+    /* Check if superclass is parameterized */
+    bool has_parameterized_super = false;
+    type_t *super_type = NULL;
+    if (class_sym && class_sym->data.class_data.superclass_type) {
+        super_type = class_sym->data.class_data.superclass_type;
+        if (super_type->kind == TYPE_CLASS && super_type->data.class_type.type_args) {
+            has_parameterized_super = true;
+        }
+    }
+    
+    /* If no type parameters and no parameterized superclass, no signature needed */
+    if (!type_params && !has_parameterized_super) {
         return NULL;
     }
     
     string_t *sig = string_new("");
     
     /* Type parameters: <T:Ljava/lang/Object;> */
-    char *tp_sig = generate_type_params_signature(type_params);
-    if (tp_sig) {
-        string_append(sig, tp_sig);
-        free(tp_sig);
+    if (type_params) {
+        char *tp_sig = generate_type_params_signature(type_params);
+        if (tp_sig) {
+            string_append(sig, tp_sig);
+            free(tp_sig);
+        }
+        slist_free(type_params);
     }
     
-    /* Superclass signature - default to Object since we don't track generic supertypes yet */
-    string_append(sig, "Ljava/lang/Object;");
-    
-    slist_free(type_params);
+    /* Superclass signature */
+    if (super_type) {
+        char *super_sig = type_to_signature(super_type);
+        if (super_sig) {
+            string_append(sig, super_sig);
+            free(super_sig);
+        } else {
+            string_append(sig, "Ljava/lang/Object;");
+        }
+    } else {
+        string_append(sig, "Ljava/lang/Object;");
+    }
     
     return string_free(sig, false);
 }
@@ -1311,8 +1368,13 @@ char *generate_method_signature(ast_node_t *method_decl, symbol_t *method_sym)
     }
     string_append_c(sig, ')');
     
-    /* Return type signature */
-    if (method_sym && method_sym->type) {
+    /* Return type signature - constructors always use V, not the class type */
+    bool is_constructor = (method_decl->type == AST_CONSTRUCTOR_DECL) ||
+                          (method_sym && method_sym->kind == SYM_CONSTRUCTOR);
+    
+    if (is_constructor) {
+        string_append_c(sig, 'V');
+    } else if (method_sym && method_sym->type) {
         char *ret_sig = type_to_signature(method_sym->type);
         string_append(sig, ret_sig);
         free(ret_sig);
@@ -1324,7 +1386,7 @@ char *generate_method_signature(ast_node_t *method_decl, symbol_t *method_sym)
 }
 
 /**
- * Generate field signature if field type is a type variable.
+ * Generate field signature if field type uses generics.
  * Returns NULL if no signature is needed.
  */
 char *generate_field_signature(type_t *field_type)
@@ -1333,14 +1395,24 @@ char *generate_field_signature(type_t *field_type)
         return NULL;
     }
     
-    /* Only need signature if field uses type variable */
+    /* Need signature if field uses type variable */
     if (field_type->kind == TYPE_TYPEVAR) {
+        return type_to_signature(field_type);
+    }
+    
+    /* Need signature if field type is parameterized (e.g., List<String>) */
+    if (field_type->kind == TYPE_CLASS && field_type->data.class_type.type_args) {
         return type_to_signature(field_type);
     }
     
     /* Check array element type */
     if (field_type->kind == TYPE_ARRAY && field_type->data.array_type.element_type) {
-        if (field_type->data.array_type.element_type->kind == TYPE_TYPEVAR) {
+        type_t *elem = field_type->data.array_type.element_type;
+        if (elem->kind == TYPE_TYPEVAR) {
+            return type_to_signature(field_type);
+        }
+        /* Also check for parameterized element type */
+        if (elem->kind == TYPE_CLASS && elem->data.class_type.type_args) {
             return type_to_signature(field_type);
         }
     }
@@ -1771,37 +1843,56 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
         }
         
         /* Check if this is an inner class (non-static nested class)
-         * Note: Interfaces and annotations are implicitly static, so they can't be inner classes */
+         * Note: Interfaces and annotations are implicitly static, so they can't be inner classes
+         * Also: Local classes defined in static methods don't have an outer instance */
         symbol_t *enclosing = class_sym->data.class_data.enclosing_class;
-        if (enclosing && !(class_sym->modifiers & MOD_STATIC) && !is_interface && !is_annotation) {
+        bool is_local_in_static_method = class_sym->data.class_data.is_local_class &&
+                                          class_sym->data.class_data.enclosing_method &&
+                                          (class_sym->data.class_data.enclosing_method->modifiers & MOD_STATIC);
+        if (enclosing && !(class_sym->modifiers & MOD_STATIC) && !is_interface && !is_annotation &&
+            !is_local_in_static_method) {
             cg->is_inner_class = true;
             cg->outer_class_internal = class_to_internal_name(enclosing->qualified_name);
             
-            /* Add synthetic this$0 field */
-            field_gen_t *this0 = calloc(1, sizeof(field_gen_t));
-            this0->access_flags = ACC_FINAL | ACC_SYNTHETIC;
-            this0->name = strdup("this$0");
-            
-            /* Descriptor is LOuterClass; */
-            size_t desc_len = strlen(cg->outer_class_internal) + 3;
-            this0->descriptor = malloc(desc_len);
-            snprintf(this0->descriptor, desc_len, "L%s;", cg->outer_class_internal);
-            
-            this0->name_index = cp_add_utf8(cg->cp, this0->name);
-            this0->descriptor_index = cp_add_utf8(cg->cp, this0->descriptor);
-            
-            /* Add to field list */
-            if (!cg->fields) {
-                cg->fields = slist_new(this0);
-            } else {
-                slist_append(cg->fields, this0);
+            /* Check if superclass is a non-static inner class.
+             * If so, we don't need our own this$0 - the superclass will have it.
+             * We just pass the outer instance to the superclass constructor. */
+            bool super_is_inner = false;
+            if (class_sym->data.class_data.superclass) {
+                symbol_t *super_sym = class_sym->data.class_data.superclass;
+                if (super_sym->data.class_data.enclosing_class &&
+                    !(super_sym->modifiers & MOD_STATIC)) {
+                    super_is_inner = true;
+                }
             }
             
-            hashtable_insert(cg->field_map, this0->name, this0);
-            
-            /* Store field reference for later use */
-            cg->this_dollar_zero_ref = cp_add_fieldref(cg->cp, cg->internal_name,
-                                                        "this$0", this0->descriptor);
+            /* Add synthetic this$0 field only if superclass is not an inner class */
+            if (!super_is_inner) {
+                field_gen_t *this0 = calloc(1, sizeof(field_gen_t));
+                this0->access_flags = ACC_FINAL | ACC_SYNTHETIC;
+                this0->name = strdup("this$0");
+                
+                /* Descriptor is LOuterClass; */
+                size_t desc_len = strlen(cg->outer_class_internal) + 3;
+                this0->descriptor = malloc(desc_len);
+                snprintf(this0->descriptor, desc_len, "L%s;", cg->outer_class_internal);
+                
+                this0->name_index = cp_add_utf8(cg->cp, this0->name);
+                this0->descriptor_index = cp_add_utf8(cg->cp, this0->descriptor);
+                
+                /* Add to field list */
+                if (!cg->fields) {
+                    cg->fields = slist_new(this0);
+                } else {
+                    slist_append(cg->fields, this0);
+                }
+                
+                hashtable_insert(cg->field_map, this0->name, this0);
+                
+                /* Store field reference for later use */
+                cg->this_dollar_zero_ref = cp_add_fieldref(cg->cp, cg->internal_name,
+                                                            "this$0", this0->descriptor);
+            }
         }
         
         /* Check if this is a local or anonymous class with captured variables */
@@ -1810,6 +1901,36 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
             cg->is_local_class = class_sym->data.class_data.is_local_class;
             cg->is_anonymous_class = class_sym->data.class_data.is_anonymous_class;
             cg->captured_vars = class_sym->data.class_data.captured_vars;
+            
+            /* If superclass is also a local class with captured vars, we need to
+             * inherit those captures so we can pass them to the superclass constructor */
+            symbol_t *super_sym = class_sym->data.class_data.superclass;
+            if (super_sym && super_sym->data.class_data.is_local_class &&
+                super_sym->data.class_data.captured_vars) {
+                for (slist_t *cap = super_sym->data.class_data.captured_vars; cap; cap = cap->next) {
+                    symbol_t *var_sym = (symbol_t *)cap->data;
+                    if (!var_sym) continue;
+                    
+                    /* Check if already in our captured_vars */
+                    bool already_captured = false;
+                    for (slist_t *n = cg->captured_vars; n; n = n->next) {
+                        if (n->data == var_sym) {
+                            already_captured = true;
+                            break;
+                        }
+                    }
+                    
+                    /* Add superclass's captured var to our list */
+                    if (!already_captured) {
+                        if (!cg->captured_vars) {
+                            cg->captured_vars = slist_new(var_sym);
+                        } else {
+                            slist_append(cg->captured_vars, var_sym);
+                        }
+                    }
+                }
+            }
+            
             cg->captured_field_refs = hashtable_new();
             
             /* Add synthetic val$xxx fields for each captured variable */
@@ -2155,6 +2276,19 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
         mg->max_locals = 2;
     }
     
+    /* For local/anonymous class constructors, account for captured variable parameters */
+    if (is_constructor && (cg->is_local_class || cg->is_anonymous_class) && cg->captured_vars) {
+        for (slist_t *cap = cg->captured_vars; cap; cap = cap->next) {
+            symbol_t *var_sym = (symbol_t *)cap->data;
+            if (var_sym && var_sym->type) {
+                int size = (var_sym->type->kind == TYPE_LONG || 
+                           var_sym->type->kind == TYPE_DOUBLE) ? 2 : 1;
+                mg->next_slot += size;
+                mg->max_locals = mg->next_slot;
+            }
+        }
+    }
+    
     /* Record 'this' for instance methods (slot 0) */
     if (!is_static && cg->internal_name) {
         char *this_desc = calloc(1, strlen(cg->internal_name) + 3);
@@ -2390,7 +2524,8 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                     bc_emit_u1(mg->code, (uint8_t)slot);
                     mg_push(mg, 1);
                     slot++;
-                } else if (kind == TYPE_CLASS || kind == TYPE_ARRAY) {
+                } else if (kind == TYPE_CLASS || kind == TYPE_ARRAY || kind == TYPE_TYPEVAR) {
+                    /* Reference types including type variables (erase to Object) */
                     bc_emit(mg->code, OP_ALOAD);
                     bc_emit_u1(mg->code, (uint8_t)slot);
                     mg_push(mg, 1);
@@ -2442,12 +2577,22 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                 bc_emit(mg->code, OP_INVOKESPECIAL);
                 bc_emit_u2(mg->code, init_ref);
                 mg_pop(mg, 3);  /* Consumes 'this', name, ordinal */
+                
+                /* Mark 'this' as initialized in stackmap after super() */
+                if (mg->stackmap && cg->internal_name) {
+                    stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+                }
             } else {
                 uint16_t init_ref = cp_add_methodref(cg->cp, cg->superclass, 
                                                       "<init>", "()V");
                 bc_emit(mg->code, OP_INVOKESPECIAL);
                 bc_emit_u2(mg->code, init_ref);
                 mg_pop(mg, 1);  /* Consumes 'this' */
+            }
+            
+            /* Mark 'this' as initialized in stackmap after super() */
+            if (mg->stackmap && cg->internal_name) {
+                stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
             }
         }
         
@@ -3048,8 +3193,8 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
     /* Store AST for annotation access */
     cg->class_ast = class_decl;
     
-    /* Generate class signature if class has type parameters */
-    cg->signature = generate_class_signature(class_decl);
+    /* Generate class signature if class has type parameters or parameterized superclass */
+    cg->signature = generate_class_signature(class_decl, cg->class_sym);
     
     /* Check if this is an interface */
     bool is_interface = (class_decl->type == AST_INTERFACE_DECL);
@@ -3567,6 +3712,12 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         mg->line_numbers = NULL;
         mg->local_var_table = NULL;
         
+        /* Initialize StackMapTable tracking */
+        mg->stackmap = stackmap_new();
+        if (mg->stackmap && cg->internal_name) {
+            stackmap_init_method(mg->stackmap, mg, mg->is_static, cg->internal_name);
+        }
+        
         /* Calculate next slot based on parameters */
         /* Slot 0 = this, Slot 1 = outer (if inner), then captured vars */
         mg->next_slot = 1;  /* 'this' is slot 0 */
@@ -3686,7 +3837,8 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     bc_emit_u1(mg->code, (uint8_t)slot);
                     mg_push(mg, 1);
                     slot++;
-                } else if (kind == TYPE_CLASS || kind == TYPE_ARRAY) {
+                } else if (kind == TYPE_CLASS || kind == TYPE_ARRAY || kind == TYPE_TYPEVAR) {
+                    /* Reference types including type variables (erase to Object) */
                     bc_emit(mg->code, OP_ALOAD);
                     bc_emit_u1(mg->code, (uint8_t)slot);
                     mg_push(mg, 1);
@@ -3710,6 +3862,18 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         bc_emit(mg->code, OP_ALOAD_0);
         mg_push(mg, 1);
         
+        /* Check if superclass is a non-static inner class */
+        bool super_is_inner = false;
+        symbol_t *super_enclosing = NULL;
+        if (cg->class_sym && cg->class_sym->data.class_data.superclass) {
+            symbol_t *super_sym = cg->class_sym->data.class_data.superclass;
+            if (super_sym->data.class_data.enclosing_class &&
+                !(super_sym->modifiers & MOD_STATIC)) {
+                super_is_inner = true;
+                super_enclosing = super_sym->data.class_data.enclosing_class;
+            }
+        }
+        
         /* invokespecial superclass.<init> */
         if (is_enum) {
             /* For enums: super(name, ordinal) with (Ljava/lang/String;I)V */
@@ -3722,11 +3886,138 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             bc_emit(mg->code, OP_INVOKESPECIAL);
             bc_emit_u2(mg->code, super_init);
             mg_pop(mg, 3);  /* pops this, name, ordinal */
+            
+            /* Mark 'this' as initialized in stackmap after super() */
+            if (mg->stackmap && cg->internal_name) {
+                stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+            }
+        } else if (super_is_inner && super_enclosing && cg->is_inner_class) {
+            /* Superclass is a non-static inner class - pass its enclosing instance.
+             * If super's enclosing class != our enclosing class, we need to
+             * traverse the this$0 chain. */
+            symbol_t *our_enclosing = cg->class_sym->data.class_data.enclosing_class;
+            symbol_t *super_sym = cg->class_sym->data.class_data.superclass;
+            slist_t *super_captured = super_sym ? super_sym->data.class_data.captured_vars : NULL;
+            int super_arg_count = 1;  /* At least the outer instance */
+            
+            if (our_enclosing == super_enclosing) {
+                /* Same enclosing class - load directly from slot 1 */
+                bc_emit(mg->code, OP_ALOAD_1);
+                mg_push(mg, 1);
+            } else {
+                /* Different enclosing class - traverse the this$0 chain */
+                bc_emit(mg->code, OP_ALOAD_1);
+                mg_push(mg, 1);
+                
+                /* Traverse from our enclosing class up to super's enclosing class */
+                symbol_t *current = our_enclosing;
+                while (current && current != super_enclosing) {
+                    symbol_t *current_enc = current->data.class_data.enclosing_class;
+                    if (!current_enc) break;
+                    
+                    /* Get this$0 from current class (points to current_enc) */
+                    char *cur_internal = class_to_internal_name(current->qualified_name);
+                    char *enc_internal = class_to_internal_name(current_enc->qualified_name);
+                    size_t desc_len = strlen(enc_internal) + 3;
+                    char *this0_desc = malloc(desc_len);
+                    snprintf(this0_desc, desc_len, "L%s;", enc_internal);
+                    
+                    uint16_t this0_ref = cp_add_fieldref(cg->cp, cur_internal, "this$0", this0_desc);
+                    bc_emit(mg->code, OP_GETFIELD);
+                    bc_emit_u2(mg->code, this0_ref);
+                    /* getfield pops 1, pushes 1 - no stack change */
+                    
+                    free(cur_internal);
+                    free(enc_internal);
+                    free(this0_desc);
+                    
+                    current = current_enc;
+                }
+            }
+            
+            /* Build super() descriptor: (LOuterClass;[captured_types])V */
+            const char *enc_name = super_enclosing->qualified_name;
+            char *enc_internal = class_to_internal_name(enc_name);
+            string_t *super_desc = string_new("(L");
+            string_append(super_desc, enc_internal);
+            string_append(super_desc, ";");
+            
+            /* If superclass is a local class with captured vars, add those to descriptor
+             * and load them from our constructor parameters */
+            if (super_sym && super_sym->data.class_data.is_local_class && super_captured) {
+                /* Load captured values from our constructor parameters */
+                /* Our params are: this (slot 0), outer (slot 1), captured vars (slot 2+) */
+                uint16_t cap_slot = 2;  /* Start after this and outer */
+                
+                for (slist_t *cap = super_captured; cap; cap = cap->next) {
+                    symbol_t *var_sym = (symbol_t *)cap->data;
+                    if (!var_sym || !var_sym->type) continue;
+                    
+                    /* Add type to descriptor */
+                    char *cap_desc = type_to_descriptor(var_sym->type);
+                    string_append(super_desc, cap_desc);
+                    free(cap_desc);
+                    
+                    /* Load from parameter slot */
+                    type_kind_t kind = var_sym->type->kind;
+                    if (kind == TYPE_LONG) {
+                        bc_emit(mg->code, OP_LLOAD);
+                        bc_emit_u1(mg->code, (uint8_t)cap_slot);
+                        mg_push(mg, 2);
+                        cap_slot += 2;
+                        super_arg_count += 2;
+                    } else if (kind == TYPE_DOUBLE) {
+                        bc_emit(mg->code, OP_DLOAD);
+                        bc_emit_u1(mg->code, (uint8_t)cap_slot);
+                        mg_push(mg, 2);
+                        cap_slot += 2;
+                        super_arg_count += 2;
+                    } else if (kind == TYPE_FLOAT) {
+                        bc_emit(mg->code, OP_FLOAD);
+                        bc_emit_u1(mg->code, (uint8_t)cap_slot);
+                        mg_push(mg, 1);
+                        cap_slot++;
+                        super_arg_count++;
+                    } else if (kind == TYPE_CLASS || kind == TYPE_ARRAY || kind == TYPE_TYPEVAR) {
+                        /* Reference types including type variables (erase to Object) */
+                        bc_emit(mg->code, OP_ALOAD);
+                        bc_emit_u1(mg->code, (uint8_t)cap_slot);
+                        mg_push(mg, 1);
+                        cap_slot++;
+                        super_arg_count++;
+                    } else {
+                        /* Integer types */
+                        bc_emit(mg->code, OP_ILOAD);
+                        bc_emit_u1(mg->code, (uint8_t)cap_slot);
+                        mg_push(mg, 1);
+                        cap_slot++;
+                        super_arg_count++;
+                    }
+                }
+            }
+            
+            string_append(super_desc, ")V");
+            uint16_t super_init = cp_add_methodref(cg->cp, cg->superclass, "<init>", super_desc->str);
+            bc_emit(mg->code, OP_INVOKESPECIAL);
+            bc_emit_u2(mg->code, super_init);
+            mg_pop(mg, 1 + super_arg_count);  /* pops this + args */
+            free(enc_internal);
+            string_free(super_desc, true);
+            
+            /* Mark 'this' as initialized in stackmap after super() */
+            if (mg->stackmap && cg->internal_name) {
+                stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+            }
         } else {
             uint16_t super_init = cp_add_methodref(cg->cp, cg->superclass, "<init>", "()V");
             bc_emit(mg->code, OP_INVOKESPECIAL);
             bc_emit_u2(mg->code, super_init);
             mg_pop(mg, 1);
+            
+            /* Mark 'this' as initialized in stackmap after super() */
+            if (mg->stackmap && cg->internal_name) {
+                stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+            }
         }
         
         /* For records, initialize component fields from constructor parameters */
@@ -3746,7 +4037,6 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 bool is_long_or_double = false;
                 bool is_float = false;
                 bool is_reference = true;
-                bool is_int = false;
                 
                 if (comp_type && comp_type->type == AST_PRIMITIVE_TYPE) {
                     const char *ptype = comp_type->data.leaf.name;  /* leaf for primitives */
@@ -3759,7 +4049,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     } else if (ptype && strcmp(ptype, "float") == 0) {
                         is_float = true;
                     } else {
-                        is_int = true;  /* int, short, byte, char, boolean */
+                        /* int, short, byte, char, boolean - handled by default case */
                     }
                 } else if (comp_type && comp_type->type == AST_ARRAY_TYPE) {
                     is_reference = true;
@@ -3853,6 +4143,13 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         init->local_var_table = mg->local_var_table;
         mg->local_var_table = NULL;
         
+        /* Transfer stackmap */
+        if (mg->stackmap && mg->stackmap->num_entries > 0) {
+            init->stackmap = mg->stackmap;
+            mg->stackmap = NULL;
+            cg->use_stackmap = true;
+        }
+        
         method_gen_free(mg);
         
         /* Add to methods list */
@@ -3880,15 +4177,13 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         hashtable_insert(cg->field_map, fg->name, fg);
     }
     
-    /* Count enum constants for clinit and $VALUES array */
-    int enum_constant_count = 0;
+    /* Collect enum constants for clinit and $VALUES array */
     slist_t *enum_constants = NULL;  /* Track enum constant AST nodes */
     if (is_enum) {
         slist_t *children_iter = class_decl->data.node.children;
         while (children_iter) {
             ast_node_t *member = (ast_node_t *)children_iter->data;
             if (member->type == AST_ENUM_CONSTANT) {
-                enum_constant_count++;
                 if (!enum_constants) {
                     enum_constants = slist_new((void *)member);  /* Store AST node */
                 } else {
@@ -3918,6 +4213,12 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         mg->is_constructor = false;
         mg->next_slot = 0;  /* No 'this' for static methods */
         mg->max_locals = 0;
+        
+        /* Initialize StackMapTable tracking */
+        mg->stackmap = stackmap_new();
+        if (mg->stackmap && cg->internal_name) {
+            stackmap_init_method(mg->stackmap, mg, mg->is_static, cg->internal_name);
+        }
         
         /* 0. Generate enum constant initializers (for enums only) */
         if (is_enum && enum_constants) {
@@ -3959,10 +4260,20 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 string_t *ctor_desc = string_new("(Ljava/lang/String;I");
                 int arg_count = 2;  /* name + ordinal */
                 
-                /* Generate constructor arguments from enum constant children */
+                /* Generate constructor arguments from enum constant children.
+                 * Skip method/field/initializer declarations - those are for enum
+                 * constant bodies (anonymous subclasses) not constructor args. */
                 slist_t *args = enum_const->data.node.children;
                 while (args) {
                     ast_node_t *arg = (ast_node_t *)args->data;
+                    /* Skip class body members (methods, fields, initializers) */
+                    if (arg->type == AST_METHOD_DECL ||
+                        arg->type == AST_CONSTRUCTOR_DECL ||
+                        arg->type == AST_FIELD_DECL ||
+                        arg->type == AST_INITIALIZER_BLOCK) {
+                        args = args->next;
+                        continue;
+                    }
                     /* Generate the argument expression */
                     codegen_expr(mg, arg, cg->cp);
                     arg_count++;
@@ -4071,7 +4382,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             hashtable_insert(cg->field_map, values_field->name, values_field);
             
             /* Initialize $VALUES array with all enum constants */
-            /* Create array: anewarray enum_constant_count */
+            /* Create array: anewarray num_constants */
             int num_constants = 0;
             for (slist_t *ec = enum_constants; ec; ec = ec->next) {
                 num_constants++;
@@ -4210,6 +4521,13 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         mg->code->max_stack = mg->max_stack;
         mg->code->max_locals = mg->max_locals > 0 ? mg->max_locals : 0;
         clinit->code = mg->code;
+        
+        /* Transfer stackmap */
+        if (mg->stackmap && mg->stackmap->num_entries > 0) {
+            clinit->stackmap = mg->stackmap;
+            mg->stackmap = NULL;
+            cg->use_stackmap = true;
+        }
         
         /* Add to methods list */
         if (!cg->methods) {
@@ -5229,6 +5547,25 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             string_append(desc, ";");
         }
         
+        /* Check if superclass is a non-static inner class that needs enclosing instance */
+        bool super_is_inner = false;
+        symbol_t *super_enclosing = NULL;
+        if (cg->class_sym && cg->class_sym->data.class_data.superclass) {
+            symbol_t *super_sym = cg->class_sym->data.class_data.superclass;
+            if (super_sym->data.class_data.enclosing_class &&
+                !(super_sym->modifiers & MOD_STATIC)) {
+                super_is_inner = true;
+                super_enclosing = super_sym->data.class_data.enclosing_class;
+                /* Add enclosing class type to super descriptor */
+                string_append(super_desc, "L");
+                const char *enc_name = super_enclosing->qualified_name;
+                char *enc_internal = class_to_internal_name(enc_name);
+                string_append(super_desc, enc_internal);
+                string_append(super_desc, ";");
+                free(enc_internal);
+            }
+        }
+        
         /* Add superclass constructor argument types (for anonymous classes) */
         slist_t *super_ctor_args = NULL;
         if (cg->class_sym && cg->class_sym->data.class_data.super_ctor_args) {
@@ -5278,6 +5615,12 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         mg->is_constructor = true;
         mg->line_numbers = NULL;
         mg->local_var_table = NULL;
+        
+        /* Initialize StackMapTable tracking */
+        mg->stackmap = stackmap_new();
+        if (mg->stackmap && cg->internal_name) {
+            stackmap_init_method(mg->stackmap, mg, mg->is_static, cg->internal_name);
+        }
         
         /* Calculate next slot */
         mg->next_slot = 1;  /* 'this' is slot 0 */
@@ -5381,7 +5724,8 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                     bc_emit_u1(mg->code, (uint8_t)slot);
                     mg_push(mg, 1);
                     slot++;
-                } else if (kind == TYPE_CLASS || kind == TYPE_ARRAY) {
+                } else if (kind == TYPE_CLASS || kind == TYPE_ARRAY || kind == TYPE_TYPEVAR) {
+                    /* Reference types including type variables (erase to Object) */
                     bc_emit(mg->code, OP_ALOAD);
                     bc_emit_u1(mg->code, (uint8_t)slot);
                     mg_push(mg, 1);
@@ -5403,8 +5747,54 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         bc_emit(mg->code, OP_ALOAD_0);
         mg_push(mg, 1);
         
-        /* Load superclass constructor arguments */
+        /* If superclass is a non-static inner class, load enclosing instance for it.
+         * The enclosing instance needed depends on which class owns the superclass:
+         * - If super's enclosing class == our enclosing class, use slot 1 directly
+         * - If super's enclosing class is an outer class of our enclosing class,
+         *   we need to get it from the enclosing class's this$0 field chain */
         int super_arg_count = 0;
+        if (super_is_inner && cg->is_inner_class && super_enclosing) {
+            symbol_t *our_enclosing = cg->class_sym->data.class_data.enclosing_class;
+            
+            if (our_enclosing == super_enclosing) {
+                /* Same enclosing class - load directly from slot 1 */
+                bc_emit(mg->code, OP_ALOAD_1);
+                mg_push(mg, 1);
+            } else {
+                /* Different enclosing class - traverse the this$0 chain.
+                 * Load slot 1 (our enclosing instance), then follow the chain. */
+                bc_emit(mg->code, OP_ALOAD_1);
+                mg_push(mg, 1);
+                
+                /* Traverse from our enclosing class up to super's enclosing class */
+                symbol_t *current = our_enclosing;
+                while (current && current != super_enclosing) {
+                    symbol_t *current_enc = current->data.class_data.enclosing_class;
+                    if (!current_enc) break;
+                    
+                    /* Get this$0 from current class (points to current_enc) */
+                    char *cur_internal = class_to_internal_name(current->qualified_name);
+                    char *enc_internal = class_to_internal_name(current_enc->qualified_name);
+                    size_t desc_len = strlen(enc_internal) + 3;
+                    char *this0_desc = malloc(desc_len);
+                    snprintf(this0_desc, desc_len, "L%s;", enc_internal);
+                    
+                    uint16_t this0_ref = cp_add_fieldref(cg->cp, cur_internal, "this$0", this0_desc);
+                    bc_emit(mg->code, OP_GETFIELD);
+                    bc_emit_u2(mg->code, this0_ref);
+                    /* getfield pops 1, pushes 1 - no stack change */
+                    
+                    free(cur_internal);
+                    free(enc_internal);
+                    free(this0_desc);
+                    
+                    current = current_enc;
+                }
+            }
+            super_arg_count++;
+        }
+        
+        /* Load superclass constructor arguments */
         if (super_ctor_args) {
             uint16_t slot = super_arg_start_slot;
             for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
@@ -5475,6 +5865,11 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         bc_emit_u2(mg->code, super_init);
         mg_pop(mg, 1 + super_arg_count);
         
+        /* Mark 'this' as initialized in stackmap after super() */
+        if (mg->stackmap && cg->internal_name) {
+            stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+        }
+        
         string_free(super_desc, true);
         
         /* Inject instance field initializers */
@@ -5525,6 +5920,13 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         init->local_var_table = mg->local_var_table;
         mg->local_var_table = NULL;
         
+        /* Transfer stackmap */
+        if (mg->stackmap && mg->stackmap->num_entries > 0) {
+            init->stackmap = mg->stackmap;
+            mg->stackmap = NULL;
+            cg->use_stackmap = true;
+        }
+        
         method_gen_free(mg);
         
         /* Add to methods list */
@@ -5553,6 +5955,12 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         mg->is_constructor = false;
         mg->next_slot = 0;
         mg->max_locals = 0;
+        
+        /* Initialize StackMapTable tracking */
+        mg->stackmap = stackmap_new();
+        if (mg->stackmap && cg->internal_name) {
+            stackmap_init_method(mg->stackmap, mg, mg->is_static, cg->internal_name);
+        }
         
         /* Generate static field initializers */
         for (slist_t *node = static_field_inits; node; node = node->next) {
@@ -5591,6 +5999,13 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         mg->code->max_stack = mg->max_stack;
         mg->code->max_locals = mg->max_locals > 0 ? mg->max_locals : 0;
         clinit->code = mg->code;
+        
+        /* Transfer stackmap */
+        if (mg->stackmap && mg->stackmap->num_entries > 0) {
+            clinit->stackmap = mg->stackmap;
+            mg->stackmap = NULL;
+            cg->use_stackmap = true;
+        }
         
         if (!cg->methods) {
             cg->methods = slist_new(clinit);

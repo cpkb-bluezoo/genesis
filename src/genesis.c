@@ -42,7 +42,7 @@ compiler_options_t *compiler_options_new(void)
         return NULL;
     }
     
-    opts->source_version = strdup("17");
+    opts->source_version = strdup("21");
     opts->target_version = strdup("17");
     opts->output_dir = NULL;
     opts->output_jar = NULL;
@@ -564,6 +564,12 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
         return 1;
     }
     
+    /* Resolve type names to fully qualified names immediately after parsing.
+     * This ensures all type references use consistent qualified names. */
+    slist_t *sp_list = sourcepath_parse(opts->sourcepath);
+    resolve_types_in_compilation_unit(ast, g_classpath, sp_list);
+    sourcepath_list_free(sp_list);
+    
     if (opts->verbose) {
         /* Print AST for debugging */
         printf("AST for %s:\n", src->filename);
@@ -608,6 +614,16 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
     if (opts->verbose) {
         printf("Semantic analysis completed: %d error(s), %d warning(s)\n",
                sem->error_count, sem->warning_count);
+    }
+    
+    /* Compile source dependencies discovered during semantic analysis.
+     * These are source files that were loaded for type checking but
+     * need to be compiled to .class files. */
+    for (slist_t *dep = sem->source_dependencies; dep; dep = dep->next) {
+        const char *dep_path = (const char *)dep->data;
+        if (dep_path && !is_source_compiled(dep_path)) {
+            compile_dependency(dep_path);
+        }
     }
     
     /* Code generation */
@@ -925,6 +941,102 @@ int compile(compiler_options_t *opts)
  * ======================================================================== */
 
 /**
+ * Read arguments from a file (javac @file syntax).
+ * 
+ * Format:
+ *   - One argument per line
+ *   - Lines starting with # are comments
+ *   - Whitespace is trimmed
+ *   - Empty lines are ignored
+ * 
+ * Returns a dynamically allocated array of arguments (NULL-terminated).
+ * Caller must free the array and each string.
+ */
+static char **read_argument_file(const char *filename, int *arg_count)
+{
+    *arg_count = 0;
+    
+    /* Read file contents */
+    size_t file_size;
+    char *contents = file_get_contents(filename, &file_size);
+    if (!contents) {
+        fprintf(stderr, "error: cannot read argument file: %s\n", filename);
+        return NULL;
+    }
+    
+    /* Count lines and allocate array (overestimate) */
+    int max_args = 100;
+    char **args = malloc(sizeof(char *) * (max_args + 1));
+    if (!args) {
+        free(contents);
+        return NULL;
+    }
+    
+    /* Parse line by line */
+    char *line = contents;
+    char *end = contents + file_size;
+    
+    while (line < end) {
+        /* Find end of line */
+        char *line_end = line;
+        while (line_end < end && *line_end != '\n' && *line_end != '\r') {
+            line_end++;
+        }
+        
+        /* Null-terminate line */
+        char saved = *line_end;
+        *line_end = '\0';
+        
+        /* Trim leading whitespace */
+        while (*line == ' ' || *line == '\t') {
+            line++;
+        }
+        
+        /* Trim trailing whitespace */
+        char *trim_end = line_end - 1;
+        while (trim_end >= line && (*trim_end == ' ' || *trim_end == '\t')) {
+            *trim_end = '\0';
+            trim_end--;
+        }
+        
+        /* Skip empty lines and comments */
+        if (*line != '\0' && *line != '#') {
+            /* Grow array if needed */
+            if (*arg_count >= max_args) {
+                max_args *= 2;
+                char **new_args = realloc(args, sizeof(char *) * (max_args + 1));
+                if (!new_args) {
+                    for (int i = 0; i < *arg_count; i++) {
+                        free(args[i]);
+                    }
+                    free(args);
+                    free(contents);
+                    return NULL;
+                }
+                args = new_args;
+            }
+            
+            /* Add argument */
+            args[(*arg_count)++] = strdup(line);
+        }
+        
+        /* Move to next line */
+        *line_end = saved;
+        if (line_end < end && *line_end == '\r') {
+            line_end++;
+        }
+        if (line_end < end && *line_end == '\n') {
+            line_end++;
+        }
+        line = line_end;
+    }
+    
+    args[*arg_count] = NULL;
+    free(contents);
+    return args;
+}
+
+/**
  * Print version information.
  */
 void print_version(void)
@@ -942,8 +1054,10 @@ void print_version(void)
 void print_usage(const char *program_name)
 {
     printf("Usage: %s [options] <source files>\n", program_name);
+    printf("       %s @<filename>\n", program_name);
     printf("\n");
     printf("Options:\n");
+    printf("  @<filename>         Read options and filenames from file\n");
     printf("  -d <directory>      Specify output directory for class files\n");
     printf("  -jar <file.jar>     Output to JAR file instead of directory\n");
     printf("  -main-class <class> Specify main class for JAR manifest\n");
@@ -951,8 +1065,11 @@ void print_usage(const char *program_name)
     printf("  -classpath <path>   Specify classpath\n");
     printf("  -sourcepath <path>  Specify source path\n");
     printf("  -source <version>   Specify source version (default: 17)\n");
+    printf("  --source <version>  Specify source version (default: 17)\n");
     printf("  -target <version>   Specify target version (default: 17)\n");
+    printf("  --target <version>  Specify target version (default: 17)\n");
     printf("  -release <version>  Specify release version (sets source and target)\n");
+    printf("  --release <version> Specify release version (sets source and target)\n");
     printf("  -g                  Generate debugging information\n");
     printf("  -g:none             Do not generate debugging information\n");
     printf("  -nowarn             Disable warnings\n");
@@ -979,6 +1096,143 @@ int main(int argc, char **argv)
     
     /* Parse command-line arguments */
     for (int i = 1; i < argc; i++) {
+        /* Handle @file argument files */
+        if (argv[i][0] == '@') {
+            const char *argfile = argv[i] + 1;
+            int file_argc = 0;
+            char **file_argv = read_argument_file(argfile, &file_argc);
+            
+            if (!file_argv) {
+                compiler_options_free(opts);
+                return 1;
+            }
+            
+            /* Recursively process arguments from file */
+            for (int j = 0; j < file_argc; j++) {
+                char *arg = file_argv[j];
+                
+                if (expect_value) {
+                    free(*value_ptr);
+                    *value_ptr = strdup(arg);
+                    expect_value = false;
+                    value_ptr = NULL;
+                    continue;
+                }
+                
+                if (arg[0] == '-') {
+                    /* Process as option (same logic as below) */
+                    if (strcmp(arg, "-version") == 0) {
+                        print_version();
+                        for (int k = 0; k < file_argc; k++) {
+                            free(file_argv[k]);
+                        }
+                        free(file_argv);
+                        compiler_options_free(opts);
+                        return 0;
+                    }
+                    else if (strcmp(arg, "-help") == 0 || strcmp(arg, "--help") == 0) {
+                        print_usage(argv[0]);
+                        for (int k = 0; k < file_argc; k++) {
+                            free(file_argv[k]);
+                        }
+                        free(file_argv);
+                        compiler_options_free(opts);
+                        return 0;
+                    }
+                    else if (strcmp(arg, "-d") == 0) {
+                        expect_value = true;
+                        value_ptr = &opts->output_dir;
+                    }
+                    else if (strcmp(arg, "-jar") == 0) {
+                        expect_value = true;
+                        value_ptr = &opts->output_jar;
+                    }
+                    else if (strcmp(arg, "-main-class") == 0) {
+                        expect_value = true;
+                        value_ptr = &opts->main_class;
+                    }
+                    else if (strcmp(arg, "-cp") == 0 || strcmp(arg, "-classpath") == 0) {
+                        expect_value = true;
+                        value_ptr = &opts->classpath;
+                    }
+                    else if (strcmp(arg, "-sourcepath") == 0) {
+                        expect_value = true;
+                        value_ptr = &opts->sourcepath;
+                    }
+                    else if (strcmp(arg, "-source") == 0 || strcmp(arg, "--source") == 0) {
+                        expect_value = true;
+                        value_ptr = &opts->source_version;
+                    }
+                    else if (strcmp(arg, "-target") == 0 || strcmp(arg, "--target") == 0) {
+                        expect_value = true;
+                        value_ptr = &opts->target_version;
+                    }
+                    else if (strcmp(arg, "-release") == 0 || strcmp(arg, "--release") == 0) {
+                        /* Get next argument from file */
+                        if (j + 1 < file_argc) {
+                            j++;
+                            free(opts->source_version);
+                            free(opts->target_version);
+                            opts->source_version = strdup(file_argv[j]);
+                            opts->target_version = strdup(file_argv[j]);
+                        } else {
+                            fprintf(stderr, "error: --release requires a version argument\n");
+                            for (int k = 0; k < file_argc; k++) {
+                                free(file_argv[k]);
+                            }
+                            free(file_argv);
+                            compiler_options_free(opts);
+                            return 1;
+                        }
+                    }
+                    else if (strcmp(arg, "-g") == 0) {
+                        opts->debug_info = true;
+                    }
+                    else if (strcmp(arg, "-g:none") == 0) {
+                        opts->debug_info = false;
+                    }
+                    else if (strcmp(arg, "-nowarn") == 0) {
+                        opts->warnings = false;
+                    }
+                    else if (strcmp(arg, "-Werror") == 0) {
+                        opts->werror = true;
+                    }
+                    else if (strcmp(arg, "-verbose") == 0) {
+                        opts->verbose = true;
+                    }
+                    else {
+                        fprintf(stderr, "warning: unrecognized option: %s\n", arg);
+                    }
+                }
+                else {
+                    /* Source file */
+                    if (!str_has_suffix(arg, ".java")) {
+                        fprintf(stderr, "error: not a Java source file: %s\n", arg);
+                        for (int k = 0; k < file_argc; k++) {
+                            free(file_argv[k]);
+                        }
+                        free(file_argv);
+                        compiler_options_free(opts);
+                        return 1;
+                    }
+                    
+                    if (!opts->source_files) {
+                        opts->source_files = slist_new(strdup(arg));
+                        files_tail = opts->source_files;
+                    } else {
+                        files_tail = slist_append(files_tail, strdup(arg));
+                    }
+                }
+            }
+            
+            /* Free argument file contents */
+            for (int k = 0; k < file_argc; k++) {
+                free(file_argv[k]);
+            }
+            free(file_argv);
+            continue;
+        }
+        
         if (expect_value) {
             free(*value_ptr);
             *value_ptr = strdup(argv[i]);
@@ -1020,17 +1274,20 @@ int main(int argc, char **argv)
                 expect_value = true;
                 value_ptr = &opts->sourcepath;
             }
-            else if (strcmp(argv[i], "-source") == 0) {
+            else if (strcmp(argv[i], "-source") == 0 ||
+                     strcmp(argv[i], "--source") == 0) {
                 expect_value = true;
                 value_ptr = &opts->source_version;
             }
-            else if (strcmp(argv[i], "-target") == 0) {
+            else if (strcmp(argv[i], "-target") == 0 ||
+                     strcmp(argv[i], "--target") == 0) {
                 expect_value = true;
                 value_ptr = &opts->target_version;
             }
-            else if (strcmp(argv[i], "-release") == 0) {
+            else if (strcmp(argv[i], "-release") == 0 ||
+                     strcmp(argv[i], "--release") == 0) {
                 if (i + 1 >= argc) {
-                    fprintf(stderr, "error: -release requires a version argument\n");
+                    fprintf(stderr, "error: --release requires a version argument\n");
                     compiler_options_free(opts);
                     return 1;
                 }
