@@ -544,7 +544,9 @@ char *decode_source_file(const uint8_t *raw_data, size_t raw_length,
     if (!raw_data || raw_length == 0) {
         *out_length = 0;
         char *empty = malloc(1);
-        if (empty) empty[0] = '\0';
+        if (empty) {
+            empty[0] = '\0';
+        }
         return empty;
     }
     

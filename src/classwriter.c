@@ -936,6 +936,7 @@ static int write_annotation_default_attribute(uint8_t **p, const_pool_t *cp,
 uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
 {
     if (!cg || !size) {
+        fprintf(stderr, "write_class_bytes: invalid input (cg=%p, size=%p)\n", (void*)cg, (void*)size);
         return NULL;
     }
     
@@ -1041,6 +1042,7 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     size_t buf_size = 1024 * 1024;  /* 1MB should be enough for most classes */
     uint8_t *buffer = malloc(buf_size);
     if (!buffer) {
+        fprintf(stderr, "write_class_bytes: malloc failed for %zu bytes\n", buf_size);
         return NULL;
     }
     

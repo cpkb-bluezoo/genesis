@@ -1321,18 +1321,45 @@ char *generate_method_signature(ast_node_t *method_decl, symbol_t *method_sym)
         }
     }
     
-    /* Check if return type is a type variable */
-    if (method_sym && method_sym->type && method_sym->type->kind == TYPE_TYPEVAR) {
-        has_generic_return = true;
+    /* Check if return type uses generics (type variable or has type arguments) */
+    if (method_sym && method_sym->type) {
+        if (method_sym->type->kind == TYPE_TYPEVAR) {
+            has_generic_return = true;
+        } else if (method_sym->type->kind == TYPE_CLASS && 
+                   method_sym->type->data.class_type.type_args) {
+            has_generic_return = true;
+        } else if (method_sym->type->kind == TYPE_ARRAY && 
+                   method_sym->type->data.array_type.element_type) {
+            /* Check array element type */
+            type_t *elem = method_sym->type->data.array_type.element_type;
+            if (elem->kind == TYPE_TYPEVAR ||
+                (elem->kind == TYPE_CLASS && elem->data.class_type.type_args)) {
+                has_generic_return = true;
+            }
+        }
     }
     
-    /* Check if any parameter is a type variable */
+    /* Check if any parameter uses generics */
     if (method_sym && method_sym->data.method_data.parameters) {
         for (slist_t *node = method_sym->data.method_data.parameters; node; node = node->next) {
             symbol_t *param = (symbol_t *)node->data;
-            if (param->type && param->type->kind == TYPE_TYPEVAR) {
-                has_generic_params = true;
-                break;
+            if (param->type) {
+                if (param->type->kind == TYPE_TYPEVAR) {
+                    has_generic_params = true;
+                    break;
+                } else if (param->type->kind == TYPE_CLASS && 
+                           param->type->data.class_type.type_args) {
+                    has_generic_params = true;
+                    break;
+                } else if (param->type->kind == TYPE_ARRAY && 
+                           param->type->data.array_type.element_type) {
+                    type_t *elem = param->type->data.array_type.element_type;
+                    if (elem->kind == TYPE_TYPEVAR ||
+                        (elem->kind == TYPE_CLASS && elem->data.class_type.type_args)) {
+                        has_generic_params = true;
+                        break;
+                    }
+                }
             }
         }
     }

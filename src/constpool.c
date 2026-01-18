@@ -57,7 +57,11 @@ void const_pool_free(const_pool_t *cp)
     /* Free UTF8 strings */
     for (uint16_t i = 1; i < cp->count; i++) {
         if (cp->entries[i].type == CONST_UTF8) {
-            free(cp->entries[i].data.utf8);
+            /* Don't double-free: set to NULL after freeing */
+            if (cp->entries[i].data.utf8) {
+                free(cp->entries[i].data.utf8);
+                cp->entries[i].data.utf8 = NULL;
+            }
         }
     }
     
@@ -72,8 +76,12 @@ void const_pool_free(const_pool_t *cp)
 static uint16_t cp_add_entry(const_pool_t *cp)
 {
     if (cp->count >= cp->capacity) {
+        size_t old_capacity = cp->capacity;
         cp->capacity *= 2;
         cp->entries = realloc(cp->entries, cp->capacity * sizeof(const_pool_entry_t));
+        /* Zero new entries to avoid uninitialized memory issues */
+        memset(&cp->entries[old_capacity], 0, 
+               (cp->capacity - old_capacity) * sizeof(const_pool_entry_t));
     }
     return cp->count++;
 }

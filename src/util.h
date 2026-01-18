@@ -104,6 +104,7 @@ typedef struct hashtable
 } hashtable_t;
 
 hashtable_t *hashtable_new(void);
+hashtable_t *hashtable_new_sized(size_t expected_items);
 void hashtable_free(hashtable_t *ht);
 void hashtable_free_full(hashtable_t *ht, void (*free_func)(void *));
 void hashtable_insert(hashtable_t *ht, const char *key, void *value);
@@ -164,6 +165,95 @@ bool file_put_contents(const char *filename, const char *contents, size_t length
 
 unsigned int str_hash(const char *str);
 bool parse_boolean(const char *str, bool default_value);
+
+/* ========================================================================
+ * String Interning
+ * ======================================================================== */
+
+/**
+ * String intern table for O(1) string comparison.
+ * All interned strings are stored in a single large buffer.
+ * Interned strings can be compared with pointer equality (==).
+ */
+typedef struct intern_table {
+    char *buffer;           /* Single buffer for all interned strings */
+    size_t buffer_size;     /* Allocated size of buffer */
+    size_t buffer_used;     /* Used size of buffer */
+    hashtable_t *index;     /* hash -> offset in buffer (stored as intptr_t) */
+} intern_table_t;
+
+intern_table_t *intern_table_new(void);
+void intern_table_free(intern_table_t *table);
+
+/**
+ * Intern a string. Returns a pointer to the interned string.
+ * The returned pointer is valid for the lifetime of the intern table.
+ * Interned strings can be compared with pointer equality (==).
+ */
+const char *intern_string(intern_table_t *table, const char *str);
+
+/**
+ * Intern a string with known length (may not be null-terminated).
+ */
+const char *intern_string_len(intern_table_t *table, const char *str, size_t len);
+
+/**
+ * Global intern table for compiler-wide string interning.
+ * Call intern_init() at startup and intern_cleanup() at shutdown.
+ */
+void intern_init(void);
+void intern_cleanup(void);
+const char *intern(const char *str);
+const char *intern_len(const char *str, size_t len);
+
+/* ========================================================================
+ * Memory Pool (Arena Allocator)
+ * ======================================================================== */
+
+/**
+ * A memory pool for efficient allocation of many small objects.
+ * Objects are allocated from large blocks with a simple bump pointer.
+ * All objects are freed at once when the pool is destroyed.
+ */
+typedef struct pool_block {
+    struct pool_block *next;    /* Next block in chain */
+    size_t size;                /* Size of data[] */
+    size_t used;                /* Bytes used in data[] */
+    char data[];                /* Flexible array for allocations */
+} pool_block_t;
+
+typedef struct memory_pool {
+    pool_block_t *current;      /* Current block for allocations */
+    pool_block_t *blocks;       /* List of all blocks (for freeing) */
+    size_t block_size;          /* Default size for new blocks */
+    size_t total_allocated;     /* Total bytes allocated (for stats) */
+} memory_pool_t;
+
+/**
+ * Create a new memory pool with the given initial block size.
+ */
+memory_pool_t *pool_new(size_t block_size);
+
+/**
+ * Free all memory in the pool and the pool itself.
+ */
+void pool_free(memory_pool_t *pool);
+
+/**
+ * Reset the pool for reuse (keeps allocated blocks, resets used).
+ */
+void pool_reset(memory_pool_t *pool);
+
+/**
+ * Allocate memory from the pool (zero-initialized).
+ * Returns NULL if allocation fails.
+ */
+void *pool_alloc(memory_pool_t *pool, size_t size);
+
+/**
+ * Allocate memory with specific alignment.
+ */
+void *pool_alloc_aligned(memory_pool_t *pool, size_t size, size_t alignment);
 
 #endif /* UTIL_H */
 

@@ -81,6 +81,8 @@ static type_t *infer_type_arg(type_t *param_type, type_t *arg_type, const char *
 static type_t *substitute_type_var(type_t *type, const char *var_name, type_t *replacement);
 static symbol_t *get_functional_interface_sam(symbol_t *iface_sym);
 static char *resolve_import(semantic_t *sem, const char *simple_name);
+static symbol_t *load_class_from_source(semantic_t *sem, const char *name);
+static void preregister_nested_types(semantic_t *sem, ast_node_t *decl, symbol_t *sym, scope_t *class_scope);
 
 /**
  * Check if a narrowing primitive conversion is allowed for a constant expression.
@@ -115,19 +117,41 @@ static bool narrowing_constant_allowed(type_t *target_type, ast_node_t *init_exp
         return false;
     }
     
-    /* Check if the expression is a constant literal */
-    if (init_expr->type != AST_LITERAL) {
+    /* Check if the expression is a constant literal or unary minus on a literal */
+    ast_node_t *literal_expr = init_expr;
+    bool is_negated = false;
+    
+    /* Handle unary minus: -1, -127, etc. */
+    if (init_expr->type == AST_UNARY_EXPR && 
+        init_expr->data.node.name &&
+        strcmp(init_expr->data.node.name, "-") == 0 &&
+        init_expr->data.node.children) {
+        literal_expr = (ast_node_t *)init_expr->data.node.children->data;
+        is_negated = true;
+    }
+    
+    if (literal_expr->type != AST_LITERAL) {
         return false;
     }
     
-    /* Check if this is an integer literal (not float, string, etc.) */
-    token_type_t tok_type = init_expr->data.leaf.token_type;
-    if (tok_type != TOK_INTEGER_LITERAL && tok_type != TOK_LONG_LITERAL) {
+    /* Check if this is an integer or char literal (not float, string, etc.) */
+    token_type_t tok_type = literal_expr->data.leaf.token_type;
+    if (tok_type != TOK_INTEGER_LITERAL && tok_type != TOK_LONG_LITERAL && tok_type != TOK_CHAR_LITERAL) {
         return false;
     }
     
     /* Get the integer value */
-    long long value = init_expr->data.leaf.value.int_val;
+    long long value;
+    if (tok_type == TOK_CHAR_LITERAL) {
+        /* Char literals store the character as a string in str_val */
+        const char *str = literal_expr->data.leaf.value.str_val;
+        value = (str && str[0]) ? (unsigned char)str[0] : 0;
+    } else {
+        value = literal_expr->data.leaf.value.int_val;
+    }
+    if (is_negated) {
+        value = -value;
+    }
     
     /* Check if the value fits in the target type */
     switch (target_type->kind) {
@@ -154,6 +178,13 @@ static bool check_access(uint32_t member_mods, symbol_t *member_class, symbol_t 
 {
     /* Public is always accessible */
     if (member_mods & MOD_PUBLIC) {
+        return true;
+    }
+    
+    /* Interface members are implicitly public (unless private, Java 9+).
+     * This handles cases where the symbol was loaded without MOD_PUBLIC being set. */
+    if (member_class && member_class->kind == SYM_INTERFACE && 
+        !(member_mods & MOD_PRIVATE)) {
         return true;
     }
     
@@ -394,7 +425,7 @@ symbol_t *symbol_new(symbol_kind_t kind, const char *name)
     }
     
     sym->kind = kind;
-    sym->name = name ? strdup(name) : NULL;
+    sym->name = name ? (char *)intern(name) : NULL;
     
     return sym;
 }
@@ -408,8 +439,8 @@ void symbol_free(symbol_t *sym)
         return;
     }
     
-    free(sym->name);
-    free(sym->qualified_name);
+    /* name is interned, don't free */
+    free(sym->qualified_name);  /* qualified_name is not interned */
     /* Don't free type - it's shared */
     /* Don't free scope - it has its own lifecycle */
     
@@ -859,10 +890,23 @@ static bool method_ast_matches_signature(ast_node_t *method_ast, symbol_t *paren
             }
             if (ast_dims != sym_dims) return false;
             
-            /* Compare element types */
+            /* Compare element types - handle both primitives and classes */
             const char *sym_name = NULL;
-            if (elem && elem->kind == TYPE_CLASS) {
-                sym_name = elem->data.class_type.name;
+            if (elem) {
+                switch (elem->kind) {
+                    case TYPE_CLASS:
+                        sym_name = elem->data.class_type.name;
+                        break;
+                    case TYPE_BOOLEAN: sym_name = "boolean"; break;
+                    case TYPE_BYTE: sym_name = "byte"; break;
+                    case TYPE_CHAR: sym_name = "char"; break;
+                    case TYPE_SHORT: sym_name = "short"; break;
+                    case TYPE_INT: sym_name = "int"; break;
+                    case TYPE_LONG: sym_name = "long"; break;
+                    case TYPE_FLOAT: sym_name = "float"; break;
+                    case TYPE_DOUBLE: sym_name = "double"; break;
+                    default: break;
+                }
             }
             if (!ast_name || !sym_name) return false;
             
@@ -946,10 +990,70 @@ symbol_t *scope_lookup_method_with_types(struct semantic *sem, scope_t *scope,
  * @param recv_type The receiver type (for type argument substitution)
  * @return The best matching method, or NULL if not found
  */
+/**
+ * Collect all method overloads from a class's interfaces recursively.
+ * Used to find default methods in interfaces.
+ */
+static void collect_methods_from_interfaces(semantic_t *sem, symbol_t *class_sym, 
+                                            const char *name, slist_t **candidates)
+{
+    if (!class_sym || !name || !candidates) return;
+    
+    /* Check interfaces of this class */
+    slist_t *interfaces = class_sym->data.class_data.interfaces;
+    for (slist_t *iface_node = interfaces; iface_node; iface_node = iface_node->next) {
+        symbol_t *iface = (symbol_t *)iface_node->data;
+        if (!iface) continue;
+        
+        /* Try to load the interface if not fully loaded */
+        if (iface->kind != SYM_INTERFACE && iface->kind != SYM_CLASS) {
+            const char *iface_name = iface->qualified_name ? iface->qualified_name : iface->name;
+            if (iface_name) {
+                symbol_t *loaded = load_external_class(sem, iface_name);
+                if (loaded) iface = loaded;
+            }
+        }
+        
+        /* Collect methods from this interface */
+        if (iface->data.class_data.members) {
+            slist_t *iface_methods = scope_find_all_methods(iface->data.class_data.members, name);
+            for (slist_t *m = iface_methods; m; m = m->next) {
+                /* Only add if not already in candidates (avoid duplicates) */
+                bool found = false;
+                for (slist_t *c = *candidates; c && !found; c = c->next) {
+                    if (c->data == m->data) found = true;
+                }
+                if (!found) {
+                    if (!*candidates) {
+                        *candidates = slist_new(m->data);
+                    } else {
+                        slist_append(*candidates, m->data);
+                    }
+                }
+            }
+            slist_free(iface_methods);
+        }
+        
+        /* Recursively check super-interfaces */
+        collect_methods_from_interfaces(sem, iface, name, candidates);
+    }
+    
+    /* Also check superclass's interfaces */
+    if (class_sym->data.class_data.superclass) {
+        collect_methods_from_interfaces(sem, class_sym->data.class_data.superclass, name, candidates);
+    }
+}
+
 symbol_t *scope_lookup_method_with_types_and_recv(struct semantic *sem, scope_t *scope, 
                                                    const char *name, slist_t *args, type_t *recv_type)
 {
     slist_t *candidates = scope_find_all_methods(scope, name);
+    
+    /* Also collect methods from implemented interfaces (for default methods) */
+    if (recv_type && recv_type->kind == TYPE_CLASS && recv_type->data.class_type.symbol) {
+        collect_methods_from_interfaces(sem, recv_type->data.class_type.symbol, name, &candidates);
+    }
+    
     if (!candidates) {
         return NULL;
     }
@@ -1068,8 +1172,10 @@ semantic_t *semantic_new(classpath_t *cp)
     
     sem->global_scope = scope_new(SCOPE_GLOBAL, NULL);
     sem->current_scope = sem->global_scope;
-    sem->types = hashtable_new();
+    sem->types = hashtable_new();        /* Global cache: qualified names only */
+    sem->unit_types = hashtable_new();   /* Per-compilation-unit: simple names (like javac's toplevelScope) */
     sem->packages = hashtable_new();
+    sem->resolved_imports = hashtable_new();  /* Cache for import resolution */
     sem->classpath = cp;
     sem->warnings_enabled = true;
     sem->werror = false;
@@ -1203,8 +1309,10 @@ void semantic_free(semantic_t *sem)
     }
     
     scope_free(sem->global_scope);
-    hashtable_free(sem->types);  /* Types are singletons, don't free values */
+    hashtable_free(sem->types);       /* Types are singletons, don't free values */
+    hashtable_free(sem->unit_types);  /* Per-compilation-unit types, don't free values */
     hashtable_free(sem->packages);
+    hashtable_free(sem->resolved_imports);  /* Values are interned, don't free */
     slist_free(sem->imports);
     slist_free_full(sem->sourcepath, free);
     slist_free_full(sem->source_dependencies, free);
@@ -1219,6 +1327,12 @@ void semantic_free(semantic_t *sem)
  */
 void semantic_error(semantic_t *sem, int line, int col, const char *fmt, ...)
 {
+    /* Suppress errors when loading dependency files.
+     * Errors will be reported when the dependency is compiled directly. */
+    if (sem->loading_dependency) {
+        return;
+    }
+    
     va_list args;
     char message[1024];
     
@@ -1462,6 +1576,7 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
     } else if (cf->access_flags & ACC_ANNOTATION) {
         kind = SYM_ANNOTATION;
     }
+    
     
     /* Get simple name */
     char *simple_name = get_simple_name(binary_name);
@@ -1831,14 +1946,216 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
                             /* The symbol name from classfile is the binary name (e.g. ChannelHandler$Type).
                              * We need to use the simple name (e.g. Type) for scope lookup. */
                             if (ic->inner_name && strcmp(nested_sym->name, ic->inner_name) != 0) {
-                                free(nested_sym->name);
-                                nested_sym->name = strdup(ic->inner_name);
+                                /* Names are interned, don't free - just reassign */
+                                nested_sym->name = (char *)intern(ic->inner_name);
                             }
                         }
                     }
                 }
                 
-                /* If classfile loading failed, create a placeholder symbol */
+                /* If classfile loading failed, try parsing the outer class source
+                 * directly to find the nested type. This handles the case where
+                 * the outer class exists as a classfile but the nested class
+                 * hasn't been compiled yet.
+                 * 
+                 * We can't use load_class_from_source because it would return
+                 * this same (partially-loaded) outer class from the cache. */
+                if (!nested_sym && sem->sourcepath) {
+                    if (getenv("GENESIS_DEBUG_LOAD")) {
+                        fprintf(stderr, "DEBUG symbol_from_classfile: classfile loading failed for nested '%s', parsing outer source\n", ic->inner_class_name);
+                    }
+                    
+                    /* Build source file path from outer class name */
+                    char *file_path = strdup(sym->qualified_name);
+                    for (char *p = file_path; *p; p++) {
+                        if (*p == '.') *p = '/';
+                    }
+                    
+                    for (slist_t *entry = sem->sourcepath; entry && !nested_sym; entry = entry->next) {
+                        const char *dir = (const char *)entry->data;
+                        char full_path[1024];
+                        snprintf(full_path, sizeof(full_path), "%s/%s.java", dir, file_path);
+                        
+                        FILE *f = fopen(full_path, "r");
+                        if (f) {
+                            fclose(f);
+                            
+                            source_file_t *src = source_file_new(full_path);
+                            if (src && source_file_load(src)) {
+                                lexer_t *lexer = lexer_new(src, sem->source_version);
+                                if (lexer) {
+                                    parser_t *parser = parser_new(lexer, src);
+                                    if (parser) {
+                                        ast_node_t *ast = parser_parse(parser);
+                                        if (ast && !parser->error_msg) {
+                                            /* Find the nested type declaration in the AST */
+                                            for (slist_t *child = ast->data.node.children; child; child = child->next) {
+                                                ast_node_t *decl = (ast_node_t *)child->data;
+                                                if (decl->type == AST_CLASS_DECL || decl->type == AST_INTERFACE_DECL ||
+                                                    decl->type == AST_ENUM_DECL || decl->type == AST_RECORD_DECL) {
+                                                    /* Search for nested type within this class */
+                                                    for (slist_t *member = decl->data.node.children; member; member = member->next) {
+                                                        ast_node_t *m = (ast_node_t *)member->data;
+                                                        if ((m->type == AST_CLASS_DECL || m->type == AST_INTERFACE_DECL ||
+                                                             m->type == AST_ENUM_DECL || m->type == AST_RECORD_DECL) &&
+                                                            m->data.node.name && strcmp(m->data.node.name, ic->inner_name) == 0) {
+                                                            /* Found it! Create symbol for this nested type */
+                                                            nested_sym = symbol_new(nested_kind, ic->inner_name);
+                                                            if (nested_sym) {
+                                                                nested_sym->qualified_name = strdup(ic->inner_class_name);
+                                                                nested_sym->modifiers = m->data.node.flags;
+                                                                nested_sym->data.class_data.enclosing_class = sym;
+                                                                
+                                                                scope_t *nested_scope = scope_new(SCOPE_CLASS, class_scope);
+                                                                nested_scope->owner = nested_sym;
+                                                                nested_sym->data.class_data.members = nested_scope;
+                                                                
+                                                                type_t *nested_type = type_new_class(nested_sym->qualified_name);
+                                                                nested_type->data.class_type.symbol = nested_sym;
+                                                                nested_sym->type = nested_type;
+                                                                
+                                                                hashtable_insert(sem->types, nested_sym->qualified_name, nested_type);
+                                                                /* Also cache by simple name for self-references */
+                                                                hashtable_insert(sem->unit_types, ic->inner_name, nested_type);
+                                                                
+                                                                /* Set current_class for nested type resolution */
+                                                                symbol_t *saved_class = sem->current_class;
+                                                                sem->current_class = nested_sym;
+                                                                scope_t *saved_scope = sem->current_scope;
+                                                                sem->current_scope = nested_scope;
+                                                                
+                                                                /* Register methods and fields of this nested type */
+                                                                for (slist_t *mc = m->data.node.children; mc; mc = mc->next) {
+                                                                    ast_node_t *mm = (ast_node_t *)mc->data;
+                                                                    if (!mm) continue;
+                                                                    
+                                                                    if (mm->type == AST_METHOD_DECL) {
+                                                                        const char *mname = mm->data.node.name;
+                                                                        if (mname) {
+                                                                            symbol_t *method_sym = symbol_new(SYM_METHOD, mname);
+                                                                            method_sym->modifiers = mm->data.node.flags;
+                                                                            method_sym->ast = mm;
+                                                                            
+                                                                            /* Process method-level type parameters first */
+                                                                            scope_t *method_scope = NULL;
+                                                                            for (slist_t *tpc = mm->data.node.children; tpc; tpc = tpc->next) {
+                                                                                ast_node_t *tp = (ast_node_t *)tpc->data;
+                                                                                if (tp && tp->type == AST_TYPE_PARAMETER) {
+                                                                                    if (!method_scope) {
+                                                                                        method_scope = scope_new(SCOPE_METHOD, sem->current_scope);
+                                                                                    }
+                                                                                    const char *tp_name = tp->data.node.name;
+                                                                                    if (tp_name) {
+                                                                                        symbol_t *tp_sym = symbol_new(SYM_TYPE_PARAM, tp_name);
+                                                                                        type_t *type_var = malloc(sizeof(type_t));
+                                                                                        if (type_var) {
+                                                                                            type_var->kind = TYPE_TYPEVAR;
+                                                                                            type_var->data.type_var.name = strdup(tp_name);
+                                                                                            type_var->data.type_var.bound = NULL;
+                                                                                        }
+                                                                                        tp_sym->type = type_var;
+                                                                                        scope_define(method_scope, tp_sym);
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            /* Switch to method scope for type resolution */
+                                                                            scope_t *outer_scope = sem->current_scope;
+                                                                            if (method_scope) {
+                                                                                sem->current_scope = method_scope;
+                                                                            }
+                                                                            
+                                                                            /* Resolve return type - stored in data.node.extra */
+                                                                            ast_node_t *ret_type_node = mm->data.node.extra;
+                                                                            if (ret_type_node) {
+                                                                                if (getenv("GENESIS_DEBUG_LOAD")) {
+                                                                                    fprintf(stderr, "DEBUG: resolving return type for method '%s', type_node=%d name='%s'\n",
+                                                                                        mname, ret_type_node->type, ret_type_node->data.node.name ? ret_type_node->data.node.name : "(null)");
+                                                                                }
+                                                                                method_sym->type = semantic_resolve_type(sem, ret_type_node);
+                                                                                if (getenv("GENESIS_DEBUG_LOAD")) {
+                                                                                    fprintf(stderr, "DEBUG: resolved return type for '%s' -> %p (kind=%d)\n",
+                                                                                        mname, (void*)method_sym->type, method_sym->type ? method_sym->type->kind : -1);
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            /* Process parameters */
+                                                                            for (slist_t *pc = mm->data.node.children; pc; pc = pc->next) {
+                                                                                ast_node_t *param = (ast_node_t *)pc->data;
+                                                                                if (param && param->type == AST_PARAMETER) {
+                                                                                    const char *pname = param->data.node.name;
+                                                                                    symbol_t *param_sym = symbol_new(SYM_PARAMETER, pname ? pname : "");
+                                                                                    param_sym->ast = param;
+                                                                                    if (param->data.node.children) {
+                                                                                        ast_node_t *ptype_node = (ast_node_t *)param->data.node.children->data;
+                                                                                        param_sym->type = semantic_resolve_type(sem, ptype_node);
+                                                                                    }
+                                                                                    if (param->data.node.flags & MOD_VARARGS) {
+                                                                                        param_sym->modifiers |= MOD_VARARGS;
+                                                                                        method_sym->modifiers |= MOD_VARARGS;
+                                                                                    }
+                                                                                    if (!method_sym->data.method_data.parameters) {
+                                                                                        method_sym->data.method_data.parameters = slist_new(param_sym);
+                                                                                    } else {
+                                                                                        slist_append(method_sym->data.method_data.parameters, param_sym);
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                            
+                                                                            /* Restore scope */
+                                                                            sem->current_scope = outer_scope;
+                                                                            scope_define(nested_scope, method_sym);
+                                                                        }
+                                                                    } else if (mm->type == AST_FIELD_DECL) {
+                                                                        const char *fname = mm->data.node.name;
+                                                                        if (fname) {
+                                                                            symbol_t *field_sym = symbol_new(SYM_FIELD, fname);
+                                                                            field_sym->modifiers = mm->data.node.flags;
+                                                                            field_sym->ast = mm;
+                                                                            if (mm->data.node.children) {
+                                                                                ast_node_t *type_node = (ast_node_t *)mm->data.node.children->data;
+                                                                                field_sym->type = semantic_resolve_type(sem, type_node);
+                                                                            }
+                                                                            scope_define(nested_scope, field_sym);
+                                                                        }
+                                                                    }
+                                                                }
+                                                                
+                                                                /* Restore context */
+                                                                sem->current_class = saved_class;
+                                                                sem->current_scope = saved_scope;
+                                                                
+                                                                /* Also pre-register any nested types inside this nested type */
+                                                                preregister_nested_types(sem, m, nested_sym, nested_scope);
+                                                                
+                                                                if (getenv("GENESIS_DEBUG_LOAD")) {
+                                                                    fprintf(stderr, "DEBUG symbol_from_classfile: created nested '%s' from source AST\n", ic->inner_class_name);
+                                                                }
+                                                            }
+                                                            break;
+                                                        }
+                                                    }
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        /* Note: Don't free ast - we've stored pointers to its children 
+                                         * in symbols (param_sym->ast, field_sym->ast). The AST must outlive
+                                         * the symbols that reference it. This leaks memory but avoids crashes.
+                                         * TODO: Refactor to not store AST pointers in externally-loaded symbols. */
+                                        /* ast_free(ast); */
+                                        parser_free(parser);
+                                    }
+                                    lexer_free(lexer);
+                                }
+                            }
+                            source_file_free(src);
+                        }
+                    }
+                    free(file_path);
+                }
+                
+                /* If source loading also failed, create a placeholder symbol */
                 if (!nested_sym) {
                     nested_sym = symbol_new(nested_kind, ic->inner_name);
                     if (nested_sym) {
@@ -1846,12 +2163,24 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
                         
                         /* Convert access flags to modifiers */
                         uint32_t nested_mods = 0;
-                        if (ic->access_flags & ACC_PUBLIC) nested_mods |= MOD_PUBLIC;
-                        if (ic->access_flags & ACC_PRIVATE) nested_mods |= MOD_PRIVATE;
-                        if (ic->access_flags & ACC_PROTECTED) nested_mods |= MOD_PROTECTED;
-                        if (ic->access_flags & ACC_STATIC) nested_mods |= MOD_STATIC;
-                        if (ic->access_flags & ACC_FINAL) nested_mods |= MOD_FINAL;
-                        if (ic->access_flags & ACC_ABSTRACT) nested_mods |= MOD_ABSTRACT;
+                        if (ic->access_flags & ACC_PUBLIC) {
+                            nested_mods |= MOD_PUBLIC;
+                        }
+                        if (ic->access_flags & ACC_PRIVATE) {
+                            nested_mods |= MOD_PRIVATE;
+                        }
+                        if (ic->access_flags & ACC_PROTECTED) {
+                            nested_mods |= MOD_PROTECTED;
+                        }
+                        if (ic->access_flags & ACC_STATIC) {
+                            nested_mods |= MOD_STATIC;
+                        }
+                        if (ic->access_flags & ACC_FINAL) {
+                            nested_mods |= MOD_FINAL;
+                        }
+                        if (ic->access_flags & ACC_ABSTRACT) {
+                            nested_mods |= MOD_ABSTRACT;
+                        }
                         nested_sym->modifiers = nested_mods;
                         
                         /* Set enclosing class */
@@ -1885,9 +2214,22 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
 }
 
 /**
+ * Helper struct to track registered nested types for second pass.
+ */
+typedef struct nested_type_info {
+    ast_node_t *ast;
+    symbol_t *sym;
+    scope_t *scope;
+} nested_type_info_t;
+
+/**
  * Recursively pre-register nested types in a class declaration AST.
  * This ensures that all nested classes, interfaces, enums, etc. are available
  * for type resolution before their declarations are fully processed.
+ * 
+ * This uses a two-pass approach:
+ * Pass 1: Register all nested type names/symbols (no type resolution)
+ * Pass 2: Populate methods/fields with resolved types (all siblings now visible)
  * 
  * @param sem The semantic analyzer
  * @param decl The AST node for the class/interface/enum declaration
@@ -1903,6 +2245,11 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
                 (int)(decl->data.node.children ? slist_length(decl->data.node.children) : 0));
     }
     
+    /* Collect nested types for second pass */
+    slist_t *nested_infos = NULL;
+    
+    /* PASS 1: Register all nested type names/symbols first.
+     * This ensures forward references between sibling nested types work. */
     for (slist_t *prescan = decl->data.node.children; prescan; prescan = prescan->next) {
         ast_node_t *nested = (ast_node_t *)prescan->data;
         if (!nested) continue;
@@ -1961,34 +2308,15 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
             nested_type->data.class_type.symbol = nested_sym;
             nested_sym->type = nested_type;
             
-            /* Cache the type for resolution */
+            /* Cache by qualified name in global cache,
+             * by simple name in per-compilation-unit scope */
             hashtable_insert(sem->types, nested_sym->qualified_name, nested_type);
+            hashtable_insert(sem->unit_types, nested_name, nested_type);
             
             /* Create member scope for nested type */
             scope_t *nested_scope = scope_new(SCOPE_CLASS, parent_scope);
             nested_scope->owner = nested_sym;
             nested_sym->data.class_data.members = nested_scope;
-            
-            /* For nested enums, populate enum constants immediately
-             * so switch statements can resolve them */
-            if (nested->type == AST_ENUM_DECL) {
-                int nested_ordinal = 0;
-                for (slist_t *nc = nested->data.node.children; nc; nc = nc->next) {
-                    ast_node_t *nmember = (ast_node_t *)nc->data;
-                    if (nmember && nmember->type == AST_ENUM_CONSTANT) {
-                        const char *ec_name = nmember->data.node.name;
-                        if (ec_name) {
-                            symbol_t *ec_sym = symbol_new(SYM_FIELD, ec_name);
-                            ec_sym->modifiers = MOD_PUBLIC | MOD_STATIC | MOD_FINAL;
-                            ec_sym->type = nested_type;
-                            ec_sym->ast = nmember;
-                            ec_sym->data.var_data.is_enum_constant = true;
-                            ec_sym->data.var_data.enum_ordinal = nested_ordinal++;
-                            scope_define(nested_scope, ec_sym);
-                        }
-                    }
-                }
-            }
             
             /* Register in parent class scope */
             scope_define(parent_scope, nested_sym);
@@ -2001,10 +2329,162 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
             /* Store symbol on AST for later lookup */
             nested->sem_symbol = nested_sym;
             
-            /* Recursively pre-register nested types within this nested type */
+            /* Save for second pass */
+            nested_type_info_t *info = malloc(sizeof(nested_type_info_t));
+            info->ast = nested;
+            info->sym = nested_sym;
+            info->scope = nested_scope;
+            if (!nested_infos) {
+                nested_infos = slist_new(info);
+            } else {
+                slist_append(nested_infos, info);
+            }
+            
+            /* Recursively pre-register nested types within this nested type
+             * (depth-first to ensure all types at all levels are registered
+             * before we start resolving types) */
             preregister_nested_types(sem, nested, nested_sym, nested_scope);
         }
     }
+    
+    /* PASS 2: Now that all sibling nested types are registered, populate methods/fields.
+     * Type resolution can now find sibling types like HistogramSnapshot from HistogramBuckets. */
+    for (slist_t *node = nested_infos; node; node = node->next) {
+        nested_type_info_t *info = (nested_type_info_t *)node->data;
+        ast_node_t *nested = info->ast;
+        symbol_t *nested_sym = info->sym;
+        scope_t *nested_scope = info->scope;
+        type_t *nested_type = nested_sym->type;
+        
+        /* For nested enums, populate enum constants */
+        if (nested->type == AST_ENUM_DECL) {
+            int nested_ordinal = 0;
+            for (slist_t *nc = nested->data.node.children; nc; nc = nc->next) {
+                ast_node_t *nmember = (ast_node_t *)nc->data;
+                if (nmember && nmember->type == AST_ENUM_CONSTANT) {
+                    const char *ec_name = nmember->data.node.name;
+                    if (ec_name) {
+                        symbol_t *ec_sym = symbol_new(SYM_FIELD, ec_name);
+                        ec_sym->modifiers = MOD_PUBLIC | MOD_STATIC | MOD_FINAL;
+                        ec_sym->type = nested_type;
+                        ec_sym->ast = nmember;
+                        ec_sym->data.var_data.is_enum_constant = true;
+                        ec_sym->data.var_data.enum_ordinal = nested_ordinal++;
+                        scope_define(nested_scope, ec_sym);
+                    }
+                }
+            }
+        }
+        
+        /* Set current_class for type resolution */
+        symbol_t *saved_class = sem->current_class;
+        scope_t *saved_scope = sem->current_scope;
+        sem->current_class = nested_sym;
+        sem->current_scope = nested_scope;
+        
+        /* Pre-populate methods and fields for nested classes so static method
+         * calls like NestedClass.method() can be resolved. */
+        for (slist_t *nc = nested->data.node.children; nc; nc = nc->next) {
+            ast_node_t *nmember = (ast_node_t *)nc->data;
+            if (!nmember) {
+                continue;
+            }
+            if (nmember->type == AST_METHOD_DECL) {
+                const char *mname = nmember->data.node.name;
+                if (mname) {
+                    symbol_t *method_sym = symbol_new(SYM_METHOD, mname);
+                    method_sym->modifiers = nmember->data.node.flags;
+                    method_sym->ast = nmember;
+                    
+                    /* Process method-level type parameters first */
+                    scope_t *method_scope = NULL;
+                    for (slist_t *tpc = nmember->data.node.children; tpc; tpc = tpc->next) {
+                        ast_node_t *tp = (ast_node_t *)tpc->data;
+                        if (tp && tp->type == AST_TYPE_PARAMETER) {
+                            if (!method_scope) {
+                                method_scope = scope_new(SCOPE_METHOD, sem->current_scope);
+                            }
+                            const char *tp_name = tp->data.node.name;
+                            if (tp_name) {
+                                symbol_t *tp_sym = symbol_new(SYM_TYPE_PARAM, tp_name);
+                                type_t *type_var = malloc(sizeof(type_t));
+                                if (type_var) {
+                                    type_var->kind = TYPE_TYPEVAR;
+                                    type_var->data.type_var.name = strdup(tp_name);
+                                    type_var->data.type_var.bound = NULL;
+                                }
+                                tp_sym->type = type_var;
+                                scope_define(method_scope, tp_sym);
+                            }
+                        }
+                    }
+                    
+                    /* Switch to method scope for type resolution */
+                    scope_t *outer_scope = sem->current_scope;
+                    if (method_scope) {
+                        sem->current_scope = method_scope;
+                    }
+                    
+                    /* Resolve return type - stored in data.node.extra */
+                    ast_node_t *ret_type_node = nmember->data.node.extra;
+                    if (ret_type_node) {
+                        method_sym->type = semantic_resolve_type(sem, ret_type_node);
+                    }
+                    /* Process parameters for proper overload resolution */
+                    for (slist_t *pc = nmember->data.node.children; pc; pc = pc->next) {
+                        ast_node_t *param = (ast_node_t *)pc->data;
+                        if (param && param->type == AST_PARAMETER) {
+                            const char *pname = param->data.node.name;
+                            symbol_t *param_sym = symbol_new(SYM_PARAMETER, pname ? pname : "");
+                            param_sym->ast = param;
+                            if (param->data.node.children) {
+                                ast_node_t *ptype_node = (ast_node_t *)param->data.node.children->data;
+                                param_sym->type = semantic_resolve_type(sem, ptype_node);
+                            }
+                            /* Check for varargs modifier */
+                            if (param->data.node.flags & MOD_VARARGS) {
+                                param_sym->modifiers |= MOD_VARARGS;
+                                method_sym->modifiers |= MOD_VARARGS;
+                            }
+                            if (!method_sym->data.method_data.parameters) {
+                                method_sym->data.method_data.parameters = slist_new(param_sym);
+                            } else {
+                                slist_append(method_sym->data.method_data.parameters, param_sym);
+                            }
+                        }
+                    }
+                    
+                    /* Restore scope */
+                    sem->current_scope = outer_scope;
+                    scope_define(nested_scope, method_sym);
+                }
+            } else if (nmember->type == AST_FIELD_DECL) {
+                const char *fname = nmember->data.node.name;
+                if (fname) {
+                    symbol_t *field_sym = symbol_new(SYM_FIELD, fname);
+                    field_sym->modifiers = nmember->data.node.flags;
+                    field_sym->ast = nmember;
+                    /* Resolve type if possible */
+                    slist_t *fchildren = nmember->data.node.children;
+                    if (fchildren) {
+                        ast_node_t *type_node = (ast_node_t *)fchildren->data;
+                        if (type_node) {
+                            field_sym->type = semantic_resolve_type(sem, type_node);
+                        }
+                    }
+                    scope_define(nested_scope, field_sym);
+                }
+            }
+        }
+        
+        /* Restore context */
+        sem->current_class = saved_class;
+        sem->current_scope = saved_scope;
+        
+        free(info);
+    }
+    
+    slist_free(nested_infos);
 }
 
 /**
@@ -2074,14 +2554,31 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
                            nested->kind == SYM_ANNOTATION)) {
                 free(immediate_name);
                 
-                /* If there are more levels, recurse */
+                /* If there are more levels, continue walking the nested chain */
                 if (next_dollar) {
-                    /* Build the nested class's full name */
-                    char nested_full[512];
-                    snprintf(nested_full, sizeof(nested_full), "%s%s",
-                        nested->qualified_name ? nested->qualified_name : nested->name,
-                        next_dollar);  /* includes the $ and rest */
-                    return load_class_from_source(sem, nested_full);
+                    /* Walk through remaining nested levels directly */
+                    const char *remaining = next_dollar + 1;  /* Skip the $ */
+                    while (remaining && *remaining) {
+                        const char *next = strchr(remaining, '$');
+                        char *part = next ? strndup(remaining, next - remaining) : strdup(remaining);
+                        
+                        /* Look for this part in nested's members */
+                        symbol_t *deeper = NULL;
+                        if (nested->data.class_data.members) {
+                            deeper = scope_lookup(nested->data.class_data.members, part);
+                        }
+                        free(part);
+                        
+                        if (!deeper || (deeper->kind != SYM_CLASS && deeper->kind != SYM_INTERFACE &&
+                                        deeper->kind != SYM_ENUM && deeper->kind != SYM_RECORD &&
+                                        deeper->kind != SYM_ANNOTATION)) {
+                            /* Not a nested type (might be an enum constant or field) */
+                            return NULL;
+                        }
+                        
+                        nested = deeper;
+                        remaining = next ? next + 1 : NULL;
+                    }
                 }
                 return nested;
             }
@@ -2132,7 +2629,7 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
             }
             
             /* Lex and parse */
-            lexer_t *lexer = lexer_new(src);
+            lexer_t *lexer = lexer_new(src, sem->source_version);
             if (!lexer) {
                 source_file_free(src);
                 continue;
@@ -2146,10 +2643,11 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
             }
             
             ast_node_t *ast = parser_parse(parser);
+            bool had_parse_error = parser->error_msg != NULL;
             parser_free(parser);
             lexer_free(lexer);
             
-            if (!ast || parser->error_msg) {
+            if (!ast || had_parse_error) {
                 ast_free(ast);
                 source_file_free(src);
                 continue;
@@ -2174,8 +2672,14 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
                 }
             }
             
-            /* Save and switch package context */
+            /* Save and switch context for dependency loading.
+             * Set loading_dependency to suppress error reporting - errors will be
+             * reported when the dependency is compiled directly. */
             char *saved_package = sem->current_package;
+            source_file_t *saved_source = sem->source;
+            bool saved_loading_dependency = sem->loading_dependency;
+            sem->source = src;
+            sem->loading_dependency = true;  /* Suppress errors during dependency loading */
             if (dep_pkg) {
                 sem->current_package = strdup(dep_pkg);
             }
@@ -2230,8 +2734,10 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
                             fprintf(stderr, "DEBUG load_class_from_source: CACHING type for '%s'\n", sym->qualified_name);
                             fflush(stderr);
                         }
+                        /* Cache by qualified name only in global cache.
+                         * Don't cache by simple name - this is a dependency file,
+                         * not the current compilation unit. */
                         hashtable_insert(sem->types, sym->qualified_name, type);
-                        hashtable_insert(sem->types, sym->name, type);
                         
                         /* Pre-register all nested class/interface declarations recursively
                          * so that forward references between siblings can be resolved.
@@ -2679,13 +3185,13 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
                                     other_scope->owner = other_sym;
                                     other_sym->data.class_data.members = other_scope;
                                     
-                                    /* Create and cache type */
+                                    /* Create and cache type by qualified name only
+                                     * (this is a dependency file, not current unit) */
                                     type_t *other_type = type_new_class(other_qualified);
                                     other_type->data.class_type.symbol = other_sym;
                                     other_sym->type = other_type;
                                     
                                     hashtable_insert(sem->types, other_qualified, other_type);
-                                    hashtable_insert(sem->types, other_name, other_type);
                                     
                                     if (getenv("GENESIS_DEBUG_PKG_SCAN")) {
                                         fprintf(stderr, "DEBUG load_class_from_source: also registered '%s' from same file\n", 
@@ -2703,14 +3209,16 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
                         char *dep_path = strdup(src->filename);
                         sem->source_dependencies = slist_append(sem->source_dependencies, dep_path);
                         
-                        /* Restore package context */
+                        /* Restore context */
                         if (dep_pkg) {
                             free(sem->current_package);
                             sem->current_package = saved_package;
                         }
+                        sem->source = saved_source;
+                        sem->loading_dependency = saved_loading_dependency;
                         
                         /* Don't free ast - it's now referenced by the symbol */
-                        source_file_free(src);
+                        /* Note: Don't free src either since sym->ast references nodes with filenames from src */
                         free(file_path);
                         return sym;
                     }
@@ -2783,13 +3291,13 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
                             all_scope->owner = all_sym;
                             all_sym->data.class_data.members = all_scope;
                             
-                            /* Create and cache type */
+                            /* Create and cache type by qualified name only
+                             * (this is a dependency file, not current unit) */
                             type_t *all_type = type_new_class(all_qualified);
                             all_type->data.class_type.symbol = all_sym;
                             all_sym->type = all_type;
                             
                             hashtable_insert(sem->types, all_qualified, all_type);
-                            hashtable_insert(sem->types, decl_name, all_type);
                             
                             /* Also populate methods for @Override checks */
                             for (slist_t *mc = all_decl->data.node.children; mc; mc = mc->next) {
@@ -2799,6 +3307,17 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
                                     symbol_t *method_sym = symbol_new(SYM_METHOD, method_name);
                                     method_sym->modifiers = member->data.node.flags;
                                     method_sym->ast = member;
+                                    
+                                    /* Interface methods are implicitly public (and abstract unless default/static/private) */
+                                    if (all_kind == SYM_INTERFACE) {
+                                        bool is_private = (method_sym->modifiers & MOD_PRIVATE) != 0;
+                                        bool is_static = (method_sym->modifiers & MOD_STATIC) != 0;
+                                        bool is_default = (method_sym->modifiers & MOD_DEFAULT) != 0;
+                                        if (!is_private) method_sym->modifiers |= MOD_PUBLIC;
+                                        if (!is_default && !is_static && !is_private) method_sym->modifiers |= MOD_ABSTRACT;
+                                    } else if (all_kind == SYM_ANNOTATION) {
+                                        method_sym->modifiers |= MOD_PUBLIC | MOD_ABSTRACT;
+                                    }
                                     
                                     /* Get return type */
                                     if (member->data.node.extra) {
@@ -2841,11 +3360,13 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
                 }
             }
             
-            /* Restore package context */
+            /* Restore context */
             if (dep_pkg) {
                 free(sem->current_package);
                 sem->current_package = saved_package;
             }
+            sem->source = saved_source;
+            sem->loading_dependency = saved_loading_dependency;
             
             /* Don't free ast if we registered types from it */
             source_file_free(src);
@@ -2893,7 +3414,10 @@ symbol_t *load_external_class(semantic_t *sem, const char *name)
     if (sem->classpath) {
         classfile_t *cf = classpath_load_class(sem->classpath, name);
         if (cf) {
-    return symbol_from_classfile(sem, cf);
+            if (getenv("GENESIS_DEBUG_LOAD")) {
+                fprintf(stderr, "DEBUG load_external_class: loaded '%s' from classpath\n", name);
+            }
+            return symbol_from_classfile(sem, cf);
         }
     }
     
@@ -2942,14 +3466,23 @@ symbol_t *load_external_class(semantic_t *sem, const char *name)
             if (sem->classpath) {
                 classfile_t *cf = classpath_load_class(sem->classpath, candidate);
                 if (cf) {
+                    symbol_t *result = symbol_from_classfile(sem, cf);
+                    if (result && result->type) {
+                        /* Also cache under the original name for future lookups */
+                        hashtable_insert(sem->types, strdup(name), result->type);
+                    }
                     free(candidate);
-                    return symbol_from_classfile(sem, cf);
+                    return result;
                 }
             }
             
             /* Try sourcepath with this candidate */
             sym = load_class_from_source(sem, candidate);
             if (sym) {
+                if (sym->type) {
+                    /* Also cache under the original name for future lookups */
+                    hashtable_insert(sem->types, strdup(name), sym->type);
+                }
                 free(candidate);
                 return sym;
             }
@@ -2996,6 +3529,12 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         return NULL;
     }
     
+    /* Check cache first - returns strdup'd copy for API compatibility */
+    const char *cached = hashtable_lookup(sem->resolved_imports, simple_name);
+    if (cached) {
+        return strdup(cached);
+    }
+    
     /* Check if this is a qualified inner class name like "Map.Entry" */
     const char *dot = strchr(simple_name, '.');
     if (dot != NULL) {
@@ -3023,6 +3562,8 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
                 }
             }
             
+            /* Cache the result */
+            hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(result));
             return result;
         }
         
@@ -3053,6 +3594,8 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         const char *import_simple = last_dot ? last_dot + 1 : import_name;
         
         if (strcmp(import_simple, simple_name) == 0) {
+            /* Cache and return */
+            hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(import_name));
             return strdup(import_name);
         }
     }
@@ -3087,6 +3630,8 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
                 size_t result_len = strlen(import_name) + 1 + strlen(simple_name) + 1;
                 char *result = malloc(result_len);
                 snprintf(result, result_len, "%s$%s", import_name, simple_name);
+                /* Cache and return */
+                hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(result));
                 return result;
             }
         }
@@ -3117,6 +3662,8 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
                 classfile_t *cf = classpath_load_class(sem->classpath, qualified);
                 if (cf) {
                     /* Don't free cf - it's owned by the classpath cache */
+                    /* Cache and return */
+                    hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(qualified));
                     return strdup(qualified);
                 }
             }
@@ -3133,6 +3680,8 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         if (sem->classpath) {
             classfile_t *cf = classpath_load_class(sem->classpath, same_package);
             if (cf) {
+                /* Cache and return */
+                hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(same_package));
                 return strdup(same_package);
             }
         }
@@ -3141,6 +3690,8 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         if (sem->sourcepath) {
             symbol_t *src_sym = load_class_from_source(sem, same_package);
             if (src_sym) {
+                /* Cache and return */
+                hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(same_package));
                 return strdup(same_package);
             }
         }
@@ -3153,6 +3704,8 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         classfile_t *cf = classpath_load_class(sem->classpath, java_lang);
         if (cf) {
             /* Don't free cf - it's owned by the classpath cache */
+            /* Cache and return */
+            hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(java_lang));
             return strdup(java_lang);
         }
     }
@@ -3407,25 +3960,80 @@ static char *resolve_type_name_with_imports(const char *simple_name,
 }
 
 /**
+ * Check if a simple name is a nested type within a class declaration.
+ * This is used to prevent premature resolution of local nested types.
+ */
+static bool is_local_nested_type(ast_node_t *class_decl, const char *name)
+{
+    if (!class_decl || !name) return false;
+    
+    /* Only check within class-like declarations */
+    if (class_decl->type != AST_CLASS_DECL && 
+        class_decl->type != AST_INTERFACE_DECL &&
+        class_decl->type != AST_ENUM_DECL &&
+        class_decl->type != AST_RECORD_DECL) {
+        return false;
+    }
+    
+    /* Search children for nested type declarations with matching name */
+    for (slist_t *child = class_decl->data.node.children; child; child = child->next) {
+        ast_node_t *member = (ast_node_t *)child->data;
+        if (!member) continue;
+        
+        if ((member->type == AST_CLASS_DECL ||
+             member->type == AST_INTERFACE_DECL ||
+             member->type == AST_ENUM_DECL ||
+             member->type == AST_RECORD_DECL ||
+             member->type == AST_ANNOTATION_DECL) &&
+            member->data.node.name &&
+            strcmp(member->data.node.name, name) == 0) {
+            return true;
+        }
+    }
+    
+    return false;
+}
+
+/**
  * Recursively resolve type names in an AST node.
  * Updates data.node.name to the fully qualified name for type references.
+ * 
+ * @param enclosing_class The enclosing class declaration (for checking local nested types)
  */
-static void resolve_types_in_node(ast_node_t *node,
-                                  slist_t *imports,
-                                  const char *package,
-                                  classpath_t *classpath,
-                                  slist_t *sourcepath_list)
+static void resolve_types_in_node_with_context(ast_node_t *node,
+                                               slist_t *imports,
+                                               const char *package,
+                                               classpath_t *classpath,
+                                               slist_t *sourcepath_list,
+                                               ast_node_t *enclosing_class)
 {
     if (!node) return;
+    
+    /* Track the enclosing class for nested type resolution */
+    ast_node_t *new_enclosing = enclosing_class;
+    if (node->type == AST_CLASS_DECL || node->type == AST_INTERFACE_DECL ||
+        node->type == AST_ENUM_DECL || node->type == AST_RECORD_DECL) {
+        new_enclosing = node;
+    }
     
     switch (node->type) {
         case AST_CLASS_TYPE:
             /* Resolve the class name */
             if (node->data.node.name) {
+                const char *name = node->data.node.name;
+                
+                /* Check if this is a local nested type - if so, don't resolve it yet.
+                 * Semantic analysis will handle resolution using the local scope. */
+                bool is_simple_name = (strchr(name, '.') == NULL);
+                if (is_simple_name && enclosing_class && is_local_nested_type(enclosing_class, name)) {
+                    /* Skip - let semantic analysis handle this local type */
+                    break;
+                }
+                
                 char *qualified = resolve_type_name_with_imports(
-                    node->data.node.name, imports, package, classpath, sourcepath_list);
+                    name, imports, package, classpath, sourcepath_list);
                 if (qualified) {
-                    free(node->data.node.name);
+                    /* Note: name is interned, don't free it - just reassign */
                     node->data.node.name = qualified;
                 }
             }
@@ -3447,14 +4055,28 @@ static void resolve_types_in_node(ast_node_t *node,
         node->type != AST_THIS_EXPR && node->type != AST_SUPER_EXPR &&
         node->type != AST_PRIMITIVE_TYPE && node->type != AST_VAR_TYPE) {
         for (slist_t *child = node->data.node.children; child; child = child->next) {
-            resolve_types_in_node((ast_node_t *)child->data, imports, package, classpath, sourcepath_list);
+            resolve_types_in_node_with_context((ast_node_t *)child->data, imports, package, 
+                                               classpath, sourcepath_list, new_enclosing);
         }
         
         /* Process extra node (e.g., return type) */
         if (node->data.node.extra) {
-            resolve_types_in_node(node->data.node.extra, imports, package, classpath, sourcepath_list);
+            resolve_types_in_node_with_context(node->data.node.extra, imports, package, 
+                                               classpath, sourcepath_list, new_enclosing);
         }
     }
+}
+
+/**
+ * Wrapper for backward compatibility.
+ */
+static void resolve_types_in_node(ast_node_t *node,
+                                  slist_t *imports,
+                                  const char *package,
+                                  classpath_t *classpath,
+                                  slist_t *sourcepath_list)
+{
+    resolve_types_in_node_with_context(node, imports, package, classpath, sourcepath_list, NULL);
 }
 
 /**
@@ -4320,6 +4942,21 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     }
                 }
                 
+                /* Also check current_scope - during preregistration, method type params
+                 * are added to a method_scope that becomes current_scope but current_method
+                 * is not set. Walk up the scope chain to find method scopes. */
+                for (scope_t *s = sem->current_scope; s; s = s->parent) {
+                    if (s->type == SCOPE_METHOD) {
+                        symbol_t *type_param = scope_lookup_local(s, name);
+                        if (type_param && type_param->kind == SYM_TYPE_PARAM) {
+                            if (type_param->type) {
+                                type_node->sem_type = type_param->type;
+                                return type_param->type;
+                            }
+                        }
+                    }
+                }
+                
                 /* Check if it's a type parameter of the current class */
                 if (sem->current_class && sem->current_class->data.class_data.members) {
                     symbol_t *type_param = scope_lookup_local(
@@ -4380,10 +5017,16 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                 nested->type->data.class_type.symbol == NULL) {
                                 nested->type->data.class_type.symbol = nested;
                             }
-                            /* Cache the type under the simple name so later lookups
-                             * with current_class=(null) can still find it */
-                            if (!hashtable_lookup(sem->types, name)) {
-                                hashtable_insert(sem->types, name, nested->type);
+                            /* Cache in per-compilation-unit scope so later lookups
+                             * with current_class=(null) can still find it.
+                             * Also cache by qualified name in global cache. */
+                            if (nested->qualified_name) {
+                                if (!hashtable_lookup(sem->types, nested->qualified_name)) {
+                                    hashtable_insert(sem->types, nested->qualified_name, nested->type);
+                                }
+                            }
+                            if (!hashtable_lookup(sem->unit_types, name)) {
+                                hashtable_insert(sem->unit_types, name, nested->type);
                             }
                             type_node->sem_type = nested->type;
                             return nested->type;
@@ -4391,30 +5034,58 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     }
                 }
                 
-                /* Check if it's a nested type of an implemented interface */
-                if (sem->current_class && sem->current_class->data.class_data.interfaces) {
-                    for (slist_t *iface = sem->current_class->data.class_data.interfaces; 
-                         iface; iface = iface->next) {
-                        symbol_t *iface_sym = (symbol_t *)iface->data;
-                        /* Only check valid interface symbols */
-                        if (iface_sym && (iface_sym->kind == SYM_INTERFACE || 
-                                          iface_sym->kind == SYM_CLASS) &&
-                            iface_sym->data.class_data.members) {
-                            symbol_t *nested = scope_lookup_local(
-                                iface_sym->data.class_data.members, name);
-                            if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
-                                           nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
-                                if (nested->type) {
-                                    /* Ensure the type's symbol field is set */
-                                    if (nested->type->kind == TYPE_CLASS && 
-                                        nested->type->data.class_type.symbol == NULL) {
-                                        nested->type->data.class_type.symbol = nested;
+                /* Check if it's a nested type of an implemented interface.
+                 * Walk up the enclosing class chain to check their interfaces too. */
+                {
+                    symbol_t *check_class = sem->current_class;
+                    while (check_class) {
+                        if (getenv("GENESIS_DEBUG_IFACE_NESTED")) {
+                            fprintf(stderr, "DEBUG iface_nested: looking for '%s', check_class=%s, interfaces=%p\n",
+                                name, 
+                                check_class->name ? check_class->name : "(unnamed)",
+                                (void*)check_class->data.class_data.interfaces);
+                        }
+                        if (check_class->data.class_data.interfaces) {
+                            for (slist_t *iface = check_class->data.class_data.interfaces; 
+                                 iface; iface = iface->next) {
+                                symbol_t *iface_sym = (symbol_t *)iface->data;
+                                if (getenv("GENESIS_DEBUG_IFACE_NESTED")) {
+                                    fprintf(stderr, "DEBUG iface_nested:   checking interface '%s' (kind=%d, members=%p)\n",
+                                        iface_sym ? (iface_sym->name ? iface_sym->name : "(unnamed)") : "(null)",
+                                        iface_sym ? iface_sym->kind : -1,
+                                        iface_sym ? (void*)iface_sym->data.class_data.members : NULL);
+                                }
+                                /* Only check valid interface symbols */
+                                if (iface_sym && (iface_sym->kind == SYM_INTERFACE || 
+                                                  iface_sym->kind == SYM_CLASS) &&
+                                    iface_sym->data.class_data.members) {
+                                    symbol_t *nested = scope_lookup_local(
+                                        iface_sym->data.class_data.members, name);
+                                    if (getenv("GENESIS_DEBUG_IFACE_NESTED")) {
+                                        fprintf(stderr, "DEBUG iface_nested:   looked up '%s' in '%s' -> %p (kind=%d, type=%p)\n",
+                                            name, iface_sym->name ? iface_sym->name : "(null)",
+                                            (void*)nested, nested ? nested->kind : -1, nested ? (void*)nested->type : NULL);
                                     }
-                                    type_node->sem_type = nested->type;
-                                    return nested->type;
+                                    if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
+                                                   nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
+                                        if (nested->type) {
+                                            /* Ensure the type's symbol field is set */
+                                            if (nested->type->kind == TYPE_CLASS && 
+                                                nested->type->data.class_type.symbol == NULL) {
+                                                nested->type->data.class_type.symbol = nested;
+                                            }
+                                            if (getenv("GENESIS_DEBUG_IFACE_NESTED")) {
+                                                fprintf(stderr, "DEBUG iface_nested:   RETURNING type for '%s'\n", name);
+                                            }
+                                            type_node->sem_type = nested->type;
+                                            return nested->type;
+                                        }
+                                    }
                                 }
                             }
                         }
+                        /* Move to enclosing class */
+                        check_class = check_class->data.class_data.enclosing_class;
                     }
                 }
                 
@@ -4569,8 +5240,18 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     }
                 }
                 
-                /* Check type cache */
-                type_t *cached = hashtable_lookup(sem->types, name);
+                /* Check per-compilation-unit type scope first (like javac's toplevelScope).
+                 * This contains types defined in the current file and imported types,
+                 * keyed by simple name. For parallel compilation, each thread has its own
+                 * unit_types, avoiding race conditions. */
+                type_t *cached = hashtable_lookup(sem->unit_types, name);
+                
+                /* If not in unit scope, check global cache with qualified name.
+                 * The global cache only uses qualified names to avoid conflicts. */
+                if (!cached) {
+                    cached = hashtable_lookup(sem->types, name);
+                }
+                
                 if (cached) {
                     /* Check for diamond operator - infer type args from target type */
                     bool has_diamond = (type_node->data.node.flags & 0x1000) != 0;
@@ -4734,21 +5415,20 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                 return param_type;
                             }
                             
-                            /* No type arguments - cache and return raw type */
-                            hashtable_insert(sem->types, name, sym->type);
-                            if (strcmp(name, qualified) != 0) {
-                                hashtable_insert(sem->types, qualified, sym->type);
-                            }
+                            /* No type arguments - cache by qualified name globally,
+                             * simple name in per-compilation-unit scope */
+                            hashtable_insert(sem->types, qualified, sym->type);
+                            hashtable_insert(sem->unit_types, name, sym->type);
                             type_node->sem_type = sym->type;
                             free(qualified);
                             return sym->type;
                         }
                     }
                     
-                    /* Create type with qualified name */
+                    /* Create type with qualified name - cache appropriately */
                     type_t *type = type_new_class(qualified);
-                    hashtable_insert(sem->types, name, type);
                     hashtable_insert(sem->types, qualified, type);
+                    hashtable_insert(sem->unit_types, name, type);
                     type_node->sem_type = type;
                     free(qualified);
                     return type;
@@ -4773,8 +5453,8 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     if (!local_class->type->data.class_type.symbol) {
                         local_class->type->data.class_type.symbol = local_class;
                     }
-                    /* Cache it and return */
-                    hashtable_insert(sem->types, name, local_class->type);
+                    /* Cache in per-compilation-unit scope and return */
+                    hashtable_insert(sem->unit_types, name, local_class->type);
                     type_node->sem_type = local_class->type;
                     return local_class->type;
                 }
@@ -4792,9 +5472,9 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                 if (sem->current_package) {
                     symbol_t *pkg_sym = scan_package_for_type(sem, name, sem->current_package);
                     if (pkg_sym && pkg_sym->type) {
-                        /* Cache the type under the simple name */
-                        if (!hashtable_lookup(sem->types, name)) {
-                            hashtable_insert(sem->types, name, pkg_sym->type);
+                        /* Cache in per-compilation-unit scope */
+                        if (!hashtable_lookup(sem->unit_types, name)) {
+                            hashtable_insert(sem->unit_types, name, pkg_sym->type);
                         }
                         type_node->sem_type = pkg_sym->type;
                         return pkg_sym->type;
@@ -4805,7 +5485,8 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                 semantic_error(sem, type_node->line, type_node->column,
                               "Cannot resolve type: %s", name);
                 type_t *type = type_new_class(name);
-                hashtable_insert(sem->types, name, type);
+                /* Cache error type in unit_types to avoid repeated errors */
+                hashtable_insert(sem->unit_types, name, type);
                 return type;
             }
         
@@ -5378,7 +6059,8 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             type->data.class_type.symbol = sym;
                             sym->type = type;
                             
-                            /* Cache the type */
+                            /* Cache the type - qualified name in global cache,
+                             * simple name in per-compilation-unit scope */
                             if (getenv("GENESIS_DEBUG_LOAD")) {
                                 fprintf(stderr, "DEBUG main pass: caching type '%s' (sym=%p, members=%p)\n",
                                     sym->qualified_name, (void*)sym, (void*)sym->data.class_data.members);
@@ -5388,7 +6070,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                              * visible in their local scope and different methods can have
                              * local classes with the same short name */
                             if (!sym->data.class_data.is_local_class) {
-                                hashtable_insert(sem->types, name, type);
+                                hashtable_insert(sem->unit_types, name, type);
                             }
                             
                             } /* End of !was_preregistered */
@@ -5443,6 +6125,53 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                              * E.g., interface SAM { Foo m(); } class Foo {} - SAM needs to see Foo
                              * This also handles deeply nested types like Outer.Inner.Deeper. */
                             preregister_nested_types(sem, node, sym, class_scope);
+                            
+                            /* Pre-pass: resolve extends/implements BEFORE processing methods.
+                             * This ensures nested types from interfaces are accessible when
+                             * resolving method return types. Like javac's MemberEnter phase.
+                             * We just load them here without adding - the main pass will add. */
+                            for (slist_t *prescan = node->data.node.children; prescan; prescan = prescan->next) {
+                                ast_node_t *child = (ast_node_t *)prescan->data;
+                                if (child && (child->type == AST_CLASS_TYPE ||
+                                              child->type == AST_PRIMITIVE_TYPE ||
+                                              child->type == AST_ARRAY_TYPE) &&
+                                    child->data.node.flags == 2) {
+                                    /* implements - pre-load the interface symbol and cache on AST node.
+                                     * This ensures nested types in the interface are accessible
+                                     * when resolving method return types later. */
+                                    const char *iface_name = child->data.node.name;
+                                    symbol_t *iface_sym = scope_lookup(sem->current_scope, iface_name);
+                                    if (!iface_sym) {
+                                        char *qualified = resolve_import(sem, iface_name);
+                                        if (qualified) {
+                                            iface_sym = load_external_class(sem, qualified);
+                                            free(qualified);
+                                        }
+                                        if (!iface_sym) {
+                                            iface_sym = load_external_class(sem, iface_name);
+                                        }
+                                    }
+                                    /* Store on AST node for the main pass to use */
+                                    if (iface_sym && !child->sem_symbol) {
+                                        child->sem_symbol = iface_sym;
+                                    }
+                                    /* Also add to interfaces list now so nested types are accessible */
+                                    if (iface_sym && (iface_sym->kind == SYM_INTERFACE ||
+                                                      iface_sym->kind == SYM_CLASS)) {
+                                        bool dup = false;
+                                        for (slist_t *i = sym->data.class_data.interfaces; i; i = i->next) {
+                                            if (i->data == iface_sym) { dup = true; break; }
+                                        }
+                                        if (!dup) {
+                                            if (!sym->data.class_data.interfaces) {
+                                                sym->data.class_data.interfaces = slist_new(iface_sym);
+                                            } else {
+                                                slist_append(sym->data.class_data.interfaces, iface_sym);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             
                             /* Process type parameters (generics) using two-pass approach
                              * to handle self-referencing bounds like K, M extends Map<K, ?> */
@@ -5723,14 +6452,20 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                                 semantic_error(sem, child->line, child->column,
                                                     "interface expected here");
                                             }
-                                            /* Check for repeated interface */
+                                            /* Check for repeated interface.
+                                             * If pre-pass marked this AST node, it's already added - skip.
+                                             * Only report error if this is a DIFFERENT AST node for same interface. */
                                             bool duplicate = false;
+                                            bool was_prepass = (child->sem_symbol == iface_sym);
                                             for (slist_t *inode = sym->data.class_data.interfaces;
                                                  inode; inode = inode->next) {
                                                 if (inode->data == iface_sym) {
-                                                    semantic_error(sem, child->line, child->column,
-                                                        "repeated interface");
                                                     duplicate = true;
+                                                    if (!was_prepass) {
+                                                        /* Actual duplicate in source code */
+                                                        semantic_error(sem, child->line, child->column,
+                                                            "repeated interface");
+                                                    }
                                                     break;
                                                 }
                                             }
@@ -5959,6 +6694,25 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                             "throws clause not allowed in @interface members");
                                         break;
                                     }
+                                }
+                            }
+                            
+                            /* Interface methods are implicitly public (and abstract unless default/static/private) */
+                            if (kind == SYM_METHOD && 
+                                sem->current_class && 
+                                sem->current_class->kind == SYM_INTERFACE) {
+                                bool is_private = (sym->modifiers & MOD_PRIVATE) != 0;
+                                bool is_static = (sym->modifiers & MOD_STATIC) != 0;
+                                bool is_default = (sym->modifiers & MOD_DEFAULT) != 0;
+                                
+                                /* Non-private interface methods are implicitly public */
+                                if (!is_private) {
+                                    sym->modifiers |= MOD_PUBLIC;
+                                }
+                                
+                                /* Non-default, non-static, non-private interface methods are implicitly abstract */
+                                if (!is_default && !is_static && !is_private) {
+                                    sym->modifiers |= MOD_ABSTRACT;
                                 }
                             }
                             
@@ -6491,8 +7245,16 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                 anon_sym->data.class_data.anonymous_body = anon_body;
                                 
                                 /* Determine if in static context */
-                                bool in_static_context = !sem->current_method ||
-                                                         (sem->current_method->modifiers & MOD_STATIC);
+                                bool in_static_context = false;
+                                if (sem->current_method) {
+                                    in_static_context = (sem->current_method->modifiers & MOD_STATIC) != 0;
+                                } else {
+                                    /* Not inside a method - check if static field init */
+                                    in_static_context = sem->in_static_field_init;
+                                }
+                                if (sem->current_lambda != NULL) {
+                                    in_static_context = true;
+                                }
                                 anon_sym->modifiers = in_static_context ? MOD_STATIC : 0;
                                 
                                 /* Resolve base type */
@@ -6952,8 +7714,38 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     return field_sym->type;
                 }
                 
-                /* Could be a class reference - check types cache */
-                type_t *type = hashtable_lookup(sem->types, name);
+                /* Check for inherited field from superclass before falling back to class lookup.
+                 * This ensures 'sessionConfig' finds the field, not a class 'SessionConfig'. */
+                if (sem->current_class) {
+                    /* Determine if we're in static context */
+                    bool in_static = sem->in_static_field_init ||
+                        (sem->current_method && (sem->current_method->modifiers & MOD_STATIC));
+                    
+                    symbol_t *search_class = sem->current_class->data.class_data.superclass;
+                    while (search_class) {
+                        if (search_class->data.class_data.members) {
+                            symbol_t *inherited = scope_lookup_local(
+                                search_class->data.class_data.members, name);
+                            if (inherited && inherited->kind == SYM_FIELD &&
+                                !(inherited->modifiers & MOD_PRIVATE)) {
+                                /* Skip instance fields in static context */
+                                if ((inherited->modifiers & MOD_STATIC) || !in_static) {
+                                    expr->sem_symbol = inherited;
+                                    expr->sem_type = inherited->type;
+                                    return inherited->type;
+                                }
+                            }
+                        }
+                        search_class = search_class->data.class_data.superclass;
+                    }
+                }
+                
+                /* Could be a class reference - check per-compilation-unit scope first,
+                 * then global types cache */
+                type_t *type = hashtable_lookup(sem->unit_types, name);
+                if (!type) {
+                    type = hashtable_lookup(sem->types, name);
+                }
                 if (type) {
                     /* Set sem_symbol if we have a class symbol */
                     if (type->kind == TYPE_CLASS && type->data.class_type.symbol) {
@@ -6963,10 +7755,43 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     return type;
                 }
                 
-                /* Try resolving through imports first */
+                /* Check if it's a nested type of an implemented interface.
+                 * Walk up the enclosing class chain to check their interfaces too. */
+                {
+                    symbol_t *check_class = sem->current_class;
+                    while (check_class) {
+                        if (check_class->data.class_data.interfaces) {
+                            for (slist_t *iface = check_class->data.class_data.interfaces;
+                                 iface; iface = iface->next) {
+                                symbol_t *iface_sym = (symbol_t *)iface->data;
+                                if (iface_sym && (iface_sym->kind == SYM_INTERFACE ||
+                                                  iface_sym->kind == SYM_CLASS) &&
+                                    iface_sym->data.class_data.members) {
+                                    symbol_t *nested = scope_lookup_local(
+                                        iface_sym->data.class_data.members, name);
+                                    if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
+                                                   nested->kind == SYM_ENUM || nested->kind == SYM_RECORD) &&
+                                        nested->type) {
+                                        expr->sem_symbol = nested;
+                                        expr->sem_type = nested->type;
+                                        return nested->type;
+                                    }
+                                }
+                            }
+                        }
+                        check_class = check_class->data.class_data.enclosing_class;
+                    }
+                }
+                
+                /* Try resolving through imports */
                 char *qualified = resolve_import(sem, name);
                 if (qualified) {
-                    type = hashtable_lookup(sem->types, qualified);
+                    /* Check unit_types first (in case import was already cached there),
+                     * then global types cache */
+                    type = hashtable_lookup(sem->unit_types, qualified);
+                    if (!type) {
+                        type = hashtable_lookup(sem->types, qualified);
+                    }
                     if (type) {
                         if (type->kind == TYPE_CLASS && type->data.class_type.symbol) {
                             expr->sem_symbol = type->data.class_type.symbol;
@@ -6985,36 +7810,63 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     free(qualified);
                 }
                 
-                /* Check if it's an inherited field from superclass */
-                if (sem->current_class) {
-                    if (getenv("GENESIS_DEBUG_IFIELD")) {
-                        fprintf(stderr, "DEBUG inherited field '%s': current_class='%s' superclass=%p\n",
-                            name, sem->current_class->name ? sem->current_class->name : "(null)",
-                            (void*)sem->current_class->data.class_data.superclass);
-                    }
-                    symbol_t *search_class = sem->current_class->data.class_data.superclass;
-                    while (search_class) {
-                        if (getenv("GENESIS_DEBUG_IFIELD")) {
-                            fprintf(stderr, "DEBUG inherited field '%s': searching '%s' (members=%p)\n",
-                                name, search_class->name ? search_class->name : "(null)",
-                                (void*)search_class->data.class_data.members);
+                /* Check if it's an inherited field from superclass.
+                 * Also check enclosing class hierarchy for inner classes. */
+                {
+                    /* Start with current class, then walk enclosing classes */
+                    scope_t *class_scope = sem->current_scope;
+                    while (class_scope) {
+                        /* Find the enclosing class scope */
+                        while (class_scope && class_scope->type != SCOPE_CLASS) {
+                            class_scope = class_scope->parent;
                         }
-                        if (search_class->data.class_data.members) {
-                            symbol_t *field = scope_lookup_local(
-                                search_class->data.class_data.members, name);
+                        if (!class_scope || !class_scope->owner) break;
+                        
+                        symbol_t *class_sym = class_scope->owner;
+                        if (class_sym && (class_sym->kind == SYM_CLASS || 
+                                          class_sym->kind == SYM_ENUM ||
+                                          class_sym->kind == SYM_INTERFACE)) {
                             if (getenv("GENESIS_DEBUG_IFIELD")) {
-                                fprintf(stderr, "DEBUG inherited field '%s': lookup in '%s' returned %p (kind=%d)\n",
-                                    name, search_class->name ? search_class->name : "(null)",
-                                    (void*)field, field ? field->kind : -1);
+                                fprintf(stderr, "DEBUG inherited field '%s': checking class '%s'\n",
+                                    name, class_sym->name ? class_sym->name : "(null)");
                             }
-                            if (field && field->kind == SYM_FIELD) {
-                                /* Store as if it's our own field for codegen */
-                                expr->sem_symbol = field;
-                                expr->sem_type = field->type;
-                                return field->type;
+                            
+                            /* First check the class itself (for enclosing class fields) */
+                            if (class_sym != sem->current_class && class_sym->data.class_data.members) {
+                                symbol_t *field = scope_lookup_local(class_sym->data.class_data.members, name);
+                                if (field && field->kind == SYM_FIELD) {
+                                    expr->sem_symbol = field;
+                                    expr->sem_type = field->type;
+                                    return field->type;
+                                }
+                            }
+                            
+                            /* Then check superclass chain */
+                            symbol_t *search_class = class_sym->data.class_data.superclass;
+                            while (search_class) {
+                                if (getenv("GENESIS_DEBUG_IFIELD")) {
+                                    fprintf(stderr, "DEBUG inherited field '%s': searching superclass '%s' (members=%p)\n",
+                                        name, search_class->name ? search_class->name : "(null)",
+                                        (void*)search_class->data.class_data.members);
+                                }
+                                if (search_class->data.class_data.members) {
+                                    symbol_t *field = scope_lookup_local(
+                                        search_class->data.class_data.members, name);
+                                    if (field && field->kind == SYM_FIELD) {
+                                        /* Check access - inherited fields must be accessible */
+                                        if (!(field->modifiers & MOD_PRIVATE)) {
+                                            expr->sem_symbol = field;
+                                            expr->sem_type = field->type;
+                                            return field->type;
+                                        }
+                                    }
+                                }
+                                search_class = search_class->data.class_data.superclass;
                             }
                         }
-                        search_class = search_class->data.class_data.superclass;
+                        
+                        /* Move to enclosing scope */
+                        class_scope = class_scope->parent;
                     }
                 }
                 
@@ -7268,11 +8120,89 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 sem->current_class->data.class_data.members, recv_name);
                         }
                         
-                        /* Check the types cache as a fallback for nested types */
+                        /* Check the types cache as a fallback for nested types.
+                         * Check per-compilation-unit scope first, then global cache. */
                         if (!class_sym) {
-                            type_t *type = hashtable_lookup(sem->types, recv_name);
+                            type_t *type = hashtable_lookup(sem->unit_types, recv_name);
+                            if (!type) {
+                                type = hashtable_lookup(sem->types, recv_name);
+                            }
                             if (type && type->kind == TYPE_CLASS && type->data.class_type.symbol) {
                                 class_sym = type->data.class_type.symbol;
+                            }
+                        }
+                        
+                        /* Check superclass chain and their interfaces for inherited nested types.
+                         * This handles cases like SimpleJavaFileObject extends JavaFileObject,
+                         * where JavaFileObject.Kind should be accessible as just "Kind". */
+                        if (!class_sym && sem->current_class) {
+                            symbol_t *check_class = sem->current_class;
+                            
+                            /* Check current class and all enclosing classes */
+                            while (check_class && !class_sym) {
+                                /* Check superclass chain of this class */
+                                symbol_t *super = check_class->data.class_data.superclass;
+                                while (super && !class_sym) {
+                                    /* Check superclass members for nested type */
+                                    if (super->data.class_data.members) {
+                                        symbol_t *nested = scope_lookup_local(
+                                            super->data.class_data.members, recv_name);
+                                        if (nested && (nested->kind == SYM_CLASS ||
+                                                       nested->kind == SYM_INTERFACE ||
+                                                       nested->kind == SYM_ENUM ||
+                                                       nested->kind == SYM_RECORD)) {
+                                            class_sym = nested;
+                                            break;
+                                        }
+                                    }
+                                    
+                                    /* Check interfaces of this superclass */
+                                    for (slist_t *iface = super->data.class_data.interfaces;
+                                         iface && !class_sym; iface = iface->next) {
+                                        symbol_t *iface_sym = (symbol_t *)iface->data;
+                                        if (iface_sym && iface_sym->data.class_data.members) {
+                                            symbol_t *nested = scope_lookup_local(
+                                                iface_sym->data.class_data.members, recv_name);
+                                            if (nested && (nested->kind == SYM_CLASS ||
+                                                           nested->kind == SYM_INTERFACE ||
+                                                           nested->kind == SYM_ENUM ||
+                                                           nested->kind == SYM_RECORD)) {
+                                                class_sym = nested;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    
+                                    super = super->data.class_data.superclass;
+                                }
+                                
+                                /* Check directly implemented interfaces of this class */
+                                if (!class_sym && check_class->data.class_data.interfaces) {
+                                    for (slist_t *iface = check_class->data.class_data.interfaces;
+                                         iface; iface = iface->next) {
+                                        symbol_t *iface_sym = (symbol_t *)iface->data;
+                                        if (iface_sym && (iface_sym->kind == SYM_INTERFACE ||
+                                                          iface_sym->kind == SYM_CLASS) &&
+                                            iface_sym->data.class_data.members) {
+                                            symbol_t *nested = scope_lookup_local(
+                                                iface_sym->data.class_data.members, recv_name);
+                                            if (getenv("GENESIS_DEBUG_MCALL")) {
+                                                fprintf(stderr, "DEBUG mcall: looked up '%s' in interface '%s' -> %p\n",
+                                                    recv_name, iface_sym->name ? iface_sym->name : "(null)",
+                                                    (void*)nested);
+                                            }
+                                            if (nested && (nested->kind == SYM_CLASS ||
+                                                           nested->kind == SYM_INTERFACE ||
+                                                           nested->kind == SYM_ENUM ||
+                                                           nested->kind == SYM_RECORD)) {
+                                                class_sym = nested;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                
+                                check_class = check_class->data.class_data.enclosing_class;
                             }
                         }
                         
@@ -7306,6 +8236,14 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             first->sem_symbol = class_sym;
                             first->sem_type = class_sym->type;
                             
+                            if (getenv("GENESIS_DEBUG_MCALL")) {
+                                fprintf(stderr, "DEBUG mcall: target_class='%s' (kind=%d, members=%p) for method '%s'\n",
+                                    class_sym->name ? class_sym->name : "(null)",
+                                    class_sym->kind,
+                                    (void*)class_sym->data.class_data.members,
+                                    method_name);
+                            }
+                            
                             /* For enums, synthesize values() and valueOf() return types */
                             if (class_sym->kind == SYM_ENUM) {
                                 if (strcmp(method_name, "values") == 0) {
@@ -7324,6 +8262,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 slist_t *args = children->next;
                                 symbol_t *method = scope_lookup_method_with_types(sem,
                                     class_sym->data.class_data.members, method_name, args);
+                                if (getenv("GENESIS_DEBUG_MCALL")) {
+                                    fprintf(stderr, "DEBUG mcall: scope_lookup_method_with_types for '%s' -> %p\n",
+                                        method_name, (void*)method);
+                                }
                                 if (method && method->kind == SYM_METHOD) {
                                     found_method = method;
                                 }
@@ -7709,6 +8651,27 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 enum_class->data.class_data.members, method_name, method_args);
                         }
                     }
+                    
+                    /* Check interfaces of current class and superclass chain for default methods */
+                    if (!found_method) {
+                        symbol_t *check_class = target_class;
+                        while (check_class && !found_method) {
+                            /* Check interfaces implemented by this class */
+                            for (slist_t *iface = check_class->data.class_data.interfaces;
+                                 iface && !found_method; iface = iface->next) {
+                                symbol_t *iface_sym = (symbol_t *)iface->data;
+                                if (iface_sym && iface_sym->data.class_data.members) {
+                                    found_method = scope_lookup_method_with_types(sem,
+                                        iface_sym->data.class_data.members, method_name, method_args);
+                                }
+                                /* Also check superinterfaces recursively */
+                                if (!found_method && iface_sym) {
+                                    found_method = lookup_method_in_interfaces(sem, iface_sym, method_name);
+                                }
+                            }
+                            check_class = check_class->data.class_data.superclass;
+                        }
+                    }
                 }
                 
                 /* If not found and we're in a nested class without explicit receiver,
@@ -7789,6 +8752,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     type_t *inferred_T = NULL;  /* For type variable T (most common) */
                     type_t *inferred_R = NULL;  /* For type variable R (Function return type) */
                     type_t *inferred_E = NULL;  /* For type variable E (collection element) */
+                    type_t *inferred_A = NULL;  /* For type variable A (Files.readAttributes etc) */
                     
                     /* Check each argument type */
                     slist_t *param_node = params;
@@ -7817,15 +8781,18 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             bind_type = param_type->data.array_type.element_type;
                         }
                         
-                        /* Substitute inferred type argument if bind_type is a type variable */
-                        if (bind_type && bind_type->kind == TYPE_TYPEVAR && inferred_type_arg) {
-                            bind_type = inferred_type_arg;
+                        /* Substitute inferred type argument if bind_type is a type variable.
+                         * Only use target-inferred type for lambda/method ref binding.
+                         * For regular arguments, we'll infer from the argument type instead. */
+                        type_t *bind_type_for_lambda = bind_type;
+                        if (bind_type_for_lambda && bind_type_for_lambda->kind == TYPE_TYPEVAR && inferred_type_arg) {
+                            bind_type_for_lambda = inferred_type_arg;
                         }
                         /* Also substitute if bind_type is an array of a type variable (e.g., T[]) */
-                        else if (bind_type && bind_type->kind == TYPE_ARRAY && inferred_type_arg) {
-                            type_t *elem_type = bind_type->data.array_type.element_type;
+                        else if (bind_type_for_lambda && bind_type_for_lambda->kind == TYPE_ARRAY && inferred_type_arg) {
+                            type_t *elem_type = bind_type_for_lambda->data.array_type.element_type;
                             if (elem_type && elem_type->kind == TYPE_TYPEVAR) {
-                                bind_type = type_new_array(inferred_type_arg, bind_type->data.array_type.dimensions);
+                                bind_type_for_lambda = type_new_array(inferred_type_arg, bind_type_for_lambda->data.array_type.dimensions);
                             }
                         }
                         
@@ -7836,10 +8803,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                unwrapped_arg->data.node.children) {
                             unwrapped_arg = (ast_node_t *)unwrapped_arg->data.node.children->data;
                         }
-                        if (unwrapped_arg->type == AST_LAMBDA_EXPR && bind_type) {
-                            bind_lambda_to_target_type(sem, unwrapped_arg, bind_type);
-                        } else if (unwrapped_arg->type == AST_METHOD_REF && bind_type) {
-                            bind_method_ref_to_target_type(sem, unwrapped_arg, bind_type);
+                        if (unwrapped_arg->type == AST_LAMBDA_EXPR && bind_type_for_lambda) {
+                            bind_lambda_to_target_type(sem, unwrapped_arg, bind_type_for_lambda);
+                        } else if (unwrapped_arg->type == AST_METHOD_REF && bind_type_for_lambda) {
+                            bind_method_ref_to_target_type(sem, unwrapped_arg, bind_type_for_lambda);
                         }
                         
                         type_t *arg_type = get_expression_type(sem, arg);
@@ -7861,6 +8828,9 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                             if (!inferred_R) {
                                 inferred_R = infer_type_arg(infer_from, arg_type, "R");
+                            }
+                            if (!inferred_A) {
+                                inferred_A = infer_type_arg(infer_from, arg_type, "A");
                             }
                         }
                         
@@ -7887,8 +8857,11 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 break;
                             }
                             
-                            /* Check element type for individual varargs */
-                            if (bind_type && arg_type && !type_assignable(bind_type, arg_type)) {
+                            /* Check element type for individual varargs.
+                             * Skip check if bind_type is a type variable - the type will be
+                             * inferred from the argument type instead of checked against it. */
+                            if (bind_type && bind_type->kind != TYPE_TYPEVAR &&
+                                arg_type && !type_assignable(bind_type, arg_type)) {
                                 char *expected = type_to_string(bind_type);
                                 char *actual = type_to_string(arg_type);
                                 semantic_error(sem, arg->line, arg->column,
@@ -7973,6 +8946,9 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         }
                         if (inferred_R) {
                             return_type = substitute_type_var(return_type, "R", inferred_R);
+                        }
+                        if (inferred_A) {
+                            return_type = substitute_type_var(return_type, "A", inferred_A);
                         }
                     }
                     
@@ -8109,7 +9085,24 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                          * This prevents "server.field" from being confused with "Server.field" when
                          * there's a parameter named 'server' and a class named 'Server'. */
                         symbol_t *local_sym = scope_lookup(sem->current_scope, first_part);
-                        if (local_sym && (local_sym->kind == SYM_LOCAL_VAR || 
+                        
+                        /* Check for local nested types FIRST (class/enum/interface/record).
+                         * This handles inner classes/enums being referenced before imports are checked.
+                         * E.g., "State.IDLE" where State is a nested enum in the current class. */
+                        if (local_sym && (local_sym->kind == SYM_CLASS ||
+                                          local_sym->kind == SYM_INTERFACE ||
+                                          local_sym->kind == SYM_ENUM ||
+                                          local_sym->kind == SYM_RECORD)) {
+                            /* Found a local nested type - use it directly, skipping import resolution */
+                            resolved_class = local_sym;
+                            remaining_parts = parts->next;
+                            if (root_node && root_node->type == AST_IDENTIFIER) {
+                                root_node->sem_symbol = local_sym;
+                                root_node->sem_type = local_sym->type;
+                            }
+                            /* Jump to field lookup below */
+                        }
+                        else if (local_sym && (local_sym->kind == SYM_LOCAL_VAR || 
                                           local_sym->kind == SYM_PARAMETER ||
                                           local_sym->kind == SYM_FIELD)) {
                             /* It's a local variable, parameter, or field reference.
@@ -8123,27 +9116,69 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             goto normal_field_access;
                         }
                         
-                        /* First, check if the first part is a nested type of an implemented interface.
-                         * This handles cases like "Type.TCP" where Type is defined in ChannelHandler. */
+                        /* First, check if the first part is a nested type of an implemented interface
+                         * OR a nested type inherited from the superclass chain.
+                         * This handles cases like "Type.TCP" where Type is defined in ChannelHandler,
+                         * or "Kind.SOURCE" where Kind is JavaFileObject$Kind inherited via SimpleJavaFileObject.
+                         * Skip if we already found it as a local nested type. */
                         symbol_t *first_sym = NULL;
-                        if (sem->current_class && sem->current_class->data.class_data.interfaces) {
-                            for (slist_t *iface = sem->current_class->data.class_data.interfaces;
-                                 iface && !first_sym; iface = iface->next) {
-                                symbol_t *iface_sym = (symbol_t *)iface->data;
-                                if (iface_sym && iface_sym->data.class_data.members) {
-                                    first_sym = scope_lookup_local(
-                                        iface_sym->data.class_data.members, first_part);
-                                    if (first_sym && !(first_sym->kind == SYM_CLASS ||
-                                                       first_sym->kind == SYM_INTERFACE ||
-                                                       first_sym->kind == SYM_ENUM)) {
-                                        first_sym = NULL;  /* Not a type, ignore */
+                        if (!resolved_class && sem->current_class) {
+                            /* Check superclass chain and their interfaces */
+                            symbol_t *check_class = sem->current_class;
+                            while (check_class && !first_sym) {
+                                /* Check superclass chain */
+                                symbol_t *super = check_class->data.class_data.superclass;
+                                while (super && !first_sym) {
+                                    /* Check superclass members */
+                                    if (super->data.class_data.members) {
+                                        first_sym = scope_lookup_local(
+                                            super->data.class_data.members, first_part);
+                                        if (first_sym && !(first_sym->kind == SYM_CLASS ||
+                                                           first_sym->kind == SYM_INTERFACE ||
+                                                           first_sym->kind == SYM_ENUM)) {
+                                            first_sym = NULL;  /* Not a type, ignore */
+                                        }
+                                    }
+                                    
+                                    /* Check interfaces of this superclass */
+                                    for (slist_t *iface = super->data.class_data.interfaces;
+                                         iface && !first_sym; iface = iface->next) {
+                                        symbol_t *iface_sym = (symbol_t *)iface->data;
+                                        if (iface_sym && iface_sym->data.class_data.members) {
+                                            first_sym = scope_lookup_local(
+                                                iface_sym->data.class_data.members, first_part);
+                                            if (first_sym && !(first_sym->kind == SYM_CLASS ||
+                                                               first_sym->kind == SYM_INTERFACE ||
+                                                               first_sym->kind == SYM_ENUM)) {
+                                                first_sym = NULL;  /* Not a type, ignore */
+                                            }
+                                        }
+                                    }
+                                    
+                                    super = super->data.class_data.superclass;
+                                }
+                                
+                                /* Check directly implemented interfaces */
+                                for (slist_t *iface = check_class->data.class_data.interfaces;
+                                     iface && !first_sym; iface = iface->next) {
+                                    symbol_t *iface_sym = (symbol_t *)iface->data;
+                                    if (iface_sym && iface_sym->data.class_data.members) {
+                                        first_sym = scope_lookup_local(
+                                            iface_sym->data.class_data.members, first_part);
+                                        if (first_sym && !(first_sym->kind == SYM_CLASS ||
+                                                           first_sym->kind == SYM_INTERFACE ||
+                                                           first_sym->kind == SYM_ENUM)) {
+                                            first_sym = NULL;  /* Not a type, ignore */
+                                        }
                                     }
                                 }
+                                
+                                check_class = check_class->data.class_data.enclosing_class;
                             }
                         }
                         
-                        /* Then try import resolution */
-                        if (!first_sym) {
+                        /* Then try import resolution (skip if we already found the type) */
+                        if (!resolved_class && !first_sym) {
                             char *qualified_first = resolve_import(sem, first_part);
                         
                         if (getenv("GENESIS_DEBUG_LOAD")) {
@@ -8161,7 +9196,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                         }
                         
-                        if (first_sym && (first_sym->kind == SYM_CLASS || 
+                        if (!resolved_class && first_sym && (first_sym->kind == SYM_CLASS || 
                             first_sym->kind == SYM_INTERFACE || first_sym->kind == SYM_ENUM)) {
                             /* First part resolves to a class, now find nested classes */
                             resolved_class = first_sym;
@@ -8744,10 +9779,20 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     anon_sym->qualified_name = strdup(anon_name);
                     
                     /* Anonymous classes in static contexts are implicitly static */
-                    /* Static context means: static method, static initializer, or inside a static lambda */
-                    bool in_static_context = (sem->current_method == NULL) ||  /* static initializer */
-                                            (sem->current_method->modifiers & MOD_STATIC) ||  /* static method */
-                                            (sem->current_lambda != NULL);  /* inside lambda (lambdas are static methods) */
+                    /* Static context means: static method, static field initializer, or inside a static lambda */
+                    bool in_static_context = false;
+                    if (sem->current_method) {
+                        /* Inside a method - check if static method */
+                        in_static_context = (sem->current_method->modifiers & MOD_STATIC) != 0;
+                    } else {
+                        /* Not inside a method - either field initializer or static initializer block.
+                         * Check in_static_field_init flag set during field processing. */
+                        in_static_context = sem->in_static_field_init;
+                    }
+                    /* Lambdas generate static methods, so anonymous classes inside them are static */
+                    if (sem->current_lambda != NULL) {
+                        in_static_context = true;
+                    }
                     anon_sym->modifiers = in_static_context ? MOD_STATIC : 0;
                     anon_sym->data.class_data.enclosing_class = sem->current_class;
                     anon_sym->data.class_data.enclosing_method = sem->current_method;
@@ -9049,18 +10094,19 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 slist_t *children = expr->data.node.children;
                 if (children) {
                     type_t *elem = semantic_resolve_type(sem, children->data);
-                    /* Count dimensions from the expression */
-                    int dims = 0;
+                    
+                    /* Get total dimensions from flags (set by parser).
+                     * This includes empty brackets like in new byte[3][]. */
+                    int dims = (int)expr->data.node.flags;
+                    
+                    /* Find initializer if present */
                     ast_node_t *initializer = NULL;
-                    slist_t *c = children->next;
-                    while (c) {
+                    for (slist_t *c = children->next; c; c = c->next) {
                         ast_node_t *child = c->data;
                         if (child->type == AST_ARRAY_INIT) {
                             initializer = child;
-                        } else {
-                            dims++;
+                            break;
                         }
-                        c = c->next;
                     }
                     
                     /* Check for missing array dimensions */
@@ -9262,8 +10308,15 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
             }
         
         case AST_INSTANCEOF_EXPR:
-            /* instanceof always returns boolean */
-            return type_new_primitive(TYPE_BOOLEAN);
+            {
+                /* Process the left-hand expression to trigger variable capture detection */
+                slist_t *children = expr->data.node.children;
+                if (children) {
+                    get_expression_type(sem, (ast_node_t *)children->data);
+                }
+                /* instanceof always returns boolean */
+                return type_new_primitive(TYPE_BOOLEAN);
+            }
         
         case AST_CAST_EXPR:
             {
@@ -11936,6 +12989,11 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                             slist_t *children = node->data.node.children;
                             type_t *field_type = NULL;
                             
+                            /* Track if we're in a static field initializer.
+                             * This affects whether anonymous classes created here are static. */
+                            bool saved_static_field_init = sem->in_static_field_init;
+                            sem->in_static_field_init = (node->data.node.flags & MOD_STATIC) != 0;
+                            
                             if (children && ((ast_node_t *)children->data)->type != AST_VAR_DECLARATOR) {
                                 field_type = semantic_resolve_type(sem, children->data);
                                 children = children->next;
@@ -11989,6 +13047,8 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                 }
                                 children = children->next;
                             }
+                            
+                            sem->in_static_field_init = saved_static_field_init;
                         }
                         break;
                     
@@ -12674,7 +13734,15 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                 /* Ensure symbols loaded for proper subtype checking */
                                 ensure_type_symbol_loaded(sem, right_type);
                                 
-                                if (!type_assignable(left_type, right_type) &&
+                                /* Compound assignment operators (+=, -=, |=, etc.) include
+                                 * an implicit cast, so b |= 0x80 is valid even though the
+                                 * RHS operation produces int. Only check types for simple
+                                 * assignment (TOK_ASSIGN). */
+                                token_type_t op = node->data.node.op_token;
+                                bool is_compound = (op != TOK_ASSIGN && op != 0);
+                                
+                                if (!is_compound &&
+                                    !type_assignable(left_type, right_type) &&
                                     !narrowing_constant_allowed(left_type, right, right_type)) {
                                     char *left_str = type_to_string(left_type);
                                     char *right_str = type_to_string(right_type);
@@ -13006,6 +14074,14 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                             /* Track switch depth for break validation */
                             sem->switch_depth++;
                             
+                            /* Create a new scope for the switch statement body.
+                             * Each switch statement (including nested ones) gets its own scope
+                             * so variables declared in different switch blocks don't conflict. */
+                            scope_t *switch_scope = scope_new(SCOPE_BLOCK, sem->current_scope);
+                            frame->saved_scope = sem->current_scope;
+                            sem->current_scope = switch_scope;
+                            frame->extra = switch_scope;
+                            
                             /* Switch statement: check if selector is enum type
                              * If so, resolve case label identifiers as enum constants.
                              * Also check for duplicate case labels. */
@@ -13138,9 +14214,30 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                                 /* Must be a constant (final static field or enum constant) */
                                                 const char *name = case_expr->data.leaf.name;
                                                 symbol_t *sym = scope_lookup(sem->current_scope, name);
+                                                
+                                                /* If not found in scope, try current class members (for interface constants) */
+                                                if (!sym && sem->current_class && sem->current_class->data.class_data.members) {
+                                                    sym = scope_lookup_local(sem->current_class->data.class_data.members, name);
+                                                }
+                                                
+                                                /* Also check implemented interfaces for constants */
+                                                if (!sym && sem->current_class) {
+                                                    slist_t *ifaces = sem->current_class->data.class_data.interfaces;
+                                                    for (slist_t *i = ifaces; i && !sym; i = i->next) {
+                                                        symbol_t *iface = (symbol_t *)i->data;
+                                                        if (iface && iface->data.class_data.members) {
+                                                            sym = scope_lookup_local(iface->data.class_data.members, name);
+                                                        }
+                                                    }
+                                                }
+                                                
                                                 if (sym && sym->kind == SYM_FIELD) {
-                                                    /* Check if it's final (constant expression) */
-                                                    if (!(sym->modifiers & MOD_FINAL)) {
+                                                    /* Check if it's final (constant expression).
+                                                     * Interface fields are implicitly final but may not have MOD_FINAL
+                                                     * if declared in a source file that's not fully processed. */
+                                                    bool is_interface_field = (sem->current_class && 
+                                                                              sem->current_class->kind == SYM_INTERFACE);
+                                                    if (!is_interface_field && !(sym->modifiers & MOD_FINAL)) {
                                                         semantic_error(sem, case_expr->line, case_expr->column,
                                                             "constant expression required");
                                                     }
@@ -13271,7 +14368,13 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                             if (children) {
                                 ast_node_t *condition = (ast_node_t *)children->data;
                                 type_t *cond_type = get_expression_type(sem, condition);
-                                if (cond_type && cond_type->kind != TYPE_BOOLEAN) {
+                                /* Allow boolean or java.lang.Boolean (auto-unboxing) */
+                                bool is_boolean = cond_type && 
+                                    (cond_type->kind == TYPE_BOOLEAN ||
+                                     (cond_type->kind == TYPE_CLASS && 
+                                      cond_type->data.class_type.name &&
+                                      strcmp(cond_type->data.class_type.name, "java.lang.Boolean") == 0));
+                                if (cond_type && !is_boolean) {
                                     char *type_str = type_to_string(cond_type);
                                     semantic_error(sem, condition->line, condition->column,
                                         "ternary condition must be boolean, got %s", type_str);
@@ -13455,6 +14558,10 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                     
                     case AST_SWITCH_STMT:
                         sem->switch_depth--;
+                        /* Restore scope from before the switch */
+                        if (frame->saved_scope) {
+                            sem->current_scope = frame->saved_scope;
+                        }
                         break;
                     
                     default:
@@ -13495,6 +14602,26 @@ bool semantic_analyze(semantic_t *sem, ast_node_t *ast, source_file_t *source)
     sem->current_method = NULL;
     free(sem->current_package);
     sem->current_package = NULL;
+    
+    /* Clear per-compilation-unit type scope (like javac's toplevelScope).
+     * This ensures simple names from previous files don't pollute the current file.
+     * For parallel compilation, each thread would have its own semantic_t with
+     * its own unit_types, so no synchronization is needed. */
+    if (sem->unit_types) {
+        /* Clear the hashtable instead of freeing and reallocating.
+         * This avoids potential memory issues with frequent reallocation. */
+        for (size_t i = 0; i < sem->unit_types->size; i++) {
+            hashtable_entry_t *entry = sem->unit_types->buckets[i];
+            while (entry) {
+                hashtable_entry_t *next = entry->next;
+                free(entry->key);
+                free(entry);
+                entry = next;
+            }
+            sem->unit_types->buckets[i] = NULL;
+        }
+        sem->unit_types->count = 0;
+    }
     
     /* Pass 1: Collect all declarations */
     pass1_collect_declarations(sem, ast);

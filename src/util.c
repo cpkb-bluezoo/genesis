@@ -235,6 +235,42 @@ hashtable_t *hashtable_new(void)
 }
 
 /**
+ * Create a new hash table with pre-allocated size.
+ * This avoids expensive rehashing when the expected number of items is known.
+ * The actual size will be rounded up to avoid high load factor.
+ */
+hashtable_t *hashtable_new_sized(size_t expected_items)
+{
+    hashtable_t *ht = malloc(sizeof(hashtable_t));
+    if (!ht) {
+        return NULL;
+    }
+    
+    /* Size to achieve ~50% load factor for better performance */
+    size_t target_size = expected_items * 2;
+    if (target_size < HASHTABLE_INITIAL_SIZE) {
+        target_size = HASHTABLE_INITIAL_SIZE;
+    }
+    
+    /* Round up to power of 2 for efficient modulo */
+    size_t size = HASHTABLE_INITIAL_SIZE;
+    while (size < target_size) {
+        size *= 2;
+    }
+    
+    ht->size = size;
+    ht->count = 0;
+    ht->buckets = calloc(ht->size, sizeof(hashtable_entry_t *));
+    
+    if (!ht->buckets) {
+        free(ht);
+        return NULL;
+    }
+    
+    return ht;
+}
+
+/**
  * Free a hash table (not values).
  */
 void hashtable_free(hashtable_t *ht)
@@ -1007,3 +1043,352 @@ bool parse_boolean(const char *str, bool default_value)
     return default_value;
 }
 
+/* ========================================================================
+ * String Interning implementation
+ * ======================================================================== */
+
+#define INTERN_INITIAL_BUFFER_SIZE (1024 * 1024)  /* 1MB initial buffer */
+#define INTERN_INITIAL_INDEX_SIZE 8192            /* Initial hashtable size */
+
+/**
+ * Create a new intern table.
+ */
+intern_table_t *intern_table_new(void)
+{
+    intern_table_t *table = malloc(sizeof(intern_table_t));
+    if (!table) {
+        return NULL;
+    }
+    
+    table->buffer_size = INTERN_INITIAL_BUFFER_SIZE;
+    table->buffer_used = 0;
+    table->buffer = malloc(table->buffer_size);
+    if (!table->buffer) {
+        free(table);
+        return NULL;
+    }
+    
+    table->index = hashtable_new_sized(INTERN_INITIAL_INDEX_SIZE);
+    if (!table->index) {
+        free(table->buffer);
+        free(table);
+        return NULL;
+    }
+    
+    return table;
+}
+
+/**
+ * Free an intern table.
+ */
+void intern_table_free(intern_table_t *table)
+{
+    if (!table) {
+        return;
+    }
+    
+    /* Note: we don't free individual strings - they're all in the buffer */
+    hashtable_free(table->index);
+    free(table->buffer);
+    free(table);
+}
+
+/**
+ * Grow the intern table buffer.
+ */
+static bool intern_table_grow(intern_table_t *table, size_t needed)
+{
+    size_t new_size = table->buffer_size;
+    while (new_size < table->buffer_used + needed) {
+        new_size *= 2;
+    }
+    
+    char *new_buffer = realloc(table->buffer, new_size);
+    if (!new_buffer) {
+        return false;
+    }
+    
+    /* If buffer moved, we need to update all hashtable entries */
+    if (new_buffer != table->buffer) {
+        ptrdiff_t delta = new_buffer - table->buffer;
+        
+        /* Update all values in the hashtable (they are char* pointers) */
+        for (size_t i = 0; i < table->index->size; i++) {
+            hashtable_entry_t *entry = table->index->buckets[i];
+            while (entry) {
+                /* The value is a pointer into the old buffer - adjust it */
+                char *old_ptr = (char *)entry->value;
+                entry->value = old_ptr + delta;
+                entry = entry->next;
+            }
+        }
+    }
+    
+    table->buffer = new_buffer;
+    table->buffer_size = new_size;
+    return true;
+}
+
+/**
+ * Intern a string with known length.
+ */
+const char *intern_string_len(intern_table_t *table, const char *str, size_t len)
+{
+    if (!table || !str) {
+        return NULL;
+    }
+    
+    /* Create a temporary null-terminated copy for lookup */
+    char temp_key[256];
+    char *lookup_key;
+    bool free_key = false;
+    
+    if (len < sizeof(temp_key)) {
+        memcpy(temp_key, str, len);
+        temp_key[len] = '\0';
+        lookup_key = temp_key;
+    } else {
+        lookup_key = malloc(len + 1);
+        if (!lookup_key) {
+            return NULL;
+        }
+        memcpy(lookup_key, str, len);
+        lookup_key[len] = '\0';
+        free_key = true;
+    }
+    
+    /* Check if already interned */
+    const char *existing = (const char *)hashtable_lookup(table->index, lookup_key);
+    if (existing) {
+        if (free_key) {
+            free(lookup_key);
+        }
+        return existing;
+    }
+    
+    /* Need to add to buffer */
+    size_t needed = len + 1;  /* +1 for null terminator */
+    
+    if (table->buffer_used + needed > table->buffer_size) {
+        if (!intern_table_grow(table, needed)) {
+            if (free_key) {
+                free(lookup_key);
+            }
+            return NULL;
+        }
+    }
+    
+    /* Copy string to buffer */
+    char *interned = table->buffer + table->buffer_used;
+    memcpy(interned, str, len);
+    interned[len] = '\0';
+    table->buffer_used += needed;
+    
+    /* Add to index - the key is the interned string itself (saves a copy) */
+    hashtable_insert(table->index, interned, interned);
+    
+    if (free_key) {
+        free(lookup_key);
+    }
+    return interned;
+}
+
+/**
+ * Intern a null-terminated string.
+ */
+const char *intern_string(intern_table_t *table, const char *str)
+{
+    if (!str) {
+        return NULL;
+    }
+    return intern_string_len(table, str, strlen(str));
+}
+
+/* Global intern table */
+static intern_table_t *g_intern_table = NULL;
+
+/**
+ * Initialize the global intern table.
+ */
+void intern_init(void)
+{
+    if (!g_intern_table) {
+        g_intern_table = intern_table_new();
+    }
+}
+
+/**
+ * Clean up the global intern table.
+ */
+void intern_cleanup(void)
+{
+    if (g_intern_table) {
+        intern_table_free(g_intern_table);
+        g_intern_table = NULL;
+    }
+}
+
+/**
+ * Intern a string using the global table.
+ */
+const char *intern(const char *str)
+{
+    if (!g_intern_table) {
+        intern_init();
+    }
+    return intern_string(g_intern_table, str);
+}
+
+/**
+ * Intern a string with known length using the global table.
+ */
+const char *intern_len(const char *str, size_t len)
+{
+    if (!g_intern_table) {
+        intern_init();
+    }
+    return intern_string_len(g_intern_table, str, len);
+}
+
+/* ========================================================================
+ * Memory Pool (Arena Allocator) implementation
+ * ======================================================================== */
+
+#define POOL_DEFAULT_BLOCK_SIZE (256 * 1024)  /* 256KB default block */
+#define POOL_ALIGNMENT 8                       /* Default alignment */
+
+/**
+ * Allocate a new pool block.
+ */
+static pool_block_t *pool_block_new(size_t size)
+{
+    pool_block_t *block = malloc(sizeof(pool_block_t) + size);
+    if (!block) {
+        return NULL;
+    }
+    block->next = NULL;
+    block->size = size;
+    block->used = 0;
+    return block;
+}
+
+/**
+ * Create a new memory pool.
+ */
+memory_pool_t *pool_new(size_t block_size)
+{
+    memory_pool_t *pool = malloc(sizeof(memory_pool_t));
+    if (!pool) {
+        return NULL;
+    }
+    
+    pool->block_size = block_size > 0 ? block_size : POOL_DEFAULT_BLOCK_SIZE;
+    pool->total_allocated = 0;
+    
+    /* Allocate first block */
+    pool->blocks = pool_block_new(pool->block_size);
+    if (!pool->blocks) {
+        free(pool);
+        return NULL;
+    }
+    pool->current = pool->blocks;
+    
+    return pool;
+}
+
+/**
+ * Free all memory in the pool.
+ */
+void pool_free(memory_pool_t *pool)
+{
+    if (!pool) {
+        return;
+    }
+    
+    /* Free all blocks */
+    pool_block_t *block = pool->blocks;
+    while (block) {
+        pool_block_t *next = block->next;
+        free(block);
+        block = next;
+    }
+    
+    free(pool);
+}
+
+/**
+ * Reset the pool for reuse.
+ * Keeps allocated blocks but marks them as empty.
+ */
+void pool_reset(memory_pool_t *pool)
+{
+    if (!pool) {
+        return;
+    }
+    
+    /* Reset all blocks */
+    for (pool_block_t *block = pool->blocks; block; block = block->next) {
+        block->used = 0;
+    }
+    
+    pool->current = pool->blocks;
+    pool->total_allocated = 0;
+}
+
+/**
+ * Allocate memory from the pool with specific alignment.
+ */
+void *pool_alloc_aligned(memory_pool_t *pool, size_t size, size_t alignment)
+{
+    if (!pool || size == 0) {
+        return NULL;
+    }
+    
+    pool_block_t *block = pool->current;
+    
+    /* Calculate aligned offset */
+    size_t offset = block->used;
+    size_t aligned_offset = (offset + alignment - 1) & ~(alignment - 1);
+    
+    /* Check if current block has enough space */
+    if (aligned_offset + size > block->size) {
+        /* Need a new block */
+        size_t new_block_size = pool->block_size;
+        if (size > new_block_size) {
+            /* Allocation is larger than default block - make block bigger */
+            new_block_size = size + alignment;
+        }
+        
+        pool_block_t *new_block = pool_block_new(new_block_size);
+        if (!new_block) {
+            return NULL;
+        }
+        
+        /* Insert at head of block list (after current) */
+        new_block->next = block->next;
+        block->next = new_block;
+        pool->current = new_block;
+        block = new_block;
+        
+        /* Recalculate alignment in new block */
+        aligned_offset = 0;
+    }
+    
+    /* Allocate from current block */
+    void *ptr = block->data + aligned_offset;
+    block->used = aligned_offset + size;
+    pool->total_allocated += size;
+    
+    /* Zero-initialize */
+    memset(ptr, 0, size);
+    
+    return ptr;
+}
+
+/**
+ * Allocate memory from the pool (default alignment).
+ */
+void *pool_alloc(memory_pool_t *pool, size_t size)
+{
+    return pool_alloc_aligned(pool, size, POOL_ALIGNMENT);
+}

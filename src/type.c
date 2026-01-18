@@ -434,14 +434,26 @@ static bool class_names_equal(const char *name1, const char *name2)
     /* Check if one is java.lang.X and other is just X */
     const char *simple1 = strrchr(name1, '.');
     const char *dollar1 = strrchr(name1, '$');
-    if (dollar1 > simple1) simple1 = dollar1;
+    if (dollar1 > simple1) {
+        simple1 = dollar1;
+    }
     
     const char *simple2 = strrchr(name2, '.');
     const char *dollar2 = strrchr(name2, '$');
-    if (dollar2 > simple2) simple2 = dollar2;
+    if (dollar2 > simple2) {
+        simple2 = dollar2;
+    }
     
-    if (simple1) simple1++; else simple1 = name1;
-    if (simple2) simple2++; else simple2 = name2;
+    if (simple1) {
+        simple1++;
+    } else {
+        simple1 = name1;
+    }
+    if (simple2) {
+        simple2++;
+    } else {
+        simple2 = name2;
+    }
     
     /* If simple names match, check if qualified is java.lang.* */
     if (strcmp(simple1, simple2) == 0) {
@@ -559,7 +571,9 @@ const char *get_wrapper_class(type_kind_t kind)
  */
 type_t *type_boxed(type_t *type)
 {
-    if (!type) return type;
+    if (!type) {
+        return type;
+    }
     
     const char *wrapper = get_wrapper_class(type->kind);
     if (wrapper) {
@@ -808,7 +822,9 @@ bool type_assignable(type_t *target, type_t *source)
     if (target->kind == TYPE_CLASS && 
         (source->kind >= TYPE_BOOLEAN && source->kind <= TYPE_DOUBLE)) {
         const char *target_name = target->data.class_type.name;
-        if (!target_name) return false;
+        if (!target_name) {
+            return false;
+        }
         
         /* Any primitive can be boxed and widened to Object */
         if (strcmp(target_name, "java.lang.Object") == 0) {
@@ -1087,16 +1103,34 @@ int type_kind_to_atype(type_kind_t kind)
 
 int type_name_to_atype(const char *type_name)
 {
-    if (!type_name) return -1;
+    if (!type_name) {
+        return -1;
+    }
     
-    if (strcmp(type_name, "boolean") == 0) return 4;   /* T_BOOLEAN */
-    if (strcmp(type_name, "char") == 0)    return 5;   /* T_CHAR */
-    if (strcmp(type_name, "float") == 0)   return 6;   /* T_FLOAT */
-    if (strcmp(type_name, "double") == 0)  return 7;   /* T_DOUBLE */
-    if (strcmp(type_name, "byte") == 0)    return 8;   /* T_BYTE */
-    if (strcmp(type_name, "short") == 0)   return 9;   /* T_SHORT */
-    if (strcmp(type_name, "int") == 0)     return 10;  /* T_INT */
-    if (strcmp(type_name, "long") == 0)    return 11;  /* T_LONG */
+    if (strcmp(type_name, "boolean") == 0) {
+        return 4;   /* T_BOOLEAN */
+    }
+    if (strcmp(type_name, "char") == 0) {
+        return 5;   /* T_CHAR */
+    }
+    if (strcmp(type_name, "float") == 0) {
+        return 6;   /* T_FLOAT */
+    }
+    if (strcmp(type_name, "double") == 0) {
+        return 7;   /* T_DOUBLE */
+    }
+    if (strcmp(type_name, "byte") == 0) {
+        return 8;   /* T_BYTE */
+    }
+    if (strcmp(type_name, "short") == 0) {
+        return 9;   /* T_SHORT */
+    }
+    if (strcmp(type_name, "int") == 0) {
+        return 10;  /* T_INT */
+    }
+    if (strcmp(type_name, "long") == 0) {
+        return 11;  /* T_LONG */
+    }
     
     return -1;  /* Not a primitive type name */
 }

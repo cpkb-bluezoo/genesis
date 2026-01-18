@@ -181,6 +181,7 @@ static symbol_t *lookup_method_in_hierarchy(symbol_t *class_sym, const char *met
 /**
  * Recursively search an interface and its super-interfaces for a method.
  * Handles interface hierarchy like Collection -> List -> ArrayList.
+ * Finds both default methods and abstract interface methods.
  */
 static symbol_t *lookup_method_in_interfaces(symbol_t *iface, const char *method_name, 
                                               symbol_t **owner_class)
@@ -190,8 +191,8 @@ static symbol_t *lookup_method_in_interfaces(symbol_t *iface, const char *method
     /* Check direct members of this interface */
     if (iface->data.class_data.members) {
         symbol_t *method = lookup_method_by_name(iface->data.class_data.members, method_name);
-        if (method && (method->modifiers & MOD_DEFAULT)) {
-            /* Found a default method in this interface */
+        if (method && method->kind == SYM_METHOD) {
+            /* Found a method in this interface (default or abstract) */
             if (owner_class) {
                 *owner_class = iface;
             }
@@ -1117,72 +1118,85 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
             /* Instance field access in static context - error handled below */
         }
         
-        /* Check all enclosing classes for nested/local/anonymous classes */
+        /* Check all enclosing classes for nested/local/anonymous classes.
+         * Also check the superclass chain of each enclosing class for inherited fields. */
         symbol_t *class_sym = mg->class_gen->class_sym;
         symbol_t *enclosing = class_sym ? class_sym->data.class_data.enclosing_class : NULL;
         while (enclosing) {
-            if (enclosing->data.class_data.members) {
-                symbol_t *outer_field = scope_lookup_local(
-                    enclosing->data.class_data.members, name);
-                if (outer_field && outer_field->kind == SYM_FIELD) {
-                    char *outer_internal = class_to_internal_name(enclosing->qualified_name);
-                    char *field_desc = type_to_descriptor(outer_field->type);
-                    
-                    if (outer_field->modifiers & MOD_STATIC) {
-                        /* Static field in enclosing class - use getstatic */
-                        uint16_t fieldref = cp_add_fieldref(mg->cp, outer_internal,
-                                                             name, field_desc);
-                        bc_emit(mg->code, OP_GETSTATIC);
-                        bc_emit_u2(mg->code, fieldref);
-                        /* Push with proper type tracking */
-                        switch (field_desc[0]) {
-                            case 'J': mg_push_long(mg); break;
-                            case 'D': mg_push_double(mg); break;
-                            case 'F': mg_push_float(mg); break;
-                            case 'L': 
-                            case '[': mg_push_object_from_descriptor(mg, field_desc); break;
-                            default:  mg_push_int(mg); break;
-                        }
-                        free(outer_internal);
-                        free(field_desc);
-                        return true;
-                    } else if (mg->class_gen->is_inner_class) {
-                        /* Instance field in enclosing class - access via this$0 */
-                        /* First load this$0 */
-                        bc_emit(mg->code, OP_ALOAD_0);
-                        mg_push_object(mg, mg->class_gen->internal_name);
-                        bc_emit(mg->code, OP_GETFIELD);
-                        bc_emit_u2(mg->code, mg->class_gen->this_dollar_zero_ref);
-                        /* getfield pops 'this', pushes outer instance - update types */
-                        mg_pop_typed(mg, 1);
-                        mg_push_object(mg, outer_internal);
+            /* Check enclosing class and its superclass chain */
+            symbol_t *search = enclosing;
+            while (search) {
+                if (search->data.class_data.members) {
+                    symbol_t *outer_field = scope_lookup_local(
+                        search->data.class_data.members, name);
+                    if (outer_field && outer_field->kind == SYM_FIELD) {
+                        /* Inner classes can access any member (including private) of their
+                         * immediate enclosing class, and public/protected members from superclasses.
+                         * For Java 11+, NestHost/NestMembers attributes allow the JVM to verify this. */
+                        bool accessible = (search == enclosing) ||  /* All members from immediate enclosing */
+                                          (outer_field->modifiers & (MOD_PUBLIC | MOD_PROTECTED));  /* Or inherited public/protected */
+                        if (accessible) {
+                        /* Use the enclosing class as the receiver, but the superclass as the field owner */
+                        char *outer_internal = class_to_internal_name(enclosing->qualified_name);
+                        char *field_owner_internal = class_to_internal_name(search->qualified_name);
+                        char *field_desc = type_to_descriptor(outer_field->type);
                         
-                        /* Now get the field from outer instance */
-                        uint16_t fieldref = cp_add_fieldref(mg->cp, outer_internal,
-                                                             name, field_desc);
-                        bc_emit(mg->code, OP_GETFIELD);
-                        bc_emit_u2(mg->code, fieldref);
-                        /* getfield pops outer instance, pushes field value */
-                        mg_pop_typed(mg, 1);
-                        switch (field_desc[0]) {
-                            case 'J': mg_push_long(mg); break;
-                            case 'D': mg_push_double(mg); break;
-                            case 'F': mg_push_float(mg); break;
-                            case 'L': 
-                            case '[': mg_push_object_from_descriptor(mg, field_desc); break;
-                            default:  mg_push_int(mg); break;
+                        if (outer_field->modifiers & MOD_STATIC) {
+                            /* Static field - use getstatic with actual declaring class */
+                            uint16_t fieldref = cp_add_fieldref(mg->cp, field_owner_internal,
+                                                                 name, field_desc);
+                            bc_emit(mg->code, OP_GETSTATIC);
+                            bc_emit_u2(mg->code, fieldref);
+                            switch (field_desc[0]) {
+                                case 'J': mg_push_long(mg); break;
+                                case 'D': mg_push_double(mg); break;
+                                case 'F': mg_push_float(mg); break;
+                                case 'L': 
+                                case '[': mg_push_object_from_descriptor(mg, field_desc); break;
+                                default:  mg_push_int(mg); break;
+                            }
+                            free(outer_internal);
+                            free(field_owner_internal);
+                            free(field_desc);
+                            return true;
+                        } else if (mg->class_gen->is_inner_class) {
+                            /* Instance field - access via this$0 */
+                            bc_emit(mg->code, OP_ALOAD_0);
+                            mg_push_object(mg, mg->class_gen->internal_name);
+                            bc_emit(mg->code, OP_GETFIELD);
+                            bc_emit_u2(mg->code, mg->class_gen->this_dollar_zero_ref);
+                            mg_pop_typed(mg, 1);
+                            mg_push_object(mg, outer_internal);
+                            
+                            /* Get the field using the declaring superclass as owner */
+                            uint16_t fieldref = cp_add_fieldref(mg->cp, field_owner_internal,
+                                                                 name, field_desc);
+                            bc_emit(mg->code, OP_GETFIELD);
+                            bc_emit_u2(mg->code, fieldref);
+                            mg_pop_typed(mg, 1);
+                            switch (field_desc[0]) {
+                                case 'J': mg_push_long(mg); break;
+                                case 'D': mg_push_double(mg); break;
+                                case 'F': mg_push_float(mg); break;
+                                case 'L': 
+                                case '[': mg_push_object_from_descriptor(mg, field_desc); break;
+                                default:  mg_push_int(mg); break;
+                            }
+                            free(outer_internal);
+                            free(field_owner_internal);
+                            free(field_desc);
+                            return true;
+                        } else {
+                            free(outer_internal);
+                            free(field_owner_internal);
+                            free(field_desc);
+                            fprintf(stderr, "codegen: cannot access instance field '%s' of enclosing class from static context\n", name);
+                            return false;
                         }
-                        free(outer_internal);
-                        free(field_desc);
-                        return true;
-                    } else {
-                        /* Instance field in enclosing class but this is a static nested class */
-                        free(outer_internal);
-                        free(field_desc);
-                        fprintf(stderr, "codegen: cannot access instance field '%s' of enclosing class from static context\n", name);
-                        return false;
+                        }
                     }
                 }
+                search = search->data.class_data.superclass;
             }
             enclosing = enclosing->data.class_data.enclosing_class;
         }
@@ -4103,6 +4117,11 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
             /* The result of method1() is the receiver for method2() */
             type_t *recv_type = first->sem_type;
             
+            /* If sem_type not set, try to compute it from semantic analysis */
+            if (!recv_type && mg->class_gen && mg->class_gen->sem) {
+                recv_type = get_expression_type(mg->class_gen->sem, first);
+            }
+            
             /* Handle type variables by using their bound type */
             if (recv_type && recv_type->kind == TYPE_TYPEVAR && recv_type->data.type_var.bound) {
                 recv_type = recv_type->data.type_var.bound;
@@ -4143,7 +4162,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         }
                     }
                     
-                    /* Check interface hierarchy if not found */
+                    /* Check interface hierarchy if not found (including superinterfaces for interface types) */
                     if (!found_method || found_method->kind != SYM_METHOD) {
                         symbol_t *iface_owner = NULL;
                         found_method = lookup_method_in_interfaces(recv_class_sym, method_name, &iface_owner);
@@ -6375,10 +6394,14 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                 symbol_t *field_class = NULL;
                 symbol_t *search = mg->class_gen->class_sym->data.class_data.superclass;
                 while (search) {
-                    if (search->data.class_data.members &&
-                        scope_lookup_local(search->data.class_data.members, name) == field_sym) {
-                        field_class = search;
-                        break;
+                    if (search->data.class_data.members) {
+                        symbol_t *found = scope_lookup_local(search->data.class_data.members, name);
+                        /* Match by name, not by pointer, since symbols can be different instances */
+                        if (found && found->kind == SYM_FIELD && 
+                            strcmp(found->name, field_sym->name) == 0) {
+                            field_class = search;
+                            break;
+                        }
                     }
                     search = search->data.class_data.superclass;
                 }
@@ -7594,6 +7617,81 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                     }
                                 }
                                 
+                                /* Check enclosing class fields for inner/anonymous classes */
+                                if (mg->class_gen && mg->class_gen->class_sym && mg->class_gen->is_inner_class) {
+                                    symbol_t *class_sym = mg->class_gen->class_sym;
+                                    symbol_t *enclosing = class_sym->data.class_data.enclosing_class;
+                                    
+                                    while (enclosing) {
+                                        if (enclosing->data.class_data.members) {
+                                            symbol_t *outer_field = scope_lookup_local(
+                                                enclosing->data.class_data.members, name);
+                                            if (outer_field && outer_field->kind == SYM_FIELD &&
+                                                !(outer_field->modifiers & MOD_STATIC)) {
+                                                /* Found instance field in enclosing class */
+                                                char *outer_internal = class_to_internal_name(enclosing->qualified_name);
+                                                char *field_desc = type_to_descriptor(outer_field->type);
+                                                
+                                                /* Access via this$0 */
+                                                /* Stack: [] -> [this] -> [outer] */
+                                                bc_emit(mg->code, OP_ALOAD_0);
+                                                mg_push_object(mg, mg->class_gen->internal_name);
+                                                bc_emit(mg->code, OP_GETFIELD);
+                                                bc_emit_u2(mg->code, mg->class_gen->this_dollar_zero_ref);
+                                                mg_pop_typed(mg, 1);
+                                                mg_push_object(mg, outer_internal);
+                                                
+                                                /* Now do field++ on the outer instance */
+                                                uint16_t fieldref = cp_add_fieldref(mg->cp, outer_internal,
+                                                                                     name, field_desc);
+                                                
+                                                if (is_post) {
+                                                    /* Post: dup, getfield, dup_x1, iconst_1, iadd/isub, putfield */
+                                                    /* Stack: [outer] -> [outer,outer] -> [outer,old] -> [old,outer,old] -> [old,outer,new] -> [old] */
+                                                    bc_emit(mg->code, OP_DUP);
+                                                    mg_push_object(mg, outer_internal);  /* [outer,outer] */
+                                                    bc_emit(mg->code, OP_GETFIELD);
+                                                    bc_emit_u2(mg->code, fieldref);
+                                                    mg_pop_typed(mg, 1);
+                                                    mg_push_int(mg);  /* [outer,old] */
+                                                    bc_emit(mg->code, OP_DUP_X1);
+                                                    mg_push_int(mg);  /* [old,outer,old] */
+                                                    bc_emit(mg->code, OP_ICONST_1);
+                                                    mg_push_int(mg);  /* [old,outer,old,1] */
+                                                    bc_emit(mg->code, is_inc ? OP_IADD : OP_ISUB);
+                                                    mg_pop_typed(mg, 1);  /* [old,outer,new] */
+                                                    bc_emit(mg->code, OP_PUTFIELD);
+                                                    bc_emit_u2(mg->code, fieldref);
+                                                    mg_pop_typed(mg, 2);  /* [old] */
+                                                } else {
+                                                    /* Pre: dup, getfield, iconst_1, iadd/isub, dup_x1, putfield */
+                                                    /* Stack: [outer] -> [outer,outer] -> [outer,old] -> [outer,old,1] -> [outer,new] -> [new,outer,new] -> [new] */
+                                                    bc_emit(mg->code, OP_DUP);
+                                                    mg_push_object(mg, outer_internal);  /* [outer,outer] */
+                                                    bc_emit(mg->code, OP_GETFIELD);
+                                                    bc_emit_u2(mg->code, fieldref);
+                                                    mg_pop_typed(mg, 1);
+                                                    mg_push_int(mg);  /* [outer,old] */
+                                                    bc_emit(mg->code, OP_ICONST_1);
+                                                    mg_push_int(mg);  /* [outer,old,1] */
+                                                    bc_emit(mg->code, is_inc ? OP_IADD : OP_ISUB);
+                                                    mg_pop_typed(mg, 1);  /* [outer,new] */
+                                                    bc_emit(mg->code, OP_DUP_X1);
+                                                    mg_push_int(mg);  /* [new,outer,new] */
+                                                    bc_emit(mg->code, OP_PUTFIELD);
+                                                    bc_emit_u2(mg->code, fieldref);
+                                                    mg_pop_typed(mg, 2);  /* [new] */
+                                                }
+                                                
+                                                free(outer_internal);
+                                                free(field_desc);
+                                                return true;
+                                            }
+                                        }
+                                        enclosing = enclosing->data.class_data.enclosing_class;
+                                    }
+                                }
+                                
                                 fprintf(stderr, "codegen: cannot resolve variable for increment/decrement: %s\n", name);
                                 return false;
                             }
@@ -7673,8 +7771,146 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 return true;
                             }
                             
-                            /* TODO: Handle array access (arr[i]++) */
-                            fprintf(stderr, "codegen: increment/decrement on non-identifier/non-field not yet implemented\n");
+                            /* Handle array access (arr[i]++) */
+                            if (operand->type == AST_ARRAY_ACCESS) {
+                                slist_t *arr_children = operand->data.node.children;
+                                if (!arr_children || !arr_children->next) {
+                                    fprintf(stderr, "codegen: malformed array access for increment\n");
+                                    return false;
+                                }
+                                
+                                ast_node_t *array_expr = (ast_node_t *)arr_children->data;
+                                ast_node_t *index_expr = (ast_node_t *)arr_children->next->data;
+                                
+                                /* Determine element type from semantic type */
+                                type_kind_t elem_kind = TYPE_INT;  /* Default to int */
+                                if (operand->sem_type) {
+                                    elem_kind = operand->sem_type->kind;
+                                } else if (array_expr->sem_type && array_expr->sem_type->kind == TYPE_ARRAY) {
+                                    type_t *elem_type = array_expr->sem_type->data.array_type.element_type;
+                                    if (elem_type) {
+                                        elem_kind = elem_type->kind;
+                                    }
+                                }
+                                
+                                /* Choose appropriate load/store/add opcodes based on element type */
+                                uint8_t load_op, store_op, add_op, sub_op, const1_op;
+                                bool is_wide = false;  /* long/double take 2 stack slots */
+                                
+                                switch (elem_kind) {
+                                    case TYPE_LONG:
+                                        load_op = OP_LALOAD;
+                                        store_op = OP_LASTORE;
+                                        add_op = OP_LADD;
+                                        sub_op = OP_LSUB;
+                                        const1_op = OP_LCONST_1;
+                                        is_wide = true;
+                                        break;
+                                    case TYPE_FLOAT:
+                                        load_op = OP_FALOAD;
+                                        store_op = OP_FASTORE;
+                                        add_op = OP_FADD;
+                                        sub_op = OP_FSUB;
+                                        const1_op = OP_FCONST_1;
+                                        break;
+                                    case TYPE_DOUBLE:
+                                        load_op = OP_DALOAD;
+                                        store_op = OP_DASTORE;
+                                        add_op = OP_DADD;
+                                        sub_op = OP_DSUB;
+                                        const1_op = OP_DCONST_1;
+                                        is_wide = true;
+                                        break;
+                                    case TYPE_BYTE:
+                                    case TYPE_BOOLEAN:
+                                        load_op = OP_BALOAD;
+                                        store_op = OP_BASTORE;
+                                        add_op = OP_IADD;
+                                        sub_op = OP_ISUB;
+                                        const1_op = OP_ICONST_1;
+                                        break;
+                                    case TYPE_CHAR:
+                                        load_op = OP_CALOAD;
+                                        store_op = OP_CASTORE;
+                                        add_op = OP_IADD;
+                                        sub_op = OP_ISUB;
+                                        const1_op = OP_ICONST_1;
+                                        break;
+                                    case TYPE_SHORT:
+                                        load_op = OP_SALOAD;
+                                        store_op = OP_SASTORE;
+                                        add_op = OP_IADD;
+                                        sub_op = OP_ISUB;
+                                        const1_op = OP_ICONST_1;
+                                        break;
+                                    default:  /* TYPE_INT and others */
+                                        load_op = OP_IALOAD;
+                                        store_op = OP_IASTORE;
+                                        add_op = OP_IADD;
+                                        sub_op = OP_ISUB;
+                                        const1_op = OP_ICONST_1;
+                                        break;
+                                }
+                                
+                                /* Generate array ref */
+                                if (!codegen_expr(mg, array_expr, cp)) {
+                                    return false;
+                                }
+                                
+                                /* Generate index */
+                                if (!codegen_expr(mg, index_expr, cp)) {
+                                    return false;
+                                }
+                                
+                                if (is_post) {
+                                    /* Post-increment: arr[i]++ - result is OLD value
+                                     * Stack: [arr, i] -> [arr, i, arr, i] -> [arr, i, old] ->
+                                     *        [old, arr, i, old] -> [old, arr, i, old, 1] ->
+                                     *        [old, arr, i, new] -> [old] */
+                                    bc_emit(mg->code, OP_DUP2);
+                                    mg_push(mg, 2);  /* [arr, i, arr, i] */
+                                    bc_emit(mg->code, load_op);
+                                    mg_pop_typed(mg, 1);  /* [arr, i, old] - load consumes arr,i pushes value */
+                                    if (is_wide) {
+                                        bc_emit(mg->code, OP_DUP2_X2);
+                                        mg_push(mg, 2);  /* [old, arr, i, old] for long/double */
+                                    } else {
+                                        bc_emit(mg->code, OP_DUP_X2);
+                                        mg_push(mg, 1);  /* [old, arr, i, old] */
+                                    }
+                                    bc_emit(mg->code, const1_op);
+                                    mg_push(mg, is_wide ? 2 : 1);  /* [old, arr, i, old, 1] */
+                                    bc_emit(mg->code, is_inc ? add_op : sub_op);
+                                    mg_pop_typed(mg, is_wide ? 2 : 1);  /* [old, arr, i, new] */
+                                    bc_emit(mg->code, store_op);
+                                    mg_pop_typed(mg, is_wide ? 4 : 3);  /* [old] - store consumes arr,i,value */
+                                } else {
+                                    /* Pre-increment: ++arr[i] - result is NEW value
+                                     * Stack: [arr, i] -> [arr, i, arr, i] -> [arr, i, old] ->
+                                     *        [arr, i, old, 1] -> [arr, i, new] ->
+                                     *        [new, arr, i, new] -> [new] */
+                                    bc_emit(mg->code, OP_DUP2);
+                                    mg_push(mg, 2);  /* [arr, i, arr, i] */
+                                    bc_emit(mg->code, load_op);
+                                    mg_pop_typed(mg, 1);  /* [arr, i, old] */
+                                    bc_emit(mg->code, const1_op);
+                                    mg_push(mg, is_wide ? 2 : 1);  /* [arr, i, old, 1] */
+                                    bc_emit(mg->code, is_inc ? add_op : sub_op);
+                                    mg_pop_typed(mg, is_wide ? 2 : 1);  /* [arr, i, new] */
+                                    if (is_wide) {
+                                        bc_emit(mg->code, OP_DUP2_X2);
+                                        mg_push(mg, 2);  /* [new, arr, i, new] for long/double */
+                                    } else {
+                                        bc_emit(mg->code, OP_DUP_X2);
+                                        mg_push(mg, 1);  /* [new, arr, i, new] */
+                                    }
+                                    bc_emit(mg->code, store_op);
+                                    mg_pop_typed(mg, is_wide ? 4 : 3);  /* [new] */
+                                }
+                                return true;
+                            }
+                            
+                            fprintf(stderr, "codegen: increment/decrement on non-identifier/non-field/non-array not yet implemented\n");
                             return false;
                         }
                     
@@ -7863,25 +8099,34 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 }
                 
                 /* Get the class name for instanceof */
-                const char *class_name = NULL;
+                char *class_ref = NULL;
+                bool needs_free = false;
+                
                 if (type_node->type == AST_CLASS_TYPE) {
-                    class_name = type_node->data.node.name;
+                    const char *class_name = type_node->data.node.name;
+                    const char *resolved = resolve_java_lang_class(class_name);
+                    class_ref = class_to_internal_name(resolved);
+                    needs_free = true;
+                } else if (type_node->type == AST_ARRAY_TYPE) {
+                    /* Array type: byte[], String[][], etc.
+                     * Use the array descriptor as class name (e.g., "[B", "[[Ljava/lang/String;") */
+                    class_ref = ast_type_to_descriptor(type_node);
+                    needs_free = true;
                 } else if (type_node->type == AST_PRIMITIVE_TYPE) {
                     /* instanceof doesn't work with primitives */
                     fprintf(stderr, "codegen: instanceof not supported for primitive types\n");
                     return false;
                 }
                 
-                if (!class_name) {
+                if (!class_ref) {
                     fprintf(stderr, "codegen: instanceof without class type\n");
                     return false;
                 }
                 
-                /* Resolve to internal name */
-                const char *resolved = resolve_java_lang_class(class_name);
-                char *internal_name = class_to_internal_name(resolved);
-                uint16_t class_index = cp_add_class(cp, internal_name);
-                free(internal_name);
+                uint16_t class_index = cp_add_class(cp, class_ref);
+                if (needs_free) {
+                    free(class_ref);
+                }
                 
                 /* Emit instanceof instruction */
                 bc_emit(mg->code, OP_INSTANCEOF);

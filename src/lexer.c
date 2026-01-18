@@ -345,8 +345,10 @@ static void lexer_scan_char(lexer_t *lexer);
 
 /**
  * Create a new lexer for a source file.
+ * @param source The source file to lex
+ * @param source_version Java source version (8, 11, 17, 21, etc.) for contextual keyword handling
  */
-lexer_t *lexer_new(source_file_t *source)
+lexer_t *lexer_new(source_file_t *source, int source_version)
 {
     if (!source || !source->contents) {
         return NULL;
@@ -363,6 +365,7 @@ lexer_t *lexer_new(source_file_t *source)
     lexer->line = 1;
     lexer->column = 1;
     lexer->error_msg = NULL;
+    lexer->source_version = source_version;
     
     /* Initialize token state */
     lexer->token.type = TOK_EOF;
@@ -377,6 +380,17 @@ lexer_t *lexer_new(source_file_t *source)
     lexer_advance(lexer);
     
     return lexer;
+}
+
+/**
+ * Set the source version for contextual keyword handling.
+ * Call this before parsing to control which contextual keywords are recognized.
+ */
+void lexer_set_source_version(lexer_t *lexer, int version)
+{
+    if (lexer) {
+        lexer->source_version = version;
+    }
 }
 
 /**
@@ -537,6 +551,56 @@ static void lexer_scan_identifier(lexer_t *lexer)
     }
     
     token_type_t type = lookup_keyword(lexer->text_buf);
+    
+    /* Contextual keywords: only treat as keywords in appropriate Java versions.
+     * record, sealed, permits: Java 16+ (preview in 14-15)
+     * var: Java 10+
+     * yield: Java 14+ (switch expressions)
+     * when: Java 21+ (pattern matching guards)
+     * Module keywords (module, requires, exports, etc.): Java 9+ */
+    if (type != TOK_IDENTIFIER) {
+        switch (type) {
+            case TOK_RECORD:
+            case TOK_SEALED:
+            case TOK_NON_SEALED:
+            case TOK_PERMITS:
+                if (lexer->source_version < 14) {
+                    type = TOK_IDENTIFIER;
+                }
+                break;
+            case TOK_YIELD:
+                if (lexer->source_version < 14) {
+                    type = TOK_IDENTIFIER;
+                }
+                break;
+            case TOK_VAR:
+                if (lexer->source_version < 10) {
+                    type = TOK_IDENTIFIER;
+                }
+                break;
+            case TOK_WHEN:
+                if (lexer->source_version < 21) {
+                    type = TOK_IDENTIFIER;
+                }
+                break;
+            case TOK_MODULE:
+            case TOK_REQUIRES:
+            case TOK_EXPORTS:
+            case TOK_OPENS:
+            case TOK_USES:
+            case TOK_PROVIDES:
+            case TOK_TO:
+            case TOK_WITH:
+            case TOK_TRANSITIVE:
+            case TOK_OPEN:
+                if (lexer->source_version < 9) {
+                    type = TOK_IDENTIFIER;
+                }
+                break;
+            default:
+                break;
+        }
+    }
     
     /* For keywords, we can point directly to source; for identifiers too */
     lexer_set_token(lexer, type, start, len, start_line, start_column);
@@ -955,6 +1019,23 @@ static void lexer_scan_string(lexer_t *lexer)
 }
 
 /**
+ * Parse a hex digit and return its value (0-15), or -1 if not a hex digit.
+ */
+static int hex_digit_value(char c)
+{
+    if (c >= '0' && c <= '9') {
+        return c - '0';
+    }
+    if (c >= 'a' && c <= 'f') {
+        return c - 'a' + 10;
+    }
+    if (c >= 'A' && c <= 'F') {
+        return c - 'A' + 10;
+    }
+    return -1;
+}
+
+/**
  * Scan a character literal.
  */
 static void lexer_scan_char(lexer_t *lexer)
@@ -969,17 +1050,52 @@ static void lexer_scan_char(lexer_t *lexer)
         lexer_advance_char(lexer);
         char c = lexer_peek(lexer);
         switch (c) {
-            case 'n':  ch = '\n'; break;
-            case 't':  ch = '\t'; break;
-            case 'r':  ch = '\r'; break;
-            case 'b':  ch = '\b'; break;
-            case 'f':  ch = '\f'; break;
-            case '\\': ch = '\\'; break;
-            case '"':  ch = '"'; break;
-            case '\'': ch = '\''; break;
-            default:   ch = c; break;
+            case 'n':  ch = '\n'; lexer_advance_char(lexer); break;
+            case 't':  ch = '\t'; lexer_advance_char(lexer); break;
+            case 'r':  ch = '\r'; lexer_advance_char(lexer); break;
+            case 'b':  ch = '\b'; lexer_advance_char(lexer); break;
+            case 'f':  ch = '\f'; lexer_advance_char(lexer); break;
+            case '\\': ch = '\\'; lexer_advance_char(lexer); break;
+            case '"':  ch = '"'; lexer_advance_char(lexer); break;
+            case '\'': ch = '\''; lexer_advance_char(lexer); break;
+            case 'u':
+                /* Unicode escape \uXXXX */
+                lexer_advance_char(lexer);  /* Skip 'u' */
+                {
+                    int value = 0;
+                    for (int i = 0; i < 4; i++) {
+                        int digit = hex_digit_value(lexer_peek(lexer));
+                        if (digit < 0) {
+                            /* Invalid hex digit */
+                            ch = '?';
+                            break;
+                        }
+                        value = (value << 4) | digit;
+                        lexer_advance_char(lexer);
+                    }
+                    /* For now, only handle BMP characters that fit in a char */
+                    ch = (char)(value & 0xFF);
+                }
+                break;
+            case '0': case '1': case '2': case '3':
+            case '4': case '5': case '6': case '7':
+                /* Octal escape */
+                {
+                    int value = c - '0';
+                    lexer_advance_char(lexer);
+                    if (lexer_peek(lexer) >= '0' && lexer_peek(lexer) <= '7') {
+                        value = value * 8 + (lexer_peek(lexer) - '0');
+                        lexer_advance_char(lexer);
+                        if (c <= '3' && lexer_peek(lexer) >= '0' && lexer_peek(lexer) <= '7') {
+                            value = value * 8 + (lexer_peek(lexer) - '0');
+                            lexer_advance_char(lexer);
+                        }
+                    }
+                    ch = (char)value;
+                }
+                break;
+            default:   ch = c; lexer_advance_char(lexer); break;
         }
-        lexer_advance_char(lexer);
     } else {
         ch = lexer_peek(lexer);
         lexer_advance_char(lexer);

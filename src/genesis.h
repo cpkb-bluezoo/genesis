@@ -264,6 +264,7 @@ typedef struct lexer
     int line;                       /* Current line number */
     int column;                     /* Current column number */
     char *error_msg;                /* Error message if any */
+    int source_version;             /* Java source version (8, 11, 17, etc.) for contextual keywords */
     
     /* Current token - embedded, no allocation needed */
     struct {
@@ -280,8 +281,9 @@ typedef struct lexer
 } lexer_t;
 
 /* Lexer API */
-lexer_t *lexer_new(source_file_t *source);
+lexer_t *lexer_new(source_file_t *source, int source_version);
 void lexer_free(lexer_t *lexer);
+void lexer_set_source_version(lexer_t *lexer, int version);
 
 /* Feedforward tokenization - advance and access current token */
 void lexer_advance(lexer_t *lexer);             /* Move to next token */
@@ -339,6 +341,7 @@ typedef enum ast_node_type
     AST_WILDCARD_TYPE,
     AST_VAR_TYPE,       /* var for type inference (Java 10+) */
     AST_INTERSECTION_TYPE, /* Intersection type: Type1 & Type2 (Java 8+) */
+    AST_TYPE_ARGS,      /* Explicit type arguments on method call: obj.<Type>method() */
     
     /* Parameters and variables */
     AST_PARAMETER,
@@ -506,6 +509,11 @@ void ast_free(ast_node_t *node);
 void ast_add_child(ast_node_t *parent, ast_node_t *child);
 void ast_print(ast_node_t *node, int indent);
 const char *ast_type_name(ast_node_type_t type);
+
+/* AST Pool management - efficient allocation of AST nodes */
+void ast_pool_init(void);       /* Initialize the AST pool (call once at startup) */
+void ast_pool_reset(void);      /* Reset pool for reuse (call between files) */
+void ast_pool_cleanup(void);    /* Free all pool memory (call at shutdown) */
 
 /* ========================================================================
  * Parser (Iterative with feedforward lexer)
@@ -684,14 +692,17 @@ typedef struct semantic
     scope_t *global_scope;      /* Global/package scope */
     scope_t *current_scope;     /* Current scope during analysis */
     
-    hashtable_t *types;         /* Canonical type cache: name -> type_t* */
+    hashtable_t *types;         /* Canonical type cache: qualified_name -> type_t* */
+    hashtable_t *unit_types;    /* Per-compilation-unit: simple_name -> type_t* (like javac's toplevelScope) */
     hashtable_t *packages;      /* Package name -> scope_t* */
+    hashtable_t *resolved_imports; /* Cache: simple_name -> qualified_name (interned) */
     
     slist_t *imports;           /* Import declarations */
     slist_t *static_imports;    /* Static import declarations */
     char *current_package;      /* Current package name */
     symbol_t *current_class;    /* Current class being analyzed */
     symbol_t *current_method;   /* Current method being analyzed */
+    bool in_static_field_init;  /* True when processing a static field initializer */
     ast_node_t *current_lambda; /* Current lambda being analyzed (for capture tracking) */
     scope_t *lambda_enclosing_scope; /* Scope at lambda definition (parent of lambda params) */
     symbol_t *pending_pattern_var; /* Pattern variable from instanceof to add to next scope */
@@ -712,6 +723,7 @@ typedef struct semantic
     struct classpath *classpath; /* Classpath for resolving external types */
     slist_t *sourcepath;        /* Source path directories for finding .java files */
     slist_t *source_dependencies; /* Source files loaded as dependencies (need compilation) */
+    bool loading_dependency;    /* True when loading dependency files (suppress errors) */
 } semantic_t;
 
 /* Semantic analyzer API */

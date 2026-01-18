@@ -22,15 +22,65 @@
 #include "genesis.h"
 
 /* ========================================================================
+ * AST Node Pool
+ * ======================================================================== */
+
+/* Global AST pool - allocated nodes live until pool reset */
+static memory_pool_t *g_ast_pool = NULL;
+
+/* Pool block size: 256KB = ~2400 nodes per block */
+#define AST_POOL_BLOCK_SIZE (256 * 1024)
+
+/**
+ * Initialize the AST pool.
+ */
+void ast_pool_init(void)
+{
+    if (!g_ast_pool) {
+        g_ast_pool = pool_new(AST_POOL_BLOCK_SIZE);
+    }
+}
+
+/**
+ * Reset the AST pool for reuse between files.
+ */
+void ast_pool_reset(void)
+{
+    if (g_ast_pool) {
+        pool_reset(g_ast_pool);
+    }
+}
+
+/**
+ * Clean up the AST pool.
+ */
+void ast_pool_cleanup(void)
+{
+    if (g_ast_pool) {
+        pool_free(g_ast_pool);
+        g_ast_pool = NULL;
+    }
+}
+
+/* ========================================================================
  * AST Node Implementation
  * ======================================================================== */
 
 /**
  * Create a new AST node.
+ * Uses pooled allocation for better performance.
  */
 ast_node_t *ast_new(ast_node_type_t type, int line, int column)
 {
-    ast_node_t *node = calloc(1, sizeof(ast_node_t));
+    ast_node_t *node;
+    
+    /* Use pool allocation if available, otherwise fall back to malloc */
+    if (g_ast_pool) {
+        node = pool_alloc(g_ast_pool, sizeof(ast_node_t));
+    } else {
+        node = calloc(1, sizeof(ast_node_t));
+    }
+    
     if (!node) {
         return NULL;
     }
@@ -53,7 +103,7 @@ ast_node_t *ast_new_leaf(ast_node_type_t type, const char *name, int line, int c
     }
     
     if (name) {
-        node->data.leaf.name = strdup(name);
+        node->data.leaf.name = (char *)intern(name);
     }
     
     return node;
@@ -79,32 +129,32 @@ ast_node_t *ast_new_literal_from_lexer(lexer_t *lexer)
         case TOK_INTEGER_LITERAL:
         case TOK_LONG_LITERAL:
             node->data.leaf.value.int_val = value.int_value;
-            node->data.leaf.name = text ? strdup(text) : NULL;
+            node->data.leaf.name = text ? (char *)intern(text) : NULL;
             break;
         case TOK_FLOAT_LITERAL:
         case TOK_DOUBLE_LITERAL:
             node->data.leaf.value.float_val = value.float_value;
-            node->data.leaf.name = text ? strdup(text) : NULL;
+            node->data.leaf.name = text ? (char *)intern(text) : NULL;
             break;
         case TOK_STRING_LITERAL:
         case TOK_TEXT_BLOCK:
         case TOK_CHAR_LITERAL:
-            node->data.leaf.value.str_val = text ? strdup(text) : NULL;
-            node->data.leaf.name = text ? strdup(text) : NULL;
+            node->data.leaf.value.str_val = text ? strdup(text) : NULL;  /* String values are freed */
+            node->data.leaf.name = text ? (char *)intern(text) : NULL;
             break;
         case TOK_TRUE:
             node->data.leaf.value.int_val = 1;
-            node->data.leaf.name = strdup("true");
+            node->data.leaf.name = (char *)intern("true");
             break;
         case TOK_FALSE:
             node->data.leaf.value.int_val = 0;
-            node->data.leaf.name = strdup("false");
+            node->data.leaf.name = (char *)intern("false");
             break;
         case TOK_NULL:
-            node->data.leaf.name = strdup("null");
+            node->data.leaf.name = (char *)intern("null");
             break;
         default:
-            node->data.leaf.name = text ? strdup(text) : NULL;
+            node->data.leaf.name = text ? (char *)intern(text) : NULL;
             break;
     }
     
@@ -113,12 +163,23 @@ ast_node_t *ast_new_literal_from_lexer(lexer_t *lexer)
 
 /**
  * Free an AST node and all children.
+ * 
+ * When using pooled allocation (g_ast_pool != NULL):
+ * - AST nodes themselves are not freed (they live in the pool)
+ * - We still free slist_t children lists (not pooled)
+ * - We still free strdup'd string values (string literals)
+ * 
+ * When not using pooled allocation:
+ * - Everything is freed individually
  */
 void ast_free(ast_node_t *node)
 {
     if (!node) {
         return;
     }
+    
+    /* Determine if we're using pooled allocation */
+    bool using_pool = (g_ast_pool != NULL);
     
     /* Use an explicit stack to avoid recursion */
     slist_t *stack = slist_new(node);
@@ -143,8 +204,8 @@ void ast_free(ast_node_t *node)
             case AST_SUPER_EXPR:
             case AST_PRIMITIVE_TYPE:
             case AST_VAR_TYPE:
-                /* Leaf nodes - free name */
-                free(current->data.leaf.name);
+                /* Leaf nodes - names are interned, don't free them.
+                 * String literal values are NOT interned, still need to free */
                 if (current->type == AST_LITERAL &&
                     (current->data.leaf.token_type == TOK_STRING_LITERAL ||
                      current->data.leaf.token_type == TOK_TEXT_BLOCK ||
@@ -180,12 +241,15 @@ void ast_free(ast_node_t *node)
                 }
             }
             
-            /* Free children list (not the children themselves) */
+            /* Free children list (not the children themselves - they're on the stack) */
             slist_free(current->data.node.children);
-            free(current->data.node.name);
+            /* Note: node.name is interned, don't free it */
         }
         
-        free(current);
+        /* Only free the node if not using pooled allocation */
+        if (!using_pool) {
+            free(current);
+        }
     }
 }
 
@@ -231,6 +295,7 @@ const char *ast_type_name(ast_node_type_t type)
         case AST_WILDCARD_TYPE:      return "WildcardType";
         case AST_VAR_TYPE:           return "VarType";
         case AST_INTERSECTION_TYPE:  return "IntersectionType";
+        case AST_TYPE_ARGS:          return "TypeArgs";
         case AST_PARAMETER:          return "Parameter";
         case AST_VAR_DECL:           return "VarDecl";
         case AST_VAR_DECLARATOR:     return "VarDeclarator";
@@ -706,7 +771,7 @@ static bool parser_expect_gt(parser_t *parser)
 static void parser_error(parser_t *parser, const char *message)
 {
     free(parser->error_msg);
-    parser->error_msg = strdup(message);
+    parser->error_msg = strdup(message);  /* Error messages are freed separately */
     parser->error_line = parser_current_line(parser);
     parser->error_column = parser_current_column(parser);
 }
@@ -1100,7 +1165,7 @@ static ast_node_t *parse_pattern(parser_t *parser)
         parser_advance(parser);
         
         ast_node_t *pattern = ast_new(AST_TYPE_PATTERN, pattern_line, pattern_col);
-        pattern->data.node.name = is_unnamed ? NULL : strdup(var_name);
+        pattern->data.node.name = is_unnamed ? NULL : (char *)intern(var_name);
         ast_add_child(pattern, type_node);
         
         return pattern;
@@ -1295,19 +1360,58 @@ static ast_node_t *parse_primary(parser_t *parser)
                     if (maybe_type && (parser_check(parser, TOK_RPAREN) || 
                                        parser_check(parser, TOK_BITAND))) {
                         /* Check for intersection type: (Type1 & Type2 & ...) expr
-                         * Intersection types are only valid in cast expressions */
+                         * Intersection types are only valid in cast expressions.
+                         * IMPORTANT: We must distinguish (Type1 & Type2) from (expr & expr).
+                         * If after & we don't see another type, this is NOT an intersection. */
                         if (parser_check(parser, TOK_BITAND)) {
+                            /* Peek ahead: check if what's after & could be a type.
+                             * This distinguishes (Type1 & Type2) from (expr & expr).
+                             * A type must start with an identifier or primitive type keyword. */
+                            parser_advance(parser);  /* consume & */
+                            token_type_t after_and = parser_current_type(parser);
+                            
+                            /* Types start with: identifier, primitive type keyword, or @ for annotations */
+                            bool could_be_type = (after_and == TOK_IDENTIFIER || 
+                                                  is_primitive_type(after_and) ||
+                                                  after_and == TOK_AT);
+                            
+                            if (!could_be_type) {
+                                /* Not a type after & - this is (expr & expr), not intersection.
+                                 * Restore position and treat as parenthesized expression. */
+                                lexer_restore_pos(parser->lexer, save_pos);
+                                ast_free(maybe_type);
+                                maybe_type = NULL;
+                                goto not_a_cast;
+                            }
+                            
+                            /* Looks like it could be a type - try parsing it */
+                            ast_node_t *next_type = parse_type(parser);
+                            
+                            /* It looks like an intersection type - build the AST */
                             ast_node_t *intersection = ast_new(AST_INTERSECTION_TYPE,
                                                                maybe_type->line, maybe_type->column);
                             ast_add_child(intersection, maybe_type);
+                            ast_add_child(intersection, next_type);
                             
+                            /* Continue parsing additional intersection bounds */
                             while (parser_match(parser, TOK_BITAND)) {
-                                ast_node_t *next_type = parse_type(parser);
+                                next_type = parse_type(parser);
                                 if (!next_type) {
+                                    /* Failed parsing intersection - restore and treat as expression */
                                     ast_free(intersection);
-                                    return NULL;
+                                    lexer_restore_pos(parser->lexer, save_pos);
+                                    maybe_type = NULL;
+                                    goto not_a_cast;
                                 }
                                 ast_add_child(intersection, next_type);
+                            }
+                            
+                            if (!parser_check(parser, TOK_RPAREN)) {
+                                /* Not followed by ) - restore and treat as expression */
+                                ast_free(intersection);
+                                lexer_restore_pos(parser->lexer, save_pos);
+                                maybe_type = NULL;
+                                goto not_a_cast;
                             }
                             maybe_type = intersection;
                         }
@@ -1431,7 +1535,9 @@ static ast_node_t *parse_primary(parser_t *parser)
                                 break;
                             }
                         }
-                        if (!looks_like_lambda_params) break;
+                        if (!looks_like_lambda_params) {
+                            break;
+                        }
                         
                         /* Check for parameterized type: Type<...> or Outer.Inner<...> */
                         if (parser_check(parser, TOK_LT)) {
@@ -1522,7 +1628,7 @@ static ast_node_t *parse_primary(parser_t *parser)
                         if (param_is_final) {
                             param->data.node.flags |= MOD_FINAL;
                         }
-                        param->data.node.name = strdup(parser_current_text(parser));
+                        param->data.node.name = (char *)intern(parser_current_text(parser));
                         if (param_type) {
                             ast_add_child(param, param_type);
                         }
@@ -1621,8 +1727,12 @@ static ast_node_t *parse_primary(parser_t *parser)
                         ast_add_child(node, type_node);
                     }
                     
-                    /* Parse any additional dimensions */
+                    /* Parse any additional dimensions.
+                     * Track total dimensions in flags field since empty brackets
+                     * (new byte[3][]) don't add children but still add dimensions. */
+                    int total_dims = 0;
                     while (parser_match(parser, TOK_LBRACKET)) {
+                        total_dims++;
                         if (!parser_check(parser, TOK_RBRACKET)) {
                             ast_node_t *dim = parse_expression(parser);
                             if (dim) {
@@ -1634,6 +1744,7 @@ static ast_node_t *parse_primary(parser_t *parser)
                             return NULL;
                         }
                     }
+                    node->data.node.flags = (uint32_t)total_dims;
                     
                     /* Optional array initializer */
                     if (parser_check(parser, TOK_LBRACE)) {
@@ -1718,7 +1829,7 @@ static ast_node_t *parse_primary(parser_t *parser)
                                                    parser_current_column(parser));
                         
                         if (parser_match(parser, TOK_DEFAULT)) {
-                            rule->data.node.name = strdup("default");
+                            rule->data.node.name = (char *)intern("default");
                         } else {
                             parser_advance(parser);  /* consume 'case' */
                             /* Parse one or more case patterns/constants separated by commas */
@@ -1895,7 +2006,7 @@ static ast_node_t *parse_unary(parser_t *parser)
                 }
                 
                 ast_node_t *node = ast_new(AST_UNARY_EXPR, line, col);
-                node->data.node.name = strdup(op);
+                node->data.node.name = (char *)intern(op);
                 node->data.node.op_token = op_type;  /* Store operator token */
                 ast_add_child(node, operand);
                 return node;
@@ -1994,11 +2105,11 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     ast_node_t *type_node = ast_new(AST_CLASS_TYPE, line, col);
                     
                     if (expr->type == AST_IDENTIFIER) {
-                        type_node->data.node.name = strdup(expr->data.leaf.name);
+                        type_node->data.node.name = (char *)intern(expr->data.leaf.name);
                     } else if (expr->type == AST_FIELD_ACCESS) {
                         /* Qualified name - reconstruct from AST_FIELD_ACCESS chain */
                         /* For now, just use the field name (simple case) */
-                        type_node->data.node.name = strdup(expr->data.node.name);
+                        type_node->data.node.name = (char *)intern(expr->data.node.name);
                     }
                     ast_free(expr);
                     
@@ -2043,7 +2154,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     if (parser_check(parser, TOK_THIS)) {
                         parser_advance(parser);
                         ast_node_t *this_expr = ast_new(AST_FIELD_ACCESS, line, col);
-                        this_expr->data.node.name = strdup("this");
+                        this_expr->data.node.name = (char *)intern("this");
                         ast_add_child(this_expr, expr);
                         expr = this_expr;
                         break;
@@ -2053,7 +2164,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     if (parser_check(parser, TOK_SUPER)) {
                         parser_advance(parser);
                         ast_node_t *super_expr = ast_new(AST_FIELD_ACCESS, line, col);
-                        super_expr->data.node.name = strdup("super");
+                        super_expr->data.node.name = (char *)intern("super");
                         ast_add_child(super_expr, expr);
                         expr = super_expr;
                         break;
@@ -2068,7 +2179,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                         if (expr->type == AST_IDENTIFIER) {
                             /* Simple type name - convert identifier to class type */
                             type_node = ast_new(AST_CLASS_TYPE, expr->line, expr->column);
-                            type_node->data.node.name = strdup(expr->data.leaf.name);
+                            type_node->data.node.name = (char *)intern(expr->data.leaf.name);
                             ast_free(expr);
                         } else if (expr->type == AST_ARRAY_TYPE || expr->type == AST_CLASS_TYPE ||
                                    expr->type == AST_FIELD_ACCESS) {
@@ -2087,24 +2198,69 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                         break;
                     }
                     
+                    /* Check for explicit type arguments on method call: obj.<Type>method() */
+                    slist_t *explicit_type_args = NULL;
+                    if (parser_check(parser, TOK_LT)) {
+                        parser_advance(parser);  /* consume < */
+                        
+                        /* Parse type arguments */
+                        do {
+                            ast_node_t *type_arg = parse_type(parser);
+                            if (type_arg) {
+                                if (!explicit_type_args) {
+                                    explicit_type_args = slist_new(type_arg);
+                                } else {
+                                    slist_append(explicit_type_args, type_arg);
+                                }
+                            }
+                        } while (parser_match(parser, TOK_COMMA));
+                        
+                        if (!parser_expect(parser, TOK_GT)) {
+                            /* Free type args on error */
+                            for (slist_t *n = explicit_type_args; n; n = n->next) {
+                                ast_free((ast_node_t *)n->data);
+                            }
+                            slist_free(explicit_type_args);
+                            ast_free(expr);
+                            return NULL;
+                        }
+                    }
+                    
                     /* Accept identifiers and contextual keywords (like 'open', 'var', etc.) as member names */
                     if (!parser_check_identifier_or_contextual(parser)) {
                         parser_error(parser, "Expected identifier after '.'");
+                        for (slist_t *n = explicit_type_args; n; n = n->next) {
+                            ast_free((ast_node_t *)n->data);
+                        }
+                        slist_free(explicit_type_args);
                         ast_free(expr);
                         return NULL;
                     }
                     
-                    char *name = strdup(parser_current_text(parser));
+                    char *name = (char *)intern(parser_current_text(parser));
                     parser_advance(parser);
                     
-                    if (parser_check(parser, TOK_LPAREN)) {
-                        /* Method call with explicit receiver (obj.method()) */
+                    if (parser_check(parser, TOK_LPAREN) || explicit_type_args) {
+                        /* Method call with explicit receiver (obj.method() or obj.<Type>method()) */
                         ast_node_t *call = ast_new(AST_METHOD_CALL, line, col);
                         call->data.node.name = name;
                         call->data.node.flags |= AST_METHOD_CALL_EXPLICIT_RECEIVER;
                         ast_add_child(call, expr);
                         
-                        parser_advance(parser);  /* consume ( */
+                        /* Store explicit type arguments in extra field as a TYPE_ARGS node */
+                        if (explicit_type_args) {
+                            ast_node_t *type_args_node = ast_new(AST_TYPE_ARGS, line, col);
+                            for (slist_t *n = explicit_type_args; n; n = n->next) {
+                                ast_add_child(type_args_node, (ast_node_t *)n->data);
+                            }
+                            slist_free(explicit_type_args);
+                            call->data.node.extra = type_args_node;
+                        }
+                        
+                        if (!parser_expect(parser, TOK_LPAREN)) {
+                            ast_free(call);
+                            return NULL;
+                        }
                         
                         /* Parse arguments */
                         if (!parser_check(parser, TOK_RPAREN)) {
@@ -2175,7 +2331,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     
                     if (expr->type == AST_IDENTIFIER) {
                         ast_node_t *call = ast_new(AST_METHOD_CALL, line, col);
-                        call->data.node.name = strdup(expr->data.leaf.name);
+                        call->data.node.name = (char *)intern(expr->data.leaf.name);
                         ast_free(expr);
                         
                         parser_advance(parser);  /* consume ( */
@@ -2200,7 +2356,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                         /* Explicit constructor invocation: this() or super() */
                         ast_node_t *call = ast_new(AST_EXPLICIT_CTOR_CALL, line, col);
                         /* Store whether it's this() or super() */
-                        call->data.node.name = strdup(expr->type == AST_THIS_EXPR ? "this" : "super");
+                        call->data.node.name = (char *)intern(expr->type == AST_THIS_EXPR ? "this" : "super");
                         ast_free(expr);
                         
                         parser_advance(parser);  /* consume ( */
@@ -2239,7 +2395,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     parser_advance(parser);
                     
                     ast_node_t *node = ast_new(AST_UNARY_EXPR, line, col);
-                    node->data.node.name = strdup(op);
+                    node->data.node.name = (char *)intern(op);
                     node->data.node.op_token = op_type;
                     node->data.node.flags = 1;  /* Mark as postfix */
                     ast_add_child(node, expr);
@@ -2258,10 +2414,10 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     ast_add_child(ref, expr);
                     
                     if (parser_check(parser, TOK_NEW)) {
-                        ref->data.node.name = strdup("new");
+                        ref->data.node.name = (char *)intern("new");
                         parser_advance(parser);
                     } else if (parser_check(parser, TOK_IDENTIFIER)) {
-                        ref->data.node.name = strdup(parser_current_text(parser));
+                        ref->data.node.name = (char *)intern(parser_current_text(parser));
                         parser_advance(parser);
                     } else {
                         parser_error(parser, "Expected method name or 'new' after '::'");
@@ -2491,7 +2647,7 @@ static ast_node_t *parse_expression_prec(parser_t *parser, precedence_t min_prec
         }
         
         ast_node_t *binary = ast_new(node_type, line, col);
-        binary->data.node.name = strdup(op_name);
+        binary->data.node.name = (char *)intern(op_name);
         binary->data.node.op_token = op;  /* Store operator token for efficient codegen */
         ast_add_child(binary, left);
         ast_add_child(binary, right);
@@ -2624,6 +2780,12 @@ ast_node_t *parse_type(parser_t *parser)
                 parser_advance(parser);
                 type_node->data.node.flags |= 0x1000;  /* Diamond operator flag */
             } else {
+                /* Try parsing type arguments. If we don't end up with valid
+                 * type arguments (terminated by >), restore and treat as < operator.
+                 * This handles cases like (expr.length < expr2.length) where
+                 * < is a comparison, not a generic type argument start. */
+                slist_t *parsed_type_args = NULL;
+                
                 do {
                     if (parser_check(parser, TOK_QUESTION)) {
                         /* Wildcard */
@@ -2636,28 +2798,57 @@ ast_node_t *parse_type(parser_t *parser)
                             parser_advance(parser);
                             ast_node_t *bound = parse_type(parser);
                             if (bound) {
-                                wildcard->data.node.name = strdup("extends");
+                                wildcard->data.node.name = (char *)intern("extends");
                                 ast_add_child(wildcard, bound);
                             }
                         } else if (parser_check(parser, TOK_SUPER)) {
                             parser_advance(parser);
                             ast_node_t *bound = parse_type(parser);
                             if (bound) {
-                                wildcard->data.node.name = strdup("super");
+                                wildcard->data.node.name = (char *)intern("super");
                                 ast_add_child(wildcard, bound);
                             }
                         }
                         
-                        ast_add_child(type_node, wildcard);
+                        if (!parsed_type_args) {
+                            parsed_type_args = slist_new(wildcard);
+                        } else {
+                            slist_append(parsed_type_args, wildcard);
+                        }
                     } else {
                         ast_node_t *type_arg = parse_type(parser);
                         if (type_arg) {
-                            ast_add_child(type_node, type_arg);
+                            if (!parsed_type_args) {
+                                parsed_type_args = slist_new(type_arg);
+                            } else {
+                                slist_append(parsed_type_args, type_arg);
+                            }
                         }
                     }
                 } while (parser_match(parser, TOK_COMMA));
                 
-                parser_expect_gt(parser);
+                /* Check if we ended up with a valid type argument list */
+                if (!parser_check(parser, TOK_GT)) {
+                    /* Not a valid type argument list - restore and return without generics.
+                     * This happens when < is actually a comparison operator. */
+                    
+                    /* Free the parsed type arguments */
+                    for (slist_t *node = parsed_type_args; node; node = node->next) {
+                        ast_free((ast_node_t *)node->data);
+                    }
+                    slist_free(parsed_type_args);
+                    
+                    lexer_restore_pos(parser->lexer, save_generic);
+                    return type_node;
+                }
+                
+                parser_advance(parser);  /* consume > */
+                
+                /* Add the parsed type arguments to the type node */
+                for (slist_t *node = parsed_type_args; node; node = node->next) {
+                    ast_add_child(type_node, (ast_node_t *)node->data);
+                }
+                slist_free(parsed_type_args);
             }
         }
     } else {
@@ -2884,8 +3075,11 @@ static ast_node_t *parse_statement(parser_t *parser)
                                     fprintf(stderr, "[PARSER] FOR lookahead: token=%d, depth=%d\n", 
                                             parser_current_type(parser), depth);
                                 }
-                                if (parser_check(parser, TOK_LT)) depth++;
-                                else if (parser_check(parser, TOK_GT)) depth--;
+                                if (parser_check(parser, TOK_LT)) {
+                                    depth++;
+                                } else if (parser_check(parser, TOK_GT)) {
+                                    depth--;
+                                }
                                 parser_advance(parser);
                             }
                             if (getenv("GENESIS_DEBUG_PARSER")) {
@@ -2900,8 +3094,8 @@ static ast_node_t *parse_statement(parser_t *parser)
                                 break;
                             }
                         }
-                        /* If followed by identifier, it's a declaration */
-                        if (parser_check(parser, TOK_IDENTIFIER)) {
+                        /* If followed by identifier (or contextual keyword used as identifier), it's a declaration */
+                        if (parser_check_identifier_or_contextual(parser)) {
                             is_var_decl = true;
                         } else {
                             if (getenv("GENESIS_DEBUG_PARSER")) {
@@ -2925,9 +3119,10 @@ static ast_node_t *parse_statement(parser_t *parser)
                                     parser_current_type(parser));
                         }
                         
-                        /* Check for enhanced for loop: for (Type var : iterable) */
-                        if (parser_check(parser, TOK_IDENTIFIER)) {
-                            char *var_name = strdup(parser_current_text(parser));
+                        /* Check for enhanced for loop: for (Type var : iterable)
+                         * Note: var name can be a contextual keyword like 'record' used as identifier */
+                        if (parser_check_identifier_or_contextual(parser)) {
+                            char *var_name = (char *)intern(parser_current_text(parser));
                             int var_line = parser_current_line(parser);
                             int var_col = parser_current_column(parser);
                             parser_advance(parser);
@@ -2964,7 +3159,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                                             parser_current_type(parser));
                                 }
                                 
-                                free(var_name);
+                                /* var_name is interned, don't free */
                                 
                                 if (!parser_expect(parser, TOK_RPAREN)) {
                                     ast_free(node);
@@ -3012,10 +3207,10 @@ static ast_node_t *parse_statement(parser_t *parser)
                             
                             /* More declarators? */
                             while (parser_match(parser, TOK_COMMA)) {
-                                if (parser_check(parser, TOK_IDENTIFIER)) {
+                                if (parser_check_identifier_or_contextual(parser)) {
                                     ast_node_t *decl = ast_new(AST_VAR_DECLARATOR, 
                                         parser_current_line(parser), parser_current_column(parser));
-                                    decl->data.node.name = strdup(parser_current_text(parser));
+                                    decl->data.node.name = (char *)intern(parser_current_text(parser));
                                     parser_advance(parser);
                                     
                                     if (parser_check(parser, TOK_ASSIGN)) {
@@ -3193,7 +3388,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                                                          parser_current_column(parser));
                         
                         if (parser_match(parser, TOK_DEFAULT)) {
-                            case_label->data.node.name = strdup("default");
+                            case_label->data.node.name = (char *)intern("default");
                         } else {
                             parser_advance(parser);  /* consume 'case' */
                             ast_node_t *case_expr = parse_expression(parser);
@@ -3282,7 +3477,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                 ast_node_t *node = ast_new(AST_BREAK_STMT, line, col);
                 
                 if (parser_check(parser, TOK_IDENTIFIER)) {
-                    node->data.node.name = strdup(parser_current_text(parser));
+                    node->data.node.name = (char *)intern(parser_current_text(parser));
                     parser_advance(parser);
                 }
                 
@@ -3296,7 +3491,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                 ast_node_t *node = ast_new(AST_CONTINUE_STMT, line, col);
                 
                 if (parser_check(parser, TOK_IDENTIFIER)) {
-                    node->data.node.name = strdup(parser_current_text(parser));
+                    node->data.node.name = (char *)intern(parser_current_text(parser));
                     parser_advance(parser);
                 }
                 
@@ -3351,7 +3546,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                             }
                             
                             if (parser_check(parser, TOK_IDENTIFIER)) {
-                                resource->data.node.name = strdup(parser_current_text(parser));
+                                resource->data.node.name = (char *)intern(parser_current_text(parser));
                                 parser_advance(parser);
                             }
                             
@@ -3378,7 +3573,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                                     ast_add_child(resource, first);  /* Type node */
                                 }
                                 
-                                resource->data.node.name = strdup(parser_current_text(parser));
+                                resource->data.node.name = (char *)intern(parser_current_text(parser));
                                 parser_advance(parser);
                                 
                                 if (!parser_expect(parser, TOK_ASSIGN)) {
@@ -3404,7 +3599,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                                 if (first && first->type == AST_CLASS_TYPE && first->data.node.name) {
                                     /* Convert to identifier expression */
                                     ast_node_t *ident = ast_new(AST_IDENTIFIER, res_line, res_col);
-                                    ident->data.leaf.name = strdup(first->data.node.name);
+                                    ident->data.leaf.name = (char *)intern(first->data.node.name);
                                     ast_free(first);
                                     ast_add_child(resource, ident);
                                 } else if (first) {
@@ -3471,7 +3666,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                     }
                     
                     if (parser_check(parser, TOK_IDENTIFIER)) {
-                        catch_clause->data.node.name = strdup(parser_current_text(parser));
+                        catch_clause->data.node.name = (char *)intern(parser_current_text(parser));
                         parser_advance(parser);
                     }
                     
@@ -3577,8 +3772,12 @@ static ast_node_t *parse_statement(parser_t *parser)
                     
                     uint32_t mods = 0;
                     while (parser_check(parser, TOK_FINAL) || parser_check(parser, TOK_ABSTRACT)) {
-                        if (parser_match(parser, TOK_FINAL)) mods |= MOD_FINAL;
-                        if (parser_match(parser, TOK_ABSTRACT)) mods |= MOD_ABSTRACT;
+                        if (parser_match(parser, TOK_FINAL)) {
+                            mods |= MOD_FINAL;
+                        }
+                        if (parser_match(parser, TOK_ABSTRACT)) {
+                            mods |= MOD_ABSTRACT;
+                        }
                     }
                     
                     if (parser_check(parser, TOK_CLASS) || parser_check(parser, TOK_INTERFACE) || parser_check(parser, TOK_RECORD)) {
@@ -3592,7 +3791,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                 /* Check for labeled statement */
                 if (tok_type == TOK_IDENTIFIER) {
                     lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
-                    const char *label_name = strdup(parser_current_text(parser));
+                    const char *label_name = (char *)intern(parser_current_text(parser));
                     parser_advance(parser);
                     
                     if (parser_check(parser, TOK_COLON)) {
@@ -3608,8 +3807,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                         return node;
                     }
                     
-                    /* Restore position */
-                    free((void *)label_name);
+                    /* Restore position - label_name is interned, don't free */
                     lexer_restore_pos(parser->lexer, save_pos);
                 }
                 
@@ -3637,15 +3835,16 @@ static ast_node_t *parse_statement(parser_t *parser)
                         /* Try parsing as type */
                         ast_node_t *type_node = parse_type(parser);
                         
-                        /* If followed by identifier, it's a variable declaration */
-                        if (type_node && parser_check(parser, TOK_IDENTIFIER)) {
+                        /* If followed by identifier (or contextual keyword used as identifier),
+                         * it's a variable declaration */
+                        if (type_node && parser_check_identifier_or_contextual(parser)) {
                             ast_node_t *var_decl = ast_new(AST_VAR_DECL, line, col);
                             var_decl->data.node.flags = modifiers;
                             ast_add_child(var_decl, type_node);
                             
                             /* Parse declarators */
                             do {
-                                if (!parser_check(parser, TOK_IDENTIFIER)) {
+                                if (!parser_check_identifier_or_contextual(parser)) {
                                     parser_error(parser, "Expected variable name");
                                     ast_free(var_decl);
                                     return NULL;
@@ -3654,7 +3853,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                                 ast_node_t *declarator = ast_new(AST_VAR_DECLARATOR,
                                                                  parser_current_line(parser),
                                                                  parser_current_column(parser));
-                                declarator->data.node.name = strdup(parser_current_text(parser));
+                                declarator->data.node.name = (char *)intern(parser_current_text(parser));
                                 parser_advance(parser);
                                 
                                 /* Array dimensions on variable */
@@ -3781,7 +3980,7 @@ static ast_node_t *parse_annotation(parser_t *parser)
     }
     
     ast_node_t *annot = ast_new(AST_ANNOTATION, line, col);
-    annot->data.node.name = strdup(name->str);
+    annot->data.node.name = (char *)intern(name->str);
     string_free(name, true);
     
     /* Parse annotation arguments if present */
@@ -3790,7 +3989,7 @@ static ast_node_t *parse_annotation(parser_t *parser)
             do {
                 /* Check for name=value pair or just value */
                 if (parser_check(parser, TOK_IDENTIFIER)) {
-                    const char *first_text = strdup(parser_current_text(parser));
+                    const char *first_text = (char *)intern(parser_current_text(parser));
                     int first_line = parser_current_line(parser);
                     int first_col = parser_current_column(parser);
                     parser_advance(parser);
@@ -3813,20 +4012,27 @@ static ast_node_t *parse_annotation(parser_t *parser)
                             parser_advance(parser);
                         } else if (parser_check(parser, TOK_AT)) {
                             ast_node_t *nested = parse_annotation(parser);
-                            if (nested) ast_add_child(pair, nested);
+                            if (nested) {
+                                ast_add_child(pair, nested);
+                            }
                         } else if (parser_check(parser, TOK_LBRACE)) {
                             /* Array value - skip for now */
                             int depth = 1;
                             parser_advance(parser);
                             while (depth > 0 && !parser_check(parser, TOK_EOF)) {
-                                if (parser_check(parser, TOK_LBRACE)) depth++;
-                                else if (parser_check(parser, TOK_RBRACE)) depth--;
+                                if (parser_check(parser, TOK_LBRACE)) {
+                                    depth++;
+                                } else if (parser_check(parser, TOK_RBRACE)) {
+                                    depth--;
+                                }
                                 parser_advance(parser);
                             }
                         } else {
                             /* Could be enum constant or class literal */
                             ast_node_t *val = parse_expression(parser);
-                            if (val) ast_add_child(pair, val);
+                            if (val) {
+                                ast_add_child(pair, val);
+                            }
                         }
                         
                         ast_add_child(annot, pair);
@@ -3834,7 +4040,7 @@ static ast_node_t *parse_annotation(parser_t *parser)
                         /* Single value - first token was the value, need to handle as identifier */
                         /* Actually this is tricky - we already consumed it. For now, create identifier */
                         ast_node_t *pair = ast_new(AST_ANNOTATION_VALUE, first_line, first_col);
-                        pair->data.node.name = strdup("value");  /* Default element name */
+                        pair->data.node.name = (char *)intern("value");  /* Default element name */
                         ast_node_t *val = ast_new_leaf(AST_IDENTIFIER, first_text, first_line, first_col);
                         free((void *)first_text);
                         ast_add_child(pair, val);
@@ -3843,7 +4049,7 @@ static ast_node_t *parse_annotation(parser_t *parser)
                 } else if (parser_check(parser, TOK_STRING_LITERAL)) {
                     /* Single value annotation like @SuppressWarnings("unchecked") */
                     ast_node_t *pair = ast_new(AST_ANNOTATION_VALUE, parser_current_line(parser), parser_current_column(parser));
-                    pair->data.node.name = strdup("value");
+                    pair->data.node.name = (char *)intern("value");
                     ast_node_t *val = ast_new_literal_from_lexer(parser->lexer);
                     ast_add_child(pair, val);
                     parser_advance(parser);
@@ -3932,7 +4138,7 @@ static ast_node_t *parse_method_decl(parser_t *parser, uint32_t modifiers,
     ast_node_type_t type = return_type ? AST_METHOD_DECL : AST_CONSTRUCTOR_DECL;
     ast_node_t *method = ast_new(type, line, col);
     method->data.node.flags = modifiers;
-    method->data.node.name = strdup(name);
+    method->data.node.name = (char *)intern(name);
     method->data.node.extra = return_type;
     
     /* Parse parameters */
@@ -3956,7 +4162,7 @@ static ast_node_t *parse_method_decl(parser_t *parser, uint32_t modifiers,
             
             ast_node_t *param = ast_new(AST_PARAMETER, parser_current_line(parser),
                                         parser_current_column(parser));
-            param->data.node.name = strdup(parser_current_text(parser));
+            param->data.node.name = (char *)intern(parser_current_text(parser));
             param->data.node.flags = param_mods | (varargs ? MOD_VARARGS : 0);
             param->annotations = param_annotations;  /* Store parameter annotations */
             parser_advance(parser);
@@ -4041,7 +4247,7 @@ static ast_node_t *parse_field_decl(parser_t *parser, uint32_t modifiers,
     
     /* Parse declarators (starting with the first one we already have) */
     ast_node_t *declarator = ast_new(AST_VAR_DECLARATOR, line, col);
-    declarator->data.node.name = strdup(name);
+    declarator->data.node.name = (char *)intern(name);
     
     /* Array dimensions on variable */
     while (parser_match(parser, TOK_LBRACKET)) {
@@ -4074,7 +4280,7 @@ static ast_node_t *parse_field_decl(parser_t *parser, uint32_t modifiers,
         
         declarator = ast_new(AST_VAR_DECLARATOR, parser_current_line(parser),
                              parser_current_column(parser));
-        declarator->data.node.name = strdup(parser_current_text(parser));
+        declarator->data.node.name = (char *)intern(parser_current_text(parser));
         parser_advance(parser);
         
         while (parser_match(parser, TOK_LBRACKET)) {
@@ -4176,7 +4382,7 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
                 ast_node_t *type_param = ast_new(AST_TYPE_PARAMETER,
                                                   parser_current_line(parser),
                                                   parser_current_column(parser));
-                type_param->data.node.name = strdup(parser_current_text(parser));
+                type_param->data.node.name = (char *)intern(parser_current_text(parser));
                 parser_advance(parser);
                 
                 /* Bounds: T extends A & B & C */
@@ -4284,7 +4490,7 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
         return NULL;
     }
     
-    char *name = strdup(parser_current_text(parser));
+    char *name = (char *)intern(parser_current_text(parser));
     parser_advance(parser);
     
     if (parser_check(parser, TOK_LPAREN)) {
@@ -4301,7 +4507,7 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
                 slist_free(method_type_params);
             }
         }
-        free(name);
+        /* name is interned, don't free */
         return method;
     } else {
         /* Field - type parameters are not allowed */
@@ -4314,8 +4520,10 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
         }
         ast_node_t *field = parse_field_decl(parser, modifiers, type_node, name,
                                              line, col);
-        if (field) field->annotations = annotations;
-        free(name);
+        if (field) {
+            field->annotations = annotations;
+        }
+        /* name is interned, don't free */
         return field;
     }
 }
@@ -4402,7 +4610,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
     
     ast_node_t *decl = ast_new(type, line, col);
     decl->data.node.flags = modifiers;
-    decl->data.node.name = strdup(parser_current_text(parser));
+    decl->data.node.name = (char *)intern(parser_current_text(parser));
     decl->annotations = annotations;  /* Store annotations on the declaration */
     parser_advance(parser);
     
@@ -4414,7 +4622,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
                 ast_node_t *type_param = ast_new(AST_TYPE_PARAMETER,
                                                   parser_current_line(parser),
                                                   parser_current_column(parser));
-                type_param->data.node.name = strdup(parser_current_text(parser));
+                type_param->data.node.name = (char *)intern(parser_current_text(parser));
                 parser_advance(parser);
                 
                 /* Bounds: T extends A & B & C */
@@ -4472,7 +4680,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
                 ast_node_t *component = ast_new(AST_PARAMETER,
                                                parser_current_line(parser),
                                                parser_current_column(parser));
-                component->data.node.name = strdup(parser_current_text(parser));
+                component->data.node.name = (char *)intern(parser_current_text(parser));
                 component->data.node.flags = MOD_FINAL | MOD_RECORD_COMPONENT;
                 component->annotations = comp_annotations;
                 if (comp_type) {
@@ -4572,7 +4780,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
             ast_node_t *constant = ast_new(AST_ENUM_CONSTANT, 
                                            parser_current_line(parser),
                                            parser_current_column(parser));
-            constant->data.node.name = strdup(parser_current_text(parser));
+            constant->data.node.name = (char *)intern(parser_current_text(parser));
             constant->annotations = const_annotations;
             parser_advance(parser);
             

@@ -248,6 +248,7 @@ static bool output_class(class_gen_t *cg, const char *qualified_name,
     size_t size;
     uint8_t *bytes = write_class_bytes(cg, &size);
     if (!bytes) {
+        fprintf(stderr, "output_class: write_class_bytes returned NULL for %s\n", qualified_name);
         return false;
     }
     
@@ -296,8 +297,12 @@ static bool output_class(class_gen_t *cg, const char *qualified_name,
                 if (opts->verbose) {
                     printf("Generated: %s\n", output_path);
                 }
+            } else {
+                fprintf(stderr, "output_class: fwrite failed for %s\n", output_path);
             }
             fclose(fp);
+        } else {
+            fprintf(stderr, "output_class: fopen failed for %s\n", output_path);
         }
         
         free(path_name);
@@ -520,7 +525,9 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
     }
     
     /* Lexical analysis - feedforward tokenization */
-    lexer_t *lexer = lexer_new(src);
+    int source_version = classfile_java_version(
+        classfile_version_from_string(opts->source_version));
+    lexer_t *lexer = lexer_new(src, source_version);
     if (!lexer) {
         fprintf(stderr, "error: failed to create lexer for: %s\n", src->filename);
         return 1;
@@ -552,7 +559,8 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
                 parser->error_msg);
         parser_free(parser);
         lexer_free(lexer);
-        ast_free(ast);
+        /* Don't free AST - it may be referenced by symbols from other compilation units */
+        /* ast_free(ast); */
         return 1;
     }
     
@@ -581,7 +589,8 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
     semantic_t *sem = semantic_new(g_classpath);
     if (!sem) {
         fprintf(stderr, "error: failed to create semantic analyzer\n");
-        ast_free(ast);
+        /* Don't free AST - it may be referenced by symbols from other compilation units */
+        /* ast_free(ast); */
         return 1;
     }
     
@@ -607,7 +616,8 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
     if (!sem_ok) {
         fprintf(stderr, "%d error(s)\n", sem->error_count);
         semantic_free(sem);
-        ast_free(ast);
+        /* Don't free AST - it may be referenced by symbols from other compilation units */
+        /* ast_free(ast); */
         return 1;
     }
     
@@ -725,7 +735,8 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
             
             /* package-info.java files don't have type declarations */
             semantic_free(sem);
-            ast_free(ast);
+            /* Don't free AST - it may be referenced by symbols from other compilation units */
+            /* ast_free(ast); */
             return 0;
         }
         
@@ -837,7 +848,8 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
     }
     
     semantic_free(sem);
-    ast_free(ast);
+    /* Don't free AST - it may be referenced by symbols from other compilation units */
+    /* ast_free(ast); */
     return 0;
 }
 
@@ -1084,9 +1096,16 @@ void print_usage(const char *program_name)
  */
 int main(int argc, char **argv)
 {
+    /* Initialize string interning for performance */
+    intern_init();
+    
+    /* Initialize AST node pool for efficient allocation */
+    ast_pool_init();
+    
     compiler_options_t *opts = compiler_options_new();
     if (!opts) {
         fprintf(stderr, "error: failed to allocate compiler options\n");
+        intern_cleanup();
         return 1;
     }
     
@@ -1353,6 +1372,12 @@ int main(int argc, char **argv)
     slist_free_full(opts->source_files, free);
     opts->source_files = NULL;
     compiler_options_free(opts);
+    
+    /* Clean up AST pool */
+    ast_pool_cleanup();
+    
+    /* Clean up string interning */
+    intern_cleanup();
     
     return result;
 }

@@ -61,6 +61,7 @@ typedef struct jar_handle
     zip_entry_t *entries;
     int entry_count;
     long base_offset;           /* Offset to start of ZIP data (4 for JMOD, 0 for JAR) */
+    hashtable_t *entry_index;   /* O(1) lookup: filename -> zip_entry_t* */
 } jar_handle_t;
 
 /*
@@ -209,6 +210,15 @@ static bool parse_central_directory(jar_handle_t *jar)
     }
 
     free(cd);
+    
+    /* Build hashtable index for O(1) lookups */
+    jar->entry_index = hashtable_new_sized(jar->entry_count);
+    if (jar->entry_index) {
+        for (zip_entry_t *e = jar->entries; e; e = e->next) {
+            hashtable_insert(jar->entry_index, e->filename, e);
+        }
+    }
+    
     return true;
 }
 
@@ -291,6 +301,11 @@ void jar_close(void *handle)
         fclose(jar->fp);
     }
     free(jar->path);
+    
+    /* Free entry index */
+    if (jar->entry_index) {
+        hashtable_free(jar->entry_index);
+    }
 
     /* Free entries */
     zip_entry_t *entry = jar->entries;
@@ -306,6 +321,12 @@ void jar_close(void *handle)
 
 static zip_entry_t *jar_find_entry(jar_handle_t *jar, const char *entry_path)
 {
+    /* Use O(1) hashtable lookup if available */
+    if (jar->entry_index) {
+        return (zip_entry_t *)hashtable_lookup(jar->entry_index, entry_path);
+    }
+    
+    /* Fallback to linear search */
     for (zip_entry_t *e = jar->entries; e; e = e->next) {
         if (strcmp(e->filename, entry_path) == 0) {
             return e;
@@ -785,8 +806,9 @@ classpath_t *classpath_new(void)
     cp->boot_entries = NULL;  /* slist starts as NULL */
     cp->entries = NULL;
     cp->cache = hashtable_new();
+    cp->negative_cache = hashtable_new_sized(1024);  /* Pre-sized for common misses */
 
-    if (!cp->cache) {
+    if (!cp->cache || !cp->negative_cache) {
         classpath_free(cp);
         return NULL;
     }
@@ -823,6 +845,11 @@ void classpath_free(classpath_t *cp)
     /* Free cache */
     if (cp->cache) {
         hashtable_free_full(cp->cache, free_classfile);
+    }
+    
+    /* Free negative cache (values are just sentinel, no need to free) */
+    if (cp->negative_cache) {
+        hashtable_free(cp->negative_cache);
     }
 
     free(cp->java_home);
@@ -908,6 +935,9 @@ bool classpath_setup_jdk(classpath_t *cp, jdk_info_t *jdk)
             "java.xml.jmod",        /* javax.xml */
             "java.management.jmod", /* java.lang.management */
             "java.compiler.jmod",   /* javax.tools (JavaCompiler, etc.) */
+            "java.security.sasl.jmod", /* javax.security.sasl (SASL) */
+            "java.naming.jmod",     /* javax.naming (JNDI) */
+            "java.desktop.jmod",    /* java.beans (BeanInfo, Introspector) */
             NULL
         };
         
@@ -1033,11 +1063,17 @@ static classfile_t *load_from_entry(cp_entry_t *entry, const char *path)
 
 classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
 {
-    /* Check cache first */
+    /* Check positive cache first */
     classfile_t *cached = (classfile_t *)hashtable_lookup(cp->cache, classname);
     if (cached) {
         cp->cache_hits++;
         return cached;
+    }
+    
+    /* Check negative cache - avoid repeated failed lookups */
+    if (cp->negative_cache && hashtable_lookup(cp->negative_cache, classname)) {
+        cp->negative_cache_hits++;
+        return NULL;
     }
 
     char *path = classname_to_path(classname);
@@ -1060,9 +1096,12 @@ classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
     free(path);
 
     if (cf) {
-        /* Add to cache */
+        /* Add to positive cache */
         hashtable_insert(cp->cache, classname, cf);
         cp->classes_loaded++;
+    } else if (cp->negative_cache) {
+        /* Add to negative cache so we don't search again */
+        hashtable_insert(cp->negative_cache, classname, (void *)1);
     }
 
     return cf;

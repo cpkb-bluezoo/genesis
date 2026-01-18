@@ -74,10 +74,14 @@ typedef struct classpath
 
     /* Class cache: maps fully qualified name -> classfile_t* */
     hashtable_t *cache;
+    
+    /* Negative cache: classes we know don't exist (value is (void*)1) */
+    hashtable_t *negative_cache;
 
     /* Statistics */
     int classes_loaded;
     int cache_hits;
+    int negative_cache_hits;
 } classpath_t;
 
 /*
