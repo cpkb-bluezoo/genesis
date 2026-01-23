@@ -27,6 +27,23 @@
 #include "jarwriter.h"
 
 #include <sys/stat.h>  /* For mkdir() */
+#include <pthread.h>   /* For parallel compilation */
+#include <stdatomic.h> /* For atomic operations */
+
+/* ========================================================================
+ * Parallel Compilation Infrastructure
+ * ======================================================================== */
+
+/* Get number of CPU cores */
+static int get_cpu_count(void)
+{
+#ifdef _SC_NPROCESSORS_ONLN
+    int count = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    return count > 0 ? count : 1;
+#else
+    return 4;  /* Default fallback */
+#endif
+}
 
 /* ========================================================================
  * Compiler options
@@ -54,6 +71,7 @@ compiler_options_t *compiler_options_new(void)
     opts->debug_info = true;
     opts->warnings = true;
     opts->werror = false;
+    opts->jobs = -1;  /* -1 = auto-detect thread count (parallel default) */
     
     return opts;
 }
@@ -168,6 +186,11 @@ static compiler_options_t *g_opts = NULL;
 
 /* Global JAR writer for JAR output mode */
 static jar_writer_t *g_jar_writer = NULL;
+
+/* Note: Shared type cache for parallel compilation was removed due to complexity.
+ * Cross-file source dependencies require a more sophisticated multi-phase approach.
+ * Current parallel compilation works well for independent files or files that only
+ * depend on classpath types (JAR/class files). */
 
 /**
  * Initialize the classpath from JDK and user options.
@@ -853,22 +876,550 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
     return 0;
 }
 
+/* ========================================================================
+ * Parallel Compilation Implementation
+ * ======================================================================== */
+
+/* Result of parsing a single file */
+typedef struct parse_result {
+    char *filename;
+    source_file_t *source;
+    ast_node_t *ast;
+    char *error_msg;
+    int error_line;
+    int error_column;
+    semantic_t *sem;  /* Semantic analyzer (set after serial semantic phase) */
+} parse_result_t;
+
+/* Shared state for parallel parsing phase */
+typedef struct parse_phase_state {
+    char **filenames;
+    int file_count;
+    atomic_int next_index;
+    parse_result_t *results;
+    int source_version;
+} parse_phase_state_t;
+
+/* Shared state for parallel codegen phase */
+typedef struct codegen_phase_state {
+    parse_result_t *results;
+    int file_count;
+    atomic_int next_index;
+    atomic_int error_count;
+    compiler_options_t *opts;
+    pthread_mutex_t output_mutex;
+    type_registry_t *registry;  /* Shared type registry for cross-file resolution */
+} codegen_phase_state_t;
+
 /**
- * Compile all source files.
+ * Extract package name from a compilation unit AST.
  */
-int compile(compiler_options_t *opts)
+static const char *get_package_from_ast(ast_node_t *ast)
+{
+    if (!ast || ast->type != AST_COMPILATION_UNIT) {
+        return NULL;
+    }
+    
+    slist_t *children = ast->data.node.children;
+    while (children) {
+        ast_node_t *child = (ast_node_t *)children->data;
+        if (child && child->type == AST_PACKAGE_DECL) {
+            return child->data.node.name;
+        }
+        children = children->next;
+    }
+    return NULL;
+}
+
+/**
+ * Create a member scope for an interface stub, extracting method names from AST.
+ * This allows @Override checks to find interface methods.
+ * Only call this for interfaces - classes/enums get full member population
+ * during semantic analysis.
+ */
+static void populate_interface_stub_methods(symbol_t *sym, ast_node_t *decl)
+{
+    if (!sym || !decl || !decl->data.node.children || sym->kind != SYM_INTERFACE) {
+        return;
+    }
+    
+    /* Create member scope */
+    sym->data.class_data.members = scope_new(SCOPE_CLASS, NULL);
+    if (!sym->data.class_data.members) {
+        return;
+    }
+    
+    /* Walk AST children looking for method declarations */
+    for (slist_t *child = decl->data.node.children; child; child = child->next) {
+        ast_node_t *member = (ast_node_t *)child->data;
+        if (!member) continue;
+        
+        if (member->type == AST_METHOD_DECL) {
+            const char *name = member->data.node.name;
+            if (name) {
+                /* Create method stub - include return type for lazy resolution */
+                symbol_t *method_sym = calloc(1, sizeof(symbol_t));
+                if (method_sym) {
+                    method_sym->kind = SYM_METHOD;
+                    method_sym->name = strdup(name);
+                    method_sym->modifiers = member->data.node.flags;
+                    method_sym->ast = member;  /* Keep AST for type resolution */
+                    /* Interface methods are implicitly public abstract (unless static/default) */
+                    if (!(method_sym->modifiers & MOD_PRIVATE)) {
+                        method_sym->modifiers |= MOD_PUBLIC;
+                    }
+                    if (!(method_sym->modifiers & MOD_STATIC) && 
+                        !(method_sym->modifiers & MOD_DEFAULT)) {
+                        method_sym->modifiers |= MOD_ABSTRACT;
+                    }
+                    scope_define(sym->data.class_data.members, method_sym);
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Create a minimal symbol entry for a type declaration.
+ * This creates a stub symbol that will be fully populated during semantic analysis.
+ */
+static symbol_t *create_type_stub(const char *qname, ast_node_t *decl, 
+                                  const char *package)
+{
+    symbol_t *sym = calloc(1, sizeof(symbol_t));
+    if (!sym) {
+        return NULL;
+    }
+    
+    /* Set basic symbol info */
+    switch (decl->type) {
+        case AST_INTERFACE_DECL:
+        case AST_ANNOTATION_DECL:
+            sym->kind = SYM_INTERFACE;
+            break;
+        case AST_ENUM_DECL:
+            sym->kind = SYM_ENUM;
+            break;
+        case AST_RECORD_DECL:
+            sym->kind = SYM_RECORD;
+            break;
+        default:
+            sym->kind = SYM_CLASS;
+            break;
+    }
+    
+    sym->name = strdup(decl->data.node.name);
+    sym->qualified_name = strdup(qname);
+    
+    /* Store package for type resolution */
+    if (package) {
+        sym->data.class_data.package = strdup(package);
+    }
+    /* Don't store AST reference - the symbol is just a type stub,
+     * the real symbol with AST will be created by the file's own
+     * semantic analyzer */
+    sym->ast = NULL;
+    
+    /* Extract modifiers from AST - modifiers are stored in node.flags */
+    sym->modifiers = decl->data.node.flags;
+    
+    /* Create a type for this symbol */
+    type_t *type = type_new_class(qname);
+    if (type) {
+        type->data.class_type.symbol = sym;
+        sym->type = type;
+    }
+    
+    /* Extract type parameters (generics like <E>, <K,V>) from AST children */
+    if (decl->data.node.children) {
+        for (slist_t *child = decl->data.node.children; child; child = child->next) {
+            ast_node_t *member = (ast_node_t *)child->data;
+            if (member && member->type == AST_TYPE_PARAMETER && member->data.node.name) {
+                /* Create a symbol for the type parameter */
+                symbol_t *tparam_sym = calloc(1, sizeof(symbol_t));
+                if (tparam_sym) {
+                    tparam_sym->kind = SYM_TYPE_PARAM;
+                    tparam_sym->name = strdup(member->data.node.name);
+                    tparam_sym->ast = member;
+                    
+                    /* Create a type variable type (TYPE_TYPEVAR) */
+                    type_t *tvar_type = malloc(sizeof(type_t));
+                    if (tvar_type) {
+                        tvar_type->kind = TYPE_TYPEVAR;
+                        tvar_type->data.type_var.name = strdup(member->data.node.name);
+                        tvar_type->data.type_var.bound = NULL;
+                        tparam_sym->type = tvar_type;
+                    }
+                    
+                    /* Add to type_params list */
+                    if (!sym->data.class_data.type_params) {
+                        sym->data.class_data.type_params = slist_new(tparam_sym);
+                    } else {
+                        slist_append(sym->data.class_data.type_params, tparam_sym);
+                    }
+                }
+            }
+        }
+    }
+    
+    /* For interfaces, populate method stubs for @Override checks */
+    if (sym->kind == SYM_INTERFACE) {
+        populate_interface_stub_methods(sym, decl);
+    }
+    
+    /* For enums, populate enum constants */
+    if (sym->kind == SYM_ENUM && decl->data.node.children) {
+        sym->data.class_data.members = scope_new(SCOPE_CLASS, NULL);
+        if (sym->data.class_data.members) {
+            for (slist_t *child = decl->data.node.children; child; child = child->next) {
+                ast_node_t *member = (ast_node_t *)child->data;
+                if (member && member->type == AST_ENUM_CONSTANT && member->data.node.name) {
+                    symbol_t *const_sym = calloc(1, sizeof(symbol_t));
+                    if (const_sym) {
+                        const_sym->kind = SYM_FIELD;
+                        const_sym->name = strdup(member->data.node.name);
+                        const_sym->modifiers = MOD_PUBLIC | MOD_STATIC | MOD_FINAL;
+                        const_sym->type = type;  /* Type is the enum itself */
+                        const_sym->data.var_data.is_enum_constant = true;
+                        scope_define(sym->data.class_data.members, const_sym);
+                    }
+                }
+            }
+        }
+    }
+    
+    return sym;
+}
+
+/**
+ * Register a type declaration and any nested types into the registry.
+ * This is a recursive function that handles nested classes.
+ * Also sets the completer on each symbol for lazy member population.
+ */
+static void register_type_decl(type_registry_t *reg, ast_node_t *decl, 
+                               const char *parent_qname, const char *package,
+                               completer_context_t *completer_ctx)
+{
+    if (!decl || !decl->data.node.name) {
+        return;
+    }
+    
+    /* Build qualified name */
+    char *qname;
+    if (parent_qname) {
+        /* Nested type: ParentClass$NestedClass */
+        size_t len = strlen(parent_qname) + 1 + strlen(decl->data.node.name) + 1;
+        qname = malloc(len);
+        if (qname) {
+            snprintf(qname, len, "%s$%s", parent_qname, decl->data.node.name);
+        }
+    } else if (package) {
+        /* Top-level type in package */
+        size_t len = strlen(package) + 1 + strlen(decl->data.node.name) + 1;
+        qname = malloc(len);
+        if (qname) {
+            snprintf(qname, len, "%s.%s", package, decl->data.node.name);
+        }
+    } else {
+        /* Default package */
+        qname = strdup(decl->data.node.name);
+    }
+    
+    if (!qname) {
+        return;
+    }
+    
+    /* Create symbol stub and register it */
+    symbol_t *sym = create_type_stub(qname, decl, package);
+    if (sym) {
+        /* Set the completer for lazy member population (javac-style) */
+        if (completer_ctx) {
+            symbol_set_completer(sym, class_symbol_completer, completer_ctx);
+        }
+        type_registry_register(reg, qname, sym, decl);
+    }
+    
+    /* Recursively register nested types */
+    if (decl->data.node.children) {
+        for (slist_t *child = decl->data.node.children; child; child = child->next) {
+            ast_node_t *member = (ast_node_t *)child->data;
+            if (member && (member->type == AST_CLASS_DECL ||
+                member->type == AST_INTERFACE_DECL ||
+                member->type == AST_ENUM_DECL ||
+                member->type == AST_RECORD_DECL ||
+                member->type == AST_ANNOTATION_DECL)) {
+                if (getenv("GENESIS_DEBUG_REGISTRY")) {
+                    fprintf(stderr, "DEBUG register: nested type '%s' in '%s'\n",
+                            member->data.node.name ? member->data.node.name : "(null)",
+                            qname ? qname : "(null)");
+                }
+                register_type_decl(reg, member, qname, package, completer_ctx);
+            }
+        }
+    }
+    
+    free(qname);
+}
+
+/**
+ * Register all types from an AST compilation unit into the shared registry.
+ * This runs during Phase 2 (Type Entry) to make all types visible.
+ * Sets completer on each type for lazy member population.
+ */
+static void register_types_from_ast(type_registry_t *reg, ast_node_t *ast,
+                                    completer_context_t *completer_ctx)
+{
+    if (!reg || !ast || ast->type != AST_COMPILATION_UNIT) {
+        return;
+    }
+    
+    const char *package = get_package_from_ast(ast);
+    
+    /* Walk children looking for type declarations */
+    slist_t *children = ast->data.node.children;
+    while (children) {
+        ast_node_t *child = (ast_node_t *)children->data;
+        
+        if (child && (child->type == AST_CLASS_DECL ||
+            child->type == AST_INTERFACE_DECL ||
+            child->type == AST_ENUM_DECL ||
+            child->type == AST_RECORD_DECL ||
+            child->type == AST_ANNOTATION_DECL)) {
+            
+            /* Count children of the class decl */
+            if (getenv("GENESIS_DEBUG_REGISTRY")) {
+                int child_count = 0;
+                for (slist_t *c = child->data.node.children; c; c = c->next) child_count++;
+                fprintf(stderr, "DEBUG register: type '%s' has %d children (from package '%s', ast=%p, cu=%p)\n",
+                        child->data.node.name ? child->data.node.name : "(null)", 
+                        child_count,
+                        package ? package : "(default)",
+                        (void*)child, (void*)ast);
+            }
+            
+            register_type_decl(reg, child, NULL, package, completer_ctx);
+        }
+        
+        children = children->next;
+    }
+}
+
+/**
+ * Worker thread for Phase 1: Parallel parsing.
+ * Each thread parses files independently - no shared state.
+ */
+static void *parse_phase_worker(void *arg)
+{
+    parse_phase_state_t *state = (parse_phase_state_t *)arg;
+    
+    while (1) {
+        int idx = atomic_fetch_add(&state->next_index, 1);
+        if (idx >= state->file_count) {
+            break;
+        }
+        
+        char *filename = state->filenames[idx];
+        parse_result_t *result = &state->results[idx];
+        
+        result->filename = filename;
+        result->source = NULL;
+        result->ast = NULL;
+        result->error_msg = NULL;
+        
+        /* Create and load source file */
+        result->source = source_file_new(filename);
+        if (!result->source) {
+            result->error_msg = strdup("cannot allocate source file");
+            continue;
+        }
+        
+        if (!source_file_load(result->source)) {
+            result->error_msg = strdup("cannot read source file");
+            continue;
+        }
+        
+        /* Lexing */
+        lexer_t *lexer = lexer_new(result->source, state->source_version);
+        if (!lexer) {
+            result->error_msg = strdup("failed to create lexer");
+            continue;
+        }
+        
+        if (lexer_type(lexer) == TOK_ERROR) {
+            result->error_msg = strdup(lexer_text(lexer));
+            result->error_line = lexer_line(lexer);
+            result->error_column = lexer_column(lexer);
+            lexer_free(lexer);
+            continue;
+        }
+        
+        /* Parsing */
+        parser_t *parser = parser_new(lexer, result->source);
+        if (!parser) {
+            result->error_msg = strdup("failed to create parser");
+            lexer_free(lexer);
+            continue;
+        }
+        
+        result->ast = parser_parse(parser);
+        
+        if (parser->error_msg) {
+            result->error_msg = strdup(parser->error_msg);
+            result->error_line = parser->error_line;
+            result->error_column = parser->error_column;
+        }
+        
+        parser_free(parser);
+        lexer_free(lexer);
+    }
+    
+    return NULL;
+}
+
+/**
+ * Worker thread for parallel codegen ONLY.
+ * Semantic analysis is done serially before this runs.
+ * This only does bytecode generation and writing, which is stateless.
+ */
+static void *codegen_phase_worker(void *arg)
+{
+    codegen_phase_state_t *state = (codegen_phase_state_t *)arg;
+    
+    while (1) {
+        int idx = atomic_fetch_add(&state->next_index, 1);
+        if (idx >= state->file_count) {
+            break;
+        }
+        
+        parse_result_t *pr = &state->results[idx];
+        
+        /* Skip files with parse errors or semantic errors (marked by NULL sem) */
+        if (pr->error_msg || !pr->ast || !pr->sem) {
+            continue;
+        }
+        
+        semantic_t *sem = pr->sem;
+        
+        /* Code generation for each top-level type */
+        slist_t *children = pr->ast->data.node.children;
+        while (children) {
+            ast_node_t *child = (ast_node_t *)children->data;
+            
+            if (child && (child->type == AST_CLASS_DECL ||
+                child->type == AST_INTERFACE_DECL ||
+                child->type == AST_ENUM_DECL ||
+                child->type == AST_RECORD_DECL ||
+                child->type == AST_ANNOTATION_DECL)) {
+                
+                const char *class_name = child->data.node.name;
+                if (!class_name) {
+                    children = children->next;
+                    continue;
+                }
+                
+                /* Get class symbol */
+                symbol_t *class_sym = child->sem_symbol;
+                if (!class_sym && sem->current_class) {
+                    class_sym = sem->current_class;
+                }
+                
+                class_gen_t *cg = class_gen_new(sem, class_sym);
+                if (!cg) {
+                    pthread_mutex_lock(&state->output_mutex);
+                    fprintf(stderr, "error: cannot create class generator for %s\n",
+                            class_name);
+                    pthread_mutex_unlock(&state->output_mutex);
+                    atomic_fetch_add(&state->error_count, 1);
+                    children = children->next;
+                    continue;
+                }
+                
+                if (!codegen_class(cg, child)) {
+                    pthread_mutex_lock(&state->output_mutex);
+                    fprintf(stderr, "error: code generation failed for: %s\n",
+                            class_name);
+                    pthread_mutex_unlock(&state->output_mutex);
+                    atomic_fetch_add(&state->error_count, 1);
+                    class_gen_free(cg);
+                    children = children->next;
+                    continue;
+                }
+                
+                /* Write class file */
+                const char *qname = class_sym ? class_sym->qualified_name : class_name;
+                pthread_mutex_lock(&state->output_mutex);
+                bool write_ok = output_class(cg, qname, state->opts);
+                pthread_mutex_unlock(&state->output_mutex);
+                
+                if (!write_ok) {
+                    atomic_fetch_add(&state->error_count, 1);
+                }
+                
+                /* Determine target major version */
+                int target_major = 52; /* Default to Java 8 */
+                if (state->opts->target_version) {
+                    int v = atoi(state->opts->target_version);
+                    if (v >= 8) target_major = v + 44;
+                }
+                
+                /* Process nested classes (static and non-static inner classes) */
+                process_nested_classes(sem, cg, class_sym, state->opts, target_major);
+                
+                /* Process local classes (classes defined inside method bodies) */
+                process_local_classes(sem, cg, state->opts, target_major);
+                
+                /* Process anonymous classes */
+                process_anonymous_classes(sem, cg, state->opts, target_major);
+                
+                class_gen_free(cg);
+            }
+            
+            children = children->next;
+        }
+    }
+    
+    return NULL;
+}
+
+/**
+ * Compile all source files using parallel compilation.
+ * 
+ * Three-phase approach:
+ *   Phase 1: Parse all files in parallel (no shared state)
+ *   Phase 2: Resolve types (uses thread-safe classpath cache)
+ *   Phase 3: Analyze and codegen in parallel (thread-local semantic_t)
+ */
+static int compile_parallel(compiler_options_t *opts, int thread_count)
 {
     if (!opts || !opts->source_files) {
         fprintf(stderr, "error: no source files\n");
         return 1;
     }
     
-    /* Initialize classpath */
-    if (!init_classpath(opts)) {
+    /* Count source files and build array */
+    int file_count = 0;
+    for (slist_t *list = opts->source_files; list; list = list->next) {
+        file_count++;
+    }
+    
+    char **filenames = malloc(file_count * sizeof(char *));
+    if (!filenames) {
+        fprintf(stderr, "error: out of memory\n");
         return 1;
     }
     
-    /* Set up global state for dependency compilation */
+    int i = 0;
+    for (slist_t *list = opts->source_files; list; list = list->next) {
+        filenames[i++] = (char *)list->data;
+    }
+    
+    /* Initialize classpath (thread-safe cache) */
+    if (!init_classpath(opts)) {
+        free(filenames);
+        return 1;
+    }
+    
+    /* Set up global state */
     g_opts = opts;
     g_compiled_sources = hashtable_new();
     
@@ -880,6 +1431,7 @@ int compile(compiler_options_t *opts)
             hashtable_free(g_compiled_sources);
             g_compiled_sources = NULL;
             g_opts = NULL;
+            free(filenames);
             free_classpath();
             return 1;
         }
@@ -888,37 +1440,326 @@ int compile(compiler_options_t *opts)
         }
     }
     
-    int errors = 0;
-    slist_t *list = opts->source_files;
+    int source_version = classfile_java_version(
+        classfile_version_from_string(opts->source_version));
     
-    while (list) {
-        char *filename = (char *)list->data;
+    if (opts->verbose) {
+        printf("Parallel compilation with %d threads for %d files\n", 
+               thread_count, file_count);
+    }
+    
+    /* Allocate parse results */
+    parse_result_t *parse_results = calloc(file_count, sizeof(parse_result_t));
+    if (!parse_results) {
+        fprintf(stderr, "error: out of memory\n");
+        free(filenames);
+        free_classpath();
+        return 1;
+    }
+    
+    /* Thread attributes for larger stack */
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 8 * 1024 * 1024);
+    
+    /* ================================================================
+     * Phase 1: Parallel Parsing
+     * Disable AST pool for thread-safe parsing - each thread will use malloc.
+     * ================================================================ */
+    ast_pool_disable();
+    
+    /* Note: We don't enable type_cache because type comparison already 
+     * uses name-based comparison (class_names_equal in type_equals).
+     * The type cache was causing issues with shared type_args modification. */
+    
+    if (opts->verbose) {
+        printf("Phase 1: Parsing %d files...\n", file_count);
+    }
+    
+    parse_phase_state_t parse_state = {
+        .filenames = filenames,
+        .file_count = file_count,
+        .next_index = ATOMIC_VAR_INIT(0),
+        .results = parse_results,
+        .source_version = source_version
+    };
+    
+    pthread_t *threads = malloc(thread_count * sizeof(pthread_t));
+    for (i = 0; i < thread_count; i++) {
+        pthread_create(&threads[i], &attr, parse_phase_worker, &parse_state);
+    }
+    for (i = 0; i < thread_count; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    /* Report parse errors */
+    int parse_errors = 0;
+    for (i = 0; i < file_count; i++) {
+        if (parse_results[i].error_msg) {
+            fprintf(stderr, "%s:%d:%d: error: %s\n",
+                    filenames[i],
+                    parse_results[i].error_line,
+                    parse_results[i].error_column,
+                    parse_results[i].error_msg);
+            parse_errors++;
+        }
+    }
+    
+    if (parse_errors > 0) {
+        fprintf(stderr, "%d parse error(s)\n", parse_errors);
+    }
+    
+    if (opts->verbose) {
+        printf("Phase 1 complete: %d files parsed, %d errors\n",
+               file_count - parse_errors, parse_errors);
+    }
+    
+    /* ================================================================
+     * Phase 2: Type Entry (serial)
+     * Register all types from all parsed ASTs into a shared registry.
+     * This enables cross-file type resolution during parallel analysis.
+     * ================================================================ */
+    if (opts->verbose) {
+        printf("Phase 2: Registering types...\n");
+    }
+    
+    /* Create shared type registry */
+    type_registry_t *registry = type_registry_new();
+    if (!registry) {
+        fprintf(stderr, "error: failed to create type registry\n");
+        free(parse_results);
+        free(threads);
+        free(filenames);
+        free_classpath();
+        return 1;
+    }
+    
+    /* Create completer context for lazy member population (javac-style) */
+    completer_context_t *completer_ctx = completer_context_new(registry, g_classpath);
+    
+    /* Register all types from successfully parsed files */
+    int types_registered = 0;
+    for (i = 0; i < file_count; i++) {
+        if (parse_results[i].ast && !parse_results[i].error_msg) {
+            if (getenv("GENESIS_DEBUG_REGISTRY")) {
+                fprintf(stderr, "DEBUG Phase 2: registering types from file[%d] = '%s'\n",
+                        i, parse_results[i].filename ? parse_results[i].filename : "(null)");
+            }
+            register_types_from_ast(registry, parse_results[i].ast, completer_ctx);
+            types_registered++;
+        }
+    }
+    
+    if (opts->verbose) {
+        printf("Phase 2 complete: types registered from %d files\n", types_registered);
+    }
+    
+    /* ================================================================
+     * Phase 2b: Type Name Qualification (serial)
+     * Resolve simple type names to fully qualified names using imports.
+     * This MUST happen BEFORE member entry so that field/method types
+     * are stored with fully qualified names, not simple names.
+     * ================================================================ */
+    if (opts->verbose) {
+        printf("Phase 2b: Qualifying type names...\n");
+    }
+    
+    /* Resolve type names in all ASTs before extracting member signatures */
+    slist_t *sp_list = sourcepath_parse(opts->sourcepath);
+    for (i = 0; i < file_count; i++) {
+        if (parse_results[i].ast && !parse_results[i].error_msg) {
+            resolve_types_in_compilation_unit(parse_results[i].ast, g_classpath, sp_list);
+        }
+    }
+    sourcepath_list_free(sp_list);
+    
+    if (opts->verbose) {
+        printf("Phase 2b complete: type names qualified\n");
+    }
+    
+    /* ================================================================
+     * Phase 3: Member Entry (serial)
+     * Add method and field signatures to all registered types.
+     * Type references now use fully qualified names (from Phase 2b).
+     * 
+     * NOTE: Even with completers set on symbols, we still do eager population
+     * here to avoid race conditions during parallel Phase 5. The completers
+     * serve as a fallback for types loaded dynamically during analysis.
+     * ================================================================ */
+    if (opts->verbose) {
+        printf("Phase 3: Entering members...\n");
+    }
+    
+    registry_enter_members(registry, g_classpath);
+    
+    if (opts->verbose) {
+        printf("Phase 3 complete: members entered\n");
+    }
+    
+    /* ================================================================
+     * Phase 4: Type Resolution (serial)
+     * Resolve all unresolved type references in method signatures,
+     * superclass declarations, and interface implementations.
+     * ================================================================ */
+    if (opts->verbose) {
+        printf("Phase 4: Resolving types...\n");
+    }
+    
+    registry_resolve_types(registry, g_classpath);
+    
+    /* Pre-load common JDK types into classpath cache */
+    semantic_t *init_sem = semantic_new(g_classpath);
+    if (init_sem) {
+        semantic_free(init_sem);
+    }
+    
+    if (opts->verbose) {
+        printf("Phase 4 complete: types resolved\n");
         
-        /* Skip if already compiled as a dependency */
-        if (!is_source_compiled(filename)) {
-            /* Mark as compiled */
-            hashtable_insert(g_compiled_sources, filename, (void *)1);
-            
-            source_file_t *src = source_file_new(filename);
-            
-            if (src) {
-                int result = compile_file(src, opts);
-                if (result != 0) {
-                    errors++;
+        /* Debug: print method return types */
+        if (getenv("GENESIS_DEBUG_REGISTRY")) {
+            for (size_t i = 0; i < registry->types->size; i++) {
+                hashtable_entry_t *entry = registry->types->buckets[i];
+                while (entry) {
+                    symbol_t *sym = (symbol_t *)entry->value;
+                    if (sym && sym->data.class_data.members) {
+                        fprintf(stderr, "DEBUG registry type '%s' members:\n", 
+                                sym->qualified_name ? sym->qualified_name : sym->name);
+                        for (size_t j = 0; j < sym->data.class_data.members->symbols->size; j++) {
+                            hashtable_entry_t *mem = sym->data.class_data.members->symbols->buckets[j];
+                            while (mem) {
+                                symbol_t *member = (symbol_t *)mem->value;
+                                if (member && member->kind == SYM_METHOD) {
+                                    fprintf(stderr, "  method '%s' return_type=%p (%s)\n",
+                                            member->name,
+                                            (void*)member->type,
+                                            member->type ? type_to_string(member->type) : "NULL");
+                                }
+                                mem = mem->next;
+                            }
+                        }
+                    }
+                    entry = entry->next;
                 }
-                source_file_free(src);
-            } else {
-                fprintf(stderr, "error: cannot allocate source file: %s\n", filename);
-                errors++;
             }
         }
+    }
+    
+    /* ================================================================
+     * Phase 5a: Serial Semantic Analysis
+     * Must be done serially to avoid race conditions in type resolution.
+     * ================================================================ */
+    if (opts->verbose) {
+        printf("Phase 5a: Serial semantic analysis...\n");
+    }
+    
+    int sem_errors = 0;
+    for (i = 0; i < file_count; i++) {
+        parse_result_t *pr = &parse_results[i];
         
-        list = slist_next(list);
+        /* Skip files with parse errors */
+        if (pr->error_msg || !pr->ast) {
+            pr->sem = NULL;
+            continue;
+        }
+        
+        /* Create semantic analyzer with shared registry for cross-file type resolution.
+         * The registry allows resolving types from other files in the same compilation batch.
+         * This is now safe because the intern table has mutex protection. */
+        semantic_t *sem = semantic_new_with_registry(g_classpath, registry);
+        if (!sem) {
+            fprintf(stderr, "error: cannot create semantic analyzer for %s\n", pr->filename);
+            pr->sem = NULL;
+            sem_errors++;
+            continue;
+        }
+        
+        sem->warnings_enabled = opts->warnings;
+        sem->werror = opts->werror;
+        sem->source_version = classfile_java_version(
+            classfile_version_from_string(opts->source_version));
+        
+        if (opts->sourcepath) {
+            semantic_set_sourcepath(sem, opts->sourcepath);
+        }
+        
+        /* Type names were already qualified in Phase 2b */
+        
+        /* Semantic analysis */
+        bool sem_ok = semantic_analyze(sem, pr->ast, pr->source);
+        
+        if (sem->error_count > 0 || sem->warning_count > 0) {
+            semantic_print_diagnostics(sem);
+        }
+        
+        if (!sem_ok) {
+            fprintf(stderr, "%d error(s) in %s\n", sem->error_count, pr->filename);
+            sem_errors++;
+            semantic_free(sem);
+            pr->sem = NULL;
+            continue;
+        }
+        
+        /* Store semantic analyzer for codegen phase */
+        pr->sem = sem;
+    }
+    
+    if (opts->verbose) {
+        printf("Phase 5a complete: %d semantic errors\n", sem_errors);
+    }
+    
+    /* ================================================================
+     * Phase 5b: Parallel Code Generation
+     * Semantic analysis is complete, codegen is stateless and safe.
+     * ================================================================ */
+    if (opts->verbose) {
+        printf("Phase 5b: Parallel code generation...\n");
+    }
+    
+    codegen_phase_state_t codegen_state = {
+        .results = parse_results,
+        .file_count = file_count,
+        .next_index = ATOMIC_VAR_INIT(0),
+        .error_count = ATOMIC_VAR_INIT(0),
+        .opts = opts,
+        .registry = registry
+    };
+    pthread_mutex_init(&codegen_state.output_mutex, NULL);
+    
+    /* Reset next_index for codegen phase */
+    atomic_store(&codegen_state.next_index, 0);
+    
+    for (i = 0; i < thread_count; i++) {
+        pthread_create(&threads[i], &attr, codegen_phase_worker, &codegen_state);
+    }
+    for (i = 0; i < thread_count; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    pthread_attr_destroy(&attr);
+    pthread_mutex_destroy(&codegen_state.output_mutex);
+    free(threads);
+    
+    /* Free semantic analyzers */
+    for (i = 0; i < file_count; i++) {
+        if (parse_results[i].sem) {
+            semantic_free(parse_results[i].sem);
+            parse_results[i].sem = NULL;
+        }
+    }
+    
+    int codegen_errors = atomic_load(&codegen_state.error_count);
+    int total_errors = parse_errors + sem_errors + codegen_errors;
+    
+    if (opts->verbose) {
+        printf("Phase 5b complete: %d codegen errors\n", codegen_errors);
+        printf("Total: %d parse + %d semantic + %d codegen = %d errors\n",
+               parse_errors, sem_errors, codegen_errors, total_errors);
     }
     
     /* Finalize JAR if in JAR output mode */
     if (g_jar_writer) {
-        if (errors > 0) {
+        if (total_errors > 0) {
             jar_writer_abort(g_jar_writer);
             if (opts->verbose) {
                 printf("JAR creation aborted due to errors\n");
@@ -930,22 +1771,35 @@ int compile(compiler_options_t *opts)
                 }
             } else {
                 fprintf(stderr, "error: failed to finalize JAR file\n");
-                errors++;
+                total_errors++;
             }
         }
         g_jar_writer = NULL;
     }
     
-    /* Clean up global state */
+    /* Cleanup */
+    for (i = 0; i < file_count; i++) {
+        free(parse_results[i].error_msg);
+        /* Don't free source/ast - may be referenced */
+    }
+    free(parse_results);
+    
+    /* Free type registry */
+    if (registry) {
+        type_registry_free(registry);
+    }
+    
     hashtable_free(g_compiled_sources);
     g_compiled_sources = NULL;
     g_opts = NULL;
-    
-    
-    /* Clean up classpath */
+    free(filenames);
     free_classpath();
     
-    return errors > 0 ? 1 : 0;
+    if (opts->verbose) {
+        printf("Compilation complete: %d error(s)\n", total_errors);
+    }
+    
+    return total_errors > 0 ? 1 : 0;
 }
 
 /* ========================================================================
@@ -1087,6 +1941,7 @@ void print_usage(const char *program_name)
     printf("  -nowarn             Disable warnings\n");
     printf("  -Werror             Treat warnings as errors\n");
     printf("  -verbose            Enable verbose output\n");
+    printf("  -j[N]               Use N threads (default: auto, -j1 for single-threaded)\n");
     printf("  -version            Print version information\n");
     printf("  -help               Print this help message\n");
 }
@@ -1331,6 +2186,31 @@ int main(int argc, char **argv)
             else if (strcmp(argv[i], "-verbose") == 0) {
                 opts->verbose = true;
             }
+            else if (strcmp(argv[i], "-j") == 0 || 
+                     strncmp(argv[i], "-j", 2) == 0) {
+                /* -j or -jN for parallel compilation
+                 * -j alone = auto-detect thread count
+                 * -jN = use N threads (N > 0)
+                 * -j0 = serial mode (same as --serial) */
+                int jobs = -1;  /* -1 = auto-detect thread count */
+                if (strlen(argv[i]) > 2) {
+                    /* -jN format */
+                    jobs = atoi(argv[i] + 2);
+                } else if (i + 1 < argc && argv[i + 1][0] != '-') {
+                    /* -j N format */
+                    jobs = atoi(argv[++i]);
+                }
+                /* -j alone means auto-detect (jobs stays -1) */
+                opts->jobs = jobs;
+            }
+            else if (strcmp(argv[i], "--jobs") == 0) {
+                if (i + 1 >= argc) {
+                    fprintf(stderr, "error: --jobs requires a value\n");
+                    compiler_options_free(opts);
+                    return 1;
+                }
+                opts->jobs = atoi(argv[++i]);
+            }
             else {
                 fprintf(stderr, "warning: unrecognized option: %s\n", argv[i]);
             }
@@ -1365,8 +2245,15 @@ int main(int argc, char **argv)
         return 1;
     }
     
-    /* Compile */
-    int result = compile(opts);
+    /* Compile using parallel infrastructure
+     * This handles the shared type registry correctly for all cases.
+     * -j1 or --serial = single thread, -j or default = auto-detect */
+    ast_pool_cleanup();  /* Disable pooled allocation */
+    int thread_count = opts->jobs;
+    if (thread_count <= 0) {
+        thread_count = get_cpu_count();
+    }
+    int result = compile_parallel(opts, thread_count);
     
     /* Clean up */
     slist_free_full(opts->source_files, free);

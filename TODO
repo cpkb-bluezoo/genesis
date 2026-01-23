@@ -1,404 +1,24 @@
 GENESIS TODO
 ============
 
-This document tracks features and improvements needed for the genesis Java compiler.
+This document tracks features and improvements still needed for genesis.
 
 Legend:
-  [x] Complete
   [-] Partial / In Progress
   [ ] Not Started
 
 
 ================================================================================
-PRIORITY 1: CORE JAVA (1.0-1.4) - Bug Fixes & Foundation
+PENDING FEATURES
 ================================================================================
-
-These are fundamental features and bug fixes needed before Java 5 features.
-
-Bug Fixes:
-  [x] Fix long/double local variable storage (use lstore/lload/dstore/dload)
-  [x] Fix long/double/float arithmetic opcodes (ladd/dadd/fadd etc.)
-  [x] Default constructor generation when class has no explicit constructor
-  [x] Superclass resolution from extends clause (was causing super(x) to call Object)
-  [x] Type widening conversions (int to long, etc.) for mixed-type arithmetic
-  [x] Field access on local variables of class types (proper type tracking)
-  [x] Stack tracking fixes for long/double field getfield/putfield
-  [x] Method overload resolution for array element expressions
-  [x] Return opcode for field identifiers (areturn for String/object fields)
-  [x] Constructor descriptor inference from argument types (not just count)
-  [x] Fix spurious boxing on wrapper constructor calls (new Integer(42))
-  [x] StackMapTable expression-level tracking improvements
-      [x] Fixed array local variable types (use proper descriptors like [I not [Ljava/lang/Object;)
-      [x] Added frame recording for comparison operators (if_icmpXX → iconst_1 → goto → iconst_0)
-      [x] Added frame recording for short-circuit && and || operators
-      [x] Replaced untyped mg_pop with mg_pop_typed for consistent stack tracking
-      [x] Fixed method return value tracking to use proper types
-      [x] Converted mg_push calls to typed versions (mg_push_int, mg_push_null, etc.)
-
-Core Language Features:
-  [x] Interfaces (declarations and implementation)
-      [x] Interface declaration (ACC_INTERFACE | ACC_ABSTRACT)
-      [x] Abstract methods (no Code attribute)
-      [x] implements clause (multiple interfaces)
-      [x] Interface type compatibility in semantic analysis
-      [x] Method calls on interface-typed variables (invokeinterface)
-  [x] Abstract classes and methods
-      [x] Abstract class declaration (ACC_ABSTRACT on class)
-      [x] Abstract method declaration (ACC_ABSTRACT, no Code attribute)
-      [x] Inheritance from abstract classes
-      [x] Method lookup in superclass chain
-  [x] Static initializers (<clinit>)
-      [x] Static field initializers
-      [x] Static initializer blocks
-      [x] Combined with assertions initialization
-  [x] Static field access in static methods (getstatic/putstatic)
-  [x] Instance initializers
-      [x] Instance field initializers (injected into constructors)
-      [x] Instance initializer blocks (injected into constructors)
-  [x] Access control checking (public/private/protected/package-private)
-      [x] Public/protected/package-private field access
-      [x] Public/protected/package-private method access
-      [x] Same-package access allowed
-      [x] Private access from same class
-      [x] Private access error for external classes
-  [x] Default constructor instance initializers (fixed)
-  [x] Final variable checking
-      [x] Cannot extend final class
-      [x] Cannot override final method
-      [x] Cannot reassign final field
-      [x] Cannot reassign final parameter
-
-Inner Classes:
-  [x] Static nested classes
-      [x] Parser support for nested type declarations
-      [x] OuterClass$Nested naming convention
-      [x] Access to enclosing class's static members
-      [x] Separate class file generation
-  [x] Inner classes (non-static)
-      [x] Synthetic this$0 field for outer instance reference
-      [x] Constructor accepts outer instance as implicit first parameter
-      [x] Access outer instance members via this$0
-      [x] Pass outer reference when creating inner class instance
-      [x] Note: Private member access requires synthetic accessors (not yet implemented)
-  [x] Local classes (in methods)
-      [x] Parser support for class declarations inside method bodies
-      [x] Unique naming convention (OuterClass$NLocalClass where N is counter)
-      [x] Synthetic this$0 field for outer instance reference
-      [x] Constructor accepts outer instance as implicit first parameter
-      [x] Access outer instance members via this$0
-      [x] Capture final/effectively final local variables
-          [x] Track captured variables in semantic analysis
-          [x] Generate val$xxx synthetic fields for captured vars
-          [x] Modify local class constructors to accept captured values
-          [x] Pass captured values when instantiating local class
-          [x] Access captured vars via val$xxx fields in method bodies
-  [x] Anonymous classes
-      [x] Parser support (new Type() { body })
-      [x] Semantic analysis creates synthetic class symbol
-      [x] Unique naming convention (OuterClass$N where N is counter)
-      [x] Synthetic this$0 field for outer instance reference
-      [x] Constructor accepts outer instance as implicit first parameter
-      [x] Access outer instance members via this$0
-      [x] Support for interface implementation (anonymous implements)
-      [x] Support for class extension (anonymous extends)
-      [x] Instance initializers in anonymous classes
-      [x] Field declarations in anonymous classes
-      [x] Method declarations in anonymous classes
-      [x] Multiple anonymous classes in same method
-      [x] Captured variables (same implementation as local classes)
-
-Class File Improvements:
-  [x] InnerClasses attribute (for both outer and inner classes)
-  [x] LineNumberTable attribute (maps bytecode offsets to source lines for stack traces)
-  [x] LocalVariableTable attribute (variable names/types for debugging)
-      [x] Local variables recorded at declaration
-      [x] Method parameters recorded at slot allocation (for parameter names)
-      [x] 'this' and 'this$0' recorded for instance methods/inner classes
-      [x] Default constructors include LocalVariableTable
-      Note: Scope lengths are estimated as method-end minus start_pc (conservative)
-
-
-================================================================================
-PRIORITY 2: JAVA 5 FEATURES (excluding Generics & Enums)
-================================================================================
-
-These features complete Java 5 support without generics/enums complexity.
-
-Enhanced For Loop (for-each):
-  [x] Enhanced for loop over arrays
-      [x] Basic array iteration (int[], String[], etc.)
-      [x] Array initializer syntax support
-      [x] Nested enhanced for loops (2D arrays)
-      [x] Break/continue in enhanced for loops
-      [x] Array type detection via sem_type and local_types
-      [x] Checkcast for reference element types (String[], etc.)
-      [x] Proper stackmap frame recording for loop points
-  [x] Enhanced for loop over Iterable
-      [x] Iterator pattern codegen (collection.iterator(), hasNext(), next())
-      [x] Checkcast for element type (Iterator.next() returns Object)
-      [x] Proper stackmap frame recording
-      [x] Interface lookup via imports (java.util.Iterator, etc.)
-      [x] Type compatibility fix: class implements interface assignability
-      [x] Deep Iterable interface checking (uses type_assignable for inheritance)
-
-Autoboxing/Unboxing:
-  [x] Automatic boxing (int -> Integer, etc.)
-      [x] Helper functions for boxing/unboxing (emit_boxing, emit_unboxing)
-      [x] Semantic type checking for boxing/unboxing compatibility
-      [x] Boxing code generation for variable initializers
-      [x] Generated class files run correctly
-  [x] Automatic unboxing (Integer -> int, etc.)
-      [x] Unboxing in variable initializers
-      [x] Unboxing in binary expressions (e.g., Integer + Integer)
-      [x] Generated class files run correctly
-  [x] Boxing/unboxing in method arguments
-      [x] Boxing primitive arg to wrapper param
-      [x] Unboxing wrapper arg to primitive param
-      [x] Fixed method receiver disambiguation in semantic analysis
-      [x] Parameter class type tracking in codegen
-
-Varargs:
-  [x] Varargs parameter declaration (Type... args)
-      [x] Parser support (TOK_ELLIPSIS)
-      [x] Semantic analysis - convert to array type
-      [x] Validate varargs is last parameter
-  [x] Varargs method calls
-      [x] Pack trailing arguments into array
-      [x] Handle empty varargs (create empty array)
-      [x] Mixed fixed + varargs parameters
-      [x] ACC_VARARGS method flag in class file
-  [x] Array to varargs conversion (pass existing array directly)
-
-Static Imports:
-  [x] Static import declarations
-      [x] Parser support (static keyword in imports)
-      [x] Semantic analysis storage (static_imports list)
-  [x] Static import resolution
-      [x] Static field imports (import static java.lang.Math.PI)
-      [x] Static method imports (import static java.lang.Math.sqrt)
-      [x] Codegen for static imported fields (GETSTATIC)
-      [x] Codegen for static imported methods (INVOKESTATIC)
-
-Annotations (Basic):
-  [x] Annotation declarations (@interface) - parser support
-  [x] Annotation usage (@Override, @Deprecated, @SuppressWarnings)
-      [x] Parse @Name, @Name(value), @Name(key=value, ...)
-      [x] Store annotations on AST nodes (annotations field)
-      [x] Support on classes, methods, fields, constructors
-  [x] Retention policy handling
-      [x] Map known annotations to SOURCE/CLASS/RUNTIME retention
-      [x] Filter annotations by retention when writing to class file
-  [x] Annotations in class file (RuntimeVisibleAnnotations attribute)
-      [x] Class-level annotations
-      [x] Method-level annotations
-      [x] Field-level annotations
-
-Annotations (Advanced):
-  [x] Parameter annotations
-      [x] Parse annotations on method/constructor parameters
-      [x] RuntimeVisibleParameterAnnotations attribute
-  [x] Type annotations (JSR 308, Java 8)
-      [x] Parse annotations on type uses: @NonNull String, @A String @B []
-      [x] RuntimeVisibleTypeAnnotations attribute for fields
-      [x] RuntimeVisibleTypeAnnotations for method returns/params
-      [x] RuntimeVisibleTypeAnnotations for local variables (in Code attribute)
-      [ ] Type path for nested types (generics, arrays) - low priority
-  [x] Annotation element defaults
-      [x] Parse: @interface Foo { }
-      [x] AnnotationDefault attribute in class file
-
-Covariant Return Types:
-  [x] Override with more specific return type
-      [x] Return type validation (subtype checking)
-      [x] Track overridden methods for bridge generation
-      [x] Generate bridge methods with ACC_BRIDGE | ACC_SYNTHETIC
-
-
-================================================================================
-PRIORITY 3: GENERICS & ENUMS (Java 5 completion)
-================================================================================
-
-These complete full Java 5 support.
-
-Generic Types:
-  [x] Type parameters on classes
-  [x] Type parameters on methods
-  [x] Type erasure
-  [x] Method calls on type variable receivers (use bound type)
-  [x] Signature attribute in class file
-      [x] Class signatures (<T:Ljava/lang/Object;>...)
-      [x] Method signatures (<E:Ljava/lang/Number;>(TE;)I)
-      [x] Field signatures (TT;)
-  [x] Bridge methods (for covariant overrides)
-      [x] Track overridden methods in semantic analysis
-      [x] Generate bridge with ACC_BRIDGE | ACC_SYNTHETIC flags
-      [x] Bridge delegates to actual method via invokevirtual
-
-Wildcards & Bounds:
-  [x] Wildcard types (?)
-  [x] Upper bounded wildcards (? extends T)
-  [x] Lower bounded wildcards (? super T)
-  [x] Multiple bounds (T extends A & B)
-
-Enums:
-  [x] Enum declarations (AST_ENUM_DECL, SYM_ENUM)
-  [x] Enum constants (ACC_ENUM flag, static final fields)
-  [x] Superclass java.lang.Enum (automatic)
-  [x] Enum constructor (String name, int ordinal)
-  [x] Static initializer for enum constants
-  [x] $VALUES array field
-  [x] values() method (clone $VALUES)
-  [x] valueOf(String) method (manual loop over $VALUES)
-  [x] Inherited methods from Enum (name(), ordinal(), toString())
-  [x] Enum in switch statements
-  [x] Enum with custom fields and methods
-  [x] Enum with constructor parameters
-
-  Implementation notes:
-    - Method lookup uses "()" suffix for classfile-loaded methods to avoid
-      field/method name collisions (e.g., Enum.ordinal field vs ordinal() method).
-    - scope_lookup_method() in semantic.c and lookup_method_by_name() in codegen_expr.c
-    - symbol_from_classfile() now recursively loads superclass chain
-
-
-================================================================================
-PRIORITY 4: JAVA 7/8 FEATURES (invokedynamic era)
-================================================================================
-
-These require invokedynamic and more advanced features.
-
-Java 7 Features:
-  [x] Try-with-resources (AutoCloseable)
-      [x] Parser: try (Type var = expr) { } syntax
-      [x] AST: AST_RESOURCE_SPEC node type
-      [x] Semantic: resource variable in try scope
-      [x] Codegen: resource init, close in finally, suppressed exceptions
-  [x] Multi-catch (catch (A | B e))
-  [x] Diamond operator (<>)
-  [x] Strings in switch (hashCode + equals dispatch)
-  [x] Binary literals (0b prefix)
-  [x] Underscores in numeric literals
-
-Java 8 - Lambdas & Method References:
-  [x] invokedynamic instruction
-  [x] BootstrapMethods attribute
-  [x] Lambda expressions
-      [x] Single-parameter lambdas (s -> s.length())
-      [x] Multi-parameter lambdas ((a, b) -> a + b)
-      [x] Zero-parameter lambdas (() -> "Hello")
-      [x] Void-returning lambdas (msg -> println(msg))
-      [x] Variable capture from enclosing scope
-      [x] Synthetic lambda$N method generation
-      [x] invokedynamic with LambdaMetafactory bootstrap
-  [x] Method references (::)
-      [x] Static method references (Class::staticMethod)
-      [x] Bound instance references (object::instanceMethod)
-      [x] Unbound instance references (Class::instanceMethod)
-      [x] Constructor references (Class::new)
-      [x] Array constructor references (Type[]::new)
-      Note: Constructor references only work with no-arg constructors currently
-  [x] @FunctionalInterface annotation validation
-  [x] Default methods in interfaces
-      [x] Parse 'default' keyword in interface method declarations
-      [x] Generate bytecode for default method bodies
-      [x] invokeinterface for implicit this calls in default methods
-      [x] Class file version 52 (Java 8) for interfaces with default methods
-  [x] Static methods in interfaces
-      [x] Parse static methods in interface declarations
-      [x] Generate bytecode for static method bodies
-      [x] Use InterfaceMethodref for invokestatic on interface methods
-      [x] ACC_PUBLIC flag for static interface methods
-      [x] Class file version 52 for callers of static interface methods
-
-
-================================================================================
-PRIORITY 5: MODERN JAVA (9+)
-================================================================================
-
-Features from Java 9 and later versions.
-
-Java 9:
-  [x] Module declarations (module-info.java)
-      [x] Parse [open] module name { ... }
-      [x] requires [transitive] [static] module.name
-      [x] exports package.name [to module.name, ...]
-      [x] opens package.name [to module.name, ...]
-      [x] uses service.type
-      [x] provides service.type with impl.type, ...
-      [x] Generate module-info.class with Module attribute
-  [x] Private interface methods
-      [x] Parse private methods in interfaces
-      [x] Generate bytecode for private instance methods
-      [x] Generate bytecode for private static methods
-      [x] Ensure private methods are not implicitly public
-  [x] Try-with-resources on existing variable
-      [x] Parse: try (existingVar) { } - use effectively final variable
-      [x] No new declaration, just reference existing resource
-
-Java 10:
-  [x] Local variable type inference (var)
-      [x] Infer type from initializer expression
-      [x] Error on null/void initializers
-      [x] Support primitives, classes, arrays
 
 Java 11:
-  [x] var in lambda parameters
-      [x] Parse: (var x, var y) -> x + y
-      [ ] Allows annotations on lambda params: (@NonNull var x) -> x
+  [ ] Annotations on lambda params with var: (@NonNull var x) -> x
 
-Java 14-16:
-  [x] Records
-      [x] Record declaration syntax (record Name(Type comp, ...))
-      [x] Implicit java.lang.Record superclass
-      [x] Canonical constructor generation
-      [x] Private final component fields
-      [x] Public accessor methods
-      [x] Synthetic equals(), hashCode(), toString()
-      [x] ACC_RECORD flag in class file
-  [x] Pattern matching for instanceof
-      [x] Parse: expr instanceof Type varName
-      [x] Semantic: create pattern variable in then-block scope
-      [x] Codegen: reload object, checkcast, store to local variable
-  [x] Switch expressions (->)
-      [x] Parse: switch (expr)
-      [x] Parse: yield statement for block cases
-      [x] Semantic: infer switch expression type from branches
-      [x] Codegen: lookupswitch with value yielding to stack
-
-Java 15:
-  [x] Text blocks (""")
-      [x] Opening followed by mandatory line terminator
-      [x] Incidental whitespace stripping (based on closing delimiter)
-      [x] Escape sequences (\n, \t, \r, \b, \f, \\, \", \')
-      [x] \s escape for explicit trailing space
-      [x] Line continuation (\ at end of line suppresses newline)
-
-Java 17+:
-  [x] Sealed classes
-      [x] sealed/non-sealed/permits keywords in lexer
-      [x] Parse permits clause in class/interface declarations
-      [x] PermittedSubclasses class file attribute
-
-Java 21+:
-  [x] Pattern matching in switch (basic)
-      [x] when keyword in lexer
-      [x] AST_TYPE_PATTERN and AST_GUARDED_PATTERN node types
-      [x] Parse type patterns: case Type var ->
-      [x] Parse guarded patterns: case Type var when expr ->
-      [x] Semantic analysis for pattern variable scoping
-      [x] Codegen using instanceof chain for type patterns
-      [x] Multiple type patterns in single switch
-  [x] Unnamed patterns (Java 21)
-      [x] case _ -> (matches anything, like exhaustive default)
-      [x] case Type _ -> (type test but ignore variable)
-  [x] Record patterns
-      [x] AST_RECORD_PATTERN node type
-      [x] Parse: case Record(Type x, Type y) ->
-      [x] Semantic: resolve record type and define component variables
-      [x] Codegen: extract components via accessor methods
-      [ ] Parse Record attribute for positional component matching
-          Currently pattern variable names must match record component names.
-          Should read Record attribute from external class files for position-based matching.
+Java 21:
+  [ ] Record attribute parsing for positional component matching
+      Currently pattern variable names must match record component names.
+      Should read Record attribute from external class files for position-based matching.
 
 Java 22+:
   [ ] Unnamed variables (JEP 456)
@@ -408,213 +28,65 @@ Java 22+:
       Note: Different from unnamed patterns in switch (already implemented)
   [ ] Statements before super() (JEP 447, preview in 22-24)
       [ ] Allow initialization code before super() call
-      [ ] Still in preview, may wait for finalization
+      Still in preview, may wait for finalization
 
 
 ================================================================================
 DEFERRED / WILL NOT IMPLEMENT
 ================================================================================
 
-These features are intentionally not being implemented at this time.
-
   [ ] String templates (JEP 430, 459, 465)
       Withdrawn in Java 23 pending complete redesign.
       The template processor API was considered too complex and is being
       rethought. Wait for the redesigned feature in a future Java version.
+
   [ ] Better error recovery in parser
-  [ ] Error synchronization points
       Basic recovery already exists (skip to ; or } on error).
       More sophisticated recovery (multiple errors, smarter sync points)
       would be useful for IDE integration but not critical for CLI use.
 
-
-================================================================================
-COMPLETED FEATURES
-================================================================================
-
-Control Flow:
-  [x] if / if-else
-  [x] while loop
-  [x] for loop
-  [x] do-while loop
-  [x] switch statement (lookupswitch)
-  [x] break / continue
-  [x] throw
-  [x] try-catch-finally (exception tables)
-  [x] synchronized (monitorenter/monitorexit)
-  [x] labeled statements (labeled break/continue)
-
-Method Invocation:
-  [x] invokestatic
-  [x] invokevirtual
-  [x] invokespecial (constructors, super calls)
-  [x] invokeinterface
-
-Field Access:
-  [x] Instance fields (getfield/putfield)
-  [x] Static fields (getstatic/putstatic) - e.g., System.out
-  [x] Chained field access (obj.field.subfield)
-  [x] Chained method calls (obj.method1().method2())
-
-Expressions:
-  [x] Binary arithmetic (+, -, *, /, %)
-  [x] Binary bitwise (&, |, ^, <<, >>, >>>)
-  [x] Comparison operators (==, !=, <, >, <=, >=)
-  [x] Logical operators (&&, ||)
-  [x] Unary operators (-, +, !, ~)
-  [x] String concatenation (via StringBuilder)
-  [x] Assignment operators (=, +=, -=, etc.)
-  [x] Ternary operator (? :)
-  [x] Parenthesized expressions
-  [x] Pre/post increment/decrement (++x, x++, --x, x--)
-  [x] instanceof
-  [x] Cast expressions (reference and primitive)
-
-Arrays:
-  [x] Array creation (new int[n])
-  [x] Array access (arr[i])
-  [x] Array element assignment (arr[i] = value)
-  [x] Array length (arr.length)
-  [x] Array initializers (new int[]{1, 2, 3})
-  [x] Multi-dimensional arrays (creation, access, chained access, inner length)
-  [x] Nested array initializers (int[][] m = {{1,2},{3,4}})
-
-Objects:
-  [x] Object creation (new)
-  [x] Constructor calls
-  [x] this() constructor chaining
-  [x] super() explicit calls
-  [x] Null checks (null literal, null comparisons, return null)
-
-Type System:
-  [x] Primitive types (int, long, float, double, boolean, byte, char, short)
-  [x] Class types (basic resolution)
-  [x] Array types
-
-Class Features:
-  [x] Class declarations
-  [x] Interface declarations (basic)
-  [x] implements clause (class implements interfaces)
-  [x] Instance fields
-  [x] Static fields (declaration only)
-  [x] Instance methods
-  [x] Static methods
-  [x] Constructors
-  [x] Assert statements
-
-Semantic Analysis:
-  [x] Symbol table construction
-  [x] Scope management
-  [x] Basic name resolution
-  [x] Classpath integration
-
-Parsing:
-  [x] Iterative expression parser (Pratt)
-  [x] Iterative statement parser
-  [x] Class/interface declarations
-
-Class File:
-  [x] Basic class file structure
-  [x] Constant pool
-  [x] Method bytecode
-  [x] Field declarations
+  [ ] Type path for nested type annotations (generics, arrays)
+      Low priority - rarely used in practice.
 
 
 ================================================================================
-TOOLING (ongoing improvements)
+KNOWN BUGS
 ================================================================================
 
-  [x] Source file encoding detection (UTF-8/16/32 with BOM)
-  [x] Dependency tracking (auto-compile source dependencies)
-  [x] JAR file output (-jar option with manifest and compression)
-  [x] StackMapTable attribute (required for class file version 50+)
-      [x] Infrastructure: stackmap.h/stackmap.c with verification types
-      [x] Frame types: same_frame, append_frame, chop_frame, full_frame
-      [x] Serialization to class file format
-      [x] Integration: stackmap in method_gen_t, local tracking
-      [x] Write StackMapTable in classwriter.c
-      [x] use_stackmap flag and version 50+ support
-      [x] Record frames at branch targets (if/else, loops, switch)
-      [x] Record frames at exception handlers (catch, finally, try-with-resources)
-  [x] Error messages with file:line:column format
-  [x] Warning system
-      [x] -nowarn flag to suppress warnings
-      [x] -Werror flag to treat warnings as errors
-      [x] Empty catch block warning
-      [x] Division by literal zero warning
-      [x] Constant condition warning (if true/false)
-      [x] Dead loop warning (while false)
-  [x] Check -source, -target, -release flags
-      [x] Parse version string to class file major version
-      [x] Pass source_version to semantic analyzer
-      [x] Pass target_version to codegen
-      [x] Validate features against source version:
-          - Records require Java 16+
-          - Sealed classes require Java 17+
-          - Switch expressions require Java 14+
-          - Pattern matching (instanceof) requires Java 16+
-          - Pattern matching (switch) requires Java 21+
-          - Text blocks require Java 15+
-          - Private interface methods require Java 9+
-      [x] Write correct class file version based on target and features
+1. Ternary boxing in varargs (Conditional01-03):
+   - Ternary expression results in varargs arrays get spurious Integer.valueOf()
+   - Stack: [array, idx, String] but then calls Integer.valueOf expecting int
+   - Issue in codegen_expr.c array element storage
+
+2. Switch variable scoping (LambdaScope04 testSwitchLocal* tests):
+   - Variables declared in case 0 used in default case
+   - Genesis doesn't check for possibly-uninitialized variables
+
+3. Varargs method reference with primitive array (MethodReference36):
+   - Needs synthetic bridge method to wrap argument in Object[]
+   - javac generates lambda$test$N methods that create Object[] wrapper
+
+4. Type constraint violation detection (MethodReference68):
+   - Compile-fail test - Genesis doesn't detect the error
+   - Generates invalid bytecode instead of compile error
+
+5. Lambda cast to primitive type (TargetType17):
+   - Compile-fail test - should error but doesn't
+
+6. Generic constructor Signature attribute:
+   - Uses return type instead of V
 
 
-  Future refactoring opportunities:
-  - Split codegen_expr.c (7600 lines) into smaller modules (see comment in file)
+================================================================================
+OPTIONAL IMPROVEMENTS
+================================================================================
+
+Refactoring:
+  - Split codegen_expr.c (7600+ lines) into smaller modules
   - Replace remaining slist_new/slist_append patterns with slist_push
   - Consider moving resolve_java_lang_class to a utility module
 
-================================================================================
-KNOWN ISSUES
-================================================================================
-
-  - Constructor references only support no-arg constructors (overload resolution needed)
-  
-  - Lambda parameter type inference for chained generic method calls:
-    FIXED: Stream.of("hello", "world").filter(s -> s.length() > 3) now works
-    
-    Type argument inference from method arguments is now implemented.
-    
-    Remaining issue: List.stream() and Collection.stream() not being found.
-    The stream() method is a default method on Collection interface.
-    Need to ensure interface default methods are included in method lookup.
-    
-    Workaround: Use Stream.of() directly instead of list.stream()
-
-  Genesis test suite status: 94 passed, 0 failed
-
-  jtreg compatibility testing (193 errors in VMProps.java):
-  Main issues:
-  - 47 errors: "expected Supplier, got <unknown>" - lambda/method-ref argument type inference
-  - 32 errors: "Cannot resolve symbol: s" - lambda parameter inference for chained calls
-      Most are from list.stream().filter(s -> ...) patterns where stream() isn't found
-  - 10 errors: "Incompatible return type" - return type inference
-  - 9 errors: "Cannot resolve symbol: Platform" - external jdk.test.lib classes
-  - 8 errors: "Cannot resolve symbol: StandardOpenOption" - import resolution
-  - 6 errors: "Cannot resolve symbol: Files" - import resolution (but works in simple test)
-  - 6 errors: "Cannot resolve symbol: Compiler" - external jdk.test.whitebox classes
-  
-  Root causes:
-  1. Collection.stream() is a default interface method - not found in List method lookup
-  2. External classes from jdk.test.lib and jdk.test.whitebox packages need sourcepath
-  3. Internal JDK classes (jdk.internal.foreign.CABI) not accessible
-  
-  FIXED in this session:
-  - Type argument inference from method arguments (Stream.of("a", "b") -> Stream<String>)
-  - Lambda parameter type inference with checkcast for erased types
-  - StackMapTable generation for lambda methods
-  - Collection.stream() interface default method lookup (recursive interface search)
-  - Checkcast for generic method return types (Supplier<T>.get() -> checkcast T)
-  - Sourcepath for jtreg test lib classes in fake-jdk
-  - Diamond operator type inference for packaged classes (contextual keyword as package name)
-  
-  JTREG STATUS:
-  - All 193 compilation errors FIXED!
-  - Runtime error: ClassFormatError - Invalid method Code length 0 in VMProps
-  - This is a codegen issue where an empty method body is being generated
-  
-  FIXED in this round:
-  - Diamond operator for packaged classes (contextual keywords as package names)
-  - Inner class private field access (check_access now allows nested class access)
-  - Boolean autoboxing in if conditions
-  - Chained field access method calls (Boolean.FALSE.toString())
+Inner class synthetic accessors:
+  - Private member access from inner classes currently requires members
+    to be package-private. Full javac compatibility would generate
+    synthetic access$N methods for truly private access.

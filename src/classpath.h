@@ -78,10 +78,13 @@ typedef struct classpath
     /* Negative cache: classes we know don't exist (value is (void*)1) */
     hashtable_t *negative_cache;
 
-    /* Statistics */
+    /* Statistics (use atomic operations for thread safety) */
     int classes_loaded;
     int cache_hits;
     int negative_cache_hits;
+    
+    /* Thread safety for cache access */
+    void *cache_mutex;              /* pthread_mutex_t* (opaque for header portability) */
 } classpath_t;
 
 /*

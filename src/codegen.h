@@ -435,6 +435,7 @@ typedef struct method_info_gen
     slist_t *local_var_table;    /* List of local_var_t* */
     stack_map_table_t *stackmap; /* StackMapTable for verification (Java 6+) */
     ast_node_t *ast;             /* Original AST (for annotations) */
+    slist_t *throws;             /* List of exception class names (internal format) */
 } method_info_gen_t;
 
 /*

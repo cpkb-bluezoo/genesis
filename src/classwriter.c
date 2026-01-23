@@ -1025,6 +1025,15 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         }
     }
     
+    /* Pre-add exception class names to constant pool for Exceptions attribute */
+    for (slist_t *node = cg->methods; node; node = node->next) {
+        method_info_gen_t *mi = (method_info_gen_t *)node->data;
+        for (slist_t *t = mi->throws; t; t = t->next) {
+            const char *exc_internal = (const char *)t->data;
+            cp_add_class(cg->cp, exc_internal);
+        }
+    }
+    
     /* Add all attribute names to constant pool BEFORE we write it.
      * These must be added now since the constant pool is immutable after serialization. */
     uint16_t code_attr_name = cp_add_utf8(cg->cp, "Code");
@@ -1035,6 +1044,7 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     uint16_t ps_attr_name = cg->permitted_subclasses ? cp_add_utf8(cg->cp, "PermittedSubclasses") : 0;
     uint16_t nm_attr_name = cg->nest_members ? cp_add_utf8(cg->cp, "NestMembers") : 0;
     uint16_t nh_attr_name = cg->nest_host ? cp_add_utf8(cg->cp, "NestHost") : 0;
+    uint16_t exc_attr_name_index = cp_add_utf8(cg->cp, "Exceptions");  /* For throws clauses */
     /* Pre-add RuntimeVisibleTypeAnnotations for local variable type annotations */
     cp_add_utf8(cg->cp, "RuntimeVisibleTypeAnnotations");
     
@@ -1271,8 +1281,13 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         
         /* Abstract methods (and interface methods) have no Code attribute */
         if (mi->code == NULL) {
-            /* Count attributes: annotations + signature + parameter annotations + annotation default + type annotations */
+            /* Count throws types */
+            int throws_count = 0;
+            for (slist_t *t = mi->throws; t; t = t->next) throws_count++;
+            
+            /* Count attributes: annotations + signature + parameter annotations + annotation default + type annotations + exceptions */
             int abstract_attr_count = 0;
+            if (throws_count > 0) abstract_attr_count++;  /* Exceptions attribute */
             if (method_rt_annots > 0) abstract_attr_count++;
             if (param_rt_annots > 0) abstract_attr_count++;
             if (method_type_annots > 0) abstract_attr_count++;
@@ -1280,6 +1295,18 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
             if (has_annotation_default) abstract_attr_count++;
             
             write_be_u2(&p, abstract_attr_count);
+            
+            /* Exceptions attribute (throws clause) */
+            if (throws_count > 0) {
+                write_be_u2(&p, exc_attr_name_index);
+                write_be_u4(&p, 2 + throws_count * 2);  /* length: 2 bytes count + 2 bytes per exception */
+                write_be_u2(&p, (uint16_t)throws_count);
+                for (slist_t *t = mi->throws; t; t = t->next) {
+                    const char *exc_internal = (const char *)t->data;
+                    uint16_t exc_class = cp_add_class(cg->cp, exc_internal);  /* Returns pre-added entry (deduplicated) */
+                    write_be_u2(&p, exc_class);
+                }
+            }
             
             /* Signature attribute */
             if (mi->signature) {
@@ -1308,8 +1335,13 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
             continue;
         }
         
-        /* Count method attributes: Code + optional Signature + optional annotations + parameter annotations + type annotations */
+        /* Count throws types for Exceptions attribute */
+        int concrete_throws_count = 0;
+        for (slist_t *t = mi->throws; t; t = t->next) concrete_throws_count++;
+        
+        /* Count method attributes: Code + optional Signature + optional annotations + parameter annotations + type annotations + exceptions */
         int method_attr_count = 1;  /* Code is always present for concrete methods */
+        if (concrete_throws_count > 0) method_attr_count++;  /* Exceptions attribute */
         if (mi->signature) method_attr_count++;
         if (method_rt_annots > 0) method_attr_count++;
         if (param_rt_annots > 0) method_attr_count++;
@@ -1464,6 +1496,18 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
             write_be_u2(&p, sig_attr_name);
             write_be_u4(&p, 2);
             write_be_u2(&p, sig_index);
+        }
+        
+        /* Exceptions attribute (throws clause) */
+        if (concrete_throws_count > 0) {
+            write_be_u2(&p, exc_attr_name_index);
+            write_be_u4(&p, 2 + concrete_throws_count * 2);  /* length: 2 bytes count + 2 bytes per exception */
+            write_be_u2(&p, (uint16_t)concrete_throws_count);
+            for (slist_t *t = mi->throws; t; t = t->next) {
+                const char *exc_internal = (const char *)t->data;
+                uint16_t exc_class = cp_add_class(cg->cp, exc_internal);  /* Returns pre-added entry (deduplicated) */
+                write_be_u2(&p, exc_class);
+            }
         }
         
         /* RuntimeVisibleAnnotations attribute (for method) */

@@ -1718,6 +1718,82 @@ char *ast_type_to_descriptor(ast_node_t *type_node)
     }
 }
 
+/**
+ * Extract throws clause exception types from a method AST node.
+ * Returns a list of internal class names (e.g., "java/io/IOException").
+ * The caller owns the returned list and its strings.
+ */
+static slist_t *extract_throws_types(ast_node_t *method_decl, semantic_t *sem)
+{
+    if (!method_decl) {
+        return NULL;
+    }
+    
+    slist_t *throws_list = NULL;
+    
+    /* Throws types are children with flags=0xFFFF */
+    for (slist_t *child = method_decl->data.node.children; child; child = child->next) {
+        ast_node_t *node = (ast_node_t *)child->data;
+        if (node && node->data.node.flags == 0xFFFF) {
+            /* This is a throws type node - get the internal class name */
+            char *internal_name = NULL;
+            
+            /* Try to get fully qualified name from resolved sem_type first */
+            if (node->sem_type && node->sem_type->kind == TYPE_CLASS && 
+                node->sem_type->data.class_type.name) {
+                const char *fqn = node->sem_type->data.class_type.name;
+                /* Convert dots to slashes for internal format */
+                size_t len = strlen(fqn);
+                internal_name = malloc(len + 1);
+                if (internal_name) {
+                    for (size_t i = 0; i <= len; i++) {
+                        internal_name[i] = (fqn[i] == '.') ? '/' : fqn[i];
+                    }
+                }
+            } else if (sem) {
+                /* Use semantic analyzer to resolve the type */
+                type_t *resolved = semantic_resolve_type(sem, node);
+                if (resolved && resolved->kind == TYPE_CLASS && resolved->data.class_type.name) {
+                    const char *fqn = resolved->data.class_type.name;
+                    /* Convert dots to slashes for internal format */
+                    size_t len = strlen(fqn);
+                    internal_name = malloc(len + 1);
+                    if (internal_name) {
+                        for (size_t i = 0; i <= len; i++) {
+                            internal_name[i] = (fqn[i] == '.') ? '/' : fqn[i];
+                        }
+                    }
+                }
+            }
+            
+            /* Fallback to ast_type_to_descriptor if still not resolved */
+            if (!internal_name) {
+                char *desc = ast_type_to_descriptor(node);
+                if (desc && desc[0] == 'L') {
+                    /* Convert "Ljava/io/IOException;" to "java/io/IOException" */
+                    size_t len = strlen(desc);
+                    internal_name = malloc(len - 1);  /* -2 for L; +1 for null */
+                    if (internal_name) {
+                        strncpy(internal_name, desc + 1, len - 2);
+                        internal_name[len - 2] = '\0';
+                    }
+                }
+                free(desc);
+            }
+            
+            if (internal_name) {
+                if (!throws_list) {
+                    throws_list = slist_new(internal_name);
+                } else {
+                    slist_append(throws_list, internal_name);
+                }
+            }
+        }
+    }
+    
+    return throws_list;
+}
+
 /* ========================================================================
  * invokedynamic Support
  * ======================================================================== */
@@ -2173,6 +2249,7 @@ static bool codegen_interface_method(class_gen_t *cg, ast_node_t *method_decl)
     mi->descriptor_index = cp_add_utf8(cg->cp, desc->str);
     mi->code = NULL;  /* Abstract methods have no Code attribute */
     mi->ast = method_decl;  /* Store AST for annotations and defaults */
+    mi->throws = extract_throws_types(method_decl, cg->sem);  /* Extract throws clause */
     
     string_free(desc, true);
     
@@ -2249,6 +2326,8 @@ static bool codegen_abstract_method(class_gen_t *cg, ast_node_t *method_decl)
     mi->name_index = cp_add_utf8(cg->cp, name);
     mi->descriptor_index = cp_add_utf8(cg->cp, desc->str);
     mi->code = NULL;  /* Abstract/native methods have no Code attribute */
+    mi->ast = method_decl;  /* Store AST for annotations */
+    mi->throws = extract_throws_types(method_decl, cg->sem);  /* Extract throws clause */
     
     string_free(desc, true);
     
@@ -2711,6 +2790,7 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
         mi->access_flags |= ACC_PUBLIC | ACC_ABSTRACT;
     }
     mi->ast = method_decl;  /* Store AST for annotations */
+    mi->throws = extract_throws_types(method_decl, cg->sem);  /* Extract throws clause */
     
     /* Add ACC_VARARGS if this method has a varargs parameter */
     if (method_sym && (method_sym->modifiers & MOD_VARARGS)) {
@@ -3207,6 +3287,343 @@ static void generate_superclass_bridges(class_gen_t *cg)
     }
 }
 
+/**
+ * Generate bridge methods for generic interface implementations.
+ * When a class implements Comparator<WebFragment> with compare(WebFragment, WebFragment),
+ * we need a bridge method compare(Object, Object) that casts and delegates.
+ * 
+ * Also generates bridges for interface methods inherited through abstract superclasses.
+ */
+static void generate_interface_bridges(class_gen_t *cg)
+{
+    if (!cg || !cg->class_sym) {
+        return;
+    }
+    
+    symbol_t *class_sym = cg->class_sym;
+    
+    /* Don't generate bridges for interfaces themselves */
+    if (class_sym->kind == SYM_INTERFACE) {
+        return;
+    }
+    
+    /* Process all implemented interfaces */
+    for (slist_t *iface_node = class_sym->data.class_data.interfaces; 
+         iface_node; iface_node = iface_node->next) {
+        symbol_t *iface_sym = (symbol_t *)iface_node->data;
+        if (!iface_sym || !iface_sym->data.class_data.members) {
+            continue;
+        }
+        
+        /* Iterate over interface methods */
+        scope_t *iface_members = iface_sym->data.class_data.members;
+        if (!iface_members || !iface_members->symbols) {
+            continue;
+        }
+        
+        hashtable_t *iface_ht = iface_members->symbols;
+        for (size_t i = 0; i < iface_ht->size; i++) {
+            hashtable_entry_t *entry = iface_ht->buckets[i];
+            while (entry) {
+                symbol_t *iface_method = (symbol_t *)entry->value;
+                if (!iface_method || iface_method->kind != SYM_METHOD ||
+                    (iface_method->modifiers & MOD_STATIC)) {
+                    entry = entry->next;
+                    continue;
+                }
+                
+                /* Check if method has type variable parameters or return type */
+                bool has_type_var = false;
+                slist_t *params = iface_method->data.method_data.parameters;
+                
+                for (slist_t *p = params; p && !has_type_var; p = p->next) {
+                    symbol_t *param = (symbol_t *)p->data;
+                    if (param && param->type && param->type->kind == TYPE_TYPEVAR) {
+                        has_type_var = true;
+                    }
+                }
+                if (iface_method->type && iface_method->type->kind == TYPE_TYPEVAR) {
+                    has_type_var = true;
+                }
+                
+                if (!has_type_var) {
+                    entry = entry->next;
+                    continue;
+                }
+                
+                /* Find the implementation in the current class (with concrete types) */
+                symbol_t *impl_method = NULL;
+                if (class_sym->data.class_data.members && 
+                    class_sym->data.class_data.members->symbols) {
+                    hashtable_t *class_ht = class_sym->data.class_data.members->symbols;
+                    for (size_t j = 0; j < class_ht->size && !impl_method; j++) {
+                        hashtable_entry_t *class_entry = class_ht->buckets[j];
+                        while (class_entry && !impl_method) {
+                            symbol_t *class_method = (symbol_t *)class_entry->value;
+                            if (class_method && class_method->kind == SYM_METHOD &&
+                                class_method->name && iface_method->name &&
+                                strcmp(class_method->name, iface_method->name) == 0 &&
+                                !(class_method->modifiers & MOD_STATIC)) {
+                                /* Check parameter count matches */
+                                int class_count = 0, iface_count = 0;
+                                for (slist_t *cp = class_method->data.method_data.parameters; cp; cp = cp->next)
+                                    class_count++;
+                                for (slist_t *ip = params; ip; ip = ip->next)
+                                    iface_count++;
+                                if (class_count == iface_count) {
+                                    impl_method = class_method;
+                                }
+                            }
+                            class_entry = class_entry->next;
+                        }
+                    }
+                }
+                
+                /* Also check superclass chain for implementation */
+                if (!impl_method) {
+                    symbol_t *super = class_sym->data.class_data.superclass;
+                    while (super && !impl_method) {
+                        if (super->data.class_data.members && 
+                            super->data.class_data.members->symbols) {
+                            hashtable_t *super_ht = super->data.class_data.members->symbols;
+                            for (size_t j = 0; j < super_ht->size && !impl_method; j++) {
+                                hashtable_entry_t *super_entry = super_ht->buckets[j];
+                                while (super_entry && !impl_method) {
+                                    symbol_t *super_method = (symbol_t *)super_entry->value;
+                                    if (super_method && super_method->kind == SYM_METHOD &&
+                                        super_method->name && iface_method->name &&
+                                        strcmp(super_method->name, iface_method->name) == 0 &&
+                                        !(super_method->modifiers & MOD_STATIC) &&
+                                        !(super_method->modifiers & MOD_PRIVATE)) {
+                                        int super_count = 0, iface_count = 0;
+                                        for (slist_t *sp = super_method->data.method_data.parameters; sp; sp = sp->next)
+                                            super_count++;
+                                        for (slist_t *ip = params; ip; ip = ip->next)
+                                            iface_count++;
+                                        if (super_count == iface_count) {
+                                            impl_method = super_method;
+                                        }
+                                    }
+                                    super_entry = super_entry->next;
+                                }
+                            }
+                        }
+                        super = super->data.class_data.superclass;
+                    }
+                }
+                
+                if (!impl_method) {
+                    entry = entry->next;
+                    continue;
+                }
+                
+                /* Check if implementation has concrete (non-type-var) parameter types */
+                bool impl_has_concrete = true;
+                for (slist_t *p = impl_method->data.method_data.parameters; p; p = p->next) {
+                    symbol_t *param = (symbol_t *)p->data;
+                    if (param && param->type && param->type->kind == TYPE_TYPEVAR) {
+                        impl_has_concrete = false;
+                        break;
+                    }
+                }
+                
+                if (!impl_has_concrete) {
+                    entry = entry->next;
+                    continue;
+                }
+                
+                /* Check if we already have a bridge with the erased signature */
+                string_t *erased_desc = string_new("(");
+                for (slist_t *p = params; p; p = p->next) {
+                    symbol_t *param = (symbol_t *)p->data;
+                    if (param && param->type) {
+                        if (param->type->kind == TYPE_TYPEVAR) {
+                            string_append(erased_desc, "Ljava/lang/Object;");
+                        } else {
+                            char *pdesc = type_to_descriptor(param->type);
+                            string_append(erased_desc, pdesc);
+                            free(pdesc);
+                        }
+                    }
+                }
+                string_append(erased_desc, ")");
+                if (iface_method->type) {
+                    if (iface_method->type->kind == TYPE_TYPEVAR) {
+                        string_append(erased_desc, "Ljava/lang/Object;");
+                    } else {
+                        char *rdesc = type_to_descriptor(iface_method->type);
+                        string_append(erased_desc, rdesc);
+                        free(rdesc);
+                    }
+                } else {
+                    string_append(erased_desc, "V");
+                }
+                
+                /* Check if we already have this method (don't duplicate) */
+                bool already_has_bridge = false;
+                for (slist_t *m = cg->methods; m && !already_has_bridge; m = m->next) {
+                    method_info_gen_t *existing = (method_info_gen_t *)m->data;
+                    if (existing) {
+                        /* Get method name and descriptor from existing */
+                        const char *existing_name = NULL;
+                        const char *existing_desc = NULL;
+                        for (uint16_t idx = 1; idx < cg->cp->count; idx++) {
+                            if (cg->cp->entries[idx].type == CONST_UTF8) {
+                                if (idx == existing->name_index) {
+                                    existing_name = cg->cp->entries[idx].data.utf8;
+                                }
+                                if (idx == existing->descriptor_index) {
+                                    existing_desc = cg->cp->entries[idx].data.utf8;
+                                }
+                            }
+                        }
+                        if (existing_name && existing_desc &&
+                            strcmp(existing_name, iface_method->name) == 0 &&
+                            strcmp(existing_desc, erased_desc->str) == 0) {
+                            already_has_bridge = true;
+                        }
+                    }
+                }
+                
+                if (already_has_bridge) {
+                    string_free(erased_desc, true);
+                    entry = entry->next;
+                    continue;
+                }
+                
+                /* Generate bridge method */
+                method_info_gen_t *mi = calloc(1, sizeof(method_info_gen_t));
+                if (!mi) {
+                    string_free(erased_desc, true);
+                    entry = entry->next;
+                    continue;
+                }
+                
+                mi->access_flags = ACC_PUBLIC | ACC_SYNTHETIC | ACC_BRIDGE;
+                mi->name_index = cp_add_utf8(cg->cp, iface_method->name);
+                mi->descriptor_index = cp_add_utf8(cg->cp, erased_desc->str);
+                
+                /* Build concrete method descriptor for invokevirtual */
+                string_t *concrete_desc = string_new("(");
+                for (slist_t *p = impl_method->data.method_data.parameters; p; p = p->next) {
+                    symbol_t *param = (symbol_t *)p->data;
+                    if (param && param->type) {
+                        char *pdesc = type_to_descriptor(param->type);
+                        string_append(concrete_desc, pdesc);
+                        free(pdesc);
+                    }
+                }
+                string_append(concrete_desc, ")");
+                if (impl_method->type) {
+                    char *rdesc = type_to_descriptor(impl_method->type);
+                    string_append(concrete_desc, rdesc);
+                    free(rdesc);
+                } else {
+                    string_append(concrete_desc, "V");
+                }
+                
+                /* Generate bytecode:
+                 * aload_0                           // this
+                 * aload_1                           // first Object arg
+                 * checkcast ConcreteType1           // cast to concrete type
+                 * aload_2                           // second Object arg  
+                 * checkcast ConcreteType2           // cast to concrete type
+                 * invokevirtual this.method(ConcreteTypes)
+                 * areturn/ireturn/return
+                 */
+                bytecode_t *code = bytecode_new();
+                int max_stack = 1;  /* 'this' */
+                int max_locals = 1; /* 'this' */
+                
+                /* aload_0 (this) */
+                bc_emit(code, OP_ALOAD_0);
+                
+                /* Load and cast each parameter */
+                int slot = 1;
+                slist_t *iface_param = params;
+                slist_t *impl_param = impl_method->data.method_data.parameters;
+                
+                while (iface_param && impl_param) {
+                    symbol_t *iparam = (symbol_t *)iface_param->data;
+                    symbol_t *cparam = (symbol_t *)impl_param->data;
+                    
+                    /* Load parameter */
+                    if (slot <= 3) {
+                        bc_emit(code, OP_ALOAD_0 + slot);
+                    } else {
+                        bc_emit(code, OP_ALOAD);
+                        bc_emit_u1(code, slot);
+                    }
+                    max_stack++;
+                    
+                    /* If interface param is type var but impl param is concrete, cast */
+                    if (iparam && iparam->type && iparam->type->kind == TYPE_TYPEVAR &&
+                        cparam && cparam->type && cparam->type->kind == TYPE_CLASS) {
+                        const char *cast_name = cparam->type->data.class_type.name;
+                        if (cast_name) {
+                            /* Convert dots to slashes for internal name */
+                            char *internal = strdup(cast_name);
+                            for (char *p = internal; *p; p++) {
+                                if (*p == '.') *p = '/';
+                            }
+                            uint16_t cast_class = cp_add_class(cg->cp, internal);
+                            bc_emit(code, OP_CHECKCAST);
+                            bc_emit_u2(code, cast_class);
+                            free(internal);
+                        }
+                    }
+                    
+                    slot++;
+                    max_locals++;
+                    iface_param = iface_param->next;
+                    impl_param = impl_param->next;
+                }
+                
+                /* invokevirtual this.concreteMethod */
+                uint16_t methodref = cp_add_methodref(cg->cp, cg->internal_name, 
+                                                       impl_method->name, concrete_desc->str);
+                bc_emit(code, OP_INVOKEVIRTUAL);
+                bc_emit_u2(code, methodref);
+                
+                /* Return */
+                if (impl_method->type) {
+                    switch (impl_method->type->kind) {
+                        case TYPE_VOID:   bc_emit(code, OP_RETURN); break;
+                        case TYPE_LONG:   bc_emit(code, OP_LRETURN); break;
+                        case TYPE_DOUBLE: bc_emit(code, OP_DRETURN); break;
+                        case TYPE_FLOAT:  bc_emit(code, OP_FRETURN); break;
+                        case TYPE_BOOLEAN:
+                        case TYPE_BYTE:
+                        case TYPE_CHAR:
+                        case TYPE_SHORT:
+                        case TYPE_INT:    bc_emit(code, OP_IRETURN); break;
+                        default:          bc_emit(code, OP_ARETURN); break;
+                    }
+                } else {
+                    bc_emit(code, OP_RETURN);
+                }
+                
+                code->max_stack = max_stack;
+                code->max_locals = max_locals;
+                
+                mi->code = code;
+                
+                string_free(erased_desc, true);
+                string_free(concrete_desc, true);
+                
+                /* Add to methods list */
+                if (!cg->methods) {
+                    cg->methods = slist_new(mi);
+                } else {
+                    slist_append(cg->methods, mi);
+                }
+                
+                entry = entry->next;
+            }
+        }
+    }
+}
+
 /* ========================================================================
  * Class Code Generation
  * ======================================================================== */
@@ -3662,6 +4079,12 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
      * When B extends A<String> and A<T> has f(T), B needs f(Object) -> super.f(Object). */
     if (!is_interface && !is_annotation) {
         generate_superclass_bridges(cg);
+    }
+    
+    /* Generate bridge methods for generic interface implementations.
+     * When C implements Comparator<X>, it needs compare(Object, Object) -> compare(X, X). */
+    if (!is_interface && !is_annotation) {
+        generate_interface_bridges(cg);
     }
     
     /* Generate default constructor if class has no explicit constructors

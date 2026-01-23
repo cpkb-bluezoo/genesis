@@ -180,6 +180,14 @@ uint16_t cp_add_class(const_pool_t *cp, const char *name)
     
     uint16_t name_index = cp_add_utf8(cp, name);
     
+    /* Search for existing CONST_CLASS with same name_index to avoid duplicates */
+    for (uint16_t i = 1; i < cp->count; i++) {
+        if (cp->entries[i].type == CONST_CLASS && 
+            cp->entries[i].data.class_index == name_index) {
+            return i;  /* Return existing entry */
+        }
+    }
+    
     uint16_t index = cp_add_entry(cp);
     cp->entries[index].type = CONST_CLASS;
     cp->entries[index].data.class_index = name_index;

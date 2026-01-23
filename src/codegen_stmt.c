@@ -82,7 +82,7 @@ static const char *resolve_exception_class(const char *name)
     
     for (const char **e = java_lang_exceptions; *e; e++) {
         if (strcmp(name, *e) == 0) {
-            static char buf[128];
+            static __thread char buf[128];
             snprintf(buf, sizeof(buf), "java/lang/%s", name);
             return buf;
         }

@@ -62,6 +62,19 @@ void ast_pool_cleanup(void)
     }
 }
 
+/**
+ * Disable the AST pool for thread-safe parsing.
+ * When disabled, AST nodes are allocated with malloc instead of the pool.
+ * Must be called before parsing begins.
+ */
+void ast_pool_disable(void)
+{
+    if (g_ast_pool) {
+        pool_free(g_ast_pool);
+        g_ast_pool = NULL;
+    }
+}
+
 /* ========================================================================
  * AST Node Implementation
  * ======================================================================== */
@@ -3038,6 +3051,14 @@ static ast_node_t *parse_statement(parser_t *parser)
                 if (!parser_check(parser, TOK_SEMICOLON)) {
                     /* Check if this looks like a variable declaration */
                     /* (starts with type keyword or identifier followed by identifier) */
+                    
+                    /* Handle optional 'final' modifier for for-loop variables */
+                    uint32_t var_mods = 0;
+                    if (parser_check(parser, TOK_FINAL)) {
+                        var_mods |= MOD_FINAL;
+                        parser_advance(parser);
+                    }
+                    
                     token_type_t first_type = parser_current_type(parser);
                     int first_line = parser_current_line(parser);
                     int first_col = parser_current_column(parser);
@@ -3049,6 +3070,9 @@ static ast_node_t *parse_statement(parser_t *parser)
                         first_type == TOK_FLOAT || first_type == TOK_DOUBLE ||
                         first_type == TOK_CHAR || first_type == TOK_BOOLEAN ||
                         first_type == TOK_VAR) {
+                        is_var_decl = true;
+                    } else if (var_mods != 0) {
+                        /* If we saw 'final', it MUST be a var declaration */
                         is_var_decl = true;
                     } else if (first_type == TOK_IDENTIFIER) {
                         /* Could be a type - peek ahead */
@@ -3144,8 +3168,9 @@ static ast_node_t *parse_statement(parser_t *parser)
                                     ast_add_child(node, type);
                                 }
                                 
-                                /* Add variable name as identifier */
+                                /* Add variable name as identifier (with final modifier if present) */
                                 ast_node_t *var_node = ast_new_leaf(AST_IDENTIFIER, var_name, var_line, var_col);
+                                var_node->data.node.flags = var_mods;
                                 ast_add_child(node, var_node);
                                 
                                 /* Parse iterable expression */

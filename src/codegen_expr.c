@@ -293,7 +293,7 @@ const char *resolve_java_lang_class(const char *name)
     
     for (const char **c = java_lang_classes; *c; c++) {
         if (strcmp(name, *c) == 0) {
-            static char buf[128];
+            static __thread char buf[128];
             snprintf(buf, sizeof(buf), "java/lang/%s", name);
             return buf;
         }
@@ -1348,7 +1348,7 @@ static const char *resolve_class_name(method_gen_t *mg, const char *name)
             if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
                           nested->kind == SYM_ENUM)) {
                 /* Build internal name: OuterClass$NestedClass */
-                static char nested_internal[256];
+                static __thread char nested_internal[256];
                 snprintf(nested_internal, sizeof(nested_internal), "%s$%s",
                          mg->class_gen->internal_name, name);
                 return nested_internal;
@@ -1637,7 +1637,8 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
              receiver->sem_symbol->kind == SYM_INTERFACE ||
              receiver->sem_symbol->kind == SYM_ENUM)) {
             /* External class reference - use the qualified name */
-            static char external_class_name[256];
+            /* Thread-local to avoid race conditions in parallel compilation */
+            static __thread char external_class_name[256];
             if (receiver->sem_symbol->qualified_name) {
                 char *internal = class_to_internal_name(receiver->sem_symbol->qualified_name);
                 strncpy(external_class_name, internal, sizeof(external_class_name) - 1);
@@ -1673,7 +1674,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                             symbol_t *field_sym = scope_lookup_local(
                                 nested->data.class_data.members, field_name);
                             if (field_sym && field_sym->kind == SYM_FIELD) {
-                                static char field_desc_buf[256];
+                                static __thread char field_desc_buf[256];
                                 /* For enum constants, the type is the enum type itself */
                                 if (field_sym->type && field_sym->type->kind == TYPE_CLASS) {
                                     char *internal = class_to_internal_name(field_sym->type->data.class_type.name);
@@ -1703,7 +1704,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                     symbol_t *field_sym = scope_lookup_local(
                         ext_class->data.class_data.members, field_name);
                     if (field_sym && field_sym->kind == SYM_FIELD) {
-                        static char ext_field_desc_buf[256];
+                        static __thread char ext_field_desc_buf[256];
                         if (field_sym->type && field_sym->type->kind == TYPE_CLASS) {
                             char *internal = class_to_internal_name(field_sym->type->data.class_type.name);
                             snprintf(ext_field_desc_buf, sizeof(ext_field_desc_buf), "L%s;", internal);
@@ -3069,7 +3070,7 @@ static const char *infer_arg_descriptor(ast_node_t *arg)
         case AST_NEW_OBJECT:
             /* First check if sem_type is available (resolved by semantic analysis) */
             if (arg->sem_type && arg->sem_type->kind == TYPE_CLASS) {
-                static char new_obj_desc[256];
+                static __thread char new_obj_desc[256];
                 char *desc = type_to_descriptor(arg->sem_type);
                 strncpy(new_obj_desc, desc, sizeof(new_obj_desc) - 1);
                 new_obj_desc[sizeof(new_obj_desc) - 1] = '\0';
@@ -3081,7 +3082,7 @@ static const char *infer_arg_descriptor(ast_node_t *arg)
                 ast_node_t *type_node = (ast_node_t *)arg->data.node.children->data;
                 /* Check type node's sem_type first */
                 if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS) {
-                    static char type_desc[256];
+                    static __thread char type_desc[256];
                     char *desc = type_to_descriptor(type_node->sem_type);
                     strncpy(type_desc, desc, sizeof(type_desc) - 1);
                     type_desc[sizeof(type_desc) - 1] = '\0';
@@ -3090,7 +3091,7 @@ static const char *infer_arg_descriptor(ast_node_t *arg)
                 }
                 /* Last resort: use simple name with java.lang resolution */
                 if (type_node->type == AST_CLASS_TYPE) {
-                    static char class_desc[256];
+                    static __thread char class_desc[256];
                     const char *name = resolve_java_lang_class(type_node->data.node.name);
                     snprintf(class_desc, sizeof(class_desc), "L%s;", name);
                     /* Convert dots to slashes */
@@ -3104,7 +3105,7 @@ static const char *infer_arg_descriptor(ast_node_t *arg)
         case AST_NEW_ARRAY:
             /* Check sem_type for proper array descriptor */
             if (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) {
-                static char new_arr_desc[256];
+                static __thread char new_arr_desc[256];
                 char *desc = type_to_descriptor(arg->sem_type);
                 strncpy(new_arr_desc, desc, sizeof(new_arr_desc) - 1);
                 new_arr_desc[sizeof(new_arr_desc) - 1] = '\0';
@@ -3182,7 +3183,7 @@ static const char *infer_arg_descriptor(ast_node_t *arg)
                     case TYPE_CLASS:
                         if (arg->sem_type->data.class_type.symbol &&
                             arg->sem_type->data.class_type.symbol->qualified_name) {
-                            static char sem_desc[256];
+                            static __thread char sem_desc[256];
                             const char *qn = arg->sem_type->data.class_type.symbol->qualified_name;
                             snprintf(sem_desc, sizeof(sem_desc), "L%s;", qn);
                             for (char *p = sem_desc + 1; *p != ';'; p++) {
@@ -3194,7 +3195,7 @@ static const char *infer_arg_descriptor(ast_node_t *arg)
                     case TYPE_ARRAY:
                         {
                             /* Use type_to_descriptor for proper array element type */
-                            static char arr_desc[256];
+                            static __thread char arr_desc[256];
                             char *desc = type_to_descriptor(arg->sem_type);
                             strncpy(arr_desc, desc, sizeof(arr_desc) - 1);
                             arr_desc[sizeof(arr_desc) - 1] = '\0';

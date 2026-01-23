@@ -11,21 +11,21 @@ features.
 
 ### Design Goals
 
-- **Small**: Minimal codebase, no external dependencies beyond zlib
+- **Small**: Minimal codebase, no external dependencies beyond zlib and pthreads
 - **Fast**: Direct compilation without intermediate representations
 - **Correct**: Full Java language specification compliance
 - **Portable**: Standard C99, builds on Linux and macOS
 
 ## Current Status
 
-**Version 0.6** — Java 17 baseline with Java 21 preview features
+**Version 0.6** : Full Java 21 support
 
-Genesis supports the core Java language through Java 17, including:
+Genesis supports Java language features through Java 21:
 
 - **Java 5**: Generics, enums, annotations, varargs, enhanced for loop, autoboxing
 - **Java 7**: Try-with-resources, multi-catch, diamond operator, binary literals
 - **Java 8**: Lambdas, method references, default/static interface methods, functional interfaces
-- **Java 9**: Private interface methods, try-with-resources on existing variables, module-info.java
+- **Java 9**: Private interface methods, module-info.java
 - **Java 10**: Local variable type inference (`var`)
 - **Java 14-16**: Records, text blocks, pattern matching for instanceof
 - **Java 17**: Sealed classes
@@ -33,9 +33,34 @@ Genesis supports the core Java language through Java 17, including:
 
 See [TODO](TODO) for detailed feature tracking.
 
+## Compatibility
+
+Genesis produces functionally equivalent class files to `javac`. Testing against
+a large real-world project (644 source files, 942 class files) shows:
+
+- **0 compilation errors** : identical to javac
+- **Identical method signatures** : including generics, throws clauses, and bridge methods
+- **Bytecode verification passes** : all generated classes are valid
+
+**Minor differences** (all functionally equivalent):
+- Genesis uses `ordinal()` for enum switches; javac generates synthetic `$SwitchMap` classes
+- Genesis uses `<clinit>` for constant initialization; javac uses `ConstantValue` attributes
+
+## Performance
+
+Genesis is approximately **2x faster** than javac, with parallel compilation enabled by default.
+
+| Compiler | Time (avg of 10) | Speedup |
+|----------|------------------|---------|
+| Genesis (parallel) | 1.79s | **2.03x** |
+| Genesis (-j1) | 1.97s | 1.84x |
+| javac | 3.62s | baseline |
+
+*Benchmark: 644 Java source files : 942 class files on macOS*
+
 ## Building
 
-Genesis requires a C99 compiler and zlib.
+Genesis requires a C99 compiler, zlib, and pthreads.
 
 ```bash
 # Debug build (with symbols)
@@ -86,6 +111,7 @@ genesis -version
 | `-g:none` | Do not generate debugging information |
 | `-nowarn` | Disable all warnings |
 | `-Werror` | Treat warnings as errors |
+| `-j[N]` | Use N threads (default: auto-detect, `-j1` for single-threaded) |
 | `-verbose` | Print compilation progress |
 | `-version` | Display version information |
 | `-help` | Print usage information |
@@ -106,4 +132,4 @@ See [CONTRIBUTING](CONTRIBUTING) for coding standards and guidelines.
 Genesis is free software, released under the
 [GNU General Public License](COPYING) version 3 or later.
 
-Copyright © 2016 Chris Burdess
+Copyright © 2016, 2020, 2026 Chris Burdess

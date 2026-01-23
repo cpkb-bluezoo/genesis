@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <dirent.h>
 #include <zlib.h>
+#include <pthread.h>
 #include "classpath.h"
 
 /*
@@ -812,6 +813,13 @@ classpath_t *classpath_new(void)
         classpath_free(cp);
         return NULL;
     }
+    
+    /* Initialize mutex for thread-safe cache access */
+    pthread_mutex_t *mutex = malloc(sizeof(pthread_mutex_t));
+    if (mutex) {
+        pthread_mutex_init(mutex, NULL);
+        cp->cache_mutex = mutex;
+    }
 
     return cp;
 }
@@ -850,6 +858,12 @@ void classpath_free(classpath_t *cp)
     /* Free negative cache (values are just sentinel, no need to free) */
     if (cp->negative_cache) {
         hashtable_free(cp->negative_cache);
+    }
+    
+    /* Destroy and free mutex */
+    if (cp->cache_mutex) {
+        pthread_mutex_destroy((pthread_mutex_t *)cp->cache_mutex);
+        free(cp->cache_mutex);
     }
 
     free(cp->java_home);
@@ -1063,18 +1077,28 @@ static classfile_t *load_from_entry(cp_entry_t *entry, const char *path)
 
 classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
 {
+    pthread_mutex_t *mutex = (pthread_mutex_t *)cp->cache_mutex;
+    
+    /* Lock for cache access */
+    if (mutex) pthread_mutex_lock(mutex);
+    
     /* Check positive cache first */
     classfile_t *cached = (classfile_t *)hashtable_lookup(cp->cache, classname);
     if (cached) {
         cp->cache_hits++;
+        if (mutex) pthread_mutex_unlock(mutex);
         return cached;
     }
     
     /* Check negative cache - avoid repeated failed lookups */
     if (cp->negative_cache && hashtable_lookup(cp->negative_cache, classname)) {
         cp->negative_cache_hits++;
+        if (mutex) pthread_mutex_unlock(mutex);
         return NULL;
     }
+    
+    /* Unlock while doing I/O (which is slow) */
+    if (mutex) pthread_mutex_unlock(mutex);
 
     char *path = classname_to_path(classname);
     if (!path) {
@@ -1083,17 +1107,32 @@ classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
 
     classfile_t *cf = NULL;
 
-    /* Search boot classpath first */
+    /* Search boot classpath first (read-only, no lock needed) */
     for (slist_t *node = cp->boot_entries; node && !cf; node = node->next) {
         cf = load_from_entry((cp_entry_t *)node->data, path);
     }
 
-    /* Then user classpath */
+    /* Then user classpath (read-only, no lock needed) */
     for (slist_t *node = cp->entries; node && !cf; node = node->next) {
         cf = load_from_entry((cp_entry_t *)node->data, path);
     }
 
     free(path);
+
+    /* Lock for cache update */
+    if (mutex) pthread_mutex_lock(mutex);
+    
+    /* Check cache again - another thread may have loaded it while we were doing I/O */
+    classfile_t *existing = (classfile_t *)hashtable_lookup(cp->cache, classname);
+    if (existing) {
+        /* Another thread loaded it - use that, free our copy */
+        if (cf) {
+            classfile_free(cf);
+        }
+        cp->cache_hits++;
+        if (mutex) pthread_mutex_unlock(mutex);
+        return existing;
+    }
 
     if (cf) {
         /* Add to positive cache */
@@ -1103,6 +1142,8 @@ classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
         /* Add to negative cache so we don't search again */
         hashtable_insert(cp->negative_cache, classname, (void *)1);
     }
+    
+    if (mutex) pthread_mutex_unlock(mutex);
 
     return cf;
 }

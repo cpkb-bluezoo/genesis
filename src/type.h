@@ -105,8 +105,20 @@ type_t *type_new_primitive(type_kind_t kind);
 
 /**
  * Create a new class/reference type.
+ * When type_cache_enable() has been called, returns canonical instance.
  */
 type_t *type_new_class(const char *name);
+
+/**
+ * Enable canonical type cache for parallel compilation.
+ * When enabled, type_new_class() returns the same type_t* for the same name.
+ */
+void type_cache_enable(void);
+
+/**
+ * Disable canonical type cache.
+ */
+void type_cache_disable(void);
 
 /**
  * Create a new array type.

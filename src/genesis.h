@@ -47,6 +47,7 @@ typedef struct compiler_options
     bool debug_info;                /* Generate debug information */
     bool warnings;                  /* Enable warnings */
     bool werror;                    /* Treat warnings as errors */
+    int jobs;                       /* Number of parallel jobs (0 = auto, 1 = serial) */
 } compiler_options_t;
 
 compiler_options_t *compiler_options_new(void);
@@ -535,6 +536,12 @@ parser_t *parser_new(lexer_t *lexer, source_file_t *source);
 void parser_free(parser_t *parser);
 ast_node_t *parser_parse(parser_t *parser);
 
+/* AST Pool management - use ast_pool_disable for thread-safe parallel parsing */
+void ast_pool_init(void);
+void ast_pool_reset(void);
+void ast_pool_cleanup(void);
+void ast_pool_disable(void);
+
 /* Expression parsing - parse_expression_prec uses internal precedence enum */
 ast_node_t *parse_expression(parser_t *parser);
 ast_node_t *parse_type(parser_t *parser);
@@ -572,6 +579,22 @@ typedef enum symbol_kind
 } symbol_kind_t;
 
 /**
+ * Completer function type - populates symbol members on demand.
+ * Following javac's design pattern for lazy symbol completion.
+ * @param sym     The symbol to complete
+ * @param context Opaque context pointer (e.g., type_registry + classpath)
+ */
+typedef void (*symbol_completer_t)(symbol_t *sym, void *context);
+
+/**
+ * Context for symbol completion - holds registry and classpath.
+ */
+typedef struct completer_context {
+    void *registry;             /* type_registry_t* */
+    void *classpath;            /* classpath_t* */
+} completer_context_t;
+
+/**
  * Represents a declared symbol (class, method, variable, etc.)
  */
 struct symbol
@@ -583,6 +606,10 @@ struct symbol
     type_t *type;               /* Symbol's type (field type, method return type) */
     scope_t *scope;             /* Scope containing this symbol */
     ast_node_t *ast;            /* AST node that declared this symbol */
+    
+    /* Completer for lazy member population (javac-style) */
+    symbol_completer_t completer;   /* Function to populate members */
+    void *completer_context;        /* Context for completer (type_registry + classpath) */
     
     /* Kind-specific data */
     union {
@@ -602,6 +629,10 @@ struct symbol
             slist_t *captured_vars;     /* Captured local variables (for local classes) */
             ast_node_t *anonymous_body; /* AST body for anonymous classes */
             slist_t *super_ctor_args;   /* Constructor args to pass to superclass (anonymous classes) */
+            char *package;              /* Package name (for stub types) */
+            char *unresolved_superclass; /* Unresolved superclass name (for phased compilation) */
+            void *unresolved_superclass_type; /* unresolved_type_t* with type args (e.g., extends List<String>) */
+            slist_t *unresolved_interfaces; /* Unresolved interface names (list of char*) */
         } class_data;
         
         /* SYM_METHOD, SYM_CONSTRUCTOR */
@@ -612,6 +643,10 @@ struct symbol
             symbol_t *overridden_method; /* For covariant returns: method being overridden */
             char *descriptor;           /* JVM descriptor for classfile-loaded methods */
             slist_t *type_params;       /* Method type parameters (generics, e.g. <T>) */
+            int param_count;            /* Number of parameters */
+            symbol_t **params;          /* Array of parameter symbols (for phased compilation) */
+            void *unresolved_return_type;  /* unresolved_type_t* for return type */
+            void **unresolved_param_types; /* Array of unresolved_type_t* for param types */
         } method_data;
         
         /* SYM_FIELD, SYM_LOCAL_VAR, SYM_PARAMETER */
@@ -620,6 +655,7 @@ struct symbol
             bool initialized;           /* Has been assigned a value */
             bool is_enum_constant;      /* True if this is an enum constant */
             int enum_ordinal;           /* Ordinal value (for enum constants) */
+            void *unresolved_type;      /* unresolved_type_t* for field type */
         } var_data;
     } data;
     
@@ -630,6 +666,23 @@ struct symbol
 symbol_t *symbol_new(symbol_kind_t kind, const char *name);
 void symbol_free(symbol_t *sym);
 const char *symbol_kind_name(symbol_kind_t kind);
+
+/**
+ * Complete a symbol by invoking its completer (if set).
+ * This populates members, supertypes, etc. on demand.
+ * After completion, the completer is set to NULL to prevent re-entry.
+ */
+void symbol_complete(symbol_t *sym);
+
+/**
+ * Check if a symbol has been completed (has members populated).
+ */
+bool symbol_is_completed(symbol_t *sym);
+
+/**
+ * Set the completer for a symbol.
+ */
+void symbol_set_completer(symbol_t *sym, symbol_completer_t completer, void *context);
 
 /* ========================================================================
  * Scopes
@@ -695,6 +748,7 @@ typedef struct semantic
     hashtable_t *types;         /* Canonical type cache: qualified_name -> type_t* */
     hashtable_t *unit_types;    /* Per-compilation-unit: simple_name -> type_t* (like javac's toplevelScope) */
     hashtable_t *packages;      /* Package name -> scope_t* */
+    bool owns_types;            /* True if we own the types cache (should free it) */
     hashtable_t *resolved_imports; /* Cache: simple_name -> qualified_name (interned) */
     
     slist_t *imports;           /* Import declarations */
@@ -724,10 +778,62 @@ typedef struct semantic
     slist_t *sourcepath;        /* Source path directories for finding .java files */
     slist_t *source_dependencies; /* Source files loaded as dependencies (need compilation) */
     bool loading_dependency;    /* True when loading dependency files (suppress errors) */
+    
+    /* Shared type registry for parallel compilation */
+    struct type_registry *shared_registry;  /* Optional: shared between parallel analyzers */
+    
+    /* Recursion guards to prevent stack overflow */
+    int resolve_import_depth;   /* Tracks nesting in resolve_import calls */
 } semantic_t;
+
+/*
+ * Shared Type Registry for Parallel Compilation
+ * 
+ * This structure allows multiple semantic analyzers to share type information
+ * during parallel compilation. It provides thread-safe registration and lookup
+ * of types that are being compiled together.
+ */
+typedef struct type_registry {
+    hashtable_t *types;         /* qualified_name -> symbol_t* */
+    hashtable_t *ast_map;       /* qualified_name -> ast_node_t* (for deferred population) */
+    void *mutex;                /* pthread_mutex_t* for thread safety */
+    bool populated;             /* True after all symbols have been fully populated */
+} type_registry_t;
+
+/* Type registry API */
+type_registry_t *type_registry_new(void);
+void type_registry_free(type_registry_t *reg);
+void type_registry_register(type_registry_t *reg, const char *qname, symbol_t *sym, ast_node_t *ast);
+symbol_t *type_registry_lookup(type_registry_t *reg, const char *qname);
+ast_node_t *type_registry_get_ast(type_registry_t *reg, const char *qname);
+
+/* Multi-phase compilation support (javac-style) */
+/* Phase 3: Member Entry - add method/field signatures with unresolved types */
+void registry_enter_members(type_registry_t *reg, struct classpath *cp);
+/* Phase 4: Type Resolution - resolve all type references in signatures */
+void registry_resolve_types(type_registry_t *reg, struct classpath *cp);
+
+/* Symbol Completer API (javac-style lazy completion) */
+/* Completer function that populates class members on-demand */
+void class_symbol_completer(symbol_t *sym, void *context);
+/* Create a completer context with registry and classpath */
+completer_context_t *completer_context_new(type_registry_t *reg, struct classpath *cp);
+
+/* Unresolved type reference - stores type name before resolution */
+typedef struct unresolved_type {
+    char *name;             /* Simple or qualified type name */
+    int array_dims;         /* Array dimensions */
+    slist_t *type_args;     /* Type arguments (list of unresolved_type*) */
+} unresolved_type_t;
+
+/* Create/free unresolved type references */
+unresolved_type_t *unresolved_type_new(const char *name);
+void unresolved_type_free(unresolved_type_t *ut);
 
 /* Semantic analyzer API */
 semantic_t *semantic_new(struct classpath *cp);
+semantic_t *semantic_new_with_shared_types(struct classpath *cp, hashtable_t *shared_types);
+semantic_t *semantic_new_with_registry(struct classpath *cp, type_registry_t *registry);
 void semantic_free(semantic_t *sem);
 void semantic_set_classpath(semantic_t *sem, struct classpath *cp);
 void semantic_set_sourcepath(semantic_t *sem, const char *sourcepath);

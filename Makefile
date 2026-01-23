@@ -32,7 +32,7 @@ else ifeq ($(UNAME),Linux)
 LDFLAGS ?=
 endif
 
-LIBS = -lz
+LIBS = -lz -pthread
 
 # Source files
 SOURCES = \

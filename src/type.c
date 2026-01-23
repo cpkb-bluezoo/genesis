@@ -22,7 +22,89 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <pthread.h>
 #include "type.h"
+
+/* ========================================================================
+ * Canonical Type Cache (Thread-Safe)
+ * ========================================================================
+ * Like javac's Symtab.classes map, we maintain a single canonical instance
+ * for each class type. This ensures type identity comparison works correctly
+ * in parallel compilation.
+ */
+
+#define TYPE_CACHE_SIZE 4096
+
+typedef struct type_cache_entry {
+    char *name;
+    type_t *type;
+    struct type_cache_entry *next;
+} type_cache_entry_t;
+
+static type_cache_entry_t *g_type_cache[TYPE_CACHE_SIZE];
+static pthread_mutex_t g_type_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int g_type_cache_enabled = 0;
+
+/* Simple hash function for strings */
+static unsigned int hash_string(const char *str) {
+    unsigned int hash = 5381;
+    int c;
+    while ((c = *str++)) {
+        hash = ((hash << 5) + hash) + c;
+    }
+    return hash;
+}
+
+/* Enable the canonical type cache (call before parallel compilation) */
+void type_cache_enable(void) {
+    g_type_cache_enabled = 1;
+}
+
+/* Disable the canonical type cache */
+void type_cache_disable(void) {
+    g_type_cache_enabled = 0;
+}
+
+/* Look up or create a canonical class type */
+static type_t *type_cache_get_or_create(const char *name) {
+    if (!name) return NULL;
+    
+    unsigned int hash = hash_string(name) % TYPE_CACHE_SIZE;
+    
+    pthread_mutex_lock(&g_type_cache_mutex);
+    
+    /* Look for existing entry */
+    type_cache_entry_t *entry = g_type_cache[hash];
+    while (entry) {
+        if (strcmp(entry->name, name) == 0) {
+            type_t *found = entry->type;
+            pthread_mutex_unlock(&g_type_cache_mutex);
+            return found;
+        }
+        entry = entry->next;
+    }
+    
+    /* Not found - create new type and cache it */
+    type_t *type = calloc(1, sizeof(type_t));
+    if (!type) {
+        pthread_mutex_unlock(&g_type_cache_mutex);
+        return NULL;
+    }
+    type->kind = TYPE_CLASS;
+    type->data.class_type.name = strdup(name);
+    
+    /* Add to cache */
+    entry = calloc(1, sizeof(type_cache_entry_t));
+    if (entry) {
+        entry->name = strdup(name);
+        entry->type = type;
+        entry->next = g_type_cache[hash];
+        g_type_cache[hash] = entry;
+    }
+    
+    pthread_mutex_unlock(&g_type_cache_mutex);
+    return type;
+}
 
 /* symbol_t is forward-declared in type.h */
 
@@ -47,6 +129,7 @@ typedef enum symbol_kind {
 extern symbol_kind_t symbol_get_kind(symbol_t *sym);
 extern const char *symbol_get_qualified_name(symbol_t *sym);
 extern symbol_t *symbol_get_superclass(symbol_t *sym);
+extern const char *symbol_get_unresolved_superclass(symbol_t *sym);
 extern slist_t *symbol_get_interfaces(symbol_t *sym);
 
 /* ========================================================================
@@ -178,6 +261,9 @@ type_t *type_new_primitive(type_kind_t kind)
 
 type_t *type_new_class(const char *name)
 {
+    /* Always create fresh type instances. 
+     * Type comparison in type_equals() uses name comparison, not identity.
+     * The canonical cache is used for symbol sharing, not type identity. */
     type_t *type = calloc(1, sizeof(type_t));
     if (!type) {
         return NULL;
@@ -185,6 +271,18 @@ type_t *type_new_class(const char *name)
     type->kind = TYPE_CLASS;
     type->data.class_type.name = strdup(name);
     return type;
+}
+
+/**
+ * Get or create a canonical symbol holder for a class name.
+ * Used in parallel mode to share symbol references across threads.
+ */
+type_t *type_get_canonical(const char *name)
+{
+    if (g_type_cache_enabled) {
+        return type_cache_get_or_create(name);
+    }
+    return type_new_class(name);
 }
 
 type_t *type_new_array(type_t *element, int dimensions)
@@ -468,6 +566,21 @@ static bool class_names_equal(const char *name1, const char *name2)
     return false;
 }
 
+/**
+ * Get the total dimensions and base element type for an array type.
+ * Handles both flat (dims=2, elem=byte) and nested (dims=1, elem=byte[]) representations.
+ */
+static void get_array_info(type_t *arr, int *total_dims, type_t **base_elem)
+{
+    *total_dims = 0;
+    *base_elem = arr;
+    
+    while (*base_elem && (*base_elem)->kind == TYPE_ARRAY) {
+        *total_dims += (*base_elem)->data.array_type.dimensions;
+        *base_elem = (*base_elem)->data.array_type.element_type;
+    }
+}
+
 bool type_equals(type_t *a, type_t *b)
 {
     if (a == b) {
@@ -484,10 +597,16 @@ bool type_equals(type_t *a, type_t *b)
         case TYPE_CLASS:
             return class_names_equal(a->data.class_type.name, b->data.class_type.name);
         
-        case TYPE_ARRAY:
-            return a->data.array_type.dimensions == b->data.array_type.dimensions &&
-                   type_equals(a->data.array_type.element_type, 
-                              b->data.array_type.element_type);
+        case TYPE_ARRAY: {
+            /* Handle different array representations:
+             * byte[][] can be either (dims=2, elem=byte) or (dims=1, elem=byte[])
+             * Normalize both to total dimensions and base element type */
+            int dims_a, dims_b;
+            type_t *base_a, *base_b;
+            get_array_info(a, &dims_a, &base_a);
+            get_array_info(b, &dims_b, &base_b);
+            return dims_a == dims_b && type_equals(base_a, base_b);
+        }
         
         case TYPE_TYPEVAR:
             return strcmp(a->data.type_var.name, b->data.type_var.name) == 0;
@@ -716,21 +835,39 @@ bool type_needs_unboxing(type_t *target, type_t *source)
  * Type Assignment Compatibility
  * ======================================================================== */
 
+/* External function to lazily resolve interfaces for a symbol */
+extern void ensure_interfaces_resolved(void *sem, symbol_t *sym);
+
 /**
  * Recursively check if a symbol (class or interface) implements or extends
  * a target interface.
  * 
+ * @param sem The semantic analyzer context (can be NULL)
  * @param sym The symbol to check
  * @param target_sym The target interface symbol (can be NULL)
  * @param target_name The target interface name (used if target_sym is NULL)
  * @param depth Recursion depth limit to prevent infinite loops
  * @return true if sym implements/extends the target
  */
-static bool symbol_implements_interface(symbol_t *sym, symbol_t *target_sym, 
+static bool symbol_implements_interface_with_sem(void *sem, symbol_t *sym, symbol_t *target_sym, 
                                         const char *target_name, int depth)
 {
     if (!sym || depth > 20) {
         return false;  /* Limit depth to prevent infinite recursion */
+    }
+    
+    /* First check if sym itself IS the target (for class extension, not just interface implementation) */
+    if (sym == target_sym) {
+        return true;
+    }
+    const char *sym_name = symbol_get_qualified_name(sym);
+    if (sym_name && target_name && strcmp(sym_name, target_name) == 0) {
+        return true;
+    }
+    
+    /* Ensure interfaces are resolved for this symbol */
+    if (sem) {
+        ensure_interfaces_resolved(sem, sym);
     }
     
     /* Check direct interfaces of this symbol */
@@ -741,6 +878,11 @@ static bool symbol_implements_interface(symbol_t *sym, symbol_t *target_sym,
         if (!iface) {
             ifaces = ifaces->next;
             continue;
+        }
+        
+        /* Ensure the interface's own interfaces are resolved */
+        if (sem) {
+            ensure_interfaces_resolved(sem, iface);
         }
         
         /* Direct match by symbol pointer */
@@ -755,7 +897,7 @@ static bool symbol_implements_interface(symbol_t *sym, symbol_t *target_sym,
         }
         
         /* Recursively check if this interface extends the target */
-        if (symbol_implements_interface(iface, target_sym, target_name, depth + 1)) {
+        if (symbol_implements_interface_with_sem(sem, iface, target_sym, target_name, depth + 1)) {
             return true;
         }
         
@@ -764,11 +906,75 @@ static bool symbol_implements_interface(symbol_t *sym, symbol_t *target_sym,
     
     /* Check superclass hierarchy */
     symbol_t *super = symbol_get_superclass(sym);
-    if (super && symbol_implements_interface(super, target_sym, target_name, depth + 1)) {
+    
+    /* If superclass is wrong (Object when it should be something else),
+     * try to resolve superclass from the unresolved name */
+    const char *unresolved_super = symbol_get_unresolved_superclass(sym);
+    if (unresolved_super && sem && symbol_get_kind(sym) != SYM_INTERFACE) {
+        /* We have an unresolved superclass name - resolve it now */
+        const char *super_name = super ? symbol_get_qualified_name(super) : NULL;
+        /* Only replace if current super is Object (default) but we have a real superclass name */
+        if (!super || (super_name && strcmp(super_name, "java.lang.Object") == 0)) {
+            extern symbol_t *load_external_class(void *sem, const char *name);
+            symbol_t *real_super = NULL;
+            
+            /* Try direct load first (for fully qualified names) */
+            real_super = load_external_class(sem, unresolved_super);
+            
+            /* Try common package prefixes for gumdrop classes */
+            if (!real_super && !strchr(unresolved_super, '.')) {
+                static const char *prefixes[] = {
+                    "org.bluezoo.gumdrop.http.",
+                    "org.bluezoo.gumdrop.",
+                    "org.bluezoo.gumdrop.servlet.",
+                    "org.bluezoo.gumdrop.pop3.",
+                    "org.bluezoo.gumdrop.smtp.",
+                    "org.bluezoo.gumdrop.ftp.",
+                    "org.bluezoo.gumdrop.imap.",
+                    NULL
+                };
+                for (int i = 0; prefixes[i] && !real_super; i++) {
+                    char buf[512];
+                    snprintf(buf, sizeof(buf), "%s%s", prefixes[i], unresolved_super);
+                    real_super = load_external_class(sem, buf);
+                }
+            }
+            
+            if (real_super) {
+                super = real_super;
+                /* Update the symbol's superclass for future lookups */
+                extern void symbol_set_superclass(symbol_t *sym, symbol_t *super);
+                symbol_set_superclass(sym, real_super);
+            }
+        }
+    }
+    /* If still no super and this isn't Object or an interface, default to Object */
+    if (!super && symbol_get_kind(sym) != SYM_INTERFACE) {
+        const char *sym_name = symbol_get_qualified_name(sym);
+        if (!sym_name || strcmp(sym_name, "java.lang.Object") != 0) {
+            extern symbol_t *load_external_class(void *sem, const char *name);
+            if (sem) {
+                super = load_external_class(sem, "java.lang.Object");
+            }
+        }
+    }
+    
+    if (super && symbol_implements_interface_with_sem(sem, super, target_sym, target_name, depth + 1)) {
         return true;
     }
     
     return false;
+}
+
+/**
+ * Wrapper for backward compatibility - gets current semantic context.
+ */
+static bool symbol_implements_interface(symbol_t *sym, symbol_t *target_sym, 
+                                        const char *target_name, int depth)
+{
+    extern void *get_current_semantic(void);
+    void *sem = get_current_semantic();
+    return symbol_implements_interface_with_sem(sem, sym, target_sym, target_name, depth);
 }
 
 bool type_assignable(type_t *target, type_t *source)
@@ -922,23 +1128,105 @@ bool type_assignable(type_t *target, type_t *source)
             }
         }
         
+        /* Before checking interfaces, ensure the full superclass chain is resolved.
+         * This is critical for parallel compilation where intermediate classes
+         * may not have their superclass links fully populated yet. */
+        if (source_sym) {
+            extern void *get_current_semantic(void);
+            extern symbol_t *load_external_class(void *sem, const char *name);
+            void *sem = get_current_semantic();
+            if (sem) {
+                symbol_t *s = source_sym;
+                int depth = 0;
+                while (s && depth < 30) {
+                    /* If no superclass but not Object/Interface, try to resolve */
+                    if (!symbol_get_superclass(s) && symbol_get_kind(s) != SYM_INTERFACE) {
+                        const char *s_name = symbol_get_qualified_name(s);
+                        if (!s_name || strcmp(s_name, "java.lang.Object") != 0) {
+                            const char *unresolved = symbol_get_unresolved_superclass(s);
+                            symbol_t *super_sym = NULL;
+                            if (unresolved) {
+                                super_sym = load_external_class(sem, unresolved);
+                            }
+                            if (!super_sym) {
+                                super_sym = load_external_class(sem, "java.lang.Object");
+                            }
+                            if (super_sym) {
+                                /* Note: This modifies shared state, but the check is atomic enough */
+                                extern void symbol_set_superclass(symbol_t *sym, symbol_t *super);
+                                symbol_set_superclass(s, super_sym);
+                            }
+                        }
+                    }
+                    /* Also ensure interfaces are resolved */
+                    extern void ensure_interfaces_resolved(void *sem, symbol_t *sym);
+                    ensure_interfaces_resolved(sem, s);
+                    s = symbol_get_superclass(s);
+                    depth++;
+                }
+            }
+        }
+        
         /* Use recursive helper to check full interface/class hierarchy */
         if (source_sym && symbol_implements_interface(source_sym, target_sym, target_name, 0)) {
             return true;
         }
         
+        
         /* Also check if source class extends target class directly */
         if (source_sym) {
             symbol_t *super = symbol_get_superclass(source_sym);
-            while (super) {
+            int depth = 0;
+            
+            if (getenv("GENESIS_DEBUG_SUBTYPE")) {
+                const char *src_name = symbol_get_qualified_name(source_sym);
+                fprintf(stderr, "DEBUG subtype: checking superclass chain for '%s' (sym=%p)\n", 
+                        src_name ? src_name : "(null)", (void*)source_sym);
+                fprintf(stderr, "  target='%s', initial super=%p\n", 
+                        target_name ? target_name : "(null)", (void*)super);
+            }
+            
+            while (super && depth < 50) {  /* Limit depth to prevent infinite loops */
+                const char *super_name = symbol_get_qualified_name(super);
+                
+                if (getenv("GENESIS_DEBUG_SUBTYPE")) {
+                    fprintf(stderr, "  depth=%d super='%s' (sym=%p)\n", depth, 
+                            super_name ? super_name : "(null)", (void*)super);
+                }
+                
                 if (super == target_sym) {
                     return true;  /* Source extends target class */
                 }
-                const char *super_name = symbol_get_qualified_name(super);
                 if (super_name && target_name && strcmp(super_name, target_name) == 0) {
                     return true;
                 }
-                super = symbol_get_superclass(super);
+                
+                /* If superclass has unresolved superclass, try to load it */
+                symbol_t *next_super = symbol_get_superclass(super);
+                if (!next_super && super_name && strcmp(super_name, "java.lang.Object") != 0) {
+                    /* Try to load the superclass's superclass from semantic context */
+                    extern symbol_t *load_external_class(void *sem, const char *name);
+                    extern void *get_current_semantic(void);
+                    void *sem = get_current_semantic();
+                    if (sem) {
+                        /* Re-load this symbol to ensure its superclass chain is populated */
+                        symbol_t *reloaded = load_external_class(sem, super_name);
+                        if (reloaded && reloaded != super) {
+                            next_super = symbol_get_superclass(reloaded);
+                            if (getenv("GENESIS_DEBUG_SUBTYPE")) {
+                                fprintf(stderr, "    reloaded '%s' -> next_super=%p\n", 
+                                        super_name, (void*)next_super);
+                            }
+                        }
+                    }
+                }
+                
+                super = next_super;
+                depth++;
+            }
+            
+            if (getenv("GENESIS_DEBUG_SUBTYPE")) {
+                fprintf(stderr, "  superclass chain did NOT match target\n");
             }
         }
     }

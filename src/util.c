@@ -20,6 +20,7 @@
  */
 
 #include "util.h"
+#include <pthread.h>
 
 /* ========================================================================
  * Singly-linked list implementation
@@ -1206,15 +1207,18 @@ const char *intern_string(intern_table_t *table, const char *str)
 
 /* Global intern table */
 static intern_table_t *g_intern_table = NULL;
+static pthread_mutex_t g_intern_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * Initialize the global intern table.
  */
 void intern_init(void)
 {
+    pthread_mutex_lock(&g_intern_mutex);
     if (!g_intern_table) {
         g_intern_table = intern_table_new();
     }
+    pthread_mutex_unlock(&g_intern_mutex);
 }
 
 /**
@@ -1222,32 +1226,40 @@ void intern_init(void)
  */
 void intern_cleanup(void)
 {
+    pthread_mutex_lock(&g_intern_mutex);
     if (g_intern_table) {
         intern_table_free(g_intern_table);
         g_intern_table = NULL;
     }
+    pthread_mutex_unlock(&g_intern_mutex);
 }
 
 /**
- * Intern a string using the global table.
+ * Intern a string using the global table (thread-safe).
  */
 const char *intern(const char *str)
 {
+    pthread_mutex_lock(&g_intern_mutex);
     if (!g_intern_table) {
-        intern_init();
+        g_intern_table = intern_table_new();
     }
-    return intern_string(g_intern_table, str);
+    const char *result = intern_string(g_intern_table, str);
+    pthread_mutex_unlock(&g_intern_mutex);
+    return result;
 }
 
 /**
- * Intern a string with known length using the global table.
+ * Intern a string with known length using the global table (thread-safe).
  */
 const char *intern_len(const char *str, size_t len)
 {
+    pthread_mutex_lock(&g_intern_mutex);
     if (!g_intern_table) {
-        intern_init();
+        g_intern_table = intern_table_new();
     }
-    return intern_string_len(g_intern_table, str, len);
+    const char *result = intern_string_len(g_intern_table, str, len);
+    pthread_mutex_unlock(&g_intern_mutex);
+    return result;
 }
 
 /* ========================================================================
