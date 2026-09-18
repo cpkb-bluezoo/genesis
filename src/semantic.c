@@ -2895,6 +2895,7 @@ semantic_t *semantic_new_with_registry(classpath_t *cp, type_registry_t *registr
     sem->warnings_enabled = true;
     sem->werror = false;
     sem->source_version = 17;
+    sem->in_early_construction = false;
     sem->shared_registry = registry;     /* Shared registry for parallel compilation */
     
     /* Pre-populate with java.lang classes from classpath if available */
@@ -2958,6 +2959,7 @@ semantic_t *semantic_new_with_shared_types(classpath_t *cp, hashtable_t *shared_
     sem->warnings_enabled = true;
     sem->werror = false;
     sem->source_version = 17;  /* Default to Java 17 */
+    sem->in_early_construction = false;
     sem->shared_registry = NULL;
     
     /* Pre-populate with java.lang classes from classpath if available */
@@ -7952,6 +7954,40 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             } else {
                                 slist_append(sem->static_imports, node);
                             }
+                        } else if (node->data.node.flags & MOD_MODULE_IMPORT) {
+                            /* import module M; (JEP 511) - expand to package on-demand imports */
+                            if (sem->source_version < 25) {
+                                semantic_error(sem, node->line, node->column,
+                                    "module imports are not supported in -source %d (use 25 or higher)",
+                                    sem->source_version);
+                            } else if (node->data.node.name && sem->classpath) {
+                                int export_count = 0;
+                                char **exports = classpath_module_exports(
+                                    sem->classpath, node->data.node.name, &export_count);
+                                if (!exports) {
+                                    semantic_error(sem, node->line, node->column,
+                                        "module not found: %s", node->data.node.name);
+                                } else {
+                                    for (int i = 0; i < export_count; i++) {
+                                        if (!exports[i]) continue;
+                                        /* Synthesize on-demand import pkg.* */
+                                        size_t len = strlen(exports[i]) + 3;
+                                        char *wildcard = malloc(len);
+                                        snprintf(wildcard, len, "%s.*", exports[i]);
+                                        ast_node_t *pkg_import = ast_new(AST_IMPORT_DECL,
+                                            node->line, node->column);
+                                        pkg_import->data.node.name = (char *)intern(wildcard);
+                                        free(wildcard);
+                                        if (!sem->imports) {
+                                            sem->imports = slist_new(pkg_import);
+                                        } else {
+                                            slist_append(sem->imports, pkg_import);
+                                        }
+                                        free(exports[i]);
+                                    }
+                                    free(exports);
+                                }
+                            }
                         } else {
                             /* Regular import */
                             if (!sem->imports) {
@@ -9266,7 +9302,11 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                         }
                                     }
                                     
-                                    scope_define(method_scope, param);
+                                    /* Unnamed parameters (JEP 456) are not bound in scope */
+                                    if (!(sem->source_version >= 22 && is_unnamed_name(param_name))) {
+                                        scope_define(method_scope, param);
+                                    }
+                                    child->sem_symbol = param;
                                     
                                     if (!sym->data.method_data.parameters) {
                                         sym->data.method_data.parameters = slist_new(param);
@@ -9334,16 +9374,20 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                 }
                             }
                             
-                            /* Validate main method signature */
+                            /* Validate main method signature.
+                             * Java 25+ (JEP 512) allows instance main and non-public main. */
                             if (kind == SYM_METHOD && strcmp(name, "main") == 0) {
                                 bool valid_main = true;
+                                bool flexible_main = (sem->source_version >= 25);
                                 
-                                /* Must be public and static */
-                                if (!(sym->modifiers & MOD_PUBLIC) || 
-                                    !(sym->modifiers & MOD_STATIC)) {
-                                    semantic_error(sem, node->line, node->column,
-                                        "'main' method must be declared 'public static'");
-                                    valid_main = false;
+                                /* Pre-25: must be public and static */
+                                if (!flexible_main) {
+                                    if (!(sym->modifiers & MOD_PUBLIC) || 
+                                        !(sym->modifiers & MOD_STATIC)) {
+                                        semantic_error(sem, node->line, node->column,
+                                            "'main' method must be declared 'public static'");
+                                        valid_main = false;
+                                    }
                                 }
                                 
                                 /* Must return void */
@@ -9627,6 +9671,9 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                     case AST_CONSTRUCTOR_DECL:
                         sem->current_scope = frame->saved_scope;
                         sem->current_method = frame->saved_method;
+                        if (node->type == AST_CONSTRUCTOR_DECL) {
+                            sem->in_early_construction = false;
+                        }
                         break;
                     
                     case AST_NEW_OBJECT:
@@ -15560,6 +15607,75 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                 sem->current_scope = sym->data.method_data.body_scope;
                                 sem->current_method = sym;
                             }
+                            
+                            /* Validate flexible constructor bodies (JEP 513) */
+                            if (node->type == AST_CONSTRUCTOR_DECL) {
+                                ast_node_t *body = NULL;
+                                for (slist_t *c = node->data.node.children; c; c = c->next) {
+                                    ast_node_t *ch = (ast_node_t *)c->data;
+                                    if (ch && ch->type == AST_BLOCK) {
+                                        body = ch;
+                                        break;
+                                    }
+                                }
+                                if (body) {
+                                    /* First pass: find if there is an explicit this()/super() */
+                                    bool has_explicit = false;
+                                    for (slist_t *s = body->data.node.children; s; s = s->next) {
+                                        ast_node_t *stmt = (ast_node_t *)s->data;
+                                        if (stmt->type == AST_EXPLICIT_CTOR_CALL) {
+                                            has_explicit = true;
+                                            break;
+                                        }
+                                        if (stmt->type == AST_EXPR_STMT && stmt->data.node.children) {
+                                            ast_node_t *ex = (ast_node_t *)stmt->data.node.children->data;
+                                            if (ex && ex->type == AST_EXPLICIT_CTOR_CALL) {
+                                                has_explicit = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if (has_explicit) {
+                                        bool seen_ctor_call = false;
+                                        for (slist_t *s = body->data.node.children; s; s = s->next) {
+                                            ast_node_t *stmt = (ast_node_t *)s->data;
+                                            bool is_ctor_call = false;
+                                            if (stmt->type == AST_EXPLICIT_CTOR_CALL) {
+                                                is_ctor_call = true;
+                                            } else if (stmt->type == AST_EXPR_STMT &&
+                                                       stmt->data.node.children) {
+                                                ast_node_t *ex = (ast_node_t *)stmt->data.node.children->data;
+                                                if (ex && ex->type == AST_EXPLICIT_CTOR_CALL) {
+                                                    is_ctor_call = true;
+                                                }
+                                            }
+                                            if (is_ctor_call) {
+                                                if (seen_ctor_call) {
+                                                    semantic_error(sem, stmt->line, stmt->column,
+                                                        "constructor call must be the only explicit constructor invocation");
+                                                }
+                                                seen_ctor_call = true;
+                                            } else if (!seen_ctor_call) {
+                                                /* Prologue statement before super()/this() */
+                                                if (sem->source_version < 25) {
+                                                    semantic_error(sem, stmt->line, stmt->column,
+                                                        "call to this/super must be first statement in constructor "
+                                                        "(use -source 25 or higher for flexible constructor bodies)");
+                                                    break;
+                                                }
+                                                if (stmt->type == AST_RETURN_STMT) {
+                                                    semantic_error(sem, stmt->line, stmt->column,
+                                                        "return not allowed before constructor invocation");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    /* Early construction until explicit super()/this() is walked */
+                                    sem->in_early_construction = has_explicit;
+                                } else {
+                                    sem->in_early_construction = false;
+                                }
+                            }
                         }
                         break;
                     
@@ -15685,13 +15801,18 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                 ast_node_t *type_node = (ast_node_t *)children->data;
                                 type_t *exc_type = semantic_resolve_type(sem, type_node);
                                 
-                                symbol_t *sym = symbol_new(SYM_LOCAL_VAR, exc_var_name);
-                                sym->type = exc_type;
-                                sym->ast = node;
-                                sym->line = node->line;
-                                sym->column = node->column;
-                                sym->data.var_data.initialized = true;  /* Exception is assigned by JVM */
-                                scope_define(catch_scope, sym);
+                                if (sem->source_version >= 22 && is_unnamed_name(exc_var_name)) {
+                                    /* Unnamed catch parameter (JEP 456) - no scope binding */
+                                    node->sem_type = exc_type;
+                                } else {
+                                    symbol_t *sym = symbol_new(SYM_LOCAL_VAR, exc_var_name);
+                                    sym->type = exc_type;
+                                    sym->ast = node;
+                                    sym->line = node->line;
+                                    sym->column = node->column;
+                                    sym->data.var_data.initialized = true;  /* Exception is assigned by JVM */
+                                    scope_define(catch_scope, sym);
+                                }
                             }
                         }
                         break;
@@ -15764,13 +15885,18 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                 type_t *var_type = semantic_resolve_type(sem, type_node);
                                 const char *var_name = var_node->data.leaf.name;
                                 
-                                symbol_t *sym = symbol_new(SYM_LOCAL_VAR, var_name);
-                                sym->type = var_type;
-                                sym->ast = var_node;
-                                sym->line = var_node->line;
-                                sym->column = var_node->column;
-                                
-                                scope_define(loop_scope, sym);
+                                if (sem->source_version >= 22 && is_unnamed_name(var_name)) {
+                                    /* Unnamed enhanced-for variable (JEP 456) */
+                                    var_node->sem_type = var_type;
+                                } else {
+                                    symbol_t *sym = symbol_new(SYM_LOCAL_VAR, var_name);
+                                    sym->type = var_type;
+                                    sym->ast = var_node;
+                                    sym->line = var_node->line;
+                                    sym->column = var_node->column;
+                                    
+                                    scope_define(loop_scope, sym);
+                                }
                                 
                                 /* Get iterable expression type for codegen */
                                 if (children->next->next) {
@@ -15869,9 +15995,14 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                     sym->line = decl->line;
                                     sym->column = decl->column;
                                     
-                                    if (!scope_define(sem->current_scope, sym)) {
+                                    if (sem->source_version >= 22 && is_unnamed_name(name)) {
+                                        /* Unnamed local variable (JEP 456) - allow multiple in scope */
+                                        decl->sem_symbol = sym;
+                                    } else if (!scope_define(sem->current_scope, sym)) {
                                         semantic_error(sem, decl->line, decl->column,
                                                       "Variable '%s' already defined", name);
+                                    } else {
+                                        decl->sem_symbol = sym;
                                     }
                                     
                                     /* Check initializer type (for non-var declarations) */
@@ -15996,16 +16127,20 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                     node->sem_type = res_type;
                                     
                                     if (name) {
-                                        symbol_t *sym = symbol_new(SYM_LOCAL_VAR, name);
-                                        sym->type = res_type;
-                                        sym->ast = node;
-                                        sym->line = node->line;
-                                        sym->column = node->column;
-                                        sym->modifiers = MOD_FINAL;  /* Resources are implicitly final */
-                                        
-                                        if (!scope_define(sem->current_scope, sym)) {
-                                            semantic_error(sem, node->line, node->column,
-                                                          "Variable '%s' already defined", name);
+                                        if (sem->source_version >= 22 && is_unnamed_name(name)) {
+                                            /* Unnamed try-with-resources variable (JEP 456) */
+                                        } else {
+                                            symbol_t *sym = symbol_new(SYM_LOCAL_VAR, name);
+                                            sym->type = res_type;
+                                            sym->ast = node;
+                                            sym->line = node->line;
+                                            sym->column = node->column;
+                                            sym->modifiers = MOD_FINAL;  /* Resources are implicitly final */
+                                            
+                                            if (!scope_define(sem->current_scope, sym)) {
+                                                semantic_error(sem, node->line, node->column,
+                                                              "Variable '%s' already defined", name);
+                                            }
                                         }
                                     }
                                     
@@ -16345,7 +16480,10 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                             /* this() or super() can only be called from a constructor */
                             if (!sem->current_method || sem->current_method->kind != SYM_CONSTRUCTOR) {
                                 semantic_error(sem, node->line, node->column,
-                                    "call to super must be first statement in constructor");
+                                    "constructor invocation is only allowed in a constructor");
+                            } else {
+                                /* Leaving early construction context after this call */
+                                sem->in_early_construction = false;
                             }
                             
                             /* Type-check arguments and bind lambdas to target types */
@@ -16577,19 +16715,22 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                     ast_node_t *params = (ast_node_t *)lambda_children->data;
                                     if (params && params->type == AST_IDENTIFIER) {
                                         /* Single identifier parameter - define it in scope */
-                                        symbol_t *param_sym = symbol_new(SYM_PARAMETER, params->data.leaf.name);
-                                        param_sym->type = params->sem_type ? params->sem_type : type_new_primitive(TYPE_UNKNOWN);
-                                        param_sym->line = params->line;
-                                        param_sym->column = params->column;
-                                        scope_define(lambda_scope, param_sym);
-                                        params->sem_symbol = param_sym;
+                                        const char *pname = params->data.leaf.name;
+                                        if (!(sem->source_version >= 22 && is_unnamed_name(pname))) {
+                                            symbol_t *param_sym = symbol_new(SYM_PARAMETER, pname);
+                                            param_sym->type = params->sem_type ? params->sem_type : type_new_primitive(TYPE_UNKNOWN);
+                                            param_sym->line = params->line;
+                                            param_sym->column = params->column;
+                                            scope_define(lambda_scope, param_sym);
+                                            params->sem_symbol = param_sym;
+                                        }
                                     } else if (params && params->type == AST_LAMBDA_PARAMS) {
                                         /* Multiple parameters - define each one */
                                         for (slist_t *p = params->data.node.children; p; p = p->next) {
                                             ast_node_t *param_node = (ast_node_t *)p->data;
                                             if (param_node && param_node->type == AST_PARAMETER) {
                                                 const char *pname = param_node->data.node.name;
-                                                if (pname) {
+                                                if (pname && !(sem->source_version >= 22 && is_unnamed_name(pname))) {
                                                     symbol_t *param_sym = symbol_new(SYM_PARAMETER, pname);
                                                     param_sym->type = param_node->sem_type ? param_node->sem_type : type_new_primitive(TYPE_UNKNOWN);
                                                     param_sym->line = param_node->line;
@@ -16625,6 +16766,14 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                             
                             /* Check that identifier resolves */
                             const char *name = node->data.leaf.name;
+                            
+                            /* Unnamed variables cannot be referenced (JEP 456) */
+                            if (sem->source_version >= 22 && is_unnamed_name(name)) {
+                                semantic_error(sem, node->line, node->column,
+                                    "unnamed variable '_' cannot be used as an expression");
+                                break;
+                            }
+                            
                             symbol_t *sym = scope_lookup(sem->current_scope, name);
                             if (sym) {
                                 /* Set sem_type for code generation */
@@ -17250,6 +17399,9 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                     case AST_CONSTRUCTOR_DECL:
                         sem->current_scope = frame->saved_scope;
                         sem->current_method = frame->saved_method;
+                        if (node->type == AST_CONSTRUCTOR_DECL) {
+                            sem->in_early_construction = false;
+                        }
                         break;
                     
                     case AST_BLOCK:

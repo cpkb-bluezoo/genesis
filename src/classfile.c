@@ -791,6 +791,7 @@ const char *classfile_version_name(uint16_t major_version)
         case 66: return "Java 22";
         case 67: return "Java 23";
         case 68: return "Java 24";
+        case 69: return "Java 25";
         default: return "Unknown";
     }
 }
@@ -827,6 +828,100 @@ int classfile_java_version(int major_version)
     if (major_version < 45) return 0;
     if (major_version <= 48) return major_version - 44;  /* 45->1, 46->2, 47->3, 48->4 */
     return major_version - 44;  /* 49->5, 50->6, 51->7, 52->8, ... */
+}
+
+/**
+ * Parse Module attribute exports from module-info.class.
+ * Returns a NULL-terminated array of package names in binary form (dots),
+ * or NULL on failure. Sets *count_out to the number of packages.
+ */
+char **classfile_get_module_exports(classfile_t *cf, int *count_out)
+{
+    if (count_out) {
+        *count_out = 0;
+    }
+    if (!cf) {
+        return NULL;
+    }
+    
+    attribute_info_t *module_attr = NULL;
+    for (uint16_t i = 0; i < cf->attributes_count; i++) {
+        char *aname = classfile_get_utf8(cf, cf->attributes[i].attribute_name_index);
+        if (aname && strcmp(aname, "Module") == 0) {
+            module_attr = &cf->attributes[i];
+            free(aname);
+            break;
+        }
+        free(aname);
+    }
+    if (!module_attr || !module_attr->info || module_attr->attribute_length < 8) {
+        return NULL;
+    }
+    
+    const uint8_t *p = module_attr->info;
+    const uint8_t *end = p + module_attr->attribute_length;
+    
+    /* module_name_index u2, module_flags u2, module_version_index u2 */
+    if (p + 6 > end) return NULL;
+    p += 6;
+    
+    /* requires_count */
+    if (p + 2 > end) return NULL;
+    uint16_t requires_count = ((uint16_t)p[0] << 8) | p[1];
+    p += 2;
+    for (uint16_t i = 0; i < requires_count; i++) {
+        /* requires_index u2, requires_flags u2, requires_version_index u2 */
+        if (p + 6 > end) return NULL;
+        p += 6;
+    }
+    
+    if (p + 2 > end) return NULL;
+    uint16_t exports_count = ((uint16_t)p[0] << 8) | p[1];
+    p += 2;
+    
+    char **exports = calloc((size_t)exports_count + 1, sizeof(char *));
+    if (!exports) {
+        return NULL;
+    }
+    int n = 0;
+    
+    for (uint16_t i = 0; i < exports_count; i++) {
+        if (p + 4 > end) break;
+        uint16_t exports_index = ((uint16_t)p[0] << 8) | p[1];
+        p += 2;
+        /* exports_flags */
+        p += 2;
+        if (p + 2 > end) break;
+        uint16_t exports_to_count = ((uint16_t)p[0] << 8) | p[1];
+        p += 2;
+        /* Skip qualified exports targets */
+        if (p + 2 * exports_to_count > end) break;
+        p += 2 * exports_to_count;
+        
+        /* Package CP entry -> Utf8 internal name */
+        if (exports_index == 0 || exports_index >= cf->constant_pool_count) {
+            continue;
+        }
+        cp_info_t *cp = &cf->constant_pool[exports_index];
+        if (cp->tag != CONSTANT_Package) {
+            continue;
+        }
+        char *internal = classfile_get_utf8(cf, cp->info.class_info.name_index);
+        if (!internal) {
+            continue;
+        }
+        /* Convert internal (java/lang) to binary (java.lang) */
+        char *binary = classname_to_binary(internal);
+        free(internal);
+        if (binary) {
+            exports[n++] = binary;
+        }
+    }
+    
+    if (count_out) {
+        *count_out = n;
+    }
+    return exports;
 }
 
 /* ========================================================================

@@ -59,7 +59,7 @@ compiler_options_t *compiler_options_new(void)
         return NULL;
     }
     
-    opts->source_version = strdup("21");
+    opts->source_version = strdup("25");
     opts->target_version = strdup("17");
     opts->output_dir = NULL;
     opts->output_jar = NULL;
@@ -1930,8 +1930,8 @@ void print_usage(const char *program_name)
     printf("  -cp <path>          Specify classpath\n");
     printf("  -classpath <path>   Specify classpath\n");
     printf("  -sourcepath <path>  Specify source path\n");
-    printf("  -source <version>   Specify source version (default: 17)\n");
-    printf("  --source <version>  Specify source version (default: 17)\n");
+    printf("  -source <version>   Specify source version (default: 25)\n");
+    printf("  --source <version>  Specify source version (default: 25)\n");
     printf("  -target <version>   Specify target version (default: 17)\n");
     printf("  --target <version>  Specify target version (default: 17)\n");
     printf("  -release <version>  Specify release version (sets source and target)\n");

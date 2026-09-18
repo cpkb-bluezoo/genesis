@@ -658,6 +658,8 @@ jdk_info_t *jdk_detect(void)
     /* Try common locations on macOS */
 #ifdef __APPLE__
     const char *mac_paths[] = {
+        "/Library/Java/JavaVirtualMachines/jdk-25.jdk/Contents/Home",
+        "/Library/Java/JavaVirtualMachines/jdk-25-macports.jdk/Contents/Home",
         "/Library/Java/JavaVirtualMachines/jdk-21.jdk/Contents/Home",
         "/Library/Java/JavaVirtualMachines/jdk-17.jdk/Contents/Home",
         "/Library/Java/JavaVirtualMachines/jdk-11.jdk/Contents/Home",
@@ -692,6 +694,7 @@ jdk_info_t *jdk_detect(void)
     /* Try common locations on Linux */
 #ifdef __linux__
     const char *linux_paths[] = {
+        "/usr/lib/jvm/java-25-openjdk",
         "/usr/lib/jvm/java-21-openjdk",
         "/usr/lib/jvm/java-17-openjdk",
         "/usr/lib/jvm/java-11-openjdk",
@@ -1158,6 +1161,46 @@ bool classpath_class_exists(classpath_t *cp, const char *classname)
     /* For now, just try to load it */
     /* A more efficient implementation would check without full parsing */
     return classpath_find_class(cp, classname) != NULL;
+}
+
+/**
+ * Load exported packages from a module's module-info.class in the JDK jmods.
+ */
+char **classpath_module_exports(classpath_t *cp, const char *module_name, int *count_out)
+{
+    if (count_out) {
+        *count_out = 0;
+    }
+    if (!cp || !module_name || !cp->java_home) {
+        return NULL;
+    }
+    
+    char jmod_path[1024];
+    snprintf(jmod_path, sizeof(jmod_path), "%s/jmods/%s.jmod",
+             cp->java_home, module_name);
+    
+    void *handle = jmod_open(jmod_path);
+    if (!handle) {
+        return NULL;
+    }
+    
+    size_t size = 0;
+    uint8_t *data = jmod_read_class(handle, "module-info", &size);
+    jmod_close(handle);
+    if (!data || size == 0) {
+        free(data);
+        return NULL;
+    }
+    
+    classfile_t *cf = classfile_read(data, size);
+    free(data);
+    if (!cf) {
+        return NULL;
+    }
+    
+    char **exports = classfile_get_module_exports(cf, count_out);
+    classfile_free(cf);
+    return exports;
 }
 
 /*

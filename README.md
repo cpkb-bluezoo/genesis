@@ -18,9 +18,9 @@ features.
 
 ## Current Status
 
-**Version 0.6** : Full Java 21 support
+**Version 0.7** : Full Java 25 support
 
-Genesis supports Java language features through Java 21:
+Genesis supports Java language features through Java 25:
 
 - **Java 5**: Generics, enums, annotations, varargs, enhanced for loop, autoboxing
 - **Java 7**: Try-with-resources, multi-catch, diamond operator, binary literals
@@ -30,6 +30,10 @@ Genesis supports Java language features through Java 21:
 - **Java 14-16**: Records, text blocks, pattern matching for instanceof
 - **Java 17**: Sealed classes
 - **Java 21**: Switch expressions, pattern matching in switch, record patterns, unnamed patterns
+- **Java 22**: Unnamed variables and patterns (`_`)
+- **Java 25**: Module imports, compact source files and instance main, flexible constructor bodies
+
+Preview features (e.g. primitive patterns) and withdrawn string templates are not supported.
 
 See [TODO](TODO) for detailed feature tracking.
 
@@ -104,7 +108,7 @@ genesis -version
 | `-main-class <class>` | Specify main class for JAR manifest |
 | `-cp <path>` / `-classpath <path>` | Classpath for dependency resolution |
 | `-sourcepath <path>` | Source path for finding source files |
-| `-source <version>` | Source language version (default: 17) |
+| `-source <version>` | Source language version (default: 25) |
 | `-target <version>` | Target bytecode version (default: 17) |
 | `-release <version>` | Set source and target to the same version |
 | `-g` | Generate debugging information (default) |

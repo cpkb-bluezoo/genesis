@@ -27,7 +27,7 @@
 /* Forward declaration for classpath */
 struct classpath;
 
-#define GENESIS_VERSION "0.6"
+#define GENESIS_VERSION "0.7"
 
 /* ========================================================================
  * Compiler options
@@ -488,6 +488,14 @@ struct ast_node
 #define MOD_NON_SEALED   0x2000
 #define MOD_VARARGS          0x4000  /* Parameter is varargs (Type... args) */
 #define MOD_RECORD_COMPONENT 0x8000  /* Record component (generates field + accessor) */
+#define MOD_MODULE_IMPORT    0x40000 /* import module M; (JEP 511, Java 25+) */
+#define MOD_COMPACT_SOURCE   0x80000 /* Implicitly declared class (JEP 512) */
+
+/* True if name is the unnamed variable/parameter "_" (JEP 456, Java 22+). */
+static inline bool is_unnamed_name(const char *name)
+{
+    return name != NULL && name[0] == '_' && name[1] == '\0';
+}
 
 /* AST node flags (for non-modifier uses of data.node.flags) */
 #define AST_METHOD_CALL_EXPLICIT_RECEIVER 0x10000  /* Method call has explicit receiver (obj.method()) */
@@ -772,6 +780,7 @@ typedef struct semantic
     int source_version;         /* Source version (e.g., 8, 11, 17, 21) */
     int loop_depth;             /* Current loop nesting depth (for break/continue validation) */
     int switch_depth;           /* Current switch nesting depth (for break validation) */
+    bool in_early_construction; /* True in constructor prologue before super()/this() (JEP 513) */
     
     source_file_t *source;      /* Current source file */
     struct classpath *classpath; /* Classpath for resolving external types */

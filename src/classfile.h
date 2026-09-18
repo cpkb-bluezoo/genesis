@@ -421,6 +421,12 @@ int classfile_version_from_string(const char *version);
 int classfile_java_version(int major_version);
 
 /*
+ * Module attribute - list of exported package names (binary form, e.g. "java.lang").
+ * Caller must free each string and the array.
+ */
+char **classfile_get_module_exports(classfile_t *cf, int *count_out);
+
+/*
  * InnerClasses attribute parsing
  */
 

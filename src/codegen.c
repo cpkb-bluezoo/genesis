@@ -623,7 +623,10 @@ uint16_t mg_allocate_local(method_gen_t *mg, const char *name, type_t *type)
         }
     }
     
-    hashtable_insert(mg->locals, name, info);
+    /* Unnamed variables (JEP 456) get a slot but are not name-bound */
+    if (!is_unnamed_name(name)) {
+        hashtable_insert(mg->locals, name, info);
+    }
     
     /* Update StackMapTable local tracking */
     if (mg->stackmap) {
@@ -2509,7 +2512,9 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                     }
                 }
                 
-                hashtable_insert(mg->locals, child->data.node.name, param_info);
+                if (!is_unnamed_name(child->data.node.name)) {
+                    hashtable_insert(mg->locals, child->data.node.name, param_info);
+                }
             }
             
             /* Record parameter in LocalVariableTable and update StackMapTable */
@@ -2527,7 +2532,10 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                     param_desc = array_desc;
                 }
                 
-                mg_record_local_var(mg, child->data.node.name, param_desc, slot, 0, param_type_node);
+                /* Unnamed parameters (JEP 456) omit LocalVariableTable entries */
+                if (!is_unnamed_name(child->data.node.name)) {
+                    mg_record_local_var(mg, child->data.node.name, param_desc, slot, 0, param_type_node);
+                }
                 
                 /* Update StackMapTable for this parameter using the actual type descriptor */
                 if (mg->stackmap) {
@@ -2652,18 +2660,45 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
         }
         
         bool has_explicit_ctor_call = false;
+        bool is_this_ctor_call = false;
+        ast_node_t *explicit_ctor_stmt = NULL;
+        ast_node_t *explicit_ctor_call = NULL;
         
-        /* Check if first statement is this() or super() */
+        /* Find explicit this()/super() anywhere in the body (JEP 513 allows prologue) */
         if (body_block && body_block->data.node.children) {
-            ast_node_t *first_stmt = (ast_node_t *)body_block->data.node.children->data;
-            /* The first statement might be an expression statement containing the call */
-            if (first_stmt->type == AST_EXPR_STMT && first_stmt->data.node.children) {
-                ast_node_t *expr = (ast_node_t *)first_stmt->data.node.children->data;
-                if (expr->type == AST_EXPLICIT_CTOR_CALL) {
-                    has_explicit_ctor_call = true;
+            for (slist_t *s = body_block->data.node.children; s; s = s->next) {
+                ast_node_t *stmt = (ast_node_t *)s->data;
+                ast_node_t *ctor_call = NULL;
+                if (stmt->type == AST_EXPR_STMT && stmt->data.node.children) {
+                    ast_node_t *expr = (ast_node_t *)stmt->data.node.children->data;
+                    if (expr && expr->type == AST_EXPLICIT_CTOR_CALL) {
+                        ctor_call = expr;
+                    }
+                } else if (stmt->type == AST_EXPLICIT_CTOR_CALL) {
+                    ctor_call = stmt;
                 }
-            } else if (first_stmt->type == AST_EXPLICIT_CTOR_CALL) {
-                has_explicit_ctor_call = true;
+                if (ctor_call) {
+                    has_explicit_ctor_call = true;
+                    explicit_ctor_stmt = stmt;
+                    explicit_ctor_call = ctor_call;
+                    is_this_ctor_call = (ctor_call->data.node.name &&
+                        strcmp(ctor_call->data.node.name, "this") == 0);
+                    break;
+                }
+            }
+        }
+        
+        /* Emit prologue statements before explicit ctor call (JEP 513) */
+        if (has_explicit_ctor_call && body_block) {
+            for (slist_t *s = body_block->data.node.children; s; s = s->next) {
+                ast_node_t *stmt = (ast_node_t *)s->data;
+                if (stmt == explicit_ctor_stmt) {
+                    break;
+                }
+                if (!codegen_statement(mg, stmt)) {
+                    method_gen_free(mg);
+                    return false;
+                }
             }
         }
         
@@ -2700,45 +2735,81 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
             if (mg->stackmap && cg->internal_name) {
                 stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
             }
+        } else if (explicit_ctor_call) {
+            /* Emit explicit this()/super() now (after prologue) */
+            if (!codegen_expr(mg, explicit_ctor_call, cg->cp)) {
+                method_gen_free(mg);
+                return false;
+            }
         }
         
-        /* Inject instance field initializers (after super() call) */
-        for (slist_t *node = cg->instance_field_inits; node; node = node->next) {
-            ast_node_t *assign = (ast_node_t *)node->data;
-            slist_t *assign_children = assign->data.node.children;
-            if (assign_children && assign_children->next) {
-                ast_node_t *field_id = (ast_node_t *)assign_children->data;
-                ast_node_t *init_expr = (ast_node_t *)assign_children->next->data;
-                const char *field_name = field_id->data.leaf.name;
-                
-                /* Look up field descriptor */
-                field_gen_t *field = hashtable_lookup(cg->field_map, field_name);
-                if (field) {
-                    /* aload_0 (this) */
-                    bc_emit(mg->code, OP_ALOAD_0);
-                    mg_push(mg, 1);
+        /* Inject instance field initializers after super() (not after this()) */
+        if (!is_this_ctor_call) {
+            for (slist_t *node = cg->instance_field_inits; node; node = node->next) {
+                ast_node_t *assign = (ast_node_t *)node->data;
+                slist_t *assign_children = assign->data.node.children;
+                if (assign_children && assign_children->next) {
+                    ast_node_t *field_id = (ast_node_t *)assign_children->data;
+                    ast_node_t *init_expr = (ast_node_t *)assign_children->next->data;
+                    const char *field_name = field_id->data.leaf.name;
                     
-                    /* Generate initializer expression */
-                    codegen_expr(mg, init_expr, cg->cp);
-                    
-                    /* putfield */
-                    uint16_t field_ref = cp_add_fieldref(cg->cp,
-                        cg->internal_name, field_name, field->descriptor);
-                    bc_emit(mg->code, OP_PUTFIELD);
-                    bc_emit_u2(mg->code, field_ref);
-                    mg_pop(mg, 2);  /* Consumes this + value */
+                    /* Look up field descriptor */
+                    field_gen_t *field = hashtable_lookup(cg->field_map, field_name);
+                    if (field) {
+                        /* aload_0 (this) */
+                        bc_emit(mg->code, OP_ALOAD_0);
+                        mg_push(mg, 1);
+                        
+                        /* Generate initializer expression */
+                        codegen_expr(mg, init_expr, cg->cp);
+                        
+                        /* putfield */
+                        uint16_t field_ref = cp_add_fieldref(cg->cp,
+                            cg->internal_name, field_name, field->descriptor);
+                        bc_emit(mg->code, OP_PUTFIELD);
+                        bc_emit_u2(mg->code, field_ref);
+                        mg_pop(mg, 2);  /* Consumes this + value */
+                    }
+                }
+            }
+            
+            /* Inject instance initializer blocks (after field initializers) */
+            for (slist_t *node = cg->instance_initializers; node; node = node->next) {
+                ast_node_t *init_block = (ast_node_t *)node->data;
+                if (init_block->data.node.children) {
+                    ast_node_t *block = (ast_node_t *)init_block->data.node.children->data;
+                    codegen_statement(mg, block);
                 }
             }
         }
         
-        /* Inject instance initializer blocks (after field initializers) */
-        for (slist_t *node = cg->instance_initializers; node; node = node->next) {
-            ast_node_t *init_block = (ast_node_t *)node->data;
-            if (init_block->data.node.children) {
-                ast_node_t *block = (ast_node_t *)init_block->data.node.children->data;
-                codegen_statement(mg, block);
+        /* Emit epilogue (statements after explicit ctor call), or full body if none */
+        if (body_block) {
+            if (has_explicit_ctor_call) {
+                bool past_ctor = false;
+                for (slist_t *s = body_block->data.node.children; s; s = s->next) {
+                    ast_node_t *stmt = (ast_node_t *)s->data;
+                    if (!past_ctor) {
+                        if (stmt == explicit_ctor_stmt) {
+                            past_ctor = true;
+                        }
+                        continue;
+                    }
+                    if (!codegen_statement(mg, stmt)) {
+                        method_gen_free(mg);
+                        return false;
+                    }
+                }
+            } else {
+                if (!codegen_statement(mg, body_block)) {
+                    method_gen_free(mg);
+                    return false;
+                }
             }
         }
+        
+        /* Body already generated for constructors - skip shared body path */
+        body_block = NULL;
     }
     
     /* Generate method body */

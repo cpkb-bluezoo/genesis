@@ -5089,6 +5089,7 @@ ast_node_t *parser_parse(parser_t *parser)
     
     /* Package declaration (may have annotations before it, e.g. @Deprecated package foo;) */
     slist_t *pkg_annotations = NULL;
+    bool has_package = false;
     if (parser_check(parser, TOK_AT)) {
         /* Parse annotations - these may be package annotations or type annotations */
         uint32_t pkg_mods = parse_modifiers_with_annotations(parser, &pkg_annotations);
@@ -5096,6 +5097,7 @@ ast_node_t *parser_parse(parser_t *parser)
     }
     
     if (parser_check(parser, TOK_PACKAGE)) {
+        has_package = true;
         int line = parser_current_line(parser);
         int col = parser_current_column(parser);
         parser_advance(parser);
@@ -5151,26 +5153,37 @@ ast_node_t *parser_parse(parser_t *parser)
         
         ast_node_t *import = ast_new(AST_IMPORT_DECL, line, col);
         
-        /* Static import */
+        /* Static import or module import (JEP 511) */
         if (parser_match(parser, TOK_STATIC)) {
             import->data.node.flags = MOD_STATIC;
+        } else if (parser_match(parser, TOK_MODULE)) {
+            import->data.node.flags = MOD_MODULE_IMPORT;
         }
         
         /* Parse import name */
         string_t *name = string_new("");
-        if (parser_check(parser, TOK_IDENTIFIER)) {
-            string_append(name, parser_current_text(parser));
-            parser_advance(parser);
-            
-            while (parser_match(parser, TOK_DOT)) {
-                string_append_c(name, '.');
-                if (parser_check(parser, TOK_STAR)) {
-                    string_append_c(name, '*');
-                    parser_advance(parser);
-                    break;
-                } else if (parser_check(parser, TOK_IDENTIFIER)) {
-                    string_append(name, parser_current_text(parser));
-                    parser_advance(parser);
+        if (parser_check(parser, TOK_IDENTIFIER) ||
+            (import->data.node.flags & MOD_MODULE_IMPORT)) {
+            /* Module names and package names use identifiers / contextual keywords */
+            if (parser_check_identifier_or_contextual(parser) ||
+                parser_check(parser, TOK_IDENTIFIER)) {
+                string_append(name, parser_current_text(parser));
+                parser_advance(parser);
+                
+                while (parser_match(parser, TOK_DOT)) {
+                    string_append_c(name, '.');
+                    if (!(import->data.node.flags & MOD_MODULE_IMPORT) &&
+                        parser_check(parser, TOK_STAR)) {
+                        string_append_c(name, '*');
+                        parser_advance(parser);
+                        break;
+                    } else if (parser_check_identifier_or_contextual(parser) ||
+                               parser_check(parser, TOK_IDENTIFIER)) {
+                        string_append(name, parser_current_text(parser));
+                        parser_advance(parser);
+                    } else {
+                        break;
+                    }
                 }
             }
         }
@@ -5180,7 +5193,8 @@ ast_node_t *parser_parse(parser_t *parser)
         ast_add_child(unit, import);
     }
     
-    /* Type declarations */
+    /* Type declarations, or compact source file (JEP 512) */
+    bool saw_type_decl = false;
     while (!parser_check(parser, TOK_EOF)) {
         slist_t *annotations = NULL;
         uint32_t modifiers = parse_modifiers_with_annotations(parser, &annotations);
@@ -5190,11 +5204,116 @@ ast_node_t *parser_parse(parser_t *parser)
             parser_check(parser, TOK_ENUM) ||
             parser_check(parser, TOK_RECORD) ||
             parser_check(parser, TOK_AT)) {  /* @interface */
+            saw_type_decl = true;
             ast_node_t *type_decl = parse_type_decl_with_annotations(parser, modifiers, annotations);
             if (type_decl) {
                 ast_add_child(unit, type_decl);
             }
         } else if (parser_check(parser, TOK_EOF)) {
+            break;
+        } else if (!saw_type_decl && !has_package &&
+                   parser->lexer && parser->lexer->source_version >= 25) {
+            /* Compact source file (JEP 512): wrap top-level members in an implicit class */
+            const char *path = parser->source ? parser->source->filename : "Main.java";
+            const char *base = strrchr(path, '/');
+            base = base ? base + 1 : path;
+            char simple[256];
+            size_t len = strlen(base);
+            if (len > 5 && strcmp(base + len - 5, ".java") == 0) {
+                len -= 5;
+            }
+            if (len >= sizeof(simple)) {
+                len = sizeof(simple) - 1;
+            }
+            memcpy(simple, base, len);
+            simple[len] = '\0';
+            if (simple[0] == '\0') {
+                strcpy(simple, "Main");
+            }
+            
+            /* Implicit import module java.base */
+            ast_node_t *mod_import = ast_new(AST_IMPORT_DECL, 1, 1);
+            mod_import->data.node.flags = MOD_MODULE_IMPORT;
+            mod_import->data.node.name = (char *)intern("java.base");
+            ast_add_child(unit, mod_import);
+            
+            int line = parser_current_line(parser);
+            int col = parser_current_column(parser);
+            ast_node_t *cls = ast_new(AST_CLASS_DECL, line, col);
+            cls->data.node.name = (char *)intern(simple);
+            cls->data.node.flags = MOD_FINAL | MOD_COMPACT_SOURCE;
+            
+            /* First member: modifiers/annotations already parsed.
+             * Class members are direct children of the class (not wrapped in a block). */
+            {
+                ast_node_t *first = NULL;
+                int mline = line;
+                int mcol = col;
+                ast_node_t *type_node = NULL;
+                
+                if (parser_check(parser, TOK_VOID)) {
+                    type_node = ast_new_leaf(AST_PRIMITIVE_TYPE, "void",
+                        parser_current_line(parser), parser_current_column(parser));
+                    parser_advance(parser);
+                } else {
+                    type_node = parse_type(parser);
+                }
+                
+                if (type_node && parser_check_identifier_or_contextual(parser)) {
+                    const char *mname = intern(parser_current_text(parser));
+                    parser_advance(parser);
+                    if (parser_check(parser, TOK_LPAREN)) {
+                        first = parse_method_decl(parser, modifiers, type_node, mname,
+                                                  mline, mcol);
+                        if (first) {
+                            first->annotations = annotations;
+                            annotations = NULL;
+                        }
+                    } else {
+                        first = parse_field_decl(parser, modifiers, type_node, mname,
+                                                 mline, mcol);
+                        if (first) {
+                            first->annotations = annotations;
+                            annotations = NULL;
+                        }
+                    }
+                } else if (type_node) {
+                    ast_free(type_node);
+                }
+                
+                if (first) {
+                    ast_add_child(cls, first);
+                }
+                if (annotations) {
+                    for (slist_t *node = annotations; node; node = node->next) {
+                        ast_free((ast_node_t *)node->data);
+                    }
+                    slist_free(annotations);
+                    annotations = NULL;
+                }
+            }
+            
+            while (!parser_check(parser, TOK_EOF)) {
+                ast_node_t *member = parse_class_member(parser, simple);
+                if (member) {
+                    ast_add_child(cls, member);
+                } else if (parser->error_msg) {
+                    while (!parser_check(parser, TOK_SEMICOLON) &&
+                           !parser_check(parser, TOK_EOF)) {
+                        parser_advance(parser);
+                    }
+                    if (parser_check(parser, TOK_SEMICOLON)) {
+                        parser_advance(parser);
+                    }
+                    free(parser->error_msg);
+                    parser->error_msg = NULL;
+                } else {
+                    break;
+                }
+            }
+            
+            ast_add_child(unit, cls);
+            saw_type_decl = true;
             break;
         } else {
             parser_error(parser, "Expected type declaration");

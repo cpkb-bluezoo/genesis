@@ -5016,6 +5016,11 @@ static bool codegen_explicit_ctor_call(method_gen_t *mg, ast_node_t *expr, const
     /* invokespecial consumes object ref and args, leaves nothing */
     mg_pop_typed(mg, arg_count + 1);
     
+    /* Mark 'this' as initialized after explicit super()/this() (JEP 513) */
+    if (mg->stackmap && mg->class_gen && mg->class_gen->internal_name) {
+        stackmap_init_object(mg->stackmap, 0, cp, mg->class_gen->internal_name);
+    }
+    
     return true;
 }
 
@@ -8967,7 +8972,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     }
                     local_var_info_t *info = local_var_info_new(slot, kind);
                     info->is_ref = (kind == TYPE_CLASS || kind == TYPE_ARRAY);
-                    hashtable_insert(lambda_mg->locals, params_node->data.leaf.name, info);
+                    if (!is_unnamed_name(params_node->data.leaf.name)) {
+                        hashtable_insert(lambda_mg->locals, params_node->data.leaf.name, info);
+                    }
                     
                     int size = (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
                     slot += size;
@@ -9010,7 +9017,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         }
                         local_var_info_t *info = local_var_info_new(slot, kind);
                         info->is_ref = (kind == TYPE_CLASS || kind == TYPE_ARRAY);
-                        hashtable_insert(lambda_mg->locals, param_id->data.leaf.name, info);
+                        if (!is_unnamed_name(param_id->data.leaf.name)) {
+                            hashtable_insert(lambda_mg->locals, param_id->data.leaf.name, info);
+                        }
                         
                         int size = (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
                         slot += size;
@@ -9027,7 +9036,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             type_kind_t kind = sp && sp->type ? sp->type->kind : TYPE_CLASS;
                             local_var_info_t *info = local_var_info_new(slot, kind);
                             info->is_ref = (kind == TYPE_CLASS || kind == TYPE_ARRAY);
-                            hashtable_insert(lambda_mg->locals, inner->data.leaf.name, info);
+                            if (!is_unnamed_name(inner->data.leaf.name)) {
+                                hashtable_insert(lambda_mg->locals, inner->data.leaf.name, info);
+                            }
                             
                             int size = (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
                             slot += size;
@@ -9070,7 +9081,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 }
                                 local_var_info_t *info = local_var_info_new(slot, kind);
                                 info->is_ref = (kind == TYPE_CLASS || kind == TYPE_ARRAY);
-                                hashtable_insert(lambda_mg->locals, param_id->data.leaf.name, info);
+                                if (!is_unnamed_name(param_id->data.leaf.name)) {
+                                    hashtable_insert(lambda_mg->locals, param_id->data.leaf.name, info);
+                                }
                                 
                                 int size = (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
                                 slot += size;
@@ -9105,7 +9118,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         
                         local_var_info_t *info = local_var_info_new(slot, kind);
                         info->is_ref = (kind == TYPE_CLASS || kind == TYPE_ARRAY);
-                        hashtable_insert(lambda_mg->locals, param_name, info);
+                        if (!is_unnamed_name(param_name)) {
+                            hashtable_insert(lambda_mg->locals, param_name, info);
+                        }
                         
                         int size = (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
                         slot += size;

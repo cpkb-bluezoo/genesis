@@ -118,6 +118,8 @@ TEST_SRC_10 = $(TEST_SRC)/java10
 TEST_SRC_16 = $(TEST_SRC)/java16
 TEST_SRC_17 = $(TEST_SRC)/java17
 TEST_SRC_21 = $(TEST_SRC)/java21
+TEST_SRC_22 = $(TEST_SRC)/java22
+TEST_SRC_25 = $(TEST_SRC)/java25
 
 # Test classes by version
 TEST_CLASSES_8 = $(basename $(notdir $(wildcard $(TEST_SRC_8)/*Test.java)))
@@ -126,12 +128,14 @@ TEST_CLASSES_10 = $(basename $(notdir $(wildcard $(TEST_SRC_10)/*Test.java)))
 TEST_CLASSES_16 = $(basename $(notdir $(wildcard $(TEST_SRC_16)/*Test.java)))
 TEST_CLASSES_17 = $(basename $(notdir $(wildcard $(TEST_SRC_17)/*Test.java)))
 TEST_CLASSES_21 = $(basename $(notdir $(wildcard $(TEST_SRC_21)/*Test.java)))
+TEST_CLASSES_22 = $(basename $(notdir $(wildcard $(TEST_SRC_22)/*Test.java)))
+TEST_CLASSES_25 = $(basename $(notdir $(wildcard $(TEST_SRC_25)/*Test.java)))
 
 # Helper classes (non-test files in java8 directory)
 HELPER_CLASSES = $(filter-out $(addsuffix .java,$(TEST_CLASSES_8)), $(notdir $(wildcard $(TEST_SRC_8)/*.java)))
 
 # Combined sourcepath for all version directories
-ALL_SOURCEPATHS = $(TEST_SRC_8):$(TEST_SRC_9):$(TEST_SRC_10):$(TEST_SRC_16):$(TEST_SRC_17):$(TEST_SRC_21)
+ALL_SOURCEPATHS = $(TEST_SRC_8):$(TEST_SRC_9):$(TEST_SRC_10):$(TEST_SRC_16):$(TEST_SRC_17):$(TEST_SRC_21):$(TEST_SRC_22):$(TEST_SRC_25)
 
 # Build and run all tests
 test: genesis
@@ -211,8 +215,34 @@ test: genesis
 	echo "--- Java 21 tests (pattern switch, record patterns) ---"; \
 	for test in $(TEST_CLASSES_21); do \
 		printf "Testing %-25s ... " "$$test"; \
-		if ./genesis -source 21 --enable-preview -d $(TEST_BUILD) -sourcepath $(ALL_SOURCEPATHS) $(TEST_SRC_21)/$$test.java 2>/dev/null && \
-		   $(JAVA) --enable-preview -cp $(TEST_BUILD) $$test >/dev/null 2>&1; then \
+		if ./genesis -source 21 -d $(TEST_BUILD) -sourcepath $(ALL_SOURCEPATHS) $(TEST_SRC_21)/$$test.java 2>/dev/null && \
+		   $(JAVA) -cp $(TEST_BUILD) $$test >/dev/null 2>&1; then \
+			echo "PASS"; \
+			passed=$$((passed + 1)); \
+		else \
+			echo "FAIL"; \
+			failed=$$((failed + 1)); \
+		fi; \
+	done; \
+	echo ""; \
+	echo "--- Java 22 tests (unnamed variables) ---"; \
+	for test in $(TEST_CLASSES_22); do \
+		printf "Testing %-25s ... " "$$test"; \
+		if ./genesis -source 22 -d $(TEST_BUILD) -sourcepath $(ALL_SOURCEPATHS) $(TEST_SRC_22)/$$test.java 2>/dev/null && \
+		   $(JAVA) -cp $(TEST_BUILD) $$test >/dev/null 2>&1; then \
+			echo "PASS"; \
+			passed=$$((passed + 1)); \
+		else \
+			echo "FAIL"; \
+			failed=$$((failed + 1)); \
+		fi; \
+	done; \
+	echo ""; \
+	echo "--- Java 25 tests (flexible ctors, module import, compact source) ---"; \
+	for test in $(TEST_CLASSES_25); do \
+		printf "Testing %-25s ... " "$$test"; \
+		if ./genesis -source 25 -d $(TEST_BUILD) -sourcepath $(ALL_SOURCEPATHS) $(TEST_SRC_25)/$$test.java 2>/dev/null && \
+		   $(JAVA) -cp $(TEST_BUILD) $$test >/dev/null 2>&1; then \
 			echo "PASS"; \
 			passed=$$((passed + 1)); \
 		else \
@@ -260,10 +290,20 @@ test-one: genesis
 		echo ""; echo "Running $(TEST)..."; echo "----------------------------------------"; \
 		$(JAVA) -cp $(TEST_BUILD) $(TEST); \
 	elif [ -f "$(TEST_SRC_21)/$(TEST).java" ]; then \
-		echo "Compiling $(TEST) (Java 21 --enable-preview)..."; \
-		./genesis -verbose -source 21 --enable-preview -d $(TEST_BUILD) -sourcepath $(ALL_SOURCEPATHS) $(TEST_SRC_21)/$(TEST).java; \
+		echo "Compiling $(TEST) (Java 21)..."; \
+		./genesis -verbose -source 21 -d $(TEST_BUILD) -sourcepath $(ALL_SOURCEPATHS) $(TEST_SRC_21)/$(TEST).java; \
 		echo ""; echo "Running $(TEST)..."; echo "----------------------------------------"; \
-		$(JAVA) --enable-preview -cp $(TEST_BUILD) $(TEST); \
+		$(JAVA) -cp $(TEST_BUILD) $(TEST); \
+	elif [ -f "$(TEST_SRC_22)/$(TEST).java" ]; then \
+		echo "Compiling $(TEST) (Java 22)..."; \
+		./genesis -verbose -source 22 -d $(TEST_BUILD) -sourcepath $(ALL_SOURCEPATHS) $(TEST_SRC_22)/$(TEST).java; \
+		echo ""; echo "Running $(TEST)..."; echo "----------------------------------------"; \
+		$(JAVA) -cp $(TEST_BUILD) $(TEST); \
+	elif [ -f "$(TEST_SRC_25)/$(TEST).java" ]; then \
+		echo "Compiling $(TEST) (Java 25)..."; \
+		./genesis -verbose -source 25 -d $(TEST_BUILD) -sourcepath $(ALL_SOURCEPATHS) $(TEST_SRC_25)/$(TEST).java; \
+		echo ""; echo "Running $(TEST)..."; echo "----------------------------------------"; \
+		$(JAVA) -cp $(TEST_BUILD) $(TEST); \
 	else \
 		echo "Error: Test $(TEST) not found in any source directory"; \
 		exit 1; \

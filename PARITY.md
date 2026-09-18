@@ -297,6 +297,10 @@ echo "=== Done ==="
 | Records (Java 16+) | Test files | To verify |
 | Sealed classes (Java 17+) | Test files | To verify |
 | Pattern matching (Java 21+) | Test files | To verify |
+| Unnamed variables (Java 22+) | `java22/UnnamedVariableTest` | Covered |
+| Flexible constructors (Java 25) | `java25/FlexibleCtorTest` | Covered |
+| Module imports (Java 25) | `java25/ModuleImportTest` | Covered |
+| Compact source / instance main (Java 25) | `java25/CompactSourceTest` | Covered |
 
 ---
 

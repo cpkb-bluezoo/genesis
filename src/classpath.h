@@ -135,6 +135,12 @@ classfile_t *classpath_load_class(classpath_t *cp, const char *classname);
 bool classpath_class_exists(classpath_t *cp, const char *classname);
 
 /*
+ * Load module-info for a named module and return exported package names
+ * (binary form). Caller frees each string and the array. Returns NULL on failure.
+ */
+char **classpath_module_exports(classpath_t *cp, const char *module_name, int *count_out);
+
+/*
  * JDK detection
  */
 

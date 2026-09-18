@@ -1438,10 +1438,13 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                     var_info->array_elem_class = strdup(class_name);
                                 }
                             }
-                            hashtable_insert(mg->locals, name, var_info);
+                            if (!is_unnamed_name(name)) {
+                                hashtable_insert(mg->locals, name, var_info);
+                            }
                         }
                         
-                        /* Record for LocalVariableTable */
+                        /* Record for LocalVariableTable (skip unnamed variables, JEP 456) */
+                        if (!is_unnamed_name(name))
                         {
                             const char *desc = NULL;
                             if (is_array_type) {
@@ -2278,7 +2281,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     if (loop_var_info) {
                         loop_var_info->is_ref = var_is_ref;
                         loop_var_info->is_array = (var_kind == TYPE_ARRAY);
-                        hashtable_insert(mg->locals, var_name, loop_var_info);
+                        if (!is_unnamed_name(var_name)) {
+                            hashtable_insert(mg->locals, var_name, loop_var_info);
+                        }
                     }
                     
                     /* __arr = iterable */
@@ -2494,7 +2499,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     local_var_info_t *iter_var_info = local_var_info_new(var_slot, var_kind);
                     if (iter_var_info) {
                         iter_var_info->is_ref = var_is_ref;
-                        hashtable_insert(mg->locals, var_name, iter_var_info);
+                        if (!is_unnamed_name(var_name)) {
+                            hashtable_insert(mg->locals, var_name, iter_var_info);
+                        }
                     }
                     
                     /* __iter = collection.iterator() */

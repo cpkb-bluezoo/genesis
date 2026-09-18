@@ -20,16 +20,6 @@ Java 21:
       Currently pattern variable names must match record component names.
       Should read Record attribute from external class files for position-based matching.
 
-Java 22+:
-  [ ] Unnamed variables (JEP 456)
-      [ ] int _ = compute(); - discard result
-      [ ] for (var _ : list) { } - unused loop variable
-      [ ] catch (Exception _) { } - unused exception
-      Note: Different from unnamed patterns in switch (already implemented)
-  [ ] Statements before super() (JEP 447, preview in 22-24)
-      [ ] Allow initialization code before super() call
-      Still in preview, may wait for finalization
-
 
 ================================================================================
 DEFERRED / WILL NOT IMPLEMENT
@@ -39,6 +29,9 @@ DEFERRED / WILL NOT IMPLEMENT
       Withdrawn in Java 23 pending complete redesign.
       The template processor API was considered too complex and is being
       rethought. Wait for the redesigned feature in a future Java version.
+
+  [ ] Primitive types in patterns (JEP 507)
+      Still preview in Java 25. Revisit when finalized.
 
   [ ] Better error recovery in parser
       Basic recovery already exists (skip to ; or } on error).
