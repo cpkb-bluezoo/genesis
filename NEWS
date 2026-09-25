@@ -1,6 +1,6 @@
 GNU Genesis NEWS -- history of user-visible changes.
 
-* Noteworthy changes in release 1.0.0 (2026-09-25) [stable]
+* Noteworthy changes in release 1.0.0 (unreleased)
 
 This is the first release.  Genesis is a Java compiler written in C99 that
 supports the language through Java 25.
@@ -78,3 +78,21 @@ supports the language through Java 25.
   "Expected type declaration") rather than being ignored.
 
   A failed class file write no longer prints a second, redundant message.
+
+  String concatenation with a wrapper operand ("v=" + list.get(0), where the
+  element is an Integer) was compiled as if the operand were the primitive,
+  giving a VerifyError.  Wrapper types are now appended as objects, as javac
+  does, and the stack bookkeeping no longer treats a Long or Double wrapper as
+  a two-slot primitive.
+
+  Parameters and locals of a method declared inside an anonymous or local class
+  were wrongly treated as variables captured from the enclosing method, so
+  new Comparator<String>() { public int compare(String a, String b) ... }
+  failed verification.
+
+  Anonymous classes implementing or extending a generic type did not get
+  bridge methods (apply(Object) for an apply(Integer)), causing an
+  AbstractMethodError at run time.
+
+  invokeinterface was given the wrong argument count when a primitive argument
+  was boxed for a generic parameter (list.add(4L)).

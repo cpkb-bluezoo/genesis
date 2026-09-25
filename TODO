@@ -79,6 +79,27 @@ KNOWN BUGS
    Consumers such as the functional interface lookup deduplicate by name;
    the double registration itself should be removed.
 
+9. Primitive conversions are incomplete in codegen.  Each of these produces
+   invalid bytecode (VerifyError) or wrong results:
+   - Widening in assignment contexts: "long a = 1;", "double d = i;",
+     "long f = i;" (locals, fields, array stores, return statements),
+     including "static long f = 1;".
+   - Compound assignment other than int: "long a; a += 2L;", "d *= 1.5;" and
+     "String s; s += x;" all emit integer opcodes.  Only int works.
+   - Binary numeric promotion: "long + int" arithmetic ("a + i" with a long a
+     and an int i).
+   - Unboxing on return: "int g(Integer i) { return i; }".
+   - Boxing a primitive to Object in a declaration: "Object o = 1;".
+   - "println(a < i)" selects println(int) instead of println(boolean).
+   - A conditional mixing int and long ("c ? i : 2L").
+   Widening, boxing and unboxing are only implemented for method and
+   constructor arguments (coerce_arg_to_param in codegen_expr.c), and for
+   int-typed simple assignments.  A single conversion routine driven by
+   the semantic types, used at every assignment context, is needed.
+
+10. A nested record's toString() prints the binary name ("T$P[x=1]") rather
+    than the simple name ("P[x=1]").
+
 
 ================================================================================
 OPTIONAL IMPROVEMENTS

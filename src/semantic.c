@@ -9901,6 +9901,24 @@ static ast_node_t *find_first_yield(ast_node_t *stmt)
 }
 
 /**
+ * True if sym was declared inside the class being analysed (a parameter or
+ * local of one of its own methods) rather than in an enclosing method. Only
+ * the latter are captured by a local or anonymous class.
+ */
+static bool declared_inside_current_class(semantic_t *sem, symbol_t *sym, const char *name)
+{
+    for (scope_t *s = sem->current_scope; s; s = s->parent) {
+        if (s->owner == sem->current_class) {
+            break;  /* reached the class's own scope: everything below was inside it */
+        }
+        if (scope_lookup_local(s, name) == sym) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
  * Get the type of an expression (iterative).
  */
 type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
@@ -9952,7 +9970,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         sem->current_class->kind == SYM_CLASS &&
                         (sem->current_class->data.class_data.is_local_class ||
                          sem->current_class->data.class_data.is_anonymous_class) &&
-                        (sym->kind == SYM_LOCAL_VAR || sym->kind == SYM_PARAMETER)) {
+                        (sym->kind == SYM_LOCAL_VAR || sym->kind == SYM_PARAMETER) &&
+                        !declared_inside_current_class(sem, sym, name)) {
                         symbol_t *enclosing = sem->current_class->data.class_data.enclosing_method;
                         /* If we're in a method inside the local class (current_method != enclosing),
                          * and the variable is a local/param, it must be captured */

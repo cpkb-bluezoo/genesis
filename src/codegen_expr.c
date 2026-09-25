@@ -2061,26 +2061,34 @@ static const char *get_append_descriptor(method_gen_t *mg, ast_node_t *expr)
         }
     }
     
-    /* Check resolved type */
+    /* The resolved type is authoritative when semantic analysis provided one.
+     * A wrapper (Integer, Character, ...) is a reference and is appended as an
+     * Object, exactly like javac: the primitive overloads would need the value
+     * unboxed, which is not what is on the stack. */
     if (expr->sem_type) {
-        if (expr->sem_type->kind == TYPE_CLASS) {
-            const char *name = expr->sem_type->data.class_type.name;
-            if (name && (strcmp(name, "String") == 0 || 
-                        strcmp(name, "java.lang.String") == 0)) {
-                return "(Ljava/lang/String;)Ljava/lang/StringBuilder;";
+        switch (expr->sem_type->kind) {
+            case TYPE_BOOLEAN: return "(Z)Ljava/lang/StringBuilder;";
+            case TYPE_CHAR:    return "(C)Ljava/lang/StringBuilder;";
+            case TYPE_BYTE:
+            case TYPE_SHORT:
+            case TYPE_INT:     return "(I)Ljava/lang/StringBuilder;";
+            case TYPE_LONG:    return "(J)Ljava/lang/StringBuilder;";
+            case TYPE_FLOAT:   return "(F)Ljava/lang/StringBuilder;";
+            case TYPE_DOUBLE:  return "(D)Ljava/lang/StringBuilder;";
+            case TYPE_CLASS: {
+                const char *name = expr->sem_type->data.class_type.name;
+                if (name && (strcmp(name, "String") == 0 ||
+                             strcmp(name, "java.lang.String") == 0)) {
+                    return "(Ljava/lang/String;)Ljava/lang/StringBuilder;";
+                }
+                return "(Ljava/lang/Object;)Ljava/lang/StringBuilder;";
             }
-        } else if (expr->sem_type->kind == TYPE_INT) {
-            return "(I)Ljava/lang/StringBuilder;";
-        } else if (expr->sem_type->kind == TYPE_LONG) {
-            return "(J)Ljava/lang/StringBuilder;";
-        } else if (expr->sem_type->kind == TYPE_FLOAT) {
-            return "(F)Ljava/lang/StringBuilder;";
-        } else if (expr->sem_type->kind == TYPE_DOUBLE) {
-            return "(D)Ljava/lang/StringBuilder;";
-        } else if (expr->sem_type->kind == TYPE_BOOLEAN) {
-            return "(Z)Ljava/lang/StringBuilder;";
-        } else if (expr->sem_type->kind == TYPE_CHAR) {
-            return "(C)Ljava/lang/StringBuilder;";
+            case TYPE_ARRAY:
+            case TYPE_TYPEVAR:
+            case TYPE_NULL:
+                return "(Ljava/lang/Object;)Ljava/lang/StringBuilder;";
+            default:
+                break;  /* unknown: fall back to the heuristics below */
         }
     }
     
@@ -2348,10 +2356,11 @@ static bool codegen_string_concat(method_gen_t *mg, ast_node_t *expr, const_pool
         bc_emit_u2(mg->code, append_ref);
         
         /* Stack: [StringBuilder, arg] -> [StringBuilder]
-         * append consumes this+arg and returns StringBuilder
-         * Long (J) and Double (D) args take 2 slots, others take 1 */
-        type_kind_t part_type = get_expr_type_kind(mg, part);
-        if (part_type == TYPE_LONG || part_type == TYPE_DOUBLE) {
+         * append consumes this+arg and returns StringBuilder. Only the
+         * primitive long (J) and double (D) overloads take a 2-slot argument;
+         * a Long or Double wrapper is a reference and takes one. Decide from
+         * the overload actually called, not from the operand's unboxed kind. */
+        if (strncmp(append_desc, "(J)", 3) == 0 || strncmp(append_desc, "(D)", 3) == 0) {
             mg_pop_typed(mg, 2);  /* 2-slot arg */
         } else {
             mg_pop_typed(mg, 1);  /* 1-slot arg */
@@ -4813,56 +4822,8 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
     }
     free(descriptor);
     
-    /* Emit invoke instruction */
-    if (is_static) {
-        bc_emit(mg->code, OP_INVOKESTATIC);
-        bc_emit_u2(mg->code, methodref);
-        /* Calling static interface method requires class file version 52 */
-        if (is_interface_call && mg->class_gen) {
-            mg->class_gen->has_default_methods = true;
-        }
-    } else if (use_invokespecial) {
-        /* super.method() requires invokespecial to call the superclass method directly */
-        bc_emit(mg->code, OP_INVOKESPECIAL);
-        bc_emit_u2(mg->code, methodref);
-    } else if (is_interface_call) {
-        /* invokeinterface has 5 bytes: opcode + index(2) + count(1) + zero(1) */
-        bc_emit(mg->code, OP_INVOKEINTERFACE);
-        bc_emit_u2(mg->code, methodref);
-        /* count = argument slots + 1 (for receiver) */
-        int slot_count = calculate_arg_slot_count(mg, args) + 1;
-        bc_emit_u1(mg->code, (uint8_t)slot_count);
-        bc_emit_u1(mg->code, 0);  /* Must be zero */
-    } else {
-        bc_emit(mg->code, OP_INVOKEVIRTUAL);
-        bc_emit_u2(mg->code, methodref);
-    }
-    
-    /* Check if we need a checkcast for generic return types.
-     * When a method returns a type parameter (e.g., T in Supplier<T>.get()),
-     * the actual bytecode returns Object. If semantic analysis determined a
-     * more specific type (e.g., String), we need to emit a checkcast. */
-    if (!is_void_return && expr->sem_type && expr->sem_type->kind == TYPE_CLASS) {
-        bool needs_checkcast = false;
-        const char *cast_target = NULL;
-        
-        /* Check if method's declared return type is a type variable */
-        if (method_sym && method_sym->type && method_sym->type->kind == TYPE_TYPEVAR) {
-            /* Method returns a type parameter - check if sem_type gives us the actual type */
-            cast_target = expr->sem_type->data.class_type.name;
-            if (cast_target && strcmp(cast_target, "java.lang.Object") != 0) {
-                needs_checkcast = true;
-            }
-        }
-        
-        if (needs_checkcast && cast_target) {
-            uint16_t class_idx = cp_add_class(cp, class_to_internal_name(cast_target));
-            bc_emit(mg->code, OP_CHECKCAST);
-            bc_emit_u2(mg->code, class_idx);
-        }
-    }
-    
-    /* Update stack: pop receiver (if any) and args, push return value */
+    /* Slots the arguments occupy on the stack after conversion to the parameter
+     * types; needed for invokeinterface's count operand and to update tracking. */
     /* Use slot count for args (long/double take 2 slots) */
     /* IMPORTANT: Use parameter types, not argument types, because widening
      * conversions (e.g., int -> long) have already updated the stack to
@@ -4908,6 +4869,58 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         /* Fallback to argument types if method symbol unavailable */
         arg_slots = calculate_arg_slot_count(mg, args);
     }
+
+    /* Emit invoke instruction */
+    if (is_static) {
+        bc_emit(mg->code, OP_INVOKESTATIC);
+        bc_emit_u2(mg->code, methodref);
+        /* Calling static interface method requires class file version 52 */
+        if (is_interface_call && mg->class_gen) {
+            mg->class_gen->has_default_methods = true;
+        }
+    } else if (use_invokespecial) {
+        /* super.method() requires invokespecial to call the superclass method directly */
+        bc_emit(mg->code, OP_INVOKESPECIAL);
+        bc_emit_u2(mg->code, methodref);
+    } else if (is_interface_call) {
+        /* invokeinterface has 5 bytes: opcode + index(2) + count(1) + zero(1) */
+        bc_emit(mg->code, OP_INVOKEINTERFACE);
+        bc_emit_u2(mg->code, methodref);
+        /* count = argument slots + 1 (for receiver) */
+        int slot_count = arg_slots + 1;
+        bc_emit_u1(mg->code, (uint8_t)slot_count);
+        bc_emit_u1(mg->code, 0);  /* Must be zero */
+    } else {
+        bc_emit(mg->code, OP_INVOKEVIRTUAL);
+        bc_emit_u2(mg->code, methodref);
+    }
+    
+    /* Check if we need a checkcast for generic return types.
+     * When a method returns a type parameter (e.g., T in Supplier<T>.get()),
+     * the actual bytecode returns Object. If semantic analysis determined a
+     * more specific type (e.g., String), we need to emit a checkcast. */
+    if (!is_void_return && expr->sem_type && expr->sem_type->kind == TYPE_CLASS) {
+        bool needs_checkcast = false;
+        const char *cast_target = NULL;
+        
+        /* Check if method's declared return type is a type variable */
+        if (method_sym && method_sym->type && method_sym->type->kind == TYPE_TYPEVAR) {
+            /* Method returns a type parameter - check if sem_type gives us the actual type */
+            cast_target = expr->sem_type->data.class_type.name;
+            if (cast_target && strcmp(cast_target, "java.lang.Object") != 0) {
+                needs_checkcast = true;
+            }
+        }
+        
+        if (needs_checkcast && cast_target) {
+            uint16_t class_idx = cp_add_class(cp, class_to_internal_name(cast_target));
+            bc_emit(mg->code, OP_CHECKCAST);
+            bc_emit_u2(mg->code, class_idx);
+        }
+    }
+    
+    /* Update stack: pop receiver (if any) and args, push return value.
+     * arg_slots was computed above, from the parameter types. */
     mg_pop_typed(mg, arg_slots + (is_static ? 0 : 1));
     if (!is_void_return) {
         /* Push return value with correct type for stackmap tracking */

@@ -1,6 +1,6 @@
-2026-09-25  Chris Burdess  <dog@gnu.org>
+UNRELEASED  Chris Burdess  <dog@gnu.org>
 
-	Release 1.0.0.
+	Changes towards release 1.0.0.
 
 	Build system: GNU Autoconf and Automake.
 	* configure.ac, Makefile.am, src/Makefile.am, m4/: New.  Require C99,
@@ -56,6 +56,20 @@
 	stack slots from the declared parameter types.
 	(checkcast_generic_field): New.  Cast a type-variable field read back
 	to its specific type.
+
+	String concatenation and anonymous classes.
+	* src/codegen_expr.c (get_append_descriptor): Trust the resolved type
+	first; append wrappers and other references as Object.
+	(codegen_string_concat): Take the argument slot count from the append
+	overload chosen, not from the operand's unboxed kind.
+	(codegen_method_call): Compute the argument slot count once, from the
+	parameter types, before emitting the call; use it for the invokeinterface
+	count operand.
+	* src/semantic.c (declared_inside_current_class): New.  Do not treat a
+	parameter or local of a local/anonymous class's own method as captured.
+	* src/codegen.c (codegen_anonymous_class): Generate superclass and
+	interface bridge methods, as codegen_class does.
+	* test/src/java8/{StringConcatBoxedTest,AnonymousParamTest}.java: New.
 
 	Diagnostics.
 	* src/parser.c (parser_parse): Report, and stop at, an

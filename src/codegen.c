@@ -6093,6 +6093,11 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         children = children->next;
     }
     
+    /* Bridge methods, as for a named class: new Function<Integer, Integer>() {
+     * public Integer apply(Integer x) ... } also needs apply(Object). */
+    generate_superclass_bridges(cg);
+    generate_interface_bridges(cg);
+    
     /* Generate default constructor - anonymous classes always need one
      * unless they have an explicit one (which is uncommon) */
     if (!has_constructor) {
