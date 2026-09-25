@@ -274,7 +274,6 @@ static bool output_class(class_gen_t *cg, const char *qualified_name,
     size_t size;
     uint8_t *bytes = write_class_bytes(cg, &size);
     if (!bytes) {
-        fprintf(stderr, "output_class: write_class_bytes returned NULL for %s\n", qualified_name);
         return false;
     }
     

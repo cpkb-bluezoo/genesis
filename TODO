@@ -69,6 +69,16 @@ KNOWN BUGS
 6. Generic constructor Signature attribute:
    - Uses return type instead of V
 
+7. Arrays of type variables from class files (N[] fields):
+   - A field or parameter typed N[] where N extends Number, loaded from a
+     class file rather than source, is referenced as Object[] instead of
+     Number[]. Bare type variables are handled.
+
+8. Nested interface methods are registered twice in semantic analysis
+   (once without and once with the implicit public abstract modifiers).
+   Consumers such as the functional interface lookup deduplicate by name;
+   the double registration itself should be removed.
+
 
 ================================================================================
 OPTIONAL IMPROVEMENTS
@@ -80,6 +90,8 @@ Refactoring:
   - Consider moving resolve_java_lang_class to a utility module
 
 Inner class synthetic accessors:
-  - Private member access from inner classes currently requires members
-    to be package-private. Full javac compatibility would generate
-    synthetic access$N methods for truly private access.
+  - Nested classes reach each other's private members through nestmates
+    (class file version 55, Java 11+). With an explicit -target below 11 the
+    NestHost/NestMembers attributes are omitted, so private access between
+    nested classes fails at run time. Full support for older targets would
+    generate synthetic access$N methods, as javac does for -target 8.

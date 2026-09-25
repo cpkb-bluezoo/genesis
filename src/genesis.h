@@ -910,5 +910,9 @@ void print_version(void);
  */
 void print_usage(const char *program_name);
 
+/* The single abstract method of a functional interface, or NULL if iface_sym
+ * is not one (semantic.c). Handles inherited and default methods. */
+symbol_t *get_functional_interface_sam(symbol_t *iface_sym);
+
 #endif /* GENESIS_H */
 

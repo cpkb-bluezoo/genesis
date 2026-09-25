@@ -68,7 +68,7 @@ AS_IF([test "x$enable_warnings" = xyes],
              [WARN_CFLAGS="-Wall -Wextra -pedantic"])])
 AC_SUBST([WARN_CFLAGS])
 
-dnl Development-only pieces (regression tests, jtreg, parity scripts) live in
+dnl Development-only pieces (regression tests and jtreg glue) live in
 dnl test/ and are deliberately not part of the distribution tarball.
 AM_CONDITIONAL([HAVE_TESTS], [test -f "$srcdir/test/run-tests.sh"])
 

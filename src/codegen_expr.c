@@ -117,33 +117,6 @@ static symbol_t *lookup_method_by_name(scope_t *scope, const char *method_name)
     return scope_lookup_method(scope, method_name);
 }
 
-/**
- * SAM search context for finding the single abstract method in a functional interface.
- */
-typedef struct mref_sam_search {
-    symbol_t *sam;
-    int abstract_count;
-} mref_sam_search_t;
-
-static void mref_find_sam_fn(const char *key, void *value, void *user_data)
-{
-    (void)key;
-    mref_sam_search_t *search = (mref_sam_search_t *)user_data;
-    symbol_t *sym = (symbol_t *)value;
-    if (sym && sym->kind == SYM_METHOD &&
-        !(sym->modifiers & MOD_STATIC) &&
-        !(sym->modifiers & MOD_DEFAULT)) {
-        /* This is an abstract instance method (interface methods are implicitly abstract) */
-        search->abstract_count++;
-        if (search->abstract_count == 1) {
-            search->sam = sym;
-        } else {
-            /* More than one - not a functional interface */
-            search->sam = NULL;
-        }
-    }
-}
-
 /* Forward declaration for recursive interface search */
 static symbol_t *lookup_method_in_interfaces(symbol_t *iface, const char *method_name, 
                                               symbol_t **owner_class);
@@ -3542,6 +3515,128 @@ static const char *get_field_access_type_class(ast_node_t *field_access)
     return NULL;
 }
 
+/**
+ * Convert an already-generated argument to its parameter type: box a primitive
+ * passed to a wrapper, Object or type-variable parameter, unbox a wrapper
+ * passed to a primitive parameter, and widen primitives (int -> long etc.).
+ * Shared by method calls and constructor calls.
+ *
+ * descriptor_from_args is true when the call's descriptor was built from the
+ * argument types themselves; nothing is then boxed, as the descriptor already
+ * matches what was pushed.
+ */
+static void coerce_arg_to_param(method_gen_t *mg, const_pool_t *cp, ast_node_t *arg,
+                                symbol_t *param, bool descriptor_from_args)
+{
+    if (!param || !param->type) {
+        return;
+    }
+        /* Get the argument's type - prefer sem_type, fallback to inferred */
+        type_kind_t arg_kind = TYPE_UNKNOWN;
+        const char *arg_class_name = NULL;
+        
+        if (arg->sem_type) {
+            arg_kind = arg->sem_type->kind;
+            if (arg_kind == TYPE_CLASS && arg->sem_type->data.class_type.name) {
+                arg_class_name = arg->sem_type->data.class_type.name;
+            }
+        } else {
+            /* Fallback: infer from expression */
+            arg_kind = get_expr_type_kind(mg, arg);
+            if (arg->type == AST_IDENTIFIER) {
+                arg_class_name = mg_local_class_name(mg, arg->data.leaf.name);
+            }
+        }
+        
+        /* Check if arg_kind is a primitive type */
+        bool arg_is_primitive = (arg_kind >= TYPE_BOOLEAN && arg_kind <= TYPE_DOUBLE);
+        bool param_is_primitive = (param->type->kind >= TYPE_BOOLEAN && 
+                                   param->type->kind <= TYPE_DOUBLE);
+        
+        /* Boxing: primitive arg -> wrapper param or type variable (erased to Object)
+         * Skip boxing if custom_descriptor is set - it's already built from arg types
+         * and the method_sym may not match the actual descriptor being used. */
+        if (!descriptor_from_args && param->type->kind == TYPE_TYPEVAR && arg_is_primitive) {
+            /* Type variable erases to Object at runtime - must box */
+            emit_boxing(mg, cp, arg_kind);
+        }
+        else if (!descriptor_from_args && param->type->kind == TYPE_CLASS && 
+            param->type->data.class_type.name && arg_is_primitive) {
+            /* Only box if param is specifically a wrapper type or Object */
+            const char *param_name = param->type->data.class_type.name;
+            type_kind_t target_prim = get_primitive_for_wrapper(param_name);
+            if (target_prim != TYPE_UNKNOWN || 
+                strcmp(param_name, "java.lang.Object") == 0 ||
+                strcmp(param_name, "Object") == 0) {
+                emit_boxing(mg, cp, arg_kind);
+            }
+        }
+        /* Unboxing: wrapper arg -> primitive param */
+        else if (param_is_primitive && arg_kind == TYPE_CLASS && arg_class_name) {
+            type_kind_t unbox_to = get_primitive_for_wrapper(arg_class_name);
+            if (unbox_to != TYPE_UNKNOWN && unbox_to == param->type->kind) {
+                char *internal = class_to_internal_name(arg_class_name);
+                emit_unboxing(mg, cp, param->type->kind, internal);
+                free(internal);
+            }
+        }
+        /* Widening primitive conversion: int -> long, int -> float, etc. */
+        else if (arg_is_primitive && param_is_primitive && arg_kind != param->type->kind) {
+            /* Apply widening conversion if needed */
+            switch (arg_kind) {
+                case TYPE_INT:
+                case TYPE_CHAR:
+                case TYPE_SHORT:
+                case TYPE_BYTE:
+                    switch (param->type->kind) {
+                        case TYPE_LONG:
+                            bc_emit(mg->code, OP_I2L);
+                            mg_pop_typed(mg, 1);
+                            mg_push_long(mg);
+                            break;
+                        case TYPE_FLOAT:
+                            bc_emit(mg->code, OP_I2F);
+                            mg_pop_typed(mg, 1);
+                            mg_push_float(mg);
+                            break;
+                        case TYPE_DOUBLE:
+                            bc_emit(mg->code, OP_I2D);
+                            mg_pop_typed(mg, 1);
+                            mg_push_double(mg);
+                            break;
+                        default:
+                            break;
+                    }
+                    break;
+                case TYPE_LONG:
+                    switch (param->type->kind) {
+                        case TYPE_FLOAT:
+                            bc_emit(mg->code, OP_L2F);
+                            mg_pop_typed(mg, 2);
+                            mg_push_float(mg);
+                            break;
+                        case TYPE_DOUBLE:
+                            bc_emit(mg->code, OP_L2D);
+                            mg_pop_typed(mg, 2);
+                            mg_push_double(mg);
+                            break;
+                        default:
+                            break;
+                    }
+                    break;
+                case TYPE_FLOAT:
+                    if (param->type->kind == TYPE_DOUBLE) {
+                        bc_emit(mg->code, OP_F2D);
+                        mg_pop_typed(mg, 1);
+                        mg_push_double(mg);
+                    }
+                    break;
+                default:
+                    break;
+            }
+        }
+}
+
 static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 {
     if (!expr || expr->type != AST_METHOD_CALL) {
@@ -4086,16 +4181,23 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                     search_class = search_class->data.class_data.superclass;
                 }
                 
-                if (field_sym && field_sym->type && field_sym->type->kind == TYPE_CLASS) {
+                /* A field of type-variable type (N extends Number) dispatches on its bound */
+                type_t *field_recv_type = field_sym ? field_sym->type : NULL;
+                if (field_recv_type && field_recv_type->kind == TYPE_TYPEVAR &&
+                    field_recv_type->data.type_var.bound) {
+                    field_recv_type = field_recv_type->data.type_var.bound;
+                }
+                
+                if (field_recv_type && field_recv_type->kind == TYPE_CLASS) {
                     /* It's a field with a class type - it can be a receiver */
-                    symbol_t *recv_class_sym = field_sym->type->data.class_type.symbol;
+                    symbol_t *recv_class_sym = field_recv_type->data.class_type.symbol;
                     
                     /* Try to load the class if symbol not set */
-                    if (!recv_class_sym && field_sym->type->data.class_type.name && mg->class_gen->sem) {
+                    if (!recv_class_sym && field_recv_type->data.class_type.name && mg->class_gen->sem) {
                         recv_class_sym = load_external_class(mg->class_gen->sem, 
-                            field_sym->type->data.class_type.name);
+                            field_recv_type->data.class_type.name);
                         if (recv_class_sym) {
-                            field_sym->type->data.class_type.symbol = recv_class_sym;
+                            field_recv_type->data.class_type.symbol = recv_class_sym;
                         }
                     }
                     
@@ -4634,113 +4736,8 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         
         /* Check if boxing/unboxing needed for this argument */
         if (param_node) {
-            symbol_t *param = (symbol_t *)param_node->data;
-            if (param && param->type) {
-                /* Get the argument's type - prefer sem_type, fallback to inferred */
-                type_kind_t arg_kind = TYPE_UNKNOWN;
-                const char *arg_class_name = NULL;
-                
-                if (arg->sem_type) {
-                    arg_kind = arg->sem_type->kind;
-                    if (arg_kind == TYPE_CLASS && arg->sem_type->data.class_type.name) {
-                        arg_class_name = arg->sem_type->data.class_type.name;
-                    }
-                } else {
-                    /* Fallback: infer from expression */
-                    arg_kind = get_expr_type_kind(mg, arg);
-                    if (arg->type == AST_IDENTIFIER) {
-                        arg_class_name = mg_local_class_name(mg, arg->data.leaf.name);
-                    }
-                }
-                
-                /* Check if arg_kind is a primitive type */
-                bool arg_is_primitive = (arg_kind >= TYPE_BOOLEAN && arg_kind <= TYPE_DOUBLE);
-                bool param_is_primitive = (param->type->kind >= TYPE_BOOLEAN && 
-                                           param->type->kind <= TYPE_DOUBLE);
-                
-                /* Boxing: primitive arg -> wrapper param or type variable (erased to Object)
-                 * Skip boxing if custom_descriptor is set - it's already built from arg types
-                 * and the method_sym may not match the actual descriptor being used. */
-                if (!custom_descriptor && param->type->kind == TYPE_TYPEVAR && arg_is_primitive) {
-                    /* Type variable erases to Object at runtime - must box */
-                    emit_boxing(mg, cp, arg_kind);
-                }
-                else if (!custom_descriptor && param->type->kind == TYPE_CLASS && 
-                    param->type->data.class_type.name && arg_is_primitive) {
-                    /* Only box if param is specifically a wrapper type or Object */
-                    const char *param_name = param->type->data.class_type.name;
-                    type_kind_t target_prim = get_primitive_for_wrapper(param_name);
-                    if (target_prim != TYPE_UNKNOWN || 
-                        strcmp(param_name, "java.lang.Object") == 0 ||
-                        strcmp(param_name, "Object") == 0) {
-                        emit_boxing(mg, cp, arg_kind);
-                    }
-                }
-                /* Unboxing: wrapper arg -> primitive param */
-                else if (param_is_primitive && arg_kind == TYPE_CLASS && arg_class_name) {
-                    type_kind_t unbox_to = get_primitive_for_wrapper(arg_class_name);
-                    if (unbox_to != TYPE_UNKNOWN && unbox_to == param->type->kind) {
-                        char *internal = class_to_internal_name(arg_class_name);
-                        emit_unboxing(mg, cp, param->type->kind, internal);
-                        free(internal);
-                    }
-                }
-                /* Widening primitive conversion: int -> long, int -> float, etc. */
-                else if (arg_is_primitive && param_is_primitive && arg_kind != param->type->kind) {
-                    /* Apply widening conversion if needed */
-                    switch (arg_kind) {
-                        case TYPE_INT:
-                        case TYPE_CHAR:
-                        case TYPE_SHORT:
-                        case TYPE_BYTE:
-                            switch (param->type->kind) {
-                                case TYPE_LONG:
-                                    bc_emit(mg->code, OP_I2L);
-                                    mg_pop_typed(mg, 1);
-                                    mg_push_long(mg);
-                                    break;
-                                case TYPE_FLOAT:
-                                    bc_emit(mg->code, OP_I2F);
-                                    mg_pop_typed(mg, 1);
-                                    mg_push_float(mg);
-                                    break;
-                                case TYPE_DOUBLE:
-                                    bc_emit(mg->code, OP_I2D);
-                                    mg_pop_typed(mg, 1);
-                                    mg_push_double(mg);
-                                    break;
-                                default:
-                                    break;
-                            }
-                            break;
-                        case TYPE_LONG:
-                            switch (param->type->kind) {
-                                case TYPE_FLOAT:
-                                    bc_emit(mg->code, OP_L2F);
-                                    mg_pop_typed(mg, 2);
-                                    mg_push_float(mg);
-                                    break;
-                                case TYPE_DOUBLE:
-                                    bc_emit(mg->code, OP_L2D);
-                                    mg_pop_typed(mg, 2);
-                                    mg_push_double(mg);
-                                    break;
-                                default:
-                                    break;
-                            }
-                            break;
-                        case TYPE_FLOAT:
-                            if (param->type->kind == TYPE_DOUBLE) {
-                                bc_emit(mg->code, OP_F2D);
-                                mg_pop_typed(mg, 1);
-                                mg_push_double(mg);
-                            }
-                            break;
-                        default:
-                            break;
-                    }
-                }
-            }
+            coerce_arg_to_param(mg, cp, arg, (symbol_t *)param_node->data,
+                                custom_descriptor != NULL);
             param_node = param_node->next;
         }
     }
@@ -5327,6 +5324,12 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         fixed_param_count--;  /* Last param is varargs */
     }
     
+    /* Declared parameters, when the descriptor is built from them (see below) */
+    slist_t *ctor_param_node = NULL;
+    if (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR) {
+        ctor_param_node = expr->sem_symbol->data.method_data.parameters;
+    }
+    
     /* Generate constructor arguments */
     /* Skip AST_BLOCK if this is an anonymous class (the block is the class body, not an argument) */
     int arg_index = 0;
@@ -5477,6 +5480,14 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             if (outer_internal) free(outer_internal);
             return false;
         }
+        
+        /* The descriptor below is built from the constructor's declared
+         * parameter types, so convert the argument to match (boxing for
+         * type-variable parameters, unboxing, widening). */
+        if (ctor_param_node) {
+            coerce_arg_to_param(mg, cp, arg, (symbol_t *)ctor_param_node->data, false);
+            ctor_param_node = ctor_param_node->next;
+        }
     }
     
     /* Build constructor descriptor */
@@ -5504,7 +5515,20 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
     /* Add explicit argument types - use constructor parameter types if available,
      * otherwise fall back to inferring from argument expressions */
     symbol_t *ctor_sym = expr->sem_symbol;
-    if (ctor_sym && ctor_sym->kind == SYM_CONSTRUCTOR && ctor_sym->data.method_data.parameters) {
+    if (ctor_sym && ctor_sym->kind == SYM_CONSTRUCTOR &&
+        ctor_sym->data.method_data.descriptor && !is_inner_class && !is_local_class) {
+        /* Constructor loaded from a class file: its own descriptor is exact,
+         * whereas one rebuilt from generic parameter types would erase a type
+         * variable to Object instead of to its bound. Inner and local classes
+         * are excluded as their descriptor is assembled with synthetic params. */
+        char *stored = strdup(ctor_sym->data.method_data.descriptor);
+        char *close = stored ? strchr(stored, ')') : NULL;
+        if (close) {
+            *close = '\0';
+            string_append(desc, stored + 1);  /* skip the leading '(' */
+        }
+        free(stored);
+    } else if (ctor_sym && ctor_sym->kind == SYM_CONSTRUCTOR && ctor_sym->data.method_data.parameters) {
         /* Use the constructor's declared parameter types */
         for (slist_t *param_node = ctor_sym->data.method_data.parameters; param_node; param_node = param_node->next) {
             symbol_t *param_sym = (symbol_t *)param_node->data;
@@ -5557,10 +5581,23 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             }
         }
     }
+    /* Arguments were coerced to the declared parameter types, so those decide
+     * the slot count (a boxed long is one slot, an int widened to long two). */
+    slist_t *slot_param = NULL;
+    if (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR) {
+        slot_param = expr->sem_symbol->data.method_data.parameters;
+    }
     for (slist_t *node = children->next; node; node = node->next) {
         ast_node_t *arg = (ast_node_t *)node->data;
         if (is_anonymous_class && arg->type == AST_BLOCK && !node->next) break;
         type_kind_t kind = get_expr_type_kind(mg, arg);
+        if (slot_param) {
+            symbol_t *param = (symbol_t *)slot_param->data;
+            if (param && param->type) {
+                kind = param->type->kind;
+            }
+            slot_param = slot_param->next;
+        }
         arg_slots += (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
     }
     mg_pop_typed(mg, arg_slots + 1);  /* +1 for object reference */
@@ -7391,6 +7428,58 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
  * Main Expression Code Generation Entry Point
  * ======================================================================== */
 
+/**
+ * A field declared with a type-variable type (T value) is erased to its bound
+ * in the class file. When the use site's type is more specific (a field of a
+ * Box<Integer>), the loaded value must be cast back, as is done for methods
+ * returning a type variable.
+ */
+static void checkcast_generic_field(method_gen_t *mg, const_pool_t *cp, ast_node_t *expr)
+{
+    symbol_t *field = expr->sem_symbol;
+    
+    /* Semantic analysis does not always record the field symbol on the node;
+     * find it from the receiver's class (and its superclasses) instead. */
+    if ((!field || field->kind != SYM_FIELD) && expr->type == AST_FIELD_ACCESS &&
+        expr->data.node.name && expr->data.node.children) {
+        ast_node_t *receiver = (ast_node_t *)expr->data.node.children->data;
+        type_t *rt = receiver ? receiver->sem_type : NULL;
+        symbol_t *cls = (rt && rt->kind == TYPE_CLASS) ? rt->data.class_type.symbol : NULL;
+        field = NULL;
+        for (; cls && !field; cls = cls->data.class_data.superclass) {
+            if (cls->data.class_data.members) {
+                symbol_t *found = scope_lookup_local(cls->data.class_data.members,
+                                                     expr->data.node.name);
+                if (found && found->kind == SYM_FIELD) {
+                    field = found;
+                }
+            }
+        }
+    }
+    if (!field || field->kind != SYM_FIELD || !field->type ||
+        field->type->kind != TYPE_TYPEVAR ||
+        !expr->sem_type || expr->sem_type->kind != TYPE_CLASS ||
+        !expr->sem_type->data.class_type.name) {
+        return;
+    }
+    
+    const char *target = expr->sem_type->data.class_type.name;
+    const char *erased = "java.lang.Object";
+    type_t *bound = field->type->data.type_var.bound;
+    if (bound && bound->kind == TYPE_CLASS && bound->data.class_type.name) {
+        erased = bound->data.class_type.name;
+    }
+    if (strcmp(target, erased) == 0) {
+        return;
+    }
+    
+    char *internal = class_to_internal_name(target);
+    uint16_t class_idx = cp_add_class(cp, internal);
+    free(internal);
+    bc_emit(mg->code, OP_CHECKCAST);
+    bc_emit_u2(mg->code, class_idx);
+}
+
 bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 {
     if (!expr) {
@@ -7402,7 +7491,11 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
             return codegen_literal(mg, expr, cp);
         
         case AST_IDENTIFIER:
-            return codegen_identifier(mg, expr);
+            if (!codegen_identifier(mg, expr)) {
+                return false;
+            }
+            checkcast_generic_field(mg, cp, expr);
+            return true;
         
         case AST_BINARY_EXPR:
             return codegen_binary_expr(mg, expr, cp);
@@ -8089,7 +8182,11 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
             }
         
         case AST_FIELD_ACCESS:
-            return codegen_field_access(mg, expr, cp);
+            if (!codegen_field_access(mg, expr, cp)) {
+                return false;
+            }
+            checkcast_generic_field(mg, cp, expr);
+            return true;
         
         case AST_INSTANCEOF_EXPR:
             {
@@ -9479,17 +9576,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     return false;
                 }
                 
-                /* Get SAM from functional interface using hashtable_foreach */
-                symbol_t *sam = NULL;
-                if (iface_sym->data.class_data.members && 
-                    iface_sym->data.class_data.members->symbols) {
-                    mref_sam_search_t search = { NULL, 0 };
-                    hashtable_foreach(iface_sym->data.class_data.members->symbols, 
-                                      mref_find_sam_fn, &search);
-                    if (search.abstract_count == 1) {
-                        sam = search.sam;
-                    }
-                }
+                symbol_t *sam = get_functional_interface_sam(iface_sym);
                 if (!sam) {
                     fprintf(stderr, "codegen: cannot find SAM in functional interface\n");
                     return false;

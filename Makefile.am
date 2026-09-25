@@ -8,7 +8,7 @@ ACLOCAL_AMFLAGS = -I m4
 SUBDIRS = src
 
 ## Only user-facing documentation is distributed.  Everything under test/
-## (regression tests, jtreg glue, parity scripts) is development-only and is
+## (regression tests, jtreg glue) is development-only and is
 ## intentionally absent from EXTRA_DIST.
 EXTRA_DIST = CONTRIBUTING TODO README
 

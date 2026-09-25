@@ -294,6 +294,39 @@ static uint16_t mods_to_access_flags(uint16_t mods)
     return acc;
 }
 
+/**
+ * Access flags for an InnerClasses attribute entry.
+ *
+ * The JVM takes a nested class's modifiers (Class.getModifiers, and hence
+ * Class.isInterface) from this entry, not from the class's own access_flags,
+ * so it must carry ACC_INTERFACE, ACC_ABSTRACT, ACC_ENUM and so on as well as
+ * the source modifiers. Nested interfaces, enums, records and annotations are
+ * implicitly static.
+ */
+uint16_t inner_class_access_flags(uint16_t mods, symbol_kind_t kind)
+{
+    uint16_t acc = mods_to_access_flags(mods) &
+        (ACC_PUBLIC | ACC_PRIVATE | ACC_PROTECTED | ACC_STATIC | ACC_FINAL | ACC_ABSTRACT);
+
+    switch (kind) {
+        case SYM_ANNOTATION:
+            acc |= ACC_ANNOTATION | ACC_INTERFACE | ACC_ABSTRACT | ACC_STATIC;
+            break;
+        case SYM_INTERFACE:
+            acc |= ACC_INTERFACE | ACC_ABSTRACT | ACC_STATIC;
+            break;
+        case SYM_ENUM:
+            acc |= ACC_ENUM | ACC_STATIC;
+            break;
+        case SYM_RECORD:
+            acc |= ACC_FINAL | ACC_STATIC;
+            break;
+        default:
+            break;
+    }
+    return acc;
+}
+
 /* ========================================================================
  * Method Generation Implementation
  * ======================================================================== */
@@ -2099,7 +2132,7 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
                     cg->outer_class_internal : class_to_internal_name(enclosing->qualified_name));
             }
             entry->inner_name = cp_add_utf8(cg->cp, class_sym->name);
-            entry->access_flags = class_sym->modifiers & 0x001F;  /* ACC_PUBLIC | ACC_PRIVATE | ACC_PROTECTED | ACC_STATIC | ACC_FINAL */
+            entry->access_flags = inner_class_access_flags(class_sym->modifiers, class_sym->kind);
             
             cg->inner_class_entries = slist_new(entry);
             
@@ -4098,8 +4131,13 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         entry->inner_class_info = nested_class_idx;
                         entry->outer_class_info = cg->this_class;
                         entry->inner_name = cp_add_utf8(cg->cp, nested_name);
-                        /* Convert MOD_ flags to ACC_ flags for inner class access */
-                        entry->access_flags = mods_to_access_flags(member->data.node.flags);
+                        symbol_kind_t nested_kind =
+                            member->type == AST_INTERFACE_DECL ? SYM_INTERFACE :
+                            member->type == AST_ENUM_DECL ? SYM_ENUM :
+                            member->type == AST_RECORD_DECL ? SYM_RECORD :
+                            member->type == AST_ANNOTATION_DECL ? SYM_ANNOTATION : SYM_CLASS;
+                        entry->access_flags = inner_class_access_flags(member->data.node.flags,
+                                                                       nested_kind);
                         
                         if (!cg->inner_class_entries) {
                             cg->inner_class_entries = slist_new(entry);

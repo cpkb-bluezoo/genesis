@@ -28,6 +28,9 @@
 #include "codegen.h"
 #include "classfile.h"
 
+/* Access flags for an InnerClasses entry (codegen.c) */
+uint16_t inner_class_access_flags(uint16_t mods, symbol_kind_t kind);
+
 /* ========================================================================
  * Loop Context (for break/continue handling)
  * ======================================================================== */

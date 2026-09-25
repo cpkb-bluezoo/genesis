@@ -5320,18 +5320,24 @@ ast_node_t *parser_parse(parser_t *parser)
             saw_type_decl = true;
             break;
         } else {
-            parser_error(parser, "Expected type declaration");
-            /* Skip to next likely type declaration */
-            while (!parser_check(parser, TOK_CLASS) &&
-                   !parser_check(parser, TOK_INTERFACE) &&
-                   !parser_check(parser, TOK_ENUM) &&
-                   !parser_check(parser, TOK_RECORD) &&
-                   !parser_check(parser, TOK_AT) &&
-                   !parser_check(parser, TOK_EOF)) {
-                parser_advance(parser);
+            /* Below -source 14 the lexer treats record/sealed as plain
+             * identifiers (they were legal variable names), so newer syntax
+             * lands here; say what is actually wrong. */
+            const char *tok = parser_current_text(parser);
+            int src = parser->lexer ? parser->lexer->source_version : 0;
+            char msg[96];
+            if (tok && strcmp(tok, "record") == 0) {
+                snprintf(msg, sizeof(msg),
+                         "records are not supported in -source %d (use 16 or higher)", src);
+                parser_error(parser, msg);
+            } else if (tok && (strcmp(tok, "sealed") == 0 || strcmp(tok, "non") == 0)) {
+                snprintf(msg, sizeof(msg),
+                         "sealed classes are not supported in -source %d (use 17 or higher)", src);
+                parser_error(parser, msg);
+            } else {
+                parser_error(parser, "Expected type declaration");
             }
-            free(parser->error_msg);
-            parser->error_msg = NULL;
+            
             /* Free annotations on error path */
             if (annotations) {
                 for (slist_t *node = annotations; node; node = node->next) {
@@ -5339,6 +5345,11 @@ ast_node_t *parser_parse(parser_t *parser)
                 }
                 slist_free(annotations);
             }
+            
+            /* Stop here with the error set: the caller reports it and the
+             * file fails to compile, rather than silently dropping what
+             * follows. */
+            break;
         }
     }
     

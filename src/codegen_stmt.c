@@ -3806,16 +3806,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         entry->inner_class_info = cp_add_class(mg->class_gen->cp, local_internal);
                         entry->outer_class_info = 0;  /* Local class has no outer in attribute */
                         entry->inner_name = cp_add_utf8(mg->class_gen->cp, local_name);
-                        /* Convert MOD_ flags to ACC_ flags (simplified for local classes) */
-                        uint16_t mods = stmt->data.node.flags;
-                        uint16_t acc = 0;
-                        if (mods & MOD_PUBLIC)    acc |= ACC_PUBLIC;
-                        if (mods & MOD_PRIVATE)   acc |= ACC_PRIVATE;
-                        if (mods & MOD_PROTECTED) acc |= ACC_PROTECTED;
-                        if (mods & MOD_STATIC)    acc |= ACC_STATIC;
-                        if (mods & MOD_FINAL)     acc |= ACC_FINAL;
-                        if (mods & MOD_ABSTRACT)  acc |= ACC_ABSTRACT;
-                        entry->access_flags = acc;
+                        entry->access_flags = inner_class_access_flags(
+                            stmt->data.node.flags,
+                            stmt->type == AST_INTERFACE_DECL ? SYM_INTERFACE : SYM_CLASS);
                         
                         if (!mg->class_gen->inner_class_entries) {
                             mg->class_gen->inner_class_entries = slist_new(entry);

@@ -1,20 +1,80 @@
 GNU Genesis NEWS -- history of user-visible changes.
 
-* Noteworthy changes in release 1.0.0 (unreleased)
+* Noteworthy changes in release 1.0.0 (2026-09-25) [stable]
 
-** The build system now uses GNU Autoconf and Automake.  Build with
-   "./configure && make"; a C99 compiler, zlib and POSIX threads are required.
+This is the first release.  Genesis is a Java compiler written in C99 that
+supports the language through Java 25.
 
-** Genesis no longer requires C11 atomics.
+** Build system
 
-** The -target option now defaults to "automatic": each class is written with
-   the lowest class file version its features need (never below 52, Java 8),
-   rather than a fixed 17.  An explicit -target (or -release) is a ceiling: a
-   class that needs a higher version (lambdas, records, sealed classes, ...)
-   is now an error instead of being silently written with a higher version.
+  Genesis is now built with GNU Autoconf and Automake:
 
-** Fixed: the top-level class of each source file ignored -target and
-   -release in the parallel compile path and was always written with a
-   default class file version.
+      ./configure && make && make install
 
-** Fixed: records were never recognised as requiring class file version 60.
+  A C99 compiler, zlib and POSIX threads are required.  The C11 <stdatomic.h>
+  dependency has been removed.  "genesis --version" and "genesis --help" are
+  accepted, in addition to -version and -help.
+
+  The regression tests, the jtreg glue and other development-only files are
+  kept in the source repository but are not part of the distribution tarball.
+
+** Class file version and -target
+
+  With no -target option, each class is now written with the lowest class file
+  version its features need, never below 52 (Java 8):
+
+      plain classes, lambdas, method references, default methods    52
+      classes with nested classes (nestmates)                        55
+      records                                                        60
+      sealed classes                                                 61
+
+  An explicit -target (or -release) is a ceiling: if a class needs a higher
+  version the compilation now fails with an error instead of silently writing
+  a newer class file.
+
+  Limitation: nested classes reach each other's private members through
+  nestmates (Java 11).  With an explicit -target below 11 the nest attributes
+  are omitted and such private access fails at run time; genesis does not yet
+  generate access$N accessor methods.
+
+** Bugs fixed
+
+  -target and -release were ignored for the top-level class of each source
+  file when compiling in parallel (the default); those classes were always
+  written with a default class file version.
+
+  Records were never recognised as requiring class file version 60.
+
+  Nested interfaces were not seen as interfaces by the JVM (the InnerClasses
+  attribute lacked ACC_INTERFACE and related flags), so lambdas and method
+  references targeting them failed with a BootstrapMethodError.
+
+  Method references to functional interfaces with inherited or redeclared
+  methods could fail with "cannot find SAM".
+
+  The type parameters of a nested generic class (class Box<T>) were not in
+  scope for its own methods and fields.
+
+  Calling a method on a field whose type is a bounded type variable
+  (n.intValue() with N extends Number) produced invalid bytecode.
+
+  Constructor arguments were never boxed, unboxed or widened to the declared
+  parameter types, so new Box<Integer>(21) failed verification.  Method and
+  constructor calls now share the same argument conversion.
+
+  Reading a field declared with a type-variable type from a parameterised
+  receiver (box.value where box is Box<Integer>) now casts the erased value
+  back to the specific type.
+
+  Generic classes loaded from class files rather than source were used with
+  the wrong erasure: a constructor taking N extends Number was referenced as
+  taking Object, and a field of type N as an Object field, causing
+  NoSuchMethodError or NoSuchFieldError at run time.
+
+  Records and sealed classes under an older -source (for example -source 11)
+  were silently dropped: the compiler reported success and wrote no class
+  file.  A declaration that the parser cannot recognise at the top level is
+  now an error ("records are not supported in -source 11 (use 16 or higher)",
+  "Expected type declaration") rather than being ignored.
+
+  A failed class file write no longer prints a second, redundant message.

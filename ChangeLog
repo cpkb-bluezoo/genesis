@@ -1,1 +1,78 @@
-See the git history (git log) for the detailed list of changes.
+2026-09-25  Chris Burdess  <dog@gnu.org>
+
+	Release 1.0.0.
+
+	Build system: GNU Autoconf and Automake.
+	* configure.ac, Makefile.am, src/Makefile.am, m4/: New.  Require C99,
+	zlib and POSIX threads; pin -std=c99; WARN_CFLAGS for -Wall -Wextra
+	-pedantic.  The old hand-written Makefile is removed.
+	* AUTHORS, NEWS, ChangeLog, README, CONTRIBUTING: New or updated for the
+	GNU layout.  README.md is now README.
+	* test/: Regression tests, jtreg glue (test/fake-jdk) and the test driver
+	test/run-tests.sh.  Development only; not in EXTRA_DIST, so not in the
+	distribution tarball.  "make check", "make check-one TEST=...",
+	"make jtreg-test".
+	* src/*.c: Include <config.h> first.
+	* src/genesis.h (GENESIS_VERSION): Take the version from configure.ac.
+	* src/genesis.c (shared_counter_t): Replace C11 atomics with a
+	mutex-protected counter.
+	(print_version, print_usage): Print package name, bug address.
+	(main): Accept --version and --help.
+
+	Class file version and -target.
+	* src/genesis.c (compiler_options_new): -target defaults to unset
+	(automatic).
+	(codegen_phase_worker): Set the target version on the top-level class
+	before it is generated and written; previously only nested, local and
+	anonymous classes received it.
+	* src/classwriter.c (choose_class_version): New.  Compute the lowest
+	version the class needs (floor 52); treat an explicit target as a
+	ceiling and report an error when a feature needs more.  Omit the
+	NestHost/NestMembers attributes for explicit targets below 55.
+	* src/codegen.h (class_gen_t): Add is_record.
+	* src/codegen.c (codegen_class): Set it.  The old ACC_RECORD test was
+	dead code, so records never raised the class file version.
+
+	Lambdas, method references and generics.
+	* src/codegen.c (inner_class_access_flags): New.  Build InnerClasses
+	flags including ACC_INTERFACE, ACC_ABSTRACT, ACC_ENUM, ACC_ANNOTATION
+	and implicit static.  Used for the three kinds of InnerClasses entry
+	here and in src/codegen_stmt.c.
+	* src/semantic.c (get_functional_interface_sam): Make public.
+	* src/codegen_expr.c (codegen_expr): Use it for method references
+	instead of a private single-abstract-method counter.
+	* src/semantic.c (preregister_nested_types): Declare a nested class's
+	own type parameters before resolving its member signatures; the later
+	pass reuses those symbols so the class and its members share one type
+	variable.
+	* src/semantic.c (symbol_from_classfile): Give a bare type-variable
+	field the bound implied by its descriptor.
+	* src/codegen_expr.c (codegen_method_call): Treat a field of type-
+	variable type as a receiver, dispatching on its bound.
+	(coerce_arg_to_param): New.  Shared argument conversion (boxing,
+	unboxing, widening) extracted from codegen_method_call.
+	(codegen_new_object): Convert constructor arguments with it; use the
+	descriptor stored in a class file for external constructors; count
+	stack slots from the declared parameter types.
+	(checkcast_generic_field): New.  Cast a type-variable field read back
+	to its specific type.
+
+	Diagnostics.
+	* src/parser.c (parser_parse): Report, and stop at, an
+	unrecognised top-level declaration instead of discarding the error.
+	Give a specific message for records and sealed classes below the
+	source level that supports them.
+	* src/genesis.c (output_class): Drop a redundant error message.
+
+	Tests.
+	* test/run-tests.sh: Precompile helper classes for every version
+	directory; add class file version, -target ceiling, old -source,
+	invalid input and class-file-loaded generic class checks.
+	* test/classversion/, test/oldsource/, test/external/,
+	test/invalid/StrayTopLevelMember.java,
+	test/src/java8/{NestedGenericTest,BoundedTypeVarCallTest,
+	TypeVarBoxingTest}.java: New.
+
+2016-2020  Chris Burdess  <dog@gnu.org>
+
+	Earlier development; see the git history.

@@ -1615,7 +1615,7 @@ static type_t *substitute_from_receiver(type_t *type, type_t *recv_type);
 static void bind_array_init_elements(semantic_t *sem, ast_node_t *init, type_t *array_type);
 static type_t *infer_type_arg(type_t *param_type, type_t *arg_type, const char *var_name);
 static type_t *substitute_type_var(type_t *type, const char *var_name, type_t *replacement);
-static symbol_t *get_functional_interface_sam(symbol_t *iface_sym);
+/* get_functional_interface_sam() is declared in genesis.h */
 static char *resolve_import(semantic_t *sem, const char *simple_name);
 static symbol_t *load_class_from_source(semantic_t *sem, const char *name);
 static void preregister_nested_types(semantic_t *sem, ast_node_t *decl, symbol_t *sym, scope_t *class_scope);
@@ -3486,6 +3486,20 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
                 }
             }
             
+            /* A field declared as a bare type variable (N extends Number) has no
+             * bound in its signature; the descriptor is its erasure, which is
+             * what a field reference must name. */
+            if (field_sym->type && field_sym->type->kind == TYPE_TYPEVAR && fi->descriptor) {
+                type_descriptor_t *td = descriptor_parse_field(fi->descriptor);
+                if (td) {
+                    type_t *erased = type_from_descriptor(td);
+                    if (erased && erased->kind == TYPE_CLASS) {
+                        field_sym->type->data.type_var.bound = erased;
+                    }
+                    type_descriptor_free(td);
+                }
+            }
+            
             scope_define(class_scope, field_sym);
         }
     }
@@ -4181,6 +4195,27 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
         scope_t *saved_scope = sem->current_scope;
         sem->current_class = nested_sym;
         sem->current_scope = nested_scope;
+        
+        /* Declare the nested class's own type parameters (class Box<T>) so that
+         * the member signatures below can refer to them. Bounds are resolved,
+         * in place, when the class itself is processed; that pass reuses these
+         * symbols so members and class share one type variable. */
+        for (slist_t *tc = nested->data.node.children; tc; tc = tc->next) {
+            ast_node_t *tpn = (ast_node_t *)tc->data;
+            if (tpn && tpn->type == AST_TYPE_PARAMETER && tpn->data.node.name &&
+                !scope_lookup_local(nested_scope, tpn->data.node.name)) {
+                symbol_t *ctp = symbol_new(SYM_TYPE_PARAM, tpn->data.node.name);
+                type_t *ctv = malloc(sizeof(type_t));
+                if (ctv) {
+                    memset(ctv, 0, sizeof(*ctv));
+                    ctv->kind = TYPE_TYPEVAR;
+                    ctv->data.type_var.name = strdup(tpn->data.node.name);
+                    ctv->data.type_var.bound = type_new_class("java.lang.Object");
+                }
+                ctp->type = ctv;
+                scope_define(nested_scope, ctp);
+            }
+        }
         
         /* Pre-populate methods and fields for nested classes so static method
          * calls like NestedClass.method() can be resolved. */
@@ -8350,11 +8385,15 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                             }
                                         }
                                         
+                                        /* A pre-registered nested class already declared its type
+                                         * parameters (see preregister_nested_types); reuse them so
+                                         * member signatures share the same type variable. */
+                                        symbol_t *type_param = scope_lookup_local(class_scope, param_name);
+                                        bool reused_type_param = type_param &&
+                                            type_param->kind == SYM_TYPE_PARAM && type_param->type;
+                                        if (!reused_type_param) {
                                         /* Create a type parameter symbol */
-                                        symbol_t *type_param = symbol_new(SYM_TYPE_PARAM, param_name);
-                                        type_param->ast = child;
-                                        type_param->line = child->line;
-                                        type_param->column = child->column;
+                                        type_param = symbol_new(SYM_TYPE_PARAM, param_name);
                                         
                                         /* Create a type variable type with Object bound initially */
                                         type_t *type_var = malloc(sizeof(type_t));
@@ -8363,6 +8402,10 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                             type_var->data.type_var.bound = type_new_class("java.lang.Object");
                                         
                                         type_param->type = type_var;
+                                        }
+                                        type_param->ast = child;
+                                        type_param->line = child->line;
+                                        type_param->column = child->column;
                                         
                                         /* Add to class's type parameters list */
                                         if (!sym->data.class_data.type_params) {
@@ -8372,7 +8415,9 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                         }
                                         
                                         /* Define in class scope so it can be looked up */
-                                        scope_define(class_scope, type_param);
+                                        if (!reused_type_param) {
+                                            scope_define(class_scope, type_param);
+                                        }
                                         
                                         /* Track for second pass */
                                         if (!type_param_symbols) {
@@ -13953,7 +13998,7 @@ static void collect_sam_from_interface(symbol_t *iface, hashtable_t *seen_method
  * Handles diamond inheritance by tracking seen method names.
  * Handles default method overrides (default overrides abstract).
  */
-static symbol_t *get_functional_interface_sam(symbol_t *iface_sym)
+symbol_t *get_functional_interface_sam(symbol_t *iface_sym)
 {
     if (!iface_sym) {
         return NULL;

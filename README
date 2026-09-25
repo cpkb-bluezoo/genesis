@@ -132,6 +132,11 @@ genesis -version
 
 ## Known Limitations
 
+- **Nested classes and `-target` below 11**: nested classes reach each other's
+  private members via nestmates, which need class file version 55 (Java 11).
+  With an explicit `-target` below 11, private access between nested classes
+  fails at run time. Genesis does not yet generate `access$N` accessors.
+
 - **UTF-only source encoding**: Source files must be valid UTF-8, UTF-16, or
   UTF-32 (with BOM for UTF-16/32). Unlike `javac`, genesis does not attempt to
   guess or fall back to platform-default encodings. Invalid UTF-8 sequences

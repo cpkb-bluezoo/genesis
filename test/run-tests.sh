@@ -56,12 +56,16 @@ fi
 
 echo "=== Genesis Test Suite ==="
 
-# Helper classes (non-*Test files in java8) are compiled first; failures
-# are tolerated because some depend on other helpers.
-for f in "$TEST_SRC"/src/java8/*.java; do
-    case $f in *Test.java) continue ;; esac
-    "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$sourcepath" "$f" \
-        >/dev/null 2>&1 || true
+# Helper classes (non-*Test files in every version directory) are compiled
+# first, at that directory's language level; failures are tolerated because
+# some depend on other helpers.
+for v in $versions; do
+    for f in "$TEST_SRC"/src/java$v/*.java; do
+        [ -f "$f" ] || continue
+        case $f in *Test.java) continue ;; esac
+        "$GENESIS" -source "$v" -d "$TEST_BUILD" -sourcepath "$sourcepath" "$f" \
+            >/dev/null 2>&1 || true
+    done
 done
 
 passed=0
@@ -104,6 +108,53 @@ for f in "$TEST_SRC"/invalid/*.java; do
         failed=$((failed + 1))
     fi
 done
+
+echo
+echo "--- Newer syntax under an older -source (must be rejected) ---"
+# check_source_rejected <file> <expected message fragment> [genesis options...]
+check_source_rejected() {
+    name=$1
+    msg=$2
+    shift 2
+    printf "%-14s rejected %-14s ... " "$name" "$*"
+    rm -rf "$TEST_BUILD/oldsource"
+    mkdir -p "$TEST_BUILD/oldsource"
+    out=$("$GENESIS" "$@" -d "$TEST_BUILD/oldsource" \
+              "$TEST_SRC/oldsource/$name.java" 2>&1)
+    rc=$?
+    if [ $rc -eq 1 ] && echo "$out" | grep -q "$msg"; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo "FAIL (exit $rc)"
+        failed=$((failed + 1))
+    fi
+}
+check_source_rejected OldRecord "records are not supported" -source 8
+check_source_rejected OldRecord "records are not supported" -source 11
+check_source_rejected OldRecord "records are not supported" -source 15
+check_source_rejected OldSealed "sealed classes are not supported" -source 8
+check_source_rejected OldSealed "sealed classes are not supported" -source 16
+
+echo
+echo "--- Generic classes loaded from class files ---"
+# The library is compiled first, then the client against its class files
+# only (-cp, no -sourcepath), so its symbols come from the class files.
+printf "%-30s ... " "ExternalGenericTest"
+ext_lib="$TEST_BUILD/external-lib"
+ext_out="$TEST_BUILD/external-out"
+rm -rf "$ext_lib" "$ext_out"
+mkdir -p "$ext_lib" "$ext_out"
+if "$GENESIS" -d "$ext_lib" "$TEST_SRC"/external/lib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ext_lib" -d "$ext_out" \
+       "$TEST_SRC/external/ExternalGenericTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ext_out:$ext_lib" ExternalGenericTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
 
 echo
 echo "--- Class file version (-source/-target/-release) ---"
