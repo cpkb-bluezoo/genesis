@@ -62,7 +62,7 @@ Testing
    - Test files: *Test.java (e.g., ArrayTest.java, HelloWorldTest.java)
    - Support classes: Any other .java file (e.g., Helper.java, Parent.java)
    
-   The test framework automatically discovers all *Test.java files that contain
+   The test runner (test/run-tests.sh) automatically discovers all *Test.java files that contain
    a main method. Support classes are compiled when referenced by tests.
 
 2. TEST REQUIREMENTS
@@ -94,16 +94,19 @@ Testing
 
 4. RUNNING TESTS
 
-   make test              - Run all tests
-   make test-one TEST=X   - Run single test X with verbose output
-   make test-list         - List all tests (active and excluded)
-   make test-clean        - Clean test build directory
+   make check                      - Run all tests (needs Java)
+   make check-one TEST=XxxTest     - Run single test with verbose output
+   make jtreg-test                 - Run OpenJDK javac tests via jtreg
 
-5. TEST EXCLUSIONS
+   Tests live in test/ and are not shipped in the release tarball.
 
-   Tests for features not yet implemented can be added to TEST_EXCLUDE in the
-   Makefile. When you implement a feature, remove the corresponding test from
-   the exclusion list so it gets picked up by the test suite.
+5. BUILDING
+
+   autoreconf -fi && ./configure && make
+
+   The code is C99 (plus POSIX). Do not use C11 features such as stdatomic.h.
+   Every .c file must include <config.h> (under HAVE_CONFIG_H) before any
+   other header.
 
 6. TEST GUIDELINES
 

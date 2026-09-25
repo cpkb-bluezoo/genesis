@@ -19,6 +19,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -933,10 +937,74 @@ static int write_annotation_default_attribute(uint8_t **p, const_pool_t *cp,
  * Class File Writing
  * ======================================================================== */
 
+/*
+ * Choose the class file major version.
+ *
+ * cg->target_version is 0 when no -target was given: the version is then the
+ * lowest one the class needs, never below Java 8 (52). When -target was given
+ * it is a ceiling: a class that needs more is an error, never silently raised.
+ *
+ * Nestmates (Java 11+) are what let nested classes reach each other's private
+ * members, as genesis emits no synthetic accessors. The NestHost/NestMembers
+ * attributes are therefore required in automatic mode, and simply left out
+ * (they are meaningless to the JVM) when the explicit target predates them.
+ *
+ * Returns the major version, or 0 after reporting an error.
+ */
+static int choose_class_version(class_gen_t *cg, bool *emit_nest)
+{
+    int required = 0;
+    const char *why = NULL;
+
+    if (cg->has_default_methods) {
+        required = 52;
+        why = "default or static interface methods";
+    }
+    if (cg->uses_invokedynamic) {
+        required = 52;
+        why = "lambdas or method references";
+    }
+    if (cg->is_record) {
+        required = 60;
+        why = "records";
+    }
+    if (cg->permitted_subclasses) {
+        required = 61;
+        why = "sealed classes";
+    }
+
+    bool nestmates = cg->nest_host || cg->nest_members;
+    int target = cg->target_version;
+
+    if (target > 0) {
+        if (required > target) {
+            fprintf(stderr, "error: %s: %s require class file version %d (Java %d), "
+                    "but the target is class file version %d (Java %d)\n",
+                    cg->internal_name ? cg->internal_name : "<unknown>", why,
+                    required, required - 44, target, target - 44);
+            return 0;
+        }
+        *emit_nest = nestmates && target >= 55;
+        return target;
+    }
+
+    if (nestmates && required < 55) {
+        required = 55;
+    }
+    *emit_nest = nestmates;
+    return required < 52 ? 52 : required;
+}
+
 uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
 {
     if (!cg || !size) {
         fprintf(stderr, "write_class_bytes: invalid input (cg=%p, size=%p)\n", (void*)cg, (void*)size);
+        return NULL;
+    }
+    
+    bool emit_nest = false;
+    int target_major = choose_class_version(cg, &emit_nest);
+    if (target_major == 0) {
         return NULL;
     }
     
@@ -1042,8 +1110,8 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     uint16_t smt_attr_name = cp_add_utf8(cg->cp, "StackMapTable");
     uint16_t bsm_attr_name = cg->uses_invokedynamic ? cp_add_utf8(cg->cp, "BootstrapMethods") : 0;
     uint16_t ps_attr_name = cg->permitted_subclasses ? cp_add_utf8(cg->cp, "PermittedSubclasses") : 0;
-    uint16_t nm_attr_name = cg->nest_members ? cp_add_utf8(cg->cp, "NestMembers") : 0;
-    uint16_t nh_attr_name = cg->nest_host ? cp_add_utf8(cg->cp, "NestHost") : 0;
+    uint16_t nm_attr_name = (emit_nest && cg->nest_members) ? cp_add_utf8(cg->cp, "NestMembers") : 0;
+    uint16_t nh_attr_name = (emit_nest && cg->nest_host) ? cp_add_utf8(cg->cp, "NestHost") : 0;
     uint16_t exc_attr_name_index = cp_add_utf8(cg->cp, "Exceptions");  /* For throws clauses */
     /* Pre-add RuntimeVisibleTypeAnnotations for local variable type annotations */
     cp_add_utf8(cg->cp, "RuntimeVisibleTypeAnnotations");
@@ -1060,25 +1128,6 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     
     /* Magic number */
     write_be_u4(&p, 0xCAFEBABE);
-    
-    /* Determine class file version based on target and features used.
-     * Higher target versions are required for certain features:
-     * - Java 8 (52): lambdas, default/static interface methods, invokedynamic
-     * - Java 16 (60): records
-     * - Java 17 (61): sealed classes
-     * We use the maximum of the explicit target and feature requirements. */
-    int target_major = cg->target_version;
-    
-    /* Minimum versions for features */
-    if (cg->has_default_methods || cg->uses_invokedynamic) {
-        if (target_major < 52) target_major = 52;  /* Java 8 */
-    }
-    if (cg->permitted_subclasses) {
-        if (target_major < 61) target_major = 61;  /* Java 17 for sealed classes */
-    }
-    if (cg->access_flags & ACC_RECORD) {
-        if (target_major < 60) target_major = 60;  /* Java 16 for records */
-    }
     
     /* Write version */
     if (target_major >= 50) {
@@ -1532,8 +1581,8 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     if (cg->signature) class_attr_count++;
     if (cg->bootstrap_methods && cg->bootstrap_methods->count > 0) class_attr_count++;
     if (cg->permitted_subclasses) class_attr_count++;
-    if (cg->nest_members) class_attr_count++;  /* NestMembers (Java 11+) */
-    if (cg->nest_host) class_attr_count++;     /* NestHost (Java 11+) */
+    if (emit_nest && cg->nest_members) class_attr_count++;  /* NestMembers (Java 11+) */
+    if (emit_nest && cg->nest_host) class_attr_count++;     /* NestHost (Java 11+) */
     
     /* Check for class-level annotations with RUNTIME retention */
     int runtime_annot_count = 0;
@@ -1636,7 +1685,7 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     }
     
     /* NestMembers attribute (Java 11+) - for nest host class */
-    if (cg->nest_members && nm_attr_name) {
+    if (emit_nest && cg->nest_members && nm_attr_name) {
         write_be_u2(&p, nm_attr_name);
         
         /* Count nest members */
@@ -1659,7 +1708,7 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     }
     
     /* NestHost attribute (Java 11+) - for nested classes */
-    if (cg->nest_host && nh_attr_name) {
+    if (emit_nest && cg->nest_host && nh_attr_name) {
         write_be_u2(&p, nh_attr_name);
         
         /* Attribute length: 2 (host_class_info index) */

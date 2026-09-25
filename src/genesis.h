@@ -27,7 +27,8 @@
 /* Forward declaration for classpath */
 struct classpath;
 
-#define GENESIS_VERSION "0.7"
+/* Taken from AC_INIT in configure.ac via config.h */
+#define GENESIS_VERSION VERSION
 
 /* ========================================================================
  * Compiler options

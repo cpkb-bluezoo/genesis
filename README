@@ -18,7 +18,7 @@ features.
 
 ## Current Status
 
-**Version 0.7** : Full Java 25 support
+**Version 1.0.0** : Full Java 25 support
 
 Genesis supports Java language features through Java 25:
 
@@ -64,18 +64,28 @@ Genesis is approximately **2x faster** than javac, with parallel compilation ena
 
 ## Building
 
-Genesis requires a C99 compiler, zlib, and pthreads.
+Genesis requires a C99 compiler, zlib, and POSIX threads.
+
+From a release tarball:
 
 ```bash
-# Debug build (with symbols)
+./configure
 make
-
-# Release build (optimized)
-make release
-
-# Install to /usr/local/bin
 sudo make install
 ```
+
+From a git checkout, generate the build system first (needs Autoconf 2.69+
+and Automake 1.13+):
+
+```bash
+autoreconf -fi
+./configure
+make
+```
+
+Regression tests (`make check`) and the jtreg integration live in `test/`,
+which is only present in a git checkout, not in the release tarball. They
+need a Java 21+ runtime: set `JAVA` or `JAVA_HOME`.
 
 ## Usage
 
@@ -109,7 +119,7 @@ genesis -version
 | `-cp <path>` / `-classpath <path>` | Classpath for dependency resolution |
 | `-sourcepath <path>` | Source path for finding source files |
 | `-source <version>` | Source language version (default: 25) |
-| `-target <version>` | Target bytecode version (default: 17) |
+| `-target <version>` | Target bytecode version (default: automatic) |
 | `-release <version>` | Set source and target to the same version |
 | `-g` | Generate debugging information (default) |
 | `-g:none` | Do not generate debugging information |

@@ -19,6 +19,10 @@
  * along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
 
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
+
 #include "genesis.h"
 #include "classpath.h"
 #include "classfile.h"
@@ -28,7 +32,6 @@
 
 #include <sys/stat.h>  /* For mkdir() */
 #include <pthread.h>   /* For parallel compilation */
-#include <stdatomic.h> /* For atomic operations */
 
 /* ========================================================================
  * Parallel Compilation Infrastructure
@@ -60,7 +63,7 @@ compiler_options_t *compiler_options_new(void)
     }
     
     opts->source_version = strdup("25");
-    opts->target_version = strdup("17");
+    opts->target_version = NULL;  /* Unset: computed per class from its features */
     opts->output_dir = NULL;
     opts->output_jar = NULL;
     opts->main_class = NULL;
@@ -891,11 +894,50 @@ typedef struct parse_result {
     semantic_t *sem;  /* Semantic analyzer (set after serial semantic phase) */
 } parse_result_t;
 
+/* Mutex-protected counter shared between worker threads (C99 has no atomics) */
+typedef struct shared_counter {
+    pthread_mutex_t mutex;
+    int value;
+} shared_counter_t;
+
+static void counter_init(shared_counter_t *c)
+{
+    pthread_mutex_init(&c->mutex, NULL);
+    c->value = 0;
+}
+
+static void counter_destroy(shared_counter_t *c)
+{
+    pthread_mutex_destroy(&c->mutex);
+}
+
+/* Returns the value before the increment */
+static int counter_fetch_add(shared_counter_t *c, int n)
+{
+    int old;
+
+    pthread_mutex_lock(&c->mutex);
+    old = c->value;
+    c->value += n;
+    pthread_mutex_unlock(&c->mutex);
+    return old;
+}
+
+static int counter_load(shared_counter_t *c)
+{
+    int v;
+
+    pthread_mutex_lock(&c->mutex);
+    v = c->value;
+    pthread_mutex_unlock(&c->mutex);
+    return v;
+}
+
 /* Shared state for parallel parsing phase */
 typedef struct parse_phase_state {
     char **filenames;
     int file_count;
-    atomic_int next_index;
+    shared_counter_t next_index;
     parse_result_t *results;
     int source_version;
 } parse_phase_state_t;
@@ -904,8 +946,8 @@ typedef struct parse_phase_state {
 typedef struct codegen_phase_state {
     parse_result_t *results;
     int file_count;
-    atomic_int next_index;
-    atomic_int error_count;
+    shared_counter_t next_index;
+    shared_counter_t error_count;
     compiler_options_t *opts;
     pthread_mutex_t output_mutex;
     type_registry_t *registry;  /* Shared type registry for cross-file resolution */
@@ -1213,7 +1255,7 @@ static void *parse_phase_worker(void *arg)
     parse_phase_state_t *state = (parse_phase_state_t *)arg;
     
     while (1) {
-        int idx = atomic_fetch_add(&state->next_index, 1);
+        int idx = counter_fetch_add(&state->next_index, 1);
         if (idx >= state->file_count) {
             break;
         }
@@ -1286,7 +1328,7 @@ static void *codegen_phase_worker(void *arg)
     codegen_phase_state_t *state = (codegen_phase_state_t *)arg;
     
     while (1) {
-        int idx = atomic_fetch_add(&state->next_index, 1);
+        int idx = counter_fetch_add(&state->next_index, 1);
         if (idx >= state->file_count) {
             break;
         }
@@ -1329,17 +1371,22 @@ static void *codegen_phase_worker(void *arg)
                     fprintf(stderr, "error: cannot create class generator for %s\n",
                             class_name);
                     pthread_mutex_unlock(&state->output_mutex);
-                    atomic_fetch_add(&state->error_count, 1);
+                    counter_fetch_add(&state->error_count, 1);
                     children = children->next;
                     continue;
                 }
+                
+                /* Target major version (0 = automatic); must be set before the
+                 * class is generated and written */
+                int target_major = classfile_version_from_string(state->opts->target_version);
+                class_gen_set_target_version(cg, target_major);
                 
                 if (!codegen_class(cg, child)) {
                     pthread_mutex_lock(&state->output_mutex);
                     fprintf(stderr, "error: code generation failed for: %s\n",
                             class_name);
                     pthread_mutex_unlock(&state->output_mutex);
-                    atomic_fetch_add(&state->error_count, 1);
+                    counter_fetch_add(&state->error_count, 1);
                     class_gen_free(cg);
                     children = children->next;
                     continue;
@@ -1352,14 +1399,7 @@ static void *codegen_phase_worker(void *arg)
                 pthread_mutex_unlock(&state->output_mutex);
                 
                 if (!write_ok) {
-                    atomic_fetch_add(&state->error_count, 1);
-                }
-                
-                /* Determine target major version */
-                int target_major = 52; /* Default to Java 8 */
-                if (state->opts->target_version) {
-                    int v = atoi(state->opts->target_version);
-                    if (v >= 8) target_major = v + 44;
+                    counter_fetch_add(&state->error_count, 1);
                 }
                 
                 /* Process nested classes (static and non-static inner classes) */
@@ -1479,10 +1519,10 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
     parse_phase_state_t parse_state = {
         .filenames = filenames,
         .file_count = file_count,
-        .next_index = ATOMIC_VAR_INIT(0),
         .results = parse_results,
         .source_version = source_version
     };
+    counter_init(&parse_state.next_index);
     
     pthread_t *threads = malloc(thread_count * sizeof(pthread_t));
     for (i = 0; i < thread_count; i++) {
@@ -1491,6 +1531,7 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
     for (i = 0; i < thread_count; i++) {
         pthread_join(threads[i], NULL);
     }
+    counter_destroy(&parse_state.next_index);
     
     /* Report parse errors */
     int parse_errors = 0;
@@ -1719,15 +1760,12 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
     codegen_phase_state_t codegen_state = {
         .results = parse_results,
         .file_count = file_count,
-        .next_index = ATOMIC_VAR_INIT(0),
-        .error_count = ATOMIC_VAR_INIT(0),
         .opts = opts,
         .registry = registry
     };
     pthread_mutex_init(&codegen_state.output_mutex, NULL);
-    
-    /* Reset next_index for codegen phase */
-    atomic_store(&codegen_state.next_index, 0);
+    counter_init(&codegen_state.next_index);
+    counter_init(&codegen_state.error_count);
     
     for (i = 0; i < thread_count; i++) {
         pthread_create(&threads[i], &attr, codegen_phase_worker, &codegen_state);
@@ -1748,7 +1786,9 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
         }
     }
     
-    int codegen_errors = atomic_load(&codegen_state.error_count);
+    int codegen_errors = counter_load(&codegen_state.error_count);
+    counter_destroy(&codegen_state.next_index);
+    counter_destroy(&codegen_state.error_count);
     int total_errors = parse_errors + sem_errors + codegen_errors;
     
     if (opts->verbose) {
@@ -1907,8 +1947,8 @@ static char **read_argument_file(const char *filename, int *arg_count)
  */
 void print_version(void)
 {
-    printf("genesis version %s\n", GENESIS_VERSION);
-    printf("Copyright (C) 2016, 2020, 2026 Chris Burdess\n");
+    printf("%s %s\n", PACKAGE_NAME, GENESIS_VERSION);
+    printf("Copyright (C) 2016, 2020, 2026 Chris Burdess <" PACKAGE_BUGREPORT ">\n");
     printf("License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>\n");
     printf("This is free software: you are free to change and redistribute it.\n");
     printf("There is NO WARRANTY, to the extent permitted by law.\n");
@@ -1932,8 +1972,8 @@ void print_usage(const char *program_name)
     printf("  -sourcepath <path>  Specify source path\n");
     printf("  -source <version>   Specify source version (default: 25)\n");
     printf("  --source <version>  Specify source version (default: 25)\n");
-    printf("  -target <version>   Specify target version (default: 17)\n");
-    printf("  --target <version>  Specify target version (default: 17)\n");
+    printf("  -target <version>   Specify target version (default: automatic, at least 8)\n");
+    printf("  --target <version>  Specify target version (default: automatic, at least 8)\n");
     printf("  -release <version>  Specify release version (sets source and target)\n");
     printf("  --release <version> Specify release version (sets source and target)\n");
     printf("  -g                  Generate debugging information\n");
@@ -1944,6 +1984,7 @@ void print_usage(const char *program_name)
     printf("  -j[N]               Use N threads (default: auto, -j1 for single-threaded)\n");
     printf("  -version            Print version information\n");
     printf("  -help               Print this help message\n");
+    printf("\nReport bugs to <" PACKAGE_BUGREPORT ">.\n");
 }
 
 /**
@@ -1995,7 +2036,7 @@ int main(int argc, char **argv)
                 
                 if (arg[0] == '-') {
                     /* Process as option (same logic as below) */
-                    if (strcmp(arg, "-version") == 0) {
+                    if (strcmp(arg, "-version") == 0 || strcmp(arg, "--version") == 0) {
                         print_version();
                         for (int k = 0; k < file_argc; k++) {
                             free(file_argv[k]);
@@ -2116,7 +2157,8 @@ int main(int argc, char **argv)
         }
         
         if (argv[i][0] == '-') {
-            if (strcmp(argv[i], "-version") == 0) {
+            if (strcmp(argv[i], "-version") == 0 ||
+                strcmp(argv[i], "--version") == 0) {
                 print_version();
                 compiler_options_free(opts);
                 return 0;
@@ -2237,7 +2279,6 @@ int main(int argc, char **argv)
         compiler_options_free(opts);
         return 1;
     }
-    
     if (!opts->source_files) {
         fprintf(stderr, "error: no source files\n");
         print_usage(argv[0]);

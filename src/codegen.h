@@ -498,6 +498,7 @@ struct class_gen
     bootstrap_methods_t *bootstrap_methods;  /* Bootstrap methods for invokedynamic */
     bool uses_invokedynamic;                 /* True if class uses invokedynamic */
     bool has_default_methods;                /* True if interface has default methods */
+    bool is_record;                          /* True if this class is a record (Java 16+) */
     bool use_stackmap;                       /* True to emit StackMapTable (requires version 50+) */
     int lambda_metafactory_bsm_idx;          /* BSM index for LambdaMetafactory (-1 if not used) */
     int lambda_counter;                      /* Counter for lambda$N naming */

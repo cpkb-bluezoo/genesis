@@ -3,7 +3,7 @@
 # This translates javac invocations to genesis, filtering unsupported options
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-GENESIS="$SCRIPT_DIR/../../genesis"
+GENESIS="${GENESIS:-$SCRIPT_DIR/../../../src/genesis}"
 
 # Note: JAVA_HOME check removed - jtreg runs in minimal environment
 # Genesis doesn't need JAVA_HOME to compile

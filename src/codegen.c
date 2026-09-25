@@ -19,6 +19,10 @@
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
+
 #include "codegen_internal.h"
 
 /* ========================================================================
@@ -1875,7 +1879,7 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
     cg->field_map = hashtable_new();
     
     /* Default target version (can be overridden via cg_set_target_version) */
-    cg->target_version = 45;  /* Java 1.1 default */
+    cg->target_version = 0;  /* 0: automatic, from the features used */
     
     /* Pre-add standard attribute names to constant pool */
     cp_add_utf8(cg->cp, "Code");
@@ -3740,6 +3744,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
     /* For records, set ACC_FINAL flag and superclass to java.lang.Record */
     if (is_record) {
         cg->access_flags |= ACC_FINAL;
+        cg->is_record = true;
         if (cg->superclass) free(cg->superclass);
         cg->superclass = strdup("java/lang/Record");
         cg->super_class = cp_add_class(cg->cp, cg->superclass);
@@ -7281,7 +7286,7 @@ uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
     
     /* Version */
     *p++ = 0x00; *p++ = 0x00;  /* minor */
-    int major = target_version > 0 ? target_version : 61;  /* default to Java 17 */
+    int major = target_version > 0 ? target_version : 52;  /* automatic: Java 8 floor */
     *p++ = (major >> 8) & 0xFF;
     *p++ = major & 0xFF;
     

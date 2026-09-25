@@ -1,0 +1,20 @@
+GNU Genesis NEWS -- history of user-visible changes.
+
+* Noteworthy changes in release 1.0.0 (unreleased)
+
+** The build system now uses GNU Autoconf and Automake.  Build with
+   "./configure && make"; a C99 compiler, zlib and POSIX threads are required.
+
+** Genesis no longer requires C11 atomics.
+
+** The -target option now defaults to "automatic": each class is written with
+   the lowest class file version its features need (never below 52, Java 8),
+   rather than a fixed 17.  An explicit -target (or -release) is a ceiling: a
+   class that needs a higher version (lambdas, records, sealed classes, ...)
+   is now an error instead of being silently written with a higher version.
+
+** Fixed: the top-level class of each source file ignored -target and
+   -release in the parallel compile path and was always written with a
+   default class file version.
+
+** Fixed: records were never recognised as requiring class file version 60.

@@ -1,5 +1,27 @@
-# Build artifacts
-build/
+# Autotools generated
+autom4te.cache/
+aclocal.m4
+configure
+configure~
+config.h
+config.h.in
+config.h.in~
+config.log
+config.status
+stamp-h1
+Makefile
+Makefile.in
+.deps/
+/build-aux/
+INSTALL
+.dirstamp
+*.o
+*.tar.gz
+*.tar.xz
+/genesis-*/
+
+# Build products
+src/genesis
 genesis
 *.class
 
@@ -7,7 +29,7 @@ genesis
 test/build/
 
 # jtreg integration
-fake-jdk/bin/java
+test/fake-jdk/bin/java
 jtreg-work/
 jtreg-report/
 
@@ -15,4 +37,3 @@ jtreg-report/
 *.dSYM/
 .DS_Store
 *~
-
