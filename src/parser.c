@@ -3684,6 +3684,11 @@ static ast_node_t *parse_statement(parser_t *parser)
                         return NULL;
                     }
                     
+                    /* Optional 'final' on the exception parameter (JLS 14.20) */
+                    if (parser_match(parser, TOK_FINAL)) {
+                        catch_clause->data.node.flags |= MOD_FINAL;
+                    }
+                    
                     /* Exception parameter - may have multiple types (multi-catch) */
                     ast_node_t *type_node = parse_type(parser);
                     if (type_node) {
