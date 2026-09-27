@@ -957,6 +957,7 @@ bool classpath_setup_jdk(classpath_t *cp, jdk_info_t *jdk)
             "java.management.jmod", /* java.lang.management */
             "java.compiler.jmod",   /* javax.tools (JavaCompiler, etc.) */
             "java.security.sasl.jmod", /* javax.security.sasl (SASL) */
+            "java.security.jgss.jmod", /* org.ietf.jgss (GSSAPI / Kerberos) */
             "java.naming.jmod",     /* javax.naming (JNDI) */
             "java.desktop.jmod",    /* java.beans (BeanInfo, Introspector) */
             NULL
