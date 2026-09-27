@@ -11873,6 +11873,21 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     if (target_class) {
                         resolve_types_for_symbol(found_method, sem->shared_registry,
                                                  sem->classpath, target_class);
+                        ensure_method_type_params(found_method);
+                        for (int pi = 0; pi < found_method->data.method_data.param_count; pi++) {
+                            symbol_t *param = found_method->data.method_data.params[pi];
+                            if (param && found_method->data.method_data.unresolved_param_types &&
+                                found_method->data.method_data.unresolved_param_types[pi]) {
+                                unresolved_type_t *put =
+                                    found_method->data.method_data.unresolved_param_types[pi];
+                                type_t *pt = resolve_unresolved_type_full_for_method(
+                                    put, sem->shared_registry, sem->classpath,
+                                    target_class, found_method);
+                                if (pt) {
+                                    param->type = pt;
+                                }
+                            }
+                        }
                     }
                     /* Lazy resolution: resolve return type if NULL (from interface stubs) */
                     if (!found_method->type && found_method->ast && 
@@ -11881,6 +11896,13 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         if (ret_type_node) {
                             found_method->type = semantic_resolve_type(sem, ret_type_node);
                         }
+                    }
+                    if (!found_method->type &&
+                        found_method->data.method_data.unresolved_return_type) {
+                        unresolved_type_t *rut = found_method->data.method_data.unresolved_return_type;
+                        found_method->type = resolve_unresolved_type_full_for_method(
+                            rut, sem->shared_registry, sem->classpath,
+                            target_class, found_method);
                     }
                     
                 if (found_method->type) {
@@ -12012,9 +12034,25 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         type_t *arg_type = get_expression_type(sem, arg);
                         
                         /* Infer type arguments from argument types for generic methods */
-                        if (arg_type && param->type) {
+                        type_t *infer_from = param->type;
+                        if ((!infer_from ||
+                             (infer_from->kind == TYPE_CLASS &&
+                              infer_from->data.class_type.name &&
+                              !infer_from->data.class_type.symbol)) &&
+                            found_method->data.method_data.unresolved_param_types &&
+                            arg_index < found_method->data.method_data.param_count &&
+                            found_method->data.method_data.unresolved_param_types[arg_index]) {
+                            unresolved_type_t *put =
+                                found_method->data.method_data.unresolved_param_types[arg_index];
+                            if (put && put->name) {
+                                type_t *mtp = lookup_method_type_param(found_method, put->name);
+                                if (mtp) {
+                                    infer_from = mtp;
+                                }
+                            }
+                        }
+                        if (arg_type && infer_from) {
                             /* For varargs (T[]), use the element type for inference */
-                            type_t *infer_from = param->type;
                             if (is_varargs_param && is_last_param && 
                                 infer_from->kind == TYPE_ARRAY) {
                                 infer_from = infer_from->data.array_type.element_type;
@@ -12171,9 +12209,12 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     }
 
                     /* Generic instance method return (e.g. V remove(int)) in a typed
-                     * initializer when receiver type args were not substituted. */
+                     * initializer when receiver type args were not substituted.
+                     * Do not use primitive target types (e.g. long x = m()) — that would
+                     * wrongly substitute <T> T from a static generic helper. */
                     if (return_type && sem->target_type &&
-                        sem->target_type->kind != TYPE_UNKNOWN &&
+                        (sem->target_type->kind == TYPE_CLASS ||
+                         sem->target_type->kind == TYPE_ARRAY) &&
                         sem->target_type->kind != TYPE_VOID &&
                         sem->target_type->kind != TYPE_TYPEVAR) {
                         bool infer_from_target = false;
@@ -12212,17 +12253,33 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 symbol_t *param = (symbol_t *)pnode->data;
                                 ast_node_t *arg = (ast_node_t *)anode->data;
                                 bool param_matches = false;
+                                const char *pvar = NULL;
                                 if (param && param->type) {
                                     if (param->type->kind == TYPE_TYPEVAR &&
-                                        param->type->data.type_var.name &&
-                                        strcmp(param->type->data.type_var.name, ret_var) == 0) {
-                                        param_matches = true;
+                                        param->type->data.type_var.name) {
+                                        pvar = param->type->data.type_var.name;
                                     } else if (param->type->kind == TYPE_CLASS &&
                                                param->type->data.class_type.name &&
-                                               !param->type->data.class_type.symbol &&
-                                               strcmp(param->type->data.class_type.name, ret_var) == 0) {
-                                        param_matches = true;
+                                               !param->type->data.class_type.symbol) {
+                                        pvar = param->type->data.class_type.name;
                                     }
+                                }
+                                if (!pvar && found_method->data.method_data.unresolved_param_types) {
+                                    int pidx = 0;
+                                    for (slist_t *pn = params; pn && pn != pnode; pn = pn->next) {
+                                        pidx++;
+                                    }
+                                    if (pidx < found_method->data.method_data.param_count &&
+                                        found_method->data.method_data.unresolved_param_types[pidx]) {
+                                        unresolved_type_t *put =
+                                            found_method->data.method_data.unresolved_param_types[pidx];
+                                        if (put && put->name) {
+                                            pvar = put->name;
+                                        }
+                                    }
+                                }
+                                if (pvar && strcmp(pvar, ret_var) == 0) {
+                                    param_matches = true;
                                 }
                                 if (param_matches && arg) {
                                     type_t *at = get_expression_type(sem, arg);
@@ -12240,6 +12297,9 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     /* Substitute inferred type arguments for generic methods.
                      * This handles method-level type params like R in map<R>().
                      * Both static and instance methods may have type parameters. */
+                    if (!return_type && inferred_T) {
+                        return_type = inferred_T;
+                    }
                     if (return_type) {
                         if (inferred_T) {
                             return_type = substitute_type_var(return_type, "T", inferred_T);

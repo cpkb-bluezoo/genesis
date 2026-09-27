@@ -11,7 +11,12 @@ public class GenericRequiredTest {
         return required(n).longValue();
     }
 
+    static long fromLongLocal(Long n) {
+        long v = required(n).longValue();
+        return v;
+    }
+
     public static void main(String[] args) {
-        System.out.println("GenericRequiredTest OK " + fromLong(3L));
+        System.out.println("GenericRequiredTest OK " + fromLong(3L) + " " + fromLongLocal(4L));
     }
 }
