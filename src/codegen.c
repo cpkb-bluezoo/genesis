@@ -2799,13 +2799,14 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                         
                         /* Generate initializer expression */
                         codegen_expr(mg, init_expr, cg->cp);
+                        coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
                         
                         /* putfield */
                         uint16_t field_ref = cp_add_fieldref(cg->cp,
                             cg->internal_name, field_name, field->descriptor);
                         bc_emit(mg->code, OP_PUTFIELD);
                         bc_emit_u2(mg->code, field_ref);
-                        mg_pop(mg, 2);  /* Consumes this + value */
+                        mg_pop(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 3 : 2);
                     }
                 }
             }
@@ -4673,11 +4674,12 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     bc_emit(mg->code, OP_ALOAD_0);
                     mg_push(mg, 1);
                     codegen_expr(mg, init_expr, cg->cp);
+                    coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
                     uint16_t field_ref = cp_add_fieldref(cg->cp,
                         cg->internal_name, field_name, field->descriptor);
                     bc_emit(mg->code, OP_PUTFIELD);
                     bc_emit_u2(mg->code, field_ref);
-                    mg_pop(mg, 2);
+                    mg_pop(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 3 : 2);
                 }
             }
         }
@@ -4904,13 +4906,14 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 if (field) {
                     /* Generate initializer expression */
                     codegen_expr(mg, init_expr, cg->cp);
-                    
+                    coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
+
                     /* putstatic field */
                     uint16_t field_ref = cp_add_fieldref(cg->cp,
                         cg->internal_name, field_name, field->descriptor);
                     bc_emit(mg->code, OP_PUTSTATIC);
                     bc_emit_u2(mg->code, field_ref);
-                    mg_pop(mg, 1);
+                    mg_pop(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 2 : 1);
                 }
             }
         }
@@ -6455,11 +6458,12 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                     bc_emit(mg->code, OP_ALOAD_0);
                     mg_push(mg, 1);
                     codegen_expr(mg, init_expr, cg->cp);
+                    coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
                     uint16_t field_ref = cp_add_fieldref(cg->cp,
                         cg->internal_name, field_name, field->descriptor);
                     bc_emit(mg->code, OP_PUTFIELD);
                     bc_emit_u2(mg->code, field_ref);
-                    mg_pop(mg, 2);
+                    mg_pop(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 3 : 2);
                 }
             }
         }
@@ -6543,11 +6547,12 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 field_gen_t *field = hashtable_lookup(cg->field_map, field_name);
                 if (field) {
                     codegen_expr(mg, init_expr, cg->cp);
+                    coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
                     uint16_t field_ref = cp_add_fieldref(cg->cp,
                         cg->internal_name, field_name, field->descriptor);
                     bc_emit(mg->code, OP_PUTSTATIC);
                     bc_emit_u2(mg->code, field_ref);
-                    mg_pop(mg, 1);
+                    mg_pop(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 2 : 1);
                 }
             }
         }

@@ -87,6 +87,73 @@ UNRELEASED  Chris Burdess  <dog@gnu.org>
 	test/src/java8/{NestedGenericTest,BoundedTypeVarCallTest,
 	TypeVarBoxingTest}.java: New.
 
+	String concatenation and anonymous classes.
+	* src/codegen_expr.c (get_append_descriptor): Trust the resolved type
+	first; append wrappers and other references as Object.
+	(codegen_string_concat): Take the argument slot count from the append
+	overload chosen, not from the operand's unboxed kind.
+	(codegen_method_call): Compute the argument slot count once, from the
+	parameter types, before emitting the call; use it for the invokeinterface
+	count operand.
+	* src/semantic.c (declared_inside_current_class): New.  Do not treat a
+	parameter or local of a local/anonymous class's own method as captured.
+	* src/codegen.c (codegen_anonymous_class): Generate superclass and
+	interface bridge methods, as codegen_class does.
+	* test/src/java8/{StringConcatBoxedTest,AnonymousParamTest}.java: New.
+
+	Primitive conversions: widening, boxing, unboxing, promotion.
+	* src/codegen_expr.c (emit_widen_primitive, coerce_stack_value,
+	descriptor_kind_and_class, value_kind_and_class,
+	coerce_value_to_descriptor): New, in codegen_internal.h so
+	codegen_stmt.c can use them too.  Applied at every local variable
+	declaration and simple assignment (local, static and instance field
+	via a bare name, an inherited field, a field in an enclosing class, or
+	"obj.field", and array element), at every field declaration
+	initializer (codegen.c), and to a return statement's value against
+	the method's (or, for a lambda, the SAM's) declared return type.
+	(codegen_compound_rhs): New, replacing emit_compound_op (deleted) at
+	every compound-assignment site listed above.  Generates the
+	right-hand side, applies binary numeric promotion between the
+	left-hand side's own type and the right's (an int-only shift count
+	for <<=/>>=/>>>=, never promoted), emits the correctly-typed operator,
+	and narrows the result back to the left-hand side's type (JLS
+	15.26.2); a String left-hand side with += concatenates via a
+	StringBuilder instead; a boxed numeric left-hand side is unboxed and
+	reboxed around the same logic.
+	(codegen_binary_expr): Fix the operand/result slot count at the end,
+	wrong for a long or double result since it assumed one slot
+	regardless of operand width. Exempt a shift's right operand from
+	being widened to the left operand's promoted type, which is not
+	valid input for LSHL/LSHR/LUSHR; select the shift opcode from the
+	left operand's type alone.
+	(codegen_assignment, AST_CONDITIONAL_EXPR): Apply the same numeric
+	promotion between a ternary's two branches that a binary operator's
+	operands get, needed for a consistent stack map at their merge point.
+	* src/codegen_stmt.c (AST_VAR_DECL, AST_RETURN_STMT): Use the new
+	helpers instead of a narrower, boxing/unboxing-only check.
+	* src/semantic.c (pass2_check_types): Persist sem_type on
+	AST_BINARY_EXPR, AST_UNARY_EXPR and AST_CONDITIONAL_EXPR nodes, as
+	already done for AST_FIELD_ACCESS and AST_METHOD_CALL; several codegen
+	heuristics (including overload-sensitive descriptor selection, e.g.
+	for println) already checked for this and silently fell back to
+	guessing without it.
+	(get_expression_type, AST_CONDITIONAL_EXPR): Apply the same numeric
+	promotion JLS 15.25 gives a ternary's branches that a binary
+	operator's operands get, instead of returning the "then" branch's
+	type unconditionally.
+	* src/parser.c (parser_classify_gt_sequence): New, replacing
+	parser_check_double_gt/parser_check_triple_gt (deleted). Fix >>=
+	and >>>= being silently dropped, with no error and no bytecode: the
+	lexer never combines '>' into >>/>>>, to keep a generic argument
+	list simple, but does still combine a lone '>' with an immediately
+	following '=' into one token, same as everywhere else; the old
+	reconstruction assumed a separate trailing '=' token it would never
+	find, since the *last* '>' of the run absorbs it first.
+	(parser_consume_gt_sequence): New, replacing
+	parser_consume_double_gt/parser_consume_triple_gt (deleted).
+	* test/src/java8/{PrimitiveWideningTest,CompoundAssignmentTest,
+	BinaryPromotionTest}.java: New.
+
 2016-2020  Chris Burdess  <dog@gnu.org>
 
 	Earlier development; see the git history.

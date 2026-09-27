@@ -2538,18 +2538,31 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
         ((left->type == AST_LITERAL && left->data.leaf.token_type == TOK_NULL) ||
          (right->type == AST_LITERAL && right->data.leaf.token_type == TOK_NULL));
     
-    /* Determine operand types and result type for widening */
+    /* Determine operand types and result type for widening.
+     * Shifts are not subject to binary numeric promotion (JLS 15.19): each
+     * operand is promoted independently, the shift count (right) always
+     * ending up int-shaped, and the result type is the LEFT operand's
+     * promoted type alone. Combining left_type and right_type into a shared
+     * op_type, as every other arithmetic operator does, would wrongly widen
+     * an int shift count to match a long left operand, producing LSHL with
+     * a long count where the JVM expects an int. */
+    bool is_shift = (op == TOK_LSHIFT || op == TOK_RSHIFT || op == TOK_URSHIFT);
     type_kind_t left_type = get_expr_type_kind(mg, left);
     type_kind_t right_type = get_expr_type_kind(mg, right);
     type_kind_t op_type = left_type;
-    
-    /* Use the wider type (type promotion): double > float > long > int */
-    if (right_type == TYPE_DOUBLE || op_type == TYPE_DOUBLE) {
-        op_type = TYPE_DOUBLE;
-    } else if (right_type == TYPE_FLOAT || op_type == TYPE_FLOAT) {
-        op_type = TYPE_FLOAT;
-    } else if (right_type == TYPE_LONG || op_type == TYPE_LONG) {
-        op_type = TYPE_LONG;
+
+    if (!is_shift) {
+        /* Use the wider type (type promotion): double > float > long > int */
+        if (right_type == TYPE_DOUBLE || op_type == TYPE_DOUBLE) {
+            op_type = TYPE_DOUBLE;
+        } else if (right_type == TYPE_FLOAT || op_type == TYPE_FLOAT) {
+            op_type = TYPE_FLOAT;
+        } else if (right_type == TYPE_LONG || op_type == TYPE_LONG) {
+            op_type = TYPE_LONG;
+        }
+    } else if (op_type != TYPE_LONG) {
+        /* byte/short/char/int all widen to int for the shift opcode */
+        op_type = TYPE_INT;
     }
     
     /* Generate left operand */
@@ -2640,8 +2653,10 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
         }
     }
     
-    /* Emit widening conversion for right operand if needed */
-    if (right_type != op_type) {
+    /* Emit widening conversion for right operand if needed. Never for a
+     * shift: the count is not part of the promotion that decided op_type
+     * (see above) and must stay int-shaped on the stack. */
+    if (!is_shift && right_type != op_type) {
         switch (right_type) {
             case TYPE_INT:
             case TYPE_CHAR:
@@ -3015,7 +3030,23 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
             return false;
     }
     
-    mg_pop_typed(mg, 1);  /* Two operands -> one result */
+    /* Reaching here means an arithmetic, bitwise or shift op was emitted
+     * above. Both operands are still tracked at their pushed sizes (which,
+     * except for a shift's right operand, is op_type's size); the operator
+     * consumes both and leaves one op_type-sized result. Popping a fixed 1
+     * slot here, regardless of size, undercounted a long/double result by
+     * exactly the extra slot its operands occupied, leaving the tracked
+     * stack permanently too deep and eventually emitting a spurious pop of
+     * an empty real stack at the enclosing statement. */
+    int result_slots = (op_type == TYPE_LONG || op_type == TYPE_DOUBLE) ? 2 : 1;
+    int operand_slots = is_shift ? result_slots + 1 : result_slots * 2;
+    mg_pop_typed(mg, operand_slots);
+    switch (op_type) {
+        case TYPE_LONG:   mg_push_long(mg); break;
+        case TYPE_DOUBLE: mg_push_double(mg); break;
+        case TYPE_FLOAT:  mg_push_float(mg); break;
+        default:          mg_push_int(mg); break;
+    }
     return true;
 }
 
@@ -3522,6 +3553,178 @@ static const char *get_field_access_type_class(ast_node_t *field_access)
     }
     
     return NULL;
+}
+
+/**
+ * Emit a widening primitive conversion (JLS 5.1.2) from from_kind to to_kind,
+ * updating the tracked stack. A no-op if to_kind is not actually wider (e.g.
+ * both are int-shaped, or to_kind is narrower).
+ */
+void emit_widen_primitive(method_gen_t *mg, type_kind_t from_kind, type_kind_t to_kind)
+{
+    switch (from_kind) {
+        case TYPE_BYTE:
+        case TYPE_SHORT:
+        case TYPE_CHAR:
+        case TYPE_INT:
+            switch (to_kind) {
+                case TYPE_LONG:   bc_emit(mg->code, OP_I2L); mg_pop_typed(mg, 1); mg_push_long(mg); break;
+                case TYPE_FLOAT:  bc_emit(mg->code, OP_I2F); mg_pop_typed(mg, 1); mg_push_float(mg); break;
+                case TYPE_DOUBLE: bc_emit(mg->code, OP_I2D); mg_pop_typed(mg, 1); mg_push_double(mg); break;
+                default: break;
+            }
+            break;
+        case TYPE_LONG:
+            switch (to_kind) {
+                case TYPE_FLOAT:  bc_emit(mg->code, OP_L2F); mg_pop_typed(mg, 2); mg_push_float(mg); break;
+                case TYPE_DOUBLE: bc_emit(mg->code, OP_L2D); mg_pop_typed(mg, 2); mg_push_double(mg); break;
+                default: break;
+            }
+            break;
+        case TYPE_FLOAT:
+            if (to_kind == TYPE_DOUBLE) {
+                bc_emit(mg->code, OP_F2D);
+                mg_pop_typed(mg, 1);
+                mg_push_double(mg);
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+/**
+ * Convert a value already on top of the stack, of kind/class (from_kind,
+ * from_class), to (to_kind, to_class), as an assignment conversion (JLS 5.2):
+ * unboxing (optionally followed by widening), widening alone, or boxing.
+ * to_class is only consulted when to_kind is TYPE_CLASS, to tell a wrapper
+ * or Object target (which a primitive may be boxed to) from some other
+ * reference type (which it may not); NULL is treated as such an "any
+ * reference" target, matching a type variable's erasure. A mismatch this
+ * does not cover (e.g. two unrelated reference types) is left alone, since
+ * that is either already a reference conversion needing no bytecode, or a
+ * genuine type error that semantic analysis, not codegen, should have
+ * reported.
+ */
+void coerce_stack_value(method_gen_t *mg, const_pool_t *cp,
+                               type_kind_t from_kind, const char *from_class,
+                               type_kind_t to_kind, const char *to_class)
+{
+    bool from_is_primitive = (from_kind >= TYPE_BOOLEAN && from_kind <= TYPE_DOUBLE);
+    bool to_is_primitive = (to_kind >= TYPE_BOOLEAN && to_kind <= TYPE_DOUBLE);
+
+    if (to_is_primitive && from_kind == TYPE_CLASS && from_class) {
+        type_kind_t unboxed = get_primitive_for_wrapper(from_class);
+        if (unboxed != TYPE_UNKNOWN) {
+            char *internal = class_to_internal_name(from_class);
+            emit_unboxing(mg, cp, unboxed, internal);
+            free(internal);
+            from_kind = unboxed;
+            from_is_primitive = true;
+        }
+    }
+
+    if (to_is_primitive && from_is_primitive) {
+        if (from_kind != to_kind) {
+            emit_widen_primitive(mg, from_kind, to_kind);
+        }
+        return;
+    }
+
+    if (!to_is_primitive && from_is_primitive && to_kind != TYPE_UNKNOWN) {
+        bool boxable_target = !to_class ||
+            get_primitive_for_wrapper(to_class) != TYPE_UNKNOWN ||
+            strcmp(to_class, "java.lang.Object") == 0 ||
+            strcmp(to_class, "java/lang/Object") == 0 ||
+            strcmp(to_class, "Object") == 0;
+        if (boxable_target) {
+            emit_boxing(mg, cp, from_kind);
+        }
+    }
+}
+
+/**
+ * The kind and, for a reference type, the internal class name (a pointer
+ * into desc, valid only as long as desc is; not a copy) of a JVM field or
+ * array-element descriptor such as "I", "J" or "Ljava/lang/Object;".
+ * out_class is left NULL for a primitive or array descriptor.
+ */
+void descriptor_kind_and_class(const char *desc, type_kind_t *out_kind,
+                                      char *class_buf, size_t class_buf_size)
+{
+    *out_kind = TYPE_INT;
+    if (class_buf && class_buf_size) {
+        class_buf[0] = '\0';
+    }
+    if (!desc || !desc[0]) {
+        return;
+    }
+    switch (desc[0]) {
+        case 'Z': *out_kind = TYPE_BOOLEAN; break;
+        case 'B': *out_kind = TYPE_BYTE;    break;
+        case 'C': *out_kind = TYPE_CHAR;    break;
+        case 'S': *out_kind = TYPE_SHORT;   break;
+        case 'I': *out_kind = TYPE_INT;     break;
+        case 'J': *out_kind = TYPE_LONG;    break;
+        case 'F': *out_kind = TYPE_FLOAT;   break;
+        case 'D': *out_kind = TYPE_DOUBLE;  break;
+        case '[': *out_kind = TYPE_ARRAY;   break;
+        case 'L':
+            *out_kind = TYPE_CLASS;
+            if (class_buf && class_buf_size) {
+                size_t len = strlen(desc) - 2;  /* strip leading L and trailing ; */
+                if (len >= class_buf_size) {
+                    len = class_buf_size - 1;
+                }
+                memcpy(class_buf, desc + 1, len);
+                class_buf[len] = '\0';
+            }
+            break;
+        default: break;
+    }
+}
+
+/**
+ * The kind and, for a class type, the name of an already-generated value
+ * value, preferring its resolved semantic type and falling back to the
+ * heuristics codegen otherwise uses when that is unavailable.
+ */
+void value_kind_and_class(method_gen_t *mg, ast_node_t *value,
+                                 type_kind_t *out_kind, const char **out_class)
+{
+    *out_class = NULL;
+    if (value->sem_type) {
+        *out_kind = value->sem_type->kind;
+        if (*out_kind == TYPE_CLASS) {
+            *out_class = value->sem_type->data.class_type.name;
+        }
+        return;
+    }
+    *out_kind = get_expr_type_kind(mg, value);
+    if (value->type == AST_IDENTIFIER) {
+        *out_class = mg_local_class_name(mg, value->data.leaf.name);
+    }
+}
+
+/**
+ * Convert an already-generated value to the type named by a JVM field or
+ * array-element descriptor (see coerce_stack_value). Used at every simple
+ * (non-compound) assignment target: local variable, field, array element
+ * and variable declaration initializer.
+ */
+void coerce_value_to_descriptor(method_gen_t *mg, const_pool_t *cp,
+                                       ast_node_t *value, const char *desc)
+{
+    type_kind_t to_kind;
+    char class_buf[512];
+    descriptor_kind_and_class(desc, &to_kind, class_buf, sizeof(class_buf));
+
+    type_kind_t from_kind;
+    const char *from_class;
+    value_kind_and_class(mg, value, &from_kind, &from_class);
+
+    coerce_stack_value(mg, cp, from_kind, from_class,
+                       to_kind, class_buf[0] ? class_buf : NULL);
 }
 
 /**
@@ -6228,25 +6431,292 @@ static bool codegen_new_array(method_gen_t *mg, ast_node_t *expr, const_pool_t *
  * ======================================================================== */
 
 /**
- * Emit the opcode for a compound assignment operation based on the operator token.
- * Returns true if the opcode was emitted, false if unknown operator.
+ * Compound assignment (E1 op= E2, JLS 15.26.2): given the LHS's current
+ * value already on the stack (of kind/class lhs_kind/lhs_class), generate
+ * E2, apply the operator with the correct numeric promotion, and narrow the
+ * result back to the LHS's own type -- the implicit cast that only compound
+ * assignment gets, and the reason "byte b; b += 1;" or "long a; a += 2;"
+ * needs different bytecode from a plain binary "+" (which requires an
+ * explicit cast to assign back to the narrower/original type).
+ *
+ * A boxed numeric LHS (Integer i; i += 1;) is unboxed first and reboxed at
+ * the end, exactly as if the wrapper's own primitive were being narrowed.
+ * A String LHS with += is concatenation (also JLS 15.26.2's special case),
+ * built with a StringBuilder; the LHS value, already on the stack, is
+ * appended after being moved below a newly created one with OP_SWAP (both
+ * are always 1 slot).
+ *
+ * Leaves the (narrowed/reboxed, or concatenated) result on the stack in
+ * place of the two operands, and returns false only on a genuine codegen
+ * failure while generating E2.
  */
-static bool emit_compound_op(method_gen_t *mg, token_type_t op)
+static bool codegen_compound_rhs(method_gen_t *mg, const_pool_t *cp, ast_node_t *value,
+                                 type_kind_t lhs_kind, const char *lhs_class, token_type_t op)
 {
-    switch (op) {
-        case TOK_PLUS_ASSIGN:   bc_emit(mg->code, OP_IADD); break;
-        case TOK_MINUS_ASSIGN:  bc_emit(mg->code, OP_ISUB); break;
-        case TOK_STAR_ASSIGN:   bc_emit(mg->code, OP_IMUL); break;
-        case TOK_SLASH_ASSIGN:  bc_emit(mg->code, OP_IDIV); break;
-        case TOK_MOD_ASSIGN:    bc_emit(mg->code, OP_IREM); break;
-        case TOK_AND_ASSIGN:    bc_emit(mg->code, OP_IAND); break;
-        case TOK_OR_ASSIGN:     bc_emit(mg->code, OP_IOR);  break;
-        case TOK_XOR_ASSIGN:    bc_emit(mg->code, OP_IXOR); break;
-        case TOK_LSHIFT_ASSIGN: bc_emit(mg->code, OP_ISHL); break;
-        case TOK_RSHIFT_ASSIGN: bc_emit(mg->code, OP_ISHR); break;
-        case TOK_URSHIFT_ASSIGN: bc_emit(mg->code, OP_IUSHR); break;
-        default: return false;
+    bool is_string_lhs = (lhs_kind == TYPE_CLASS && lhs_class &&
+        (strcmp(lhs_class, "java.lang.String") == 0 ||
+         strcmp(lhs_class, "java/lang/String") == 0 ||
+         strcmp(lhs_class, "String") == 0));
+
+    if (is_string_lhs && op == TOK_PLUS_ASSIGN) {
+        /* Build the StringBuilder, then SWAP it below the LHS value that is
+         * already on the stack, rather than the other way around as a fresh
+         * concatenation would. */
+        uint16_t sb_class = cp_add_class(cp, "java/lang/StringBuilder");
+        uint16_t new_offset = (uint16_t)mg->code->length;
+        bc_emit(mg->code, OP_NEW);
+        bc_emit_u2(mg->code, sb_class);
+        mg_push_uninitialized(mg, new_offset);
+        bc_emit(mg->code, OP_DUP);
+        mg_push_uninitialized(mg, new_offset);
+        uint16_t init_ref = cp_add_methodref(cp, "java/lang/StringBuilder", "<init>", "()V");
+        bc_emit(mg->code, OP_INVOKESPECIAL);
+        bc_emit_u2(mg->code, init_ref);
+        mg_pop_typed(mg, 1);
+        if (mg->stackmap) {
+            stackmap_init_object(mg->stackmap, new_offset, mg->cp, "java/lang/StringBuilder");
+        }
+
+        /* Stack: [lhs_string, sb] -> [sb, lhs_string] */
+        bc_emit(mg->code, OP_SWAP);
+        uint16_t append_str = cp_add_methodref(cp, "java/lang/StringBuilder", "append",
+                                               "(Ljava/lang/String;)Ljava/lang/StringBuilder;");
+        bc_emit(mg->code, OP_INVOKEVIRTUAL);
+        bc_emit_u2(mg->code, append_str);
+        mg_pop_typed(mg, 1);  /* consumes sb + lhs_string, leaves sb */
+
+        if (!codegen_expr(mg, value, cp)) {
+            return false;
+        }
+        const char *append_desc = get_append_descriptor(mg, value);
+        uint16_t append_ref = cp_add_methodref(cp, "java/lang/StringBuilder", "append", append_desc);
+        bc_emit(mg->code, OP_INVOKEVIRTUAL);
+        bc_emit_u2(mg->code, append_ref);
+        mg_pop_typed(mg, (strncmp(append_desc, "(J)", 3) == 0 ||
+                          strncmp(append_desc, "(D)", 3) == 0) ? 2 : 1);
+
+        uint16_t tostring_ref = cp_add_methodref(cp, "java/lang/StringBuilder", "toString",
+                                                 "()Ljava/lang/String;");
+        bc_emit(mg->code, OP_INVOKEVIRTUAL);
+        bc_emit_u2(mg->code, tostring_ref);
+        mg_pop_typed(mg, 1);
+        mg_push_object(mg, "java/lang/String");
+        return true;
     }
+
+    /* A boxed numeric LHS: unbox now, rebox at the end. */
+    bool lhs_was_wrapper = false;
+    if (lhs_kind == TYPE_CLASS && lhs_class) {
+        type_kind_t wrapper_prim = get_primitive_for_wrapper(lhs_class);
+        if (wrapper_prim != TYPE_UNKNOWN) {
+            char *internal = class_to_internal_name(lhs_class);
+            emit_unboxing(mg, cp, wrapper_prim, internal);
+            free(internal);
+            lhs_kind = wrapper_prim;
+            lhs_was_wrapper = true;
+        }
+    }
+
+    bool lhs_boolean = (lhs_kind == TYPE_BOOLEAN);
+    bool is_shift = (op == TOK_LSHIFT_ASSIGN || op == TOK_RSHIFT_ASSIGN || op == TOK_URSHIFT_ASSIGN);
+
+    type_kind_t rhs_kind;
+    const char *rhs_class;
+    value_kind_and_class(mg, value, &rhs_kind, &rhs_class);
+    if (rhs_kind == TYPE_CLASS && rhs_class) {
+        type_kind_t unboxed = get_primitive_for_wrapper(rhs_class);
+        if (unboxed != TYPE_UNKNOWN) {
+            rhs_kind = unboxed;  /* for op_type purposes only; unboxed below */
+        }
+    }
+
+    /* Binary numeric promotion (JLS 5.6.2) between the LHS's own type and
+     * the RHS's -- same rule codegen_binary_expr uses for a plain operator
+     * -- except a shift, whose right operand never joins the promotion, and
+     * boolean &=/|=/^=, which stays boolean (IAND/IOR/IXOR either way). */
+    type_kind_t op_type;
+    if (lhs_boolean) {
+        op_type = TYPE_BOOLEAN;
+    } else if (is_shift) {
+        op_type = (lhs_kind == TYPE_LONG) ? TYPE_LONG : TYPE_INT;
+    } else if (lhs_kind == TYPE_DOUBLE || rhs_kind == TYPE_DOUBLE) {
+        op_type = TYPE_DOUBLE;
+    } else if (lhs_kind == TYPE_FLOAT || rhs_kind == TYPE_FLOAT) {
+        op_type = TYPE_FLOAT;
+    } else if (lhs_kind == TYPE_LONG || rhs_kind == TYPE_LONG) {
+        op_type = TYPE_LONG;
+    } else {
+        op_type = TYPE_INT;  /* byte/short/char/int all promote to int */
+    }
+
+    if (!lhs_boolean && lhs_kind != op_type) {
+        emit_widen_primitive(mg, lhs_kind, op_type);
+    }
+
+    if (!codegen_expr(mg, value, cp)) {
+        return false;
+    }
+
+    /* Convert the RHS to match: for a shift count, unboxing only (it is
+     * never widened to op_type, exactly as in codegen_binary_expr);
+     * otherwise the same unbox-then-widen an assignment would do. */
+    {
+        type_kind_t raw_rhs_kind;
+        const char *raw_rhs_class;
+        value_kind_and_class(mg, value, &raw_rhs_kind, &raw_rhs_class);
+        if (is_shift) {
+            if (raw_rhs_kind == TYPE_CLASS && raw_rhs_class) {
+                type_kind_t unboxed = get_primitive_for_wrapper(raw_rhs_class);
+                if (unboxed != TYPE_UNKNOWN) {
+                    char *internal = class_to_internal_name(raw_rhs_class);
+                    emit_unboxing(mg, cp, unboxed, internal);
+                    free(internal);
+                }
+            }
+        } else {
+            coerce_stack_value(mg, cp, raw_rhs_kind, raw_rhs_class, op_type, NULL);
+        }
+    }
+
+    switch (op) {
+        case TOK_PLUS_ASSIGN:
+            switch (op_type) {
+                case TYPE_LONG:   bc_emit(mg->code, OP_LADD); break;
+                case TYPE_FLOAT:  bc_emit(mg->code, OP_FADD); break;
+                case TYPE_DOUBLE: bc_emit(mg->code, OP_DADD); break;
+                default:          bc_emit(mg->code, OP_IADD); break;
+            }
+            break;
+        case TOK_MINUS_ASSIGN:
+            switch (op_type) {
+                case TYPE_LONG:   bc_emit(mg->code, OP_LSUB); break;
+                case TYPE_FLOAT:  bc_emit(mg->code, OP_FSUB); break;
+                case TYPE_DOUBLE: bc_emit(mg->code, OP_DSUB); break;
+                default:          bc_emit(mg->code, OP_ISUB); break;
+            }
+            break;
+        case TOK_STAR_ASSIGN:
+            switch (op_type) {
+                case TYPE_LONG:   bc_emit(mg->code, OP_LMUL); break;
+                case TYPE_FLOAT:  bc_emit(mg->code, OP_FMUL); break;
+                case TYPE_DOUBLE: bc_emit(mg->code, OP_DMUL); break;
+                default:          bc_emit(mg->code, OP_IMUL); break;
+            }
+            break;
+        case TOK_SLASH_ASSIGN:
+            switch (op_type) {
+                case TYPE_LONG:   bc_emit(mg->code, OP_LDIV); break;
+                case TYPE_FLOAT:  bc_emit(mg->code, OP_FDIV); break;
+                case TYPE_DOUBLE: bc_emit(mg->code, OP_DDIV); break;
+                default:          bc_emit(mg->code, OP_IDIV); break;
+            }
+            break;
+        case TOK_MOD_ASSIGN:
+            switch (op_type) {
+                case TYPE_LONG:   bc_emit(mg->code, OP_LREM); break;
+                case TYPE_FLOAT:  bc_emit(mg->code, OP_FREM); break;
+                case TYPE_DOUBLE: bc_emit(mg->code, OP_DREM); break;
+                default:          bc_emit(mg->code, OP_IREM); break;
+            }
+            break;
+        case TOK_AND_ASSIGN:
+            bc_emit(mg->code, op_type == TYPE_LONG ? OP_LAND : OP_IAND);
+            break;
+        case TOK_OR_ASSIGN:
+            bc_emit(mg->code, op_type == TYPE_LONG ? OP_LOR : OP_IOR);
+            break;
+        case TOK_XOR_ASSIGN:
+            bc_emit(mg->code, op_type == TYPE_LONG ? OP_LXOR : OP_IXOR);
+            break;
+        case TOK_LSHIFT_ASSIGN:
+            bc_emit(mg->code, op_type == TYPE_LONG ? OP_LSHL : OP_ISHL);
+            break;
+        case TOK_RSHIFT_ASSIGN:
+            bc_emit(mg->code, op_type == TYPE_LONG ? OP_LSHR : OP_ISHR);
+            break;
+        case TOK_URSHIFT_ASSIGN:
+            bc_emit(mg->code, op_type == TYPE_LONG ? OP_LUSHR : OP_IUSHR);
+            break;
+        default:
+            fprintf(stderr, "codegen: unknown compound assignment operator (token %d)\n", op);
+            return false;
+    }
+
+    /* The operator consumed both operands (op_type-sized left and, for a
+     * shift, a 1-slot right regardless of op_type) and left one
+     * op_type-sized result. */
+    {
+        int result_slots = (op_type == TYPE_LONG || op_type == TYPE_DOUBLE) ? 2 : 1;
+        int operand_slots = is_shift ? result_slots + 1 : result_slots * 2;
+        mg_pop_typed(mg, operand_slots);
+        switch (op_type) {
+            case TYPE_LONG:   mg_push_long(mg); break;
+            case TYPE_DOUBLE: mg_push_double(mg); break;
+            case TYPE_FLOAT:  mg_push_float(mg); break;
+            default:          mg_push_int(mg); break;
+        }
+    }
+
+    /* Narrow the result back to the LHS's own type: the implicit cast that
+     * makes "byte b; b += 1;" legal without writing "b = (byte)(b + 1);". */
+    if (!lhs_boolean && op_type != lhs_kind) {
+        switch (op_type) {
+            case TYPE_INT:
+                if (lhs_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
+                else if (lhs_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
+                else if (lhs_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                break;
+            case TYPE_LONG:
+                bc_emit(mg->code, OP_L2I);
+                mg_pop_typed(mg, 2);
+                mg_push_int(mg);
+                if (lhs_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
+                else if (lhs_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
+                else if (lhs_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                break;
+            case TYPE_FLOAT:
+                if (lhs_kind == TYPE_LONG) {
+                    bc_emit(mg->code, OP_F2L);
+                    mg_pop_typed(mg, 1);
+                    mg_push_long(mg);
+                } else {
+                    bc_emit(mg->code, OP_F2I);
+                    mg_pop_typed(mg, 1);
+                    mg_push_int(mg);
+                    if (lhs_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
+                    else if (lhs_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
+                    else if (lhs_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                }
+                break;
+            case TYPE_DOUBLE:
+                switch (lhs_kind) {
+                    case TYPE_LONG:
+                        bc_emit(mg->code, OP_D2L);
+                        break;
+                    case TYPE_FLOAT:
+                        bc_emit(mg->code, OP_D2F);
+                        mg_pop_typed(mg, 1);
+                        mg_push_float(mg);
+                        break;
+                    default:
+                        bc_emit(mg->code, OP_D2I);
+                        mg_pop_typed(mg, 1);
+                        mg_push_int(mg);
+                        if (lhs_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
+                        else if (lhs_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
+                        else if (lhs_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                        break;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (lhs_was_wrapper) {
+        emit_boxing(mg, cp, lhs_kind);
+    }
+
     return true;
 }
 
@@ -6280,35 +6750,28 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             type_kind_t kind = local_info->kind;
             
             if (compound) {
-                /* Load current value */
+                /* Load current value, then generate the RHS, apply the
+                 * operator and narrow back to kind (JLS 15.26.2). */
                 mg_emit_load_local(mg, slot, kind);
-            }
-            
-            /* Generate right-hand side */
-            if (!codegen_expr(mg, value, cp)) {
-                return false;
-            }
-            
-            if (compound) {
-                /* Apply compound operation */
-                emit_compound_op(mg, op);
-                mg_pop_typed(mg, 1);  /* Operation consumes one operand */
-            }
-            
-            /* Autoboxing/unboxing for simple assignment (not compound) */
-            if (!compound && target->sem_type && value->sem_type) {
-                /* Check if boxing needed (primitive -> wrapper) */
-                if (type_needs_boxing(target->sem_type, value->sem_type)) {
-                    emit_boxing(mg, cp, value->sem_type->kind);
+                if (!codegen_compound_rhs(mg, cp, value, kind, local_info->class_name, op)) {
+                    return false;
                 }
-                /* Check if unboxing needed (wrapper -> primitive) */
-                else if (type_needs_unboxing(target->sem_type, value->sem_type)) {
-                    char *internal = class_to_internal_name(value->sem_type->data.class_type.name);
-                    emit_unboxing(mg, cp, target->sem_type->kind, internal);
-                    free(internal);
+            } else {
+                /* Simple assignment: box, unbox or widen to match kind */
+                if (!codegen_expr(mg, value, cp)) {
+                    return false;
+                }
+                type_kind_t val_kind;
+                const char *val_class;
+                value_kind_and_class(mg, value, &val_kind, &val_class);
+                if (local_info->is_ref) {
+                    coerce_stack_value(mg, cp, val_kind, val_class,
+                                       TYPE_CLASS, local_info->class_name);
+                } else {
+                    coerce_stack_value(mg, cp, val_kind, val_class, kind, NULL);
                 }
             }
-            
+
             /* DUP the value so assignment expression can be chained (a = b = 0)
              * The duplicate will be left on the stack as the expression's value */
             if (kind == TYPE_LONG || kind == TYPE_DOUBLE) {
@@ -6365,27 +6828,34 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     }
                     
                     /* Generate right-hand side */
-                    if (!codegen_expr(mg, value, cp)) {
-                        return false;
-                    }
-                    
                     if (compound) {
-                        /* Apply compound operation */
-                        emit_compound_op(mg, op);
-                        mg_pop_typed(mg, 1);
+                        type_kind_t field_kind;
+                        char field_class[512];
+                        descriptor_kind_and_class(field->descriptor, &field_kind,
+                                                  field_class, sizeof(field_class));
+                        if (!codegen_compound_rhs(mg, cp, value, field_kind,
+                                                  field_class[0] ? field_class : NULL, op)) {
+                            return false;
+                        }
+                    } else {
+                        if (!codegen_expr(mg, value, cp)) {
+                            return false;
+                        }
+                        coerce_value_to_descriptor(mg, cp, value, field->descriptor);
                     }
-                    
+
                     /* DUP the value so assignment expression can be chained (a = b = 0)
                      * The duplicate will be left on the stack as the expression's value */
-                    bc_emit(mg->code, OP_DUP);
-                    mg_push(mg, 1);
-                    
+                    bool field_is_wide = (field->descriptor[0] == 'J' || field->descriptor[0] == 'D');
+                    bc_emit(mg->code, field_is_wide ? OP_DUP2 : OP_DUP);
+                    mg_push(mg, field_is_wide ? 2 : 1);
+
                     /* Store to static field */
                     uint16_t fieldref = cp_add_fieldref(mg->cp, mg->class_gen->internal_name,
                                                          field->name, field->descriptor);
                     bc_emit(mg->code, OP_PUTSTATIC);
                     bc_emit_u2(mg->code, fieldref);
-                    mg_pop_typed(mg, 1);  /* PUTSTATIC consumes the original, DUP's copy remains */
+                    mg_pop_typed(mg, field_is_wide ? 2 : 1);  /* PUTSTATIC consumes the original, DUP's copy remains */
                     return true;
                 } else if (!mg->is_static) {
                     /* Instance field assignment: this.field = value */
@@ -6407,16 +6877,22 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     }
                     
                     /* Generate right-hand side */
-                    if (!codegen_expr(mg, value, cp)) {
-                        return false;
-                    }
-                    
                     if (compound) {
-                        /* Apply compound operation */
-                        emit_compound_op(mg, op);
-                        mg_pop_typed(mg, 1);  /* Operation consumes one operand */
+                        type_kind_t field_kind;
+                        char field_class[512];
+                        descriptor_kind_and_class(field->descriptor, &field_kind,
+                                                  field_class, sizeof(field_class));
+                        if (!codegen_compound_rhs(mg, cp, value, field_kind,
+                                                  field_class[0] ? field_class : NULL, op)) {
+                            return false;
+                        }
+                    } else {
+                        if (!codegen_expr(mg, value, cp)) {
+                            return false;
+                        }
+                        coerce_value_to_descriptor(mg, cp, value, field->descriptor);
                     }
-                    
+
                     /* DUP_X1 to keep a copy of value for chained assignments
                      * Stack before: [this, value]
                      * Stack after:  [value, this, value]
@@ -6428,7 +6904,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                         bc_emit(mg->code, OP_DUP_X1);
                         mg_push(mg, 1);  /* DUP_X1 adds 1 slot */
                     }
-                    
+
                     /* Store to field: putfield pops object ref and value */
                     uint16_t fieldref = cp_add_fieldref(mg->cp, mg->class_gen->internal_name,
                                                          field->name, field->descriptor);
@@ -6495,17 +6971,26 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     }
                     
                     /* Generate right-hand side */
-                    if (!codegen_expr(mg, value, cp)) {
-                        free(class_internal);
-                        free(field_desc);
-                        return false;
-                    }
-                    
                     if (compound) {
-                        emit_compound_op(mg, op);
-                        mg_pop_typed(mg, 1);
+                        type_kind_t field_kind;
+                        char field_class_name[512];
+                        descriptor_kind_and_class(field_desc, &field_kind,
+                                                  field_class_name, sizeof(field_class_name));
+                        if (!codegen_compound_rhs(mg, cp, value, field_kind,
+                                                  field_class_name[0] ? field_class_name : NULL, op)) {
+                            free(class_internal);
+                            free(field_desc);
+                            return false;
+                        }
+                    } else {
+                        if (!codegen_expr(mg, value, cp)) {
+                            free(class_internal);
+                            free(field_desc);
+                            return false;
+                        }
+                        coerce_value_to_descriptor(mg, cp, value, field_desc);
                     }
-                    
+
                     /* DUP_X1 for chained assignments */
                     if (field_desc[0] == 'J' || field_desc[0] == 'D') {
                         bc_emit(mg->code, OP_DUP2_X1);
@@ -6562,28 +7047,38 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                             }
                             
                             /* Generate right-hand side */
-                            if (!codegen_expr(mg, value, cp)) {
-                                free(outer_internal);
-                                free(field_desc);
-                                return false;
-                            }
-                            
                             if (compound) {
-                                emit_compound_op(mg, op);
-                                mg_pop_typed(mg, 1);
+                                type_kind_t field_kind;
+                                char field_class_name[512];
+                                descriptor_kind_and_class(field_desc, &field_kind,
+                                                          field_class_name, sizeof(field_class_name));
+                                if (!codegen_compound_rhs(mg, cp, value, field_kind,
+                                        field_class_name[0] ? field_class_name : NULL, op)) {
+                                    free(outer_internal);
+                                    free(field_desc);
+                                    return false;
+                                }
+                            } else {
+                                if (!codegen_expr(mg, value, cp)) {
+                                    free(outer_internal);
+                                    free(field_desc);
+                                    return false;
+                                }
+                                coerce_value_to_descriptor(mg, cp, value, field_desc);
                             }
-                            
+
                             /* DUP for chained assignments */
-                            bc_emit(mg->code, OP_DUP);
-                            mg_push(mg, 1);
-                            
+                            bool outer_static_wide = (field_desc[0] == 'J' || field_desc[0] == 'D');
+                            bc_emit(mg->code, outer_static_wide ? OP_DUP2 : OP_DUP);
+                            mg_push(mg, outer_static_wide ? 2 : 1);
+
                             /* Store to outer static field */
                             uint16_t fieldref = cp_add_fieldref(mg->cp, outer_internal,
                                                                  name, field_desc);
                             bc_emit(mg->code, OP_PUTSTATIC);
                             bc_emit_u2(mg->code, fieldref);
-                            mg_pop_typed(mg, 1);
-                            
+                            mg_pop_typed(mg, outer_static_wide ? 2 : 1);
+
                             free(outer_internal);
                             free(field_desc);
                             return true;
@@ -6620,17 +7115,26 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                             }
                             
                             /* Generate right-hand side */
-                            if (!codegen_expr(mg, value, cp)) {
-                                free(outer_internal);
-                                free(field_desc);
-                                return false;
-                            }
-                            
                             if (compound) {
-                                emit_compound_op(mg, op);
-                                mg_pop_typed(mg, 1);
+                                type_kind_t field_kind;
+                                char field_class_name[512];
+                                descriptor_kind_and_class(field_desc, &field_kind,
+                                                          field_class_name, sizeof(field_class_name));
+                                if (!codegen_compound_rhs(mg, cp, value, field_kind,
+                                        field_class_name[0] ? field_class_name : NULL, op)) {
+                                    free(outer_internal);
+                                    free(field_desc);
+                                    return false;
+                                }
+                            } else {
+                                if (!codegen_expr(mg, value, cp)) {
+                                    free(outer_internal);
+                                    free(field_desc);
+                                    return false;
+                                }
+                                coerce_value_to_descriptor(mg, cp, value, field_desc);
                             }
-                            
+
                             /* DUP_X1 for chained assignments */
                             if (field_desc[0] == 'J' || field_desc[0] == 'D') {
                                 bc_emit(mg->code, OP_DUP2_X1);
@@ -6639,7 +7143,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                                 bc_emit(mg->code, OP_DUP_X1);
                                 mg_push(mg, 1);
                             }
-                            
+
                             /* Store to outer instance field */
                             uint16_t fieldref = cp_add_fieldref(mg->cp, outer_internal,
                                                                  name, field_desc);
@@ -6706,38 +7210,32 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                 if (!codegen_expr(mg, value, cp)) {
                     return false;
                 }
-                
+                coerce_value_to_descriptor(mg, cp, value, field_desc);
+
                 /* Emit putstatic */
                 uint16_t fieldref = cp_add_fieldref(cp, class_name, field_name, field_desc);
                 bc_emit(mg->code, OP_PUTSTATIC);
                 bc_emit_u2(mg->code, fieldref);
-                mg_pop_typed(mg, 1);
-                
+                mg_pop_typed(mg, (field_desc[0] == 'J' || field_desc[0] == 'D') ? 2 : 1);
+
                 return true;
             }
         }
         
         /* Instance field assignment */
-        /* Generate receiver */
-        if (!codegen_expr(mg, receiver, cp)) {
-            return false;
-        }
-        
-        /* Generate value */
-        if (!codegen_expr(mg, value, cp)) {
-            return false;
-        }
-        
-        /* Determine field class and descriptor */
+        /* Determine field class and descriptor before generating the
+         * receiver: compound assignment needs the descriptor to load the
+         * current value right after the receiver. */
         const char *recv_class = "java/lang/Object";
         const char *field_desc = "I";  /* Default to int */
-        
+        bool field_desc_owned = false;
+
         /* Try to get receiver class from semantic info */
         if (receiver->sem_type && receiver->sem_type->kind == TYPE_CLASS) {
             if (receiver->sem_type->data.class_type.name) {
                 recv_class = class_to_internal_name(receiver->sem_type->data.class_type.name);
             }
-            
+
             /* Look up field descriptor from receiver's class symbol */
             symbol_t *class_sym = receiver->sem_type->data.class_type.symbol;
             if (class_sym && class_sym->data.class_data.members) {
@@ -6746,31 +7244,77 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     char *desc = type_to_descriptor(field_sym->type);
                     if (desc) {
                         field_desc = desc;
+                        field_desc_owned = true;
                     }
                 }
             }
         }
-        
+
         /* For this.field, use current class */
         if (receiver->type == AST_THIS_EXPR && mg->class_gen) {
             recv_class = mg->class_gen->internal_name;
             field_gen_t *field = hashtable_lookup(mg->class_gen->field_map, field_name);
             if (field) {
                 field_desc = field->descriptor;
+                field_desc_owned = false;
             }
         }
-        
+
+        bool field_is_wide = (field_desc[0] == 'J' || field_desc[0] == 'D');
+
+        /* Generate receiver */
+        if (!codegen_expr(mg, receiver, cp)) {
+            if (field_desc_owned) free((char *)field_desc);
+            return false;
+        }
+
+        if (compound) {
+            /* Duplicate the receiver for getfield, then load the current
+             * value, generate the RHS, apply the operator and narrow back
+             * to field_desc's type (JLS 15.26.2). This target does not
+             * support chaining (obj.field = x as a sub-expression) even for
+             * a simple assignment, so neither does this. */
+            bc_emit(mg->code, OP_DUP);
+            mg_push(mg, 1);
+            uint16_t getref = cp_add_fieldref(cp, recv_class, field_name, field_desc);
+            bc_emit(mg->code, OP_GETFIELD);
+            bc_emit_u2(mg->code, getref);
+            mg_pop_typed(mg, 1);  /* getfield consumes the duplicated receiver */
+            switch (field_desc[0]) {
+                case 'J': mg_push_long(mg); break;
+                case 'D': mg_push_double(mg); break;
+                case 'F': mg_push_float(mg); break;
+                case 'L':
+                case '[': mg_push_object_from_descriptor(mg, field_desc); break;
+                default:  mg_push_int(mg); break;
+            }
+
+            type_kind_t field_kind;
+            char field_class_name[512];
+            descriptor_kind_and_class(field_desc, &field_kind,
+                                      field_class_name, sizeof(field_class_name));
+            if (!codegen_compound_rhs(mg, cp, value, field_kind,
+                                      field_class_name[0] ? field_class_name : NULL, op)) {
+                if (field_desc_owned) free((char *)field_desc);
+                return false;
+            }
+        } else {
+            /* Generate value, then box, unbox or widen to the field's type */
+            if (!codegen_expr(mg, value, cp)) {
+                if (field_desc_owned) free((char *)field_desc);
+                return false;
+            }
+            coerce_value_to_descriptor(mg, cp, value, field_desc);
+        }
+
         /* Emit putfield */
         uint16_t fieldref = cp_add_fieldref(cp, recv_class, field_name, field_desc);
         bc_emit(mg->code, OP_PUTFIELD);
         bc_emit_u2(mg->code, fieldref);
         /* putfield consumes ref (1) + value (1 or 2 slots) */
-        if (field_desc && (field_desc[0] == 'J' || field_desc[0] == 'D')) {
-            mg_pop_typed(mg, 3);  /* ref=1 + long/double=2 */
-        } else {
-            mg_pop_typed(mg, 2);  /* ref=1 + other=1 */
-        }
-        
+        mg_pop_typed(mg, field_is_wide ? 3 : 2);
+
+        if (field_desc_owned) free((char *)field_desc);
         return true;
     }
     
@@ -6795,6 +7339,12 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             return false;
         }
         
+        /* Element kind/class, needed both to load the current value below
+         * (compound only) and, after the new value is generated, to convert
+         * it to the element type (both compound and simple). */
+        type_kind_t elem_kind = TYPE_INT;
+        const char *elem_class = NULL;
+
         /* For compound assignment, we need to load the current value first */
         if (compound) {
             /* Stack: arrayref, index */
@@ -6803,21 +7353,26 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             /* Push the duplicated types: arrayref (null) and index (int) */
             mg_push_null(mg);
             mg_push_int(mg);
-            
+
             /* Load current value */
-            type_kind_t elem_kind = TYPE_INT;
             if (array_expr->sem_type && array_expr->sem_type->kind == TYPE_ARRAY) {
                 type_t *elem_type = array_expr->sem_type->data.array_type.element_type;
                 if (elem_type) {
                     elem_kind = elem_type->kind;
+                    if (elem_kind == TYPE_CLASS) {
+                        elem_class = elem_type->data.class_type.name;
+                    }
                 }
             } else if (array_expr->type == AST_IDENTIFIER) {
                 const char *arr_name = array_expr->data.leaf.name;
                 if (mg_local_is_array(mg, arr_name)) {
                     elem_kind = mg_local_array_elem_kind(mg, arr_name);
+                    if (elem_kind == TYPE_CLASS) {
+                        elem_class = mg_local_array_elem_class(mg, arr_name);
+                    }
                 }
             }
-            
+
             switch (elem_kind) {
                 case TYPE_BOOLEAN:
                 case TYPE_BYTE:
@@ -6855,28 +7410,46 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         }
         
         /* Generate value expression */
-        if (!codegen_expr(mg, value, cp)) {
-            return false;
-        }
-        
         if (compound) {
-            /* Apply compound operation */
-            emit_compound_op(mg, op);
-            mg_pop_typed(mg, 1);  /* Operation consumes one operand */
+            /* elem_kind/elem_class were computed above (in scope: they are
+             * declared inside "if (compound)" but this whole target branch
+             * is only reached that way for a compound assignment). */
+            if (!codegen_compound_rhs(mg, cp, value, elem_kind, elem_class, op)) {
+                return false;
+            }
+        } else {
+            if (!codegen_expr(mg, value, cp)) {
+                return false;
+            }
         }
-        
+
         /* Determine element type and emit appropriate store opcode */
         type_kind_t store_elem_kind = TYPE_INT;
+        const char *store_elem_class = NULL;
         if (array_expr->sem_type && array_expr->sem_type->kind == TYPE_ARRAY) {
             type_t *elem_type = array_expr->sem_type->data.array_type.element_type;
             if (elem_type) {
                 store_elem_kind = elem_type->kind;
+                if (store_elem_kind == TYPE_CLASS) {
+                    store_elem_class = elem_type->data.class_type.name;
+                }
             }
         } else if (array_expr->type == AST_IDENTIFIER) {
             const char *arr_name = array_expr->data.leaf.name;
             if (mg_local_is_array(mg, arr_name)) {
                 store_elem_kind = mg_local_array_elem_kind(mg, arr_name);
+                if (store_elem_kind == TYPE_CLASS) {
+                    store_elem_class = mg_local_array_elem_class(mg, arr_name);
+                }
             }
+        }
+
+        if (!compound) {
+            /* Box, unbox or widen to the array's element type */
+            type_kind_t val_kind;
+            const char *val_class;
+            value_kind_and_class(mg, value, &val_kind, &val_class);
+            coerce_stack_value(mg, cp, val_kind, val_class, store_elem_kind, store_elem_class);
         }
         
         switch (store_elem_kind) {
@@ -8463,7 +9036,21 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     stackmap_state_free(saved_state);
                     return false;
                 }
-                
+
+                /* Numeric promotion (JLS 15.25): "cond ? someInt : someLong" must
+                 * leave the same type on both paths, or the two branches disagree
+                 * on stack depth/shape at the merge point below. A no-op for a
+                 * reference-typed ternary. */
+                if (expr->sem_type) {
+                    type_kind_t then_kind;
+                    const char *then_class;
+                    value_kind_and_class(mg, then_expr, &then_kind, &then_class);
+                    coerce_stack_value(mg, cp, then_kind, then_class,
+                                       expr->sem_type->kind,
+                                       expr->sem_type->kind == TYPE_CLASS ?
+                                           expr->sem_type->data.class_type.name : NULL);
+                }
+
                 /* goto end (skip else branch) */
                 size_t goto_pos = mg->code->length;
                 bc_emit(mg->code, OP_GOTO);
@@ -8487,7 +9074,18 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     stackmap_state_free(saved_state);
                     return false;
                 }
-                
+
+                /* Same promotion as the then branch, above */
+                if (expr->sem_type) {
+                    type_kind_t else_kind;
+                    const char *else_class;
+                    value_kind_and_class(mg, else_expr, &else_kind, &else_class);
+                    coerce_stack_value(mg, cp, else_kind, else_class,
+                                       expr->sem_type->kind,
+                                       expr->sem_type->kind == TYPE_CLASS ?
+                                           expr->sem_type->data.class_type.name : NULL);
+                }
+
                 /* Patch goto to jump here (end) */
                 uint16_t end_offset = (uint16_t)(mg->code->length - goto_pos);
                 bc_patch_u2(mg->code, goto_pos + 1, end_offset);

@@ -605,58 +605,80 @@ static inline token_type_t parser_peek_type(parser_t *parser)
 }
 
 /**
- * Check if the current position has >> (two consecutive > tokens).
- * Does not modify parser state.
+ * A run of '>' tokens at the current position, reconstructed into the
+ * operator it actually spells. The lexer never produces a >>, >>>, >>= or
+ * >>>= token (to keep generic type parsing simple: Map<String, List<X>>
+ * always sees two plain > tokens), but it does still combine a single '>'
+ * with an immediately following '=' into one >= token, same as everywhere
+ * else in the source. That means the LAST '>' in the run absorbs a
+ * trailing '=' before the parser ever sees it: ">>=" lexes as GT, GE (two
+ * tokens, not three), and ">>>=" as GT, GT, GE (three, not four). A
+ * reconstruction that assumed the naive GT-per-character count and looked
+ * for a separate trailing TOK_ASSIGN would never find it.
  */
-static bool parser_check_double_gt(parser_t *parser)
-{
-    if (parser_current_type(parser) != TOK_GT) {
-        return false;
-    }
-    return parser_peek_type(parser) == TOK_GT;
-}
+typedef enum {
+    GT_SEQ_NONE,            /* not a '>' at all */
+    GT_SEQ_RSHIFT,          /* >>   : GT, GT */
+    GT_SEQ_RSHIFT_ASSIGN,   /* >>=  : GT, GE */
+    GT_SEQ_URSHIFT,         /* >>>  : GT, GT, GT */
+    GT_SEQ_URSHIFT_ASSIGN   /* >>>= : GT, GT, GE */
+} gt_sequence_t;
 
 /**
- * Check if the current position has >>> (three consecutive > tokens).
- * Does not modify parser state.
+ * Classify the run of '>' tokens starting at the current position, without
+ * consuming anything or otherwise changing parser state.
  */
-static bool parser_check_triple_gt(parser_t *parser)
+static gt_sequence_t parser_classify_gt_sequence(parser_t *parser)
 {
     if (parser_current_type(parser) != TOK_GT) {
-        return false;
+        return GT_SEQ_NONE;
     }
-    if (parser_peek_type(parser) != TOK_GT) {
-        return false;
+    token_type_t next = parser_peek_type(parser);
+    if (next == TOK_GE) {
+        return GT_SEQ_RSHIFT_ASSIGN;
     }
-    /* Need to peek two tokens ahead - save state and check */
+    if (next != TOK_GT) {
+        return GT_SEQ_NONE;  /* a lone > */
+    }
+
+    /* Two GTs so far; peek one further to tell >> from >>>/>>>= */
     lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
     lexer_advance(parser->lexer);  /* skip first > */
-    token_type_t peek2 = parser_peek_type(parser);
+    token_type_t next2 = parser_peek_type(parser);
     lexer_restore_pos(parser->lexer, save_pos);
-    return peek2 == TOK_GT;
+
+    if (next2 == TOK_GE) {
+        return GT_SEQ_URSHIFT_ASSIGN;
+    }
+    if (next2 == TOK_GT) {
+        return GT_SEQ_URSHIFT;
+    }
+    return GT_SEQ_RSHIFT;
 }
 
 /**
- * Consume >> (two consecutive > tokens) and return TOK_RSHIFT.
- * Caller must check parser_check_double_gt() first.
+ * Consume the tokens making up a classified '>' sequence (one token for
+ * each '>' character: the last one is a GE token when the sequence ends in
+ * "=", not a separate ASSIGN token). A no-op for GT_SEQ_NONE.
  */
-static token_type_t parser_consume_double_gt(parser_t *parser)
+static void parser_consume_gt_sequence(parser_t *parser, gt_sequence_t seq)
 {
-    parser_advance(parser);  /* consume first > */
-    parser_advance(parser);  /* consume second > */
-    return TOK_RSHIFT;
-}
-
-/**
- * Consume >>> (three consecutive > tokens) and return TOK_URSHIFT.
- * Caller must check parser_check_triple_gt() first.
- */
-static token_type_t parser_consume_triple_gt(parser_t *parser)
-{
-    parser_advance(parser);  /* consume first > */
-    parser_advance(parser);  /* consume second > */
-    parser_advance(parser);  /* consume third > */
-    return TOK_URSHIFT;
+    switch (seq) {
+        case GT_SEQ_RSHIFT:
+        case GT_SEQ_RSHIFT_ASSIGN:
+            parser_advance(parser);
+            parser_advance(parser);
+            break;
+        case GT_SEQ_URSHIFT:
+        case GT_SEQ_URSHIFT_ASSIGN:
+            parser_advance(parser);
+            parser_advance(parser);
+            parser_advance(parser);
+            break;
+        case GT_SEQ_NONE:
+        default:
+            break;
+    }
 }
 
 /**
@@ -2494,52 +2516,38 @@ static ast_node_t *parse_expression_prec(parser_t *parser, precedence_t min_prec
             break;
         }
         
-        /* Check for >> or >>> sequences (since lexer no longer produces these tokens) */
+        /* Check for >>, >>>, >>= or >>>= (see parser_classify_gt_sequence).
+         * Each case's "precedence too low" branch must stop this loop
+         * entirely (break out of the enclosing while, not just an if), so
+         * this stays an if/else chain rather than a switch: an inner
+         * "break;" would otherwise only exit the switch and fall through
+         * to treating a stray '>' as a relational operator instead of, for
+         * example, the close of a generic argument list. */
         if (tok_type == TOK_GT) {
-            if (parser_check_triple_gt(parser)) {
-                /* Check if followed by = for >>>= */
-                lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
-                parser_advance(parser);  /* skip first > */
-                parser_advance(parser);  /* skip second > */
-                parser_advance(parser);  /* skip third > */
-                if (parser_check(parser, TOK_ASSIGN)) {
-                    /* Have >>>= - treat as unsigned right shift assign if precedence allows */
-                    lexer_restore_pos(parser->lexer, save_pos);
-                    if (PREC_ASSIGNMENT >= min_prec) {
-                        tok_type = TOK_URSHIFT_ASSIGN;
-                    } else {
-                        break;  /* Precedence too low */
-                    }
+            gt_sequence_t gt_seq = parser_classify_gt_sequence(parser);
+            if (gt_seq == GT_SEQ_URSHIFT_ASSIGN) {
+                if (PREC_ASSIGNMENT >= min_prec) {
+                    tok_type = TOK_URSHIFT_ASSIGN;
                 } else {
-                    /* Just >>> */
-                    lexer_restore_pos(parser->lexer, save_pos);
-                    if (PREC_SHIFT >= min_prec) {
-                        tok_type = TOK_URSHIFT;
-                    } else {
-                        break;  /* Precedence too low, must be generic close */
-                    }
+                    break;  /* Precedence too low */
                 }
-            } else if (parser_check_double_gt(parser)) {
-                /* Check if followed by = for >>= */
-                lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
-                parser_advance(parser);  /* skip first > */
-                parser_advance(parser);  /* skip second > */
-                if (parser_check(parser, TOK_ASSIGN)) {
-                    /* Have >>= - treat as right shift assign if precedence allows */
-                    lexer_restore_pos(parser->lexer, save_pos);
-                    if (PREC_ASSIGNMENT >= min_prec) {
-                        tok_type = TOK_RSHIFT_ASSIGN;
-                    } else {
-                        break;  /* Precedence too low */
-                    }
+            } else if (gt_seq == GT_SEQ_URSHIFT) {
+                if (PREC_SHIFT >= min_prec) {
+                    tok_type = TOK_URSHIFT;
                 } else {
-                    /* Just >> */
-                    lexer_restore_pos(parser->lexer, save_pos);
-                    if (PREC_SHIFT >= min_prec) {
-                        tok_type = TOK_RSHIFT;
-                    } else {
-                        break;  /* Precedence too low, must be generic close */
-                    }
+                    break;  /* Precedence too low, must be generic close */
+                }
+            } else if (gt_seq == GT_SEQ_RSHIFT_ASSIGN) {
+                if (PREC_ASSIGNMENT >= min_prec) {
+                    tok_type = TOK_RSHIFT_ASSIGN;
+                } else {
+                    break;
+                }
+            } else if (gt_seq == GT_SEQ_RSHIFT) {
+                if (PREC_SHIFT >= min_prec) {
+                    tok_type = TOK_RSHIFT;
+                } else {
+                    break;
                 }
             }
         }
@@ -2616,17 +2624,14 @@ static ast_node_t *parse_expression_prec(parser_t *parser, precedence_t min_prec
         token_type_t op = tok_type;
         const char *op_name = token_type_name(op);
         
-        /* Consume the operator token(s) */
-        if (op == TOK_URSHIFT_ASSIGN) {
-            parser_consume_triple_gt(parser);  /* Consume >>> */
-            parser_advance(parser);  /* Consume = */
-        } else if (op == TOK_URSHIFT) {
-            parser_consume_triple_gt(parser);  /* Consume >>> */
-        } else if (op == TOK_RSHIFT_ASSIGN) {
-            parser_consume_double_gt(parser);  /* Consume >> */
-            parser_advance(parser);  /* Consume = */
-        } else if (op == TOK_RSHIFT) {
-            parser_consume_double_gt(parser);  /* Consume >> */
+        /* Consume the operator token(s). Parser state has not moved since
+         * the classification above (the ternary/instanceof cases above
+         * this point already handled their own operator and used
+         * "continue", never reaching here), so re-classifying is safe and
+         * simpler than threading the gt_sequence_t through. */
+        if (op == TOK_URSHIFT_ASSIGN || op == TOK_URSHIFT ||
+            op == TOK_RSHIFT_ASSIGN || op == TOK_RSHIFT) {
+            parser_consume_gt_sequence(parser, parser_classify_gt_sequence(parser));
         } else {
             parser_advance(parser);  /* Regular single-token operator */
         }

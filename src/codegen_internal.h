@@ -32,6 +32,21 @@
 uint16_t inner_class_access_flags(uint16_t mods, symbol_kind_t kind);
 
 /* ========================================================================
+ * Primitive/reference conversions (codegen_expr.c), shared with codegen_stmt.c
+ * ======================================================================== */
+
+void emit_widen_primitive(method_gen_t *mg, type_kind_t from_kind, type_kind_t to_kind);
+void coerce_stack_value(method_gen_t *mg, const_pool_t *cp,
+                        type_kind_t from_kind, const char *from_class,
+                        type_kind_t to_kind, const char *to_class);
+void descriptor_kind_and_class(const char *desc, type_kind_t *out_kind,
+                               char *class_buf, size_t class_buf_size);
+void value_kind_and_class(method_gen_t *mg, ast_node_t *value,
+                          type_kind_t *out_kind, const char **out_class);
+void coerce_value_to_descriptor(method_gen_t *mg, const_pool_t *cp,
+                                ast_node_t *value, const char *desc);
+
+/* ========================================================================
  * Loop Context (for break/continue handling)
  * ======================================================================== */
 

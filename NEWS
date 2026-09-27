@@ -96,3 +96,61 @@ supports the language through Java 25.
 
   invokeinterface was given the wrong argument count when a primitive argument
   was boxed for a generic parameter (list.add(4L)).
+
+** Primitive conversions
+
+  Widening, boxing, unboxing and binary numeric promotion were only ever
+  applied to method and constructor arguments.  Every other place a value's
+  type must be adjusted was affected, each in its own way:
+
+  - A local variable declaration or plain assignment did not widen a
+    narrower primitive: "long a = someInt;", "double d = i;", an assignment
+    to an already-declared "long", and a static or instance field or array
+    element assignment could all leave an int on the stack where a long,
+    float or double was needed, corrupting later bytecode.
+
+  - "Object o = 1;" did not box the int, since Object is not a wrapper
+    class.
+
+  - A return statement did not convert the returned value to the method's
+    declared return type at all: "long f(int i) { return i; }" and
+    "Integer g(int i) { return i; }" both returned the plain int.
+
+  - Compound assignment (+=, -=, *=, /=, %=, &=, |=, ^=, <<=, >>=, >>>=)
+    only ever worked for a plain int: every other type, including long,
+    float, double, byte, char, a boxed wrapper and a String left-hand side
+    (which is concatenation, not arithmetic), emitted plain int opcodes
+    regardless of the actual types.  This is fixed for every primitive type,
+    String, and every kind of assignment target: local variable, static and
+    instance field (via a bare name, an inherited field, one in an enclosing
+    class, or "obj.field"), and array element.
+
+  - A binary operator between mismatched numeric types ("long + int") did
+    not always compute the right result: the tracked operand stack depth
+    after the operator was wrong for a long or double result, eventually
+    corrupting an unrelated later statement's bytecode.  A shift operator
+    (<<, >>, >>>) additionally widened its right-hand operand (the shift
+    count) to match the left operand's type, which the JVM's shift
+    instructions do not expect: "long a; a << someInt" produced invalid
+    bytecode.
+
+  - println (and the same construct anywhere else a call's argument type
+    decides between overloads) picked println(int) for "a + i" or
+    "a < i" instead of println(long) or println(boolean): semantic
+    analysis computed the right type internally but never recorded it on
+    the expression node, so codegen's own guess -- defaulting to int --
+    won instead. It now does, fixing this and several related codegen
+    heuristics that were already checking for it.
+
+  - A ternary expression did not apply numeric promotion between its two
+    branches ("cond ? someInt : someLong" stayed int on one path and long
+    on the other), corrupting the stack map at the branches' merge point.
+
+  A bug in a different area surfaced while chasing the "long + int" case,
+  present since the initial commit: >>= and >>>= were silently dropped
+  wherever they appeared, with no error and no bytecode. The parser
+  reconstructs >>/>>>/>>=/>>>= from a run of plain '>' tokens (the lexer
+  never combines them, to keep Map<String, List<X>> simple), but did not
+  account for the lexer's ordinary '>' + '=' merge combining the *last* '>'
+  of the run with a trailing '=' into one GE token, rather than leaving a
+  separate '=' token the reconstruction could look for.

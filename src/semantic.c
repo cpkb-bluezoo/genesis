@@ -12754,7 +12754,32 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     if (else_type && else_type->kind == TYPE_NULL && then_type) {
                         return then_type;
                     }
-                    
+
+                    /* Numeric binary promotion (JLS 15.25): if both branches are
+                     * numeric (primitive or a boxed wrapper) and differ, the
+                     * conditional's type is their common promoted type, e.g.
+                     * "b ? someInt : someLong" is long, not int. */
+                    if (then_type && else_type) {
+                        type_kind_t then_kind = then_type->kind;
+                        type_kind_t else_kind = else_type->kind;
+                        if (then_kind == TYPE_CLASS && then_type->data.class_type.name) {
+                            type_kind_t prim = get_primitive_for_wrapper(then_type->data.class_type.name);
+                            if (prim != TYPE_UNKNOWN) then_kind = prim;
+                        }
+                        if (else_kind == TYPE_CLASS && else_type->data.class_type.name) {
+                            type_kind_t prim = get_primitive_for_wrapper(else_type->data.class_type.name);
+                            if (prim != TYPE_UNKNOWN) else_kind = prim;
+                        }
+                        bool then_numeric = (then_kind >= TYPE_BYTE && then_kind <= TYPE_DOUBLE);
+                        bool else_numeric = (else_kind >= TYPE_BYTE && else_kind <= TYPE_DOUBLE);
+                        if (then_numeric && else_numeric && then_kind != else_kind) {
+                            if (then_kind == TYPE_DOUBLE || else_kind == TYPE_DOUBLE) return type_double();
+                            if (then_kind == TYPE_FLOAT || else_kind == TYPE_FLOAT) return type_float();
+                            if (then_kind == TYPE_LONG || else_kind == TYPE_LONG) return type_long();
+                            return type_int();
+                        }
+                    }
+
                     /* Otherwise use the then branch type (could be improved to find LUB) */
                     return then_type;
                 }
@@ -16601,6 +16626,14 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                     
                     case AST_UNARY_EXPR:
                         {
+                            /* Set sem_type for codegen, as for AST_BINARY_EXPR above */
+                            if (!node->sem_type) {
+                                type_t *result_type = get_expression_type(sem, node);
+                                if (result_type) {
+                                    node->sem_type = result_type;
+                                }
+                            }
+
                             /* Check for increment/decrement on final variables */
                             token_type_t op = node->data.node.op_token;
                             if (op == TOK_INC || op == TOK_DEC) {
@@ -16926,7 +16959,20 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                             }
                         }
                         break;
-                    
+
+                    case AST_BINARY_EXPR:
+                        {
+                            /* Set sem_type for codegen, exactly as for field access
+                             * and method calls above. Without this, codegen has no
+                             * way to know the result of "a + b" is a long rather
+                             * than an int, and falls back to guessing. */
+                            type_t *result_type = get_expression_type(sem, node);
+                            if (result_type && !node->sem_type) {
+                                node->sem_type = result_type;
+                            }
+                        }
+                        break;
+
                     case AST_METHOD_CALL:
                         {
                             /* Check method call and set sem_type for codegen.
@@ -17376,6 +17422,14 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                     
                     case AST_CONDITIONAL_EXPR:
                         {
+                            /* Set sem_type for codegen, as for AST_BINARY_EXPR above */
+                            if (!node->sem_type) {
+                                type_t *result_type = get_expression_type(sem, node);
+                                if (result_type) {
+                                    node->sem_type = result_type;
+                                }
+                            }
+
                             /* Check that ternary condition is boolean */
                             slist_t *children = node->data.node.children;
                             if (children) {

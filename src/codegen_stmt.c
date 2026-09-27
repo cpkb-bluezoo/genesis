@@ -1044,12 +1044,64 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     if (!codegen_expr(mg, return_expr, mg->cp)) {
                         return false;
                     }
-                    
-                    /* Determine appropriate return opcode based on return expression type */
+
                     uint8_t return_op = OP_IRETURN;  /* Default to int */
-                    
+                    bool return_kind_known = false;
+
+                    /* The method's declared return type (or, for a lambda/method
+                     * reference body, the SAM's) is authoritative when known: widen,
+                     * box or unbox the value to match it, and take the return opcode
+                     * from it directly, rather than guessing again from the
+                     * expression's own type as the checks below do. Without this,
+                     * "long f(int i) { return i; }" and "Integer g(int i) { return
+                     * i; }" left the value as a plain int and returned with IRETURN. */
+                    if (mg->method && mg->method->type) {
+                        type_kind_t ret_kind = mg->method->type->kind;
+                        const char *ret_class = (ret_kind == TYPE_CLASS) ?
+                            mg->method->type->data.class_type.name : NULL;
+                        type_kind_t from_kind;
+                        const char *from_class;
+                        value_kind_and_class(mg, return_expr, &from_kind, &from_class);
+                        coerce_stack_value(mg, mg->cp, from_kind, from_class, ret_kind, ret_class);
+
+                        switch (ret_kind) {
+                            case TYPE_LONG:
+                                return_op = OP_LRETURN;
+                                return_kind_known = true;
+                                break;
+                            case TYPE_FLOAT:
+                                return_op = OP_FRETURN;
+                                return_kind_known = true;
+                                break;
+                            case TYPE_DOUBLE:
+                                return_op = OP_DRETURN;
+                                return_kind_known = true;
+                                break;
+                            case TYPE_CLASS:
+                            case TYPE_ARRAY:
+                            case TYPE_TYPEVAR:
+                                return_op = OP_ARETURN;
+                                return_kind_known = true;
+                                break;
+                            case TYPE_VOID:
+                            case TYPE_UNKNOWN:
+                                /* Not actually known after all (e.g. an unresolved
+                                 * generic return); fall through to the heuristics
+                                 * below, which is what happened before this check
+                                 * existed. */
+                                break;
+                            default:
+                                /* boolean, byte, char, short, int: all IRETURN */
+                                return_op = OP_IRETURN;
+                                return_kind_known = true;
+                                break;
+                        }
+                    }
+
                     /* Check if return expression is a reference type */
-                    if (is_string_type(return_expr)) {
+                    if (return_kind_known) {
+                        /* Already decided, and coerced, from the declared type above */
+                    } else if (is_string_type(return_expr)) {
                         return_op = OP_ARETURN;
                     } else if (return_expr->type == AST_NEW_OBJECT || 
                                return_expr->type == AST_NEW_ARRAY) {
@@ -1214,7 +1266,11 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     
                     bc_emit(mg->code, return_op);
                     mg->last_opcode = return_op;
-                    mg_pop_typed(mg, 1);
+                    /* LRETURN/DRETURN consume a 2-slot value; popping a fixed 1
+                     * here left the tracked stack permanently too deep whenever
+                     * code follows the return in the same method (e.g. an early
+                     * "if (x) return someLong;" before more statements). */
+                    mg_pop_typed(mg, (return_op == OP_LRETURN || return_op == OP_DRETURN) ? 2 : 1);
                 } else {
                     bc_emit(mg->code, OP_RETURN);
                     mg->last_opcode = OP_RETURN;
@@ -1496,50 +1552,26 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                 return false;
                             }
                             
-                            /* Autoboxing/unboxing: check if conversion needed.
-                             * IMPORTANT: Don't use get_expr_type_kind alone as it returns 
-                             * primitive types for wrapper classes (for arithmetic purposes).
-                             * We need to check if the expression actually produces a reference. */
-                            
-                            /* Check if init expression produces a reference type */
+                            /* Boxing, unboxing and widening: check if init expression
+                             * produces a reference type before consulting get_expr_type_kind,
+                             * which returns a primitive kind for wrapper classes too (for
+                             * arithmetic purposes). */
                             bool init_is_ref = (init_expr->type == AST_NEW_OBJECT ||
                                                init_expr->type == AST_NEW_ARRAY ||
-                                               (init_expr->sem_type && 
+                                               (init_expr->sem_type &&
                                                 (init_expr->sem_type->kind == TYPE_CLASS ||
                                                  init_expr->sem_type->kind == TYPE_ARRAY)));
-                            
-                            if (is_ref_type && class_name && !init_is_ref) {
-                                /* Variable is a reference type and init is NOT a reference - 
-                                 * check if boxing needed */
-                                type_kind_t init_kind = get_expr_type_kind(mg, init_expr);
-                                type_kind_t target_prim = get_primitive_for_wrapper(class_name);
-                                if (target_prim != TYPE_UNKNOWN && 
-                                    (init_kind == TYPE_INT || init_kind == TYPE_LONG ||
-                                     init_kind == TYPE_FLOAT || init_kind == TYPE_DOUBLE ||
-                                     init_kind == TYPE_BYTE || init_kind == TYPE_SHORT ||
-                                     init_kind == TYPE_CHAR || init_kind == TYPE_BOOLEAN)) {
-                                    /* Variable is wrapper type, init is primitive - box it */
-                                    emit_boxing(mg, mg->cp, init_kind);
-                                }
-                            } else if (!is_ref_type) {
-                                /* Variable is primitive, init might be wrapper - unbox.
-                                 * Check init expression's sem_type for wrapper class types. */
-                                const char *init_class = NULL;
-                                if (init_expr->sem_type && init_expr->sem_type->kind == TYPE_CLASS &&
-                                    init_expr->sem_type->data.class_type.name) {
-                                    init_class = init_expr->sem_type->data.class_type.name;
-                                } else if (init_expr->type == AST_IDENTIFIER) {
-                                    /* Fallback: check local variable type for identifiers */
-                                    const char *init_ident = init_expr->data.leaf.name;
-                                    init_class = mg_local_class_name(mg, init_ident);
-                                }
-                                if (init_class) {
-                                    type_kind_t unbox_to = get_primitive_for_wrapper(init_class);
-                                    if (unbox_to != TYPE_UNKNOWN && var_kind == unbox_to) {
-                                        char *internal = class_to_internal_name(init_class);
-                                        emit_unboxing(mg, mg->cp, var_kind, internal);
-                                        free(internal);
-                                    }
+
+                            if (!init_is_ref || !is_ref_type) {
+                                type_kind_t init_kind;
+                                const char *init_class;
+                                value_kind_and_class(mg, init_expr, &init_kind, &init_class);
+                                if (is_ref_type && class_name) {
+                                    coerce_stack_value(mg, mg->cp, init_kind, init_class,
+                                                       TYPE_CLASS, class_name);
+                                } else if (!is_ref_type) {
+                                    coerce_stack_value(mg, mg->cp, init_kind, init_class,
+                                                       var_kind, NULL);
                                 }
                             }
                             
