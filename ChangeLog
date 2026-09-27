@@ -1,6 +1,6 @@
-UNRELEASED  Chris Burdess  <dog@gnu.org>
+2026-09-27  Chris Burdess  <dog@gnu.org>
 
-	Changes towards release 1.0.0.
+	Release 1.0.0.
 
 	Build system: GNU Autoconf and Automake.
 	* configure.ac, Makefile.am, src/Makefile.am, m4/: New.  Require C99,
