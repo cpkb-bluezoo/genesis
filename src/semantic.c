@@ -7846,15 +7846,25 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     }
                 }
 
+                /* Type parameters before unit_types cache — a failed resolve may have
+                 * stored a placeholder class named "V" in unit_types too early. */
+                {
+                    symbol_t *type_param = scope_lookup(sem->current_scope, name);
+                    if (type_param && type_param->kind == SYM_TYPE_PARAM && type_param->type) {
+                        type_node->sem_type = type_param->type;
+                        return type_param->type;
+                    }
+                }
+
                 /* Check per-compilation-unit type scope first (like javac's toplevelScope).
                  * This contains types defined in the current file and imported types,
                  * keyed by simple name. For parallel compilation, each thread has its own
                  * unit_types, avoiding race conditions. */
                 type_t *cached = hashtable_lookup(sem->unit_types, name);
                 
-                /* If not in unit scope, check global cache with qualified name.
-                 * The global cache only uses qualified names to avoid conflicts. */
-                if (!cached) {
+                /* Global cache: qualified names only. Simple names like V/T are
+                 * often formal type parameters and must not alias unrelated classes. */
+                if (!cached && strchr(name, '.') != NULL) {
                     cached = hashtable_lookup(sem->types, name);
                 }
                 
@@ -8139,8 +8149,10 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                 semantic_error(sem, type_node->line, type_node->column,
                               "Cannot resolve type: %s", name);
                 type_t *type = type_new_class(name);
-                /* Cache error type in unit_types to avoid repeated errors */
-                hashtable_insert(sem->unit_types, name, type);
+                /* Do not cache single-segment names — often formal type parameters */
+                if (strchr(name, '.') != NULL) {
+                    hashtable_insert(sem->unit_types, name, type);
+                }
                 return type;
             }
         
@@ -12080,19 +12092,26 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             ensure_type_symbol_loaded(sem, arg_type);
                             ensure_type_symbol_loaded(sem, bind_type);
                             
-                            /* Check if argument is array (passing whole array) */
-                            if (arg_type && arg_type->kind == TYPE_ARRAY && param_type->kind == TYPE_ARRAY) {
-                                if (!type_assignable(param_type, arg_type)) {
-                                    char *expected = type_to_string(param_type);
-                                    char *actual = type_to_string(arg_type);
-                                    semantic_error(sem, arg->line, arg->column,
-                                        "argument %d: incompatible types - expected %s, got %s",
-                                        arg_index + 1, expected, actual);
-                                    free(expected);
-                                    free(actual);
+                            /* Passing the whole array to a varargs parameter */
+                            if (arg_type && arg_type->kind == TYPE_ARRAY) {
+                                type_t *elem = arg_type->data.array_type.element_type;
+                                type_t *expected_elem = bind_type;
+                                if (param_type && param_type->kind == TYPE_ARRAY) {
+                                    if (!type_assignable(param_type, arg_type)) {
+                                        char *expected = type_to_string(param_type);
+                                        char *actual = type_to_string(arg_type);
+                                        semantic_error(sem, arg->line, arg->column,
+                                            "argument %d: incompatible types - expected %s, got %s",
+                                            arg_index + 1, expected, actual);
+                                        free(expected);
+                                        free(actual);
+                                    }
+                                    break;
                                 }
-                                /* Only one array arg for varargs - done */
-                                break;
+                                if (expected_elem && elem &&
+                                    type_assignable(expected_elem, elem)) {
+                                    break;
+                                }
                             }
                             
                             /* Check element type for individual varargs.

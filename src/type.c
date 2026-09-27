@@ -1058,6 +1058,28 @@ bool type_assignable(type_t *target, type_t *source)
         strcmp(target->data.type_var.name, source->data.type_var.name) == 0) {
         return true;
     }
+
+    /* TYPEVAR vs unresolved class stub for the same formal (e.g. return V vs cast (V)) */
+    {
+        const char *ta = NULL, *tb = NULL;
+        if (target->kind == TYPE_TYPEVAR && target->data.type_var.name) {
+            ta = target->data.type_var.name;
+        } else if (target->kind == TYPE_CLASS && target->data.class_type.name &&
+                   !target->data.class_type.symbol &&
+                   !strchr(target->data.class_type.name, '.')) {
+            ta = target->data.class_type.name;
+        }
+        if (source->kind == TYPE_TYPEVAR && source->data.type_var.name) {
+            tb = source->data.type_var.name;
+        } else if (source->kind == TYPE_CLASS && source->data.class_type.name &&
+                   !source->data.class_type.symbol &&
+                   !strchr(source->data.class_type.name, '.')) {
+            tb = source->data.class_type.name;
+        }
+        if (ta && tb && strcmp(ta, tb) == 0) {
+            return true;
+        }
+    }
     
     /* null assignable to any reference type */
     if (source->kind == TYPE_NULL && type_is_reference(target)) {
