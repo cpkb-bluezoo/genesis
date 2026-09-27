@@ -33,6 +33,9 @@ test/fake-jdk/bin/java
 jtreg-work/
 jtreg-report/
 
+# Local scratch checkouts (e.g. ad-hoc gumdrop clones for debugging)
+.bench-*/
+
 # Editor files
 *.dSYM/
 .DS_Store

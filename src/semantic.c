@@ -2742,6 +2742,232 @@ symbol_t *scope_lookup_method_with_types_and_recv(struct semantic *sem, scope_t 
 }
 
 /**
+ * Prefer the registry symbol for an interface (implements clauses may hold a
+ * placeholder without populated members).
+ */
+static symbol_t *interface_symbol_for_lookup(semantic_t *sem, symbol_t *iface)
+{
+    if (!iface) {
+        return NULL;
+    }
+    symbol_t *canonical = iface;
+    if (sem && sem->shared_registry) {
+        const char *qname = iface->qualified_name ? iface->qualified_name : iface->name;
+        if (qname) {
+            symbol_t *reg_sym = type_registry_lookup(sem->shared_registry, qname);
+            if (reg_sym) {
+                canonical = reg_sym;
+            }
+        }
+    }
+    symbol_complete(canonical);
+    return canonical;
+}
+
+/**
+ * Convert dots between nested class names to '$' (package dots unchanged).
+ * Modifies the buffer in place.
+ */
+static void nested_class_dots_to_dollars(char *name_with_dollars)
+{
+    if (!name_with_dollars) {
+        return;
+    }
+    char *p = name_with_dollars;
+    while (*p) {
+        if (*p == '.') {
+            if (p > name_with_dollars) {
+                char prev = *(p - 1);
+                char next = *(p + 1);
+                bool prev_is_class = (prev >= 'A' && prev <= 'Z') ||
+                                    (prev >= 'a' && prev <= 'z') ||
+                                    (prev >= '0' && prev <= '9');
+                bool next_is_class = (next >= 'A' && next <= 'Z');
+                char *seg_start = p - 1;
+                while (seg_start > name_with_dollars && *(seg_start - 1) != '.') {
+                    seg_start--;
+                }
+                bool seg_is_class = (*seg_start >= 'A' && *seg_start <= 'Z');
+                if (prev_is_class && next_is_class && seg_is_class) {
+                    *p = '$';
+                }
+            }
+        }
+        p++;
+    }
+}
+
+/**
+ * Resolve the class/interface symbol for the base type of an anonymous class.
+ * Phase 2b may qualify nested types with dots (Outer.Inner) while the registry
+ * uses '$' (Outer$Inner).
+ */
+static symbol_t *resolve_anon_base_symbol(semantic_t *sem, type_t *base_type,
+                                          ast_node_t *type_node)
+{
+    symbol_t *base_sym = NULL;
+    const char *lookup_name = NULL;
+
+    if (base_type && base_type->kind == TYPE_CLASS) {
+        base_sym = base_type->data.class_type.symbol;
+        lookup_name = base_type->data.class_type.name;
+    }
+    if (!lookup_name && type_node && type_node->type == AST_CLASS_TYPE) {
+        lookup_name = type_node->data.node.name;
+    }
+    if (base_sym) {
+        return base_sym;
+    }
+    if (!lookup_name) {
+        return NULL;
+    }
+
+    char *name_with_dollars = strdup(lookup_name);
+    if (name_with_dollars) {
+        nested_class_dots_to_dollars(name_with_dollars);
+        if (sem->shared_registry) {
+            base_sym = type_registry_lookup(sem->shared_registry, name_with_dollars);
+            if (base_sym) {
+                symbol_complete(base_sym);
+            }
+        }
+        if (!base_sym) {
+            base_sym = load_external_class(sem, name_with_dollars);
+        }
+        if (base_sym) {
+            if (base_type && base_type->kind == TYPE_CLASS) {
+                base_type->data.class_type.symbol = base_sym;
+            }
+            free(name_with_dollars);
+            return base_sym;
+        }
+        free(name_with_dollars);
+    }
+
+    const char *last_dot = strrchr(lookup_name, '.');
+    if (!last_dot) {
+        return NULL;
+    }
+
+    size_t outer_len = (size_t)(last_dot - lookup_name);
+    char *outer_name = strndup(lookup_name, outer_len);
+    const char *inner_name = last_dot + 1;
+    if (!outer_name || !inner_name || !*inner_name) {
+        free(outer_name);
+        return NULL;
+    }
+
+    char *qualified_outer = resolve_import(sem, outer_name);
+    free(outer_name);
+    if (!qualified_outer) {
+        return NULL;
+    }
+
+    symbol_t *outer_sym = NULL;
+    if (sem->shared_registry) {
+        outer_sym = type_registry_lookup(sem->shared_registry, qualified_outer);
+        if (outer_sym) {
+            symbol_complete(outer_sym);
+        }
+    }
+    if (!outer_sym) {
+        outer_sym = load_external_class(sem, qualified_outer);
+    }
+
+    if (outer_sym && outer_sym->data.class_data.members) {
+        base_sym = scope_lookup_local(outer_sym->data.class_data.members, inner_name);
+        if (base_sym) {
+            base_sym = interface_symbol_for_lookup(sem, base_sym);
+            if (base_type && base_type->kind == TYPE_CLASS) {
+                base_type->data.class_type.symbol = base_sym;
+            }
+        }
+    }
+
+    free(qualified_outer);
+    return base_sym;
+}
+
+/**
+ * Look up a public static field (interface constant) in one interface and its
+ * super-interface hierarchy.
+ */
+static symbol_t *lookup_static_field_in_interface(semantic_t *sem, symbol_t *iface,
+                                                   const char *name)
+{
+    if (!iface || !name) {
+        return NULL;
+    }
+
+    iface = interface_symbol_for_lookup(sem, iface);
+    if (!iface) {
+        return NULL;
+    }
+
+    if (iface->kind != SYM_INTERFACE && iface->kind != SYM_CLASS) {
+        const char *iname = iface->qualified_name ? iface->qualified_name : iface->name;
+        if (iname) {
+            iface = load_external_class(sem, iname);
+            if (!iface) {
+                return NULL;
+            }
+        }
+    }
+
+    if (iface->data.class_data.members) {
+        symbol_t *field = scope_lookup_local(iface->data.class_data.members, name);
+        if (field && field->kind == SYM_FIELD && (field->modifiers & MOD_STATIC)) {
+            return field;
+        }
+    } else if (iface->qualified_name) {
+        symbol_t *loaded = load_external_class(sem, iface->qualified_name);
+        if (loaded) {
+            loaded = interface_symbol_for_lookup(sem, loaded);
+            if (loaded && loaded->data.class_data.members) {
+                symbol_t *field = scope_lookup_local(loaded->data.class_data.members, name);
+                if (field && field->kind == SYM_FIELD && (field->modifiers & MOD_STATIC)) {
+                    return field;
+                }
+            }
+        }
+    }
+
+    for (slist_t *n = iface->data.class_data.interfaces; n; n = n->next) {
+        symbol_t *found = lookup_static_field_in_interface(sem, (symbol_t *)n->data, name);
+        if (found) {
+            return found;
+        }
+    }
+
+    return NULL;
+}
+
+/**
+ * Find an interface constant visible in class_sym (fields of interfaces
+ * directly implemented by class_sym, including super-interfaces).
+ */
+static symbol_t *lookup_interface_constant_field(semantic_t *sem, symbol_t *class_sym,
+                                                  const char *name)
+{
+    if (!class_sym || !name) {
+        return NULL;
+    }
+
+    ensure_interfaces_resolved(sem, class_sym);
+
+    for (slist_t *iface_node = class_sym->data.class_data.interfaces;
+         iface_node; iface_node = iface_node->next) {
+        symbol_t *iface = (symbol_t *)iface_node->data;
+        symbol_t *field = lookup_static_field_in_interface(sem, iface, name);
+        if (field) {
+            return field;
+        }
+    }
+
+    return NULL;
+}
+
+/**
  * Recursively look up a method in an interface hierarchy.
  * Checks the interface and all its super-interfaces.
  */
@@ -2777,7 +3003,10 @@ static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sy
     for (slist_t *iface_node = interfaces; iface_node; iface_node = iface_node->next) {
         symbol_t *iface = (symbol_t *)iface_node->data;
         if (!iface) continue;
-        
+
+        iface = interface_symbol_for_lookup(sem, iface);
+        if (!iface) continue;
+
         /* Check if interface is just a name (not fully loaded) */
         if (iface->kind != SYM_INTERFACE && iface->kind != SYM_CLASS) {
             /* Try to load the interface */
@@ -2785,13 +3014,10 @@ static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sy
             if (iface_name) {
                 symbol_t *loaded = load_external_class(sem, iface_name);
                 if (loaded) {
-                    iface = loaded;
+                    iface = interface_symbol_for_lookup(sem, loaded);
                 }
             }
         }
-        
-        /* Complete interface symbol to ensure members are populated (lazy completion) */
-        symbol_complete(iface);
         
         /* Check direct members of this interface */
         if (iface->data.class_data.members) {
@@ -9108,6 +9334,25 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                                 (void*)sem->current_class->data.class_data.interfaces,
                                                 (void*)sem->current_class->data.class_data.unresolved_interfaces);
                                     }
+
+                                    if (!sem->current_class->data.class_data.interfaces &&
+                                        sem->current_class->data.class_data.is_anonymous_class &&
+                                        sem->current_class->ast &&
+                                        sem->current_class->ast->type == AST_NEW_OBJECT) {
+                                        slist_t *new_children = sem->current_class->ast->data.node.children;
+                                        if (new_children) {
+                                            ast_node_t *type_node = (ast_node_t *)new_children->data;
+                                            type_t *bt = semantic_resolve_type(sem, type_node);
+                                            symbol_t *base = resolve_anon_base_symbol(sem, bt, type_node);
+                                            if (base && base->kind == SYM_INTERFACE) {
+                                                base = interface_symbol_for_lookup(sem, base);
+                                                sem->current_class->data.class_data.superclass =
+                                                    load_external_class(sem, "java.lang.Object");
+                                                sem->current_class->data.class_data.interfaces =
+                                                    slist_new(base);
+                                            }
+                                        }
+                                    }
                                     
                                     /* Ensure interfaces are resolved before checking */
                                     ensure_interfaces_resolved(sem, sem->current_class);
@@ -9486,12 +9731,33 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                 
                                 /* Check if already processed (avoid re-processing) */
                                 if (anon_body->sem_symbol && anon_body->sem_symbol->kind == SYM_CLASS) {
-                                    /* Already set up - save/restore context and continue */
+                                    symbol_t *anon = anon_body->sem_symbol;
+                                    if (!anon->ast) {
+                                        anon->ast = node;
+                                    }
+                                    if (anon->data.class_data.is_anonymous_class &&
+                                        !anon->data.class_data.interfaces) {
+                                        type_t *bt = semantic_resolve_type(sem, first_child);
+                                        symbol_t *base = resolve_anon_base_symbol(sem, bt, first_child);
+                                        if (base) {
+                                            symbol_t *canonical = interface_symbol_for_lookup(sem, base);
+                                            if (canonical && canonical->kind == SYM_INTERFACE) {
+                                                base = canonical;
+                                            }
+                                            if (base->kind == SYM_INTERFACE) {
+                                                anon->data.class_data.superclass =
+                                                    load_external_class(sem, "java.lang.Object");
+                                                anon->data.class_data.interfaces = slist_new(base);
+                                            } else {
+                                                anon->data.class_data.superclass = base;
+                                            }
+                                        }
+                                    }
                                     frame->saved_class = sem->current_class;
                                     frame->saved_scope = sem->current_scope;
-                                    sem->current_class = anon_body->sem_symbol;
-                                    if (anon_body->sem_symbol->data.class_data.members) {
-                                        sem->current_scope = anon_body->sem_symbol->data.class_data.members;
+                                    sem->current_class = anon;
+                                    if (anon->data.class_data.members) {
+                                        sem->current_scope = anon->data.class_data.members;
                                     }
                                     break;
                                 }
@@ -9532,61 +9798,13 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                 /* Resolve base type */
                                 type_t *base_type = semantic_resolve_type(sem, first_child);
                                 
-                                /* Determine if base type is class or interface */
-                                symbol_t *base_sym = NULL;
-                                if (base_type && base_type->kind == TYPE_CLASS) {
-                                    base_sym = base_type->data.class_type.symbol;
-                                    
-                                    /* If symbol is NULL but we have a name, try to load it.
-                                     * This handles cases like "new LongCounter.Builder()" where
-                                     * the type name uses dot notation for nested classes. */
-                                    if (!base_sym && base_type->data.class_type.name) {
-                                        const char *name_with_dots = base_type->data.class_type.name;
-                                        /* Convert dots to $ for nested class lookup.
-                                         * Only convert dots that separate class names (both sides uppercase).
-                                         * e.g., "pkg.OuterClass.Inner" -> "pkg.OuterClass$Inner" */
-                                        char *name_with_dollars = strdup(name_with_dots);
-                                        if (name_with_dollars) {
-                                            /* Find segments that look like ClassName.ClassName 
-                                             * and convert the dot to $ */
-                                            char *p = name_with_dollars;
-                                            while (*p) {
-                                                if (*p == '.') {
-                                                    /* Check if previous char was end of class name (letter/digit)
-                                                     * and next char starts a class name (uppercase) */
-                                                    if (p > name_with_dollars) {
-                                                        char prev = *(p - 1);
-                                                        char next = *(p + 1);
-                                                        /* Previous segment ends with letter/digit (not package separator) */
-                                                        bool prev_is_class = (prev >= 'A' && prev <= 'Z') || 
-                                                                            (prev >= 'a' && prev <= 'z') ||
-                                                                            (prev >= '0' && prev <= '9');
-                                                        /* Next segment starts with uppercase (class name) */
-                                                        bool next_is_class = (next >= 'A' && next <= 'Z');
-                                                        /* The segment before the dot should have started with uppercase */
-                                                        char *seg_start = p - 1;
-                                                        while (seg_start > name_with_dollars && *(seg_start - 1) != '.') {
-                                                            seg_start--;
-                                                        }
-                                                        bool seg_is_class = (*seg_start >= 'A' && *seg_start <= 'Z');
-                                                        
-                                                        if (prev_is_class && next_is_class && seg_is_class) {
-                                                            *p = '$';
-                                                        }
-                                                    }
-                                                }
-                                                p++;
-                                            }
-                                            base_sym = load_external_class(sem, name_with_dollars);
-                                            if (base_sym) {
-                                                base_type->data.class_type.symbol = base_sym;
-                                            }
-                                            free(name_with_dollars);
-                                        }
-                                    }
-                                }
+                                symbol_t *base_sym = resolve_anon_base_symbol(sem, base_type, first_child);
                                 
                                 if (base_sym) {
+                                    symbol_t *iface_canonical = interface_symbol_for_lookup(sem, base_sym);
+                                    if (iface_canonical && iface_canonical->kind == SYM_INTERFACE) {
+                                        base_sym = iface_canonical;
+                                    }
                                     if (base_sym->kind == SYM_INTERFACE) {
                                         /* Implementing an interface - extend Object */
                                         anon_sym->data.class_data.superclass = 
@@ -10092,6 +10310,31 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         search_class = search_class->data.class_data.superclass;
                     }
                 }
+
+                /* Interface constants (public static final fields on implemented interfaces). */
+                {
+                    symbol_t *check_class = sem->current_class;
+                    while (check_class) {
+                        symbol_t *iface_field = lookup_interface_constant_field(sem,
+                                                                                check_class,
+                                                                                name);
+                        if (iface_field) {
+                            if (!iface_field->type &&
+                                iface_field->data.var_data.unresolved_type) {
+                                unresolved_type_t *ut =
+                                    (unresolved_type_t *)iface_field->data.var_data.unresolved_type;
+                                iface_field->type = resolve_unresolved_type_full(ut,
+                                    sem->shared_registry, sem->classpath, sem->current_class);
+                            }
+                            if (iface_field->type) {
+                                expr->sem_symbol = iface_field;
+                                expr->sem_type = iface_field->type;
+                                return iface_field->type;
+                            }
+                        }
+                        check_class = check_class->data.class_data.enclosing_class;
+                    }
+                }
                 
                 /* Could be a class reference - check per-compilation-unit scope first,
                  * then global types cache */
@@ -10128,6 +10371,22 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                         expr->sem_symbol = nested;
                                         expr->sem_type = nested->type;
                                         return nested->type;
+                                    }
+                                    if (nested && nested->kind == SYM_FIELD &&
+                                        (nested->modifiers & MOD_STATIC)) {
+                                        if (!nested->type &&
+                                            nested->data.var_data.unresolved_type) {
+                                            unresolved_type_t *ut =
+                                                (unresolved_type_t *)nested->data.var_data.unresolved_type;
+                                            nested->type = resolve_unresolved_type_full(ut,
+                                                sem->shared_registry, sem->classpath,
+                                                sem->current_class);
+                                        }
+                                        if (nested->type) {
+                                            expr->sem_symbol = nested;
+                                            expr->sem_type = nested->type;
+                                            return nested->type;
+                                        }
                                     }
                                 }
                             }
@@ -12314,9 +12573,20 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         
                         /* Find and bind lambdas to superclass constructor parameters */
                         symbol_t *anon_sym = anon_body->sem_symbol;
+                        if (!anon_sym->data.class_data.interfaces) {
+                            symbol_t *iface_base = resolve_anon_base_symbol(sem, base_type, type_node);
+                            if (iface_base && iface_base->kind == SYM_INTERFACE) {
+                                anon_sym->data.class_data.superclass =
+                                    load_external_class(sem, "java.lang.Object");
+                                anon_sym->data.class_data.interfaces = slist_new(iface_base);
+                            }
+                        }
                         symbol_t *base_sym = anon_sym->data.class_data.superclass;
                         if (!base_sym && base_type && base_type->kind == TYPE_CLASS) {
                             base_sym = base_type->data.class_type.symbol;
+                        }
+                        if (!base_sym) {
+                            base_sym = resolve_anon_base_symbol(sem, base_type, type_node);
                         }
                         
                         if (ctor_args && base_sym && base_sym->data.class_data.members) {
@@ -12397,6 +12667,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     anon_sym->data.class_data.enclosing_method = sem->current_method;
                     anon_sym->data.class_data.is_anonymous_class = true;
                     anon_sym->data.class_data.anonymous_body = anon_body;
+                    anon_sym->ast = expr;
                     
                     /* Mark the anonymous class body block with the class symbol
                      * so pass2 can identify it and set up the proper class context */
@@ -12417,9 +12688,9 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     anon_sym->data.class_data.super_ctor_args = ctor_args;
                     
                     /* Determine if base type is class or interface */
-                    if (base_type && base_type->kind == TYPE_CLASS && 
-                        base_type->data.class_type.symbol) {
-                        symbol_t *base_sym = base_type->data.class_type.symbol;
+                    {
+                        symbol_t *base_sym = resolve_anon_base_symbol(sem, base_type, type_node);
+                        if (base_sym) {
                         if (base_sym->kind == SYM_INTERFACE) {
                             /* Implementing an interface - extend Object */
                             anon_sym->data.class_data.superclass = NULL;  /* Will default to Object */
@@ -12470,6 +12741,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 sem->current_lambda) {
                                 sem->current_lambda->lambda_captures_this = true;
                             }
+                        }
                         }
                     }
                     
@@ -16908,6 +17180,33 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                     }
                                     if (node->sem_type) {
                                         break;  /* Successfully resolved inherited field */
+                                    }
+                                }
+
+                                /* Interface constants on implemented interfaces. */
+                                if (!node->sem_type && sem->current_class) {
+                                    symbol_t *check_class = sem->current_class;
+                                    while (check_class && !node->sem_type) {
+                                        symbol_t *iface_field =
+                                            lookup_interface_constant_field(sem, check_class, name);
+                                        if (iface_field) {
+                                            if (!iface_field->type &&
+                                                iface_field->data.var_data.unresolved_type) {
+                                                unresolved_type_t *ut =
+                                                    (unresolved_type_t *)iface_field->data.var_data.unresolved_type;
+                                                iface_field->type = resolve_unresolved_type_full(ut,
+                                                    sem->shared_registry, sem->classpath,
+                                                    sem->current_class);
+                                            }
+                                            if (iface_field->type) {
+                                                node->sem_symbol = iface_field;
+                                                node->sem_type = iface_field->type;
+                                            }
+                                        }
+                                        check_class = check_class->data.class_data.enclosing_class;
+                                    }
+                                    if (node->sem_type) {
+                                        break;
                                     }
                                 }
                                 

@@ -1233,9 +1233,13 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
         symbol_t *field_sym = ident->sem_symbol;
         /* Get the class from the symbol's scope owner */
         symbol_t *class_sym = field_sym->scope ? field_sym->scope->owner : NULL;
+        const char *owner_name = NULL;
+        if (class_sym) {
+            owner_name = class_sym->qualified_name ? class_sym->qualified_name : class_sym->name;
+        }
         
-        if (class_sym && class_sym->qualified_name) {
-            char *class_internal = class_to_internal_name(class_sym->qualified_name);
+        if (owner_name) {
+            char *class_internal = class_to_internal_name(owner_name);
             char *field_desc = type_to_descriptor(field_sym->type);
             
             uint16_t fieldref = cp_add_fieldref(mg->cp, class_internal, name, field_desc);
@@ -1259,6 +1263,57 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
             free(class_internal);
             free(field_desc);
             return true;
+        }
+    }
+
+    /* Interface constants (static final fields on implemented interfaces). */
+    if (mg->class_gen && mg->class_gen->class_sym) {
+        semantic_t *sem = mg->class_gen->sem;
+        symbol_t *check_class = mg->class_gen->class_sym;
+        while (check_class) {
+            for (slist_t *iface_node = check_class->data.class_data.interfaces;
+                 iface_node; iface_node = iface_node->next) {
+                symbol_t *iface = (symbol_t *)iface_node->data;
+                if (!iface) {
+                    continue;
+                }
+                if (sem && sem->shared_registry) {
+                    const char *qname = iface->qualified_name ? iface->qualified_name : iface->name;
+                    if (qname) {
+                        symbol_t *reg_iface = type_registry_lookup(sem->shared_registry, qname);
+                        if (reg_iface) {
+                            iface = reg_iface;
+                        }
+                    }
+                }
+                if (!iface->data.class_data.members) {
+                    continue;
+                }
+                symbol_t *field = scope_lookup_local(iface->data.class_data.members, name);
+                if (field && field->kind == SYM_FIELD &&
+                    (field->modifiers & MOD_STATIC) && field->type) {
+                    const char *owner_name = iface->qualified_name ? iface->qualified_name : iface->name;
+                    if (owner_name) {
+                        char *class_internal = class_to_internal_name(owner_name);
+                        char *field_desc = type_to_descriptor(field->type);
+                        uint16_t fieldref = cp_add_fieldref(mg->cp, class_internal, name, field_desc);
+                        bc_emit(mg->code, OP_GETSTATIC);
+                        bc_emit_u2(mg->code, fieldref);
+                        switch (field->type->kind) {
+                            case TYPE_LONG:   mg_push_long(mg); break;
+                            case TYPE_DOUBLE: mg_push_double(mg); break;
+                            case TYPE_FLOAT:  mg_push_float(mg); break;
+                            case TYPE_CLASS:
+                            case TYPE_ARRAY:  mg_push_object_from_descriptor(mg, field_desc); break;
+                            default:          mg_push_int(mg); break;
+                        }
+                        free(class_internal);
+                        free(field_desc);
+                        return true;
+                    }
+                }
+            }
+            check_class = check_class->data.class_data.enclosing_class;
         }
     }
     

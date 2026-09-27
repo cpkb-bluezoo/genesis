@@ -495,6 +495,27 @@ char *type_to_string(type_t *type)
  * Handles simple name vs java.lang.* fully qualified name.
  * Also handles nested class names where '.' and '$' are equivalent separators.
  * e.g., "Outer.Inner.InnerInner" should equal "Outer$Inner$InnerInner" */
+/* True when qualified is pkg...Simple and simple has no separators. */
+static bool qualified_ends_with_simple(const char *qualified, const char *simple)
+{
+    if (!qualified || !simple) {
+        return false;
+    }
+    if (strchr(simple, '.') || strchr(simple, '$')) {
+        return false;
+    }
+    size_t slen = strlen(simple);
+    size_t qlen = strlen(qualified);
+    if (qlen <= slen + 1) {
+        return false;
+    }
+    char sep = qualified[qlen - slen - 1];
+    if (sep != '.' && sep != '$') {
+        return false;
+    }
+    return strcmp(qualified + qlen - slen, simple) == 0;
+}
+
 static bool class_names_equal(const char *name1, const char *name2)
 {
     if (!name1 || !name2) {
@@ -503,6 +524,11 @@ static bool class_names_equal(const char *name1, const char *name2)
     
     /* Exact match */
     if (strcmp(name1, name2) == 0) {
+        return true;
+    }
+
+    if (qualified_ends_with_simple(name1, name2) ||
+        qualified_ends_with_simple(name2, name1)) {
         return true;
     }
     
@@ -585,6 +611,40 @@ static void get_array_info(type_t *arr, int *total_dims, type_t **base_elem)
     }
 }
 
+/* True when two class types denote the same class, even if one name is
+ * qualified and the other is a simple name from an import. */
+static bool class_type_refer_same_class(const type_t *a, const type_t *b)
+{
+    symbol_t *sa = a->data.class_type.symbol;
+    symbol_t *sb = b->data.class_type.symbol;
+    const char *na = a->data.class_type.name;
+    const char *nb = b->data.class_type.name;
+
+    if (sa && sb) {
+        if (sa == sb) {
+            return true;
+        }
+        const char *qa = symbol_get_qualified_name(sa);
+        const char *qb = symbol_get_qualified_name(sb);
+        if (qa && qb && strcmp(qa, qb) == 0) {
+            return true;
+        }
+    }
+    if (sa) {
+        const char *qa = symbol_get_qualified_name(sa);
+        if (qa && nb && class_names_equal(qa, nb)) {
+            return true;
+        }
+    }
+    if (sb) {
+        const char *qb = symbol_get_qualified_name(sb);
+        if (qb && na && class_names_equal(qb, na)) {
+            return true;
+        }
+    }
+    return na && nb && class_names_equal(na, nb);
+}
+
 bool type_equals(type_t *a, type_t *b)
 {
     if (a == b) {
@@ -599,7 +659,7 @@ bool type_equals(type_t *a, type_t *b)
     
     switch (a->kind) {
         case TYPE_CLASS:
-            return class_names_equal(a->data.class_type.name, b->data.class_type.name);
+            return class_type_refer_same_class(a, b);
         
         case TYPE_ARRAY: {
             /* Handle different array representations:

@@ -10,7 +10,7 @@ SUBDIRS = src
 ## Only user-facing documentation is distributed.  Everything under test/
 ## (regression tests, jtreg glue) is development-only and is
 ## intentionally absent from EXTRA_DIST.
-EXTRA_DIST = CONTRIBUTING TODO README
+EXTRA_DIST = CONTRIBUTING TODO README bench/compare-compilers.sh
 
 if HAVE_TESTS
 
@@ -22,6 +22,12 @@ TEST_ENV = GENESIS="$(abs_top_builddir)/src/genesis" \
            JAVA="$(JAVA)" \
            TEST_SRC="$(abs_top_srcdir)/test" \
            TEST_BUILD="$(abs_top_builddir)/test/build"
+
+## External-project compiler benchmark (fresh git clone; see bench/compare-compilers.sh)
+bench: all
+	$(AM_V_at)GENESIS="$(abs_top_builddir)/src/genesis" \
+	  JAVA_HOME="$(JAVA_HOME)" \
+	  $(SHELL) $(top_srcdir)/bench/compare-compilers.sh
 
 check-local: all
 	$(AM_V_at)$(TEST_ENV) $(SHELL) $(top_srcdir)/test/run-tests.sh
@@ -69,6 +75,6 @@ jtreg-test-one: all jtreg-check
 clean-local:
 	-rm -rf test/build $(JTREG_WORK) $(JTREG_REPORT)
 
-.PHONY: check-one jtreg-check jtreg-test jtreg-test-one
+.PHONY: bench check-one jtreg-check jtreg-test jtreg-test-one
 
 endif HAVE_TESTS
