@@ -274,6 +274,7 @@ char *extract_type_name_from_ast(ast_node_t *type_node)
 }
 
 static void ensure_method_type_params(symbol_t *method_sym);
+static void ensure_method_return_from_descriptor(symbol_t *method);
 
 /**
  * Enter methods and fields for a single type symbol from its AST.
@@ -1224,6 +1225,17 @@ static type_t *resolve_unresolved_type(const char *name, type_registry_t *reg,
         }
     }
     
+    /* Formal type parameter of the context class (e.g. V in IntObjectHashMap<V>) */
+    if (context && (context->kind == SYM_CLASS || context->kind == SYM_INTERFACE ||
+                    context->kind == SYM_RECORD)) {
+        for (slist_t *tp = context->data.class_data.type_params; tp; tp = tp->next) {
+            symbol_t *ps = (symbol_t *)tp->data;
+            if (ps && ps->name && strcmp(ps->name, name) == 0 && ps->type) {
+                return ps->type;
+            }
+        }
+    }
+
     /* Simple name that couldn't be resolved - return NULL */
     return NULL;
 }
@@ -1255,10 +1267,14 @@ static void resolve_types_for_symbol(symbol_t *sym, type_registry_t *reg,
     
     if (sym->kind == SYM_METHOD) {
         ensure_method_type_params(sym);
+        ensure_method_return_from_descriptor(sym);
         /* Resolve return type with full type arguments */
         if (sym->data.method_data.unresolved_return_type) {
             unresolved_type_t *ut = sym->data.method_data.unresolved_return_type;
             bool reresolve = !sym->type;
+            if (!reresolve && sym->type && sym->type->kind == TYPE_UNKNOWN) {
+                reresolve = true;
+            }
             if (!reresolve && sym->type && sym->type->kind == TYPE_CLASS &&
                 sym->type->data.class_type.name &&
                 !sym->type->data.class_type.symbol &&
@@ -3780,6 +3796,29 @@ static type_t *type_from_descriptor(type_descriptor_t *td)
     }
     
     return base_type;
+}
+
+static void ensure_method_return_from_descriptor(symbol_t *method)
+{
+    if (!method || method->kind != SYM_METHOD) {
+        return;
+    }
+    if (method->type && method->type->kind != TYPE_UNKNOWN) {
+        return;
+    }
+    const char *desc = method->data.method_data.descriptor;
+    if (!desc) {
+        return;
+    }
+    method_descriptor_t *md = descriptor_parse_method(desc);
+    if (!md) {
+        return;
+    }
+    type_t *rt = type_from_descriptor(&md->return_type);
+    method_descriptor_free(md);
+    if (rt) {
+        method->type = rt;
+    }
 }
 
 /**
@@ -11883,6 +11922,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 
                 if (found_method && found_method->kind == SYM_METHOD) {
                     if (target_class) {
+                        symbol_complete(target_class);
                         resolve_types_for_symbol(found_method, sem->shared_registry,
                                                  sem->classpath, target_class);
                         ensure_method_type_params(found_method);
@@ -11901,14 +11941,6 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                         }
                     }
-                    /* Lazy resolution: resolve return type if NULL (from interface stubs) */
-                    if (!found_method->type && found_method->ast && 
-                        found_method->ast->type == AST_METHOD_DECL) {
-                        ast_node_t *ret_type_node = found_method->ast->data.node.extra;
-                        if (ret_type_node) {
-                            found_method->type = semantic_resolve_type(sem, ret_type_node);
-                        }
-                    }
                     if (!found_method->type &&
                         found_method->data.method_data.unresolved_return_type) {
                         unresolved_type_t *rut = found_method->data.method_data.unresolved_return_type;
@@ -11916,8 +11948,22 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             rut, sem->shared_registry, sem->classpath,
                             target_class, found_method);
                     }
+                    /* Lazy resolution: resolve return type if NULL (from interface stubs) */
+                    if (!found_method->type && found_method->ast && 
+                        found_method->ast->type == AST_METHOD_DECL) {
+                        ast_node_t *ret_type_node = found_method->ast->data.node.extra;
+                        if (ret_type_node) {
+                            scope_t *saved_scope = sem->current_scope;
+                            if (target_class && target_class->data.class_data.members) {
+                                sem->current_scope = target_class->data.class_data.members;
+                            }
+                            found_method->type = semantic_resolve_type(sem, ret_type_node);
+                            sem->current_scope = saved_scope;
+                        }
+                    }
+                    ensure_method_return_from_descriptor(found_method);
                     
-                if (found_method->type) {
+                if (found_method) {
                     /* Check access control (skip if target is current class) */
                     if (target_class != sem->current_class &&
                         !check_access(found_method->modifiers, target_class, sem->current_class)) {
@@ -12170,6 +12216,21 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     /* Store the found method for codegen */
                     expr->sem_symbol = found_method;
                     
+                    ensure_method_return_from_descriptor(found_method);
+                    if ((!found_method->type || found_method->type->kind == TYPE_UNKNOWN) &&
+                        found_method->data.method_data.unresolved_return_type) {
+                        symbol_t *decl = target_class;
+                        if (!decl && found_method->scope) {
+                            decl = found_method->scope->owner;
+                        }
+                        type_t *rt = resolve_unresolved_type_full_for_method(
+                            found_method->data.method_data.unresolved_return_type,
+                            sem->shared_registry, sem->classpath, decl, found_method);
+                        if (rt && rt->kind != TYPE_UNKNOWN) {
+                            found_method->type = rt;
+                        }
+                    }
+                    
                     /* Substitute receiver type arguments into return type */
                     type_t *return_type = found_method->type;
                     
@@ -12179,10 +12240,13 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                      * where the method was declared, not where it's being called. */
                     if (!return_type && found_method->data.method_data.unresolved_return_type) {
                         unresolved_type_t *ut = found_method->data.method_data.unresolved_return_type;
-                        /* Get the declaring class from the method's scope */
-                        symbol_t *declaring_class = found_method->scope ? found_method->scope->owner : NULL;
-                        return_type = resolve_unresolved_type(ut->name, 
-                            sem->shared_registry, sem->classpath, declaring_class);
+                        symbol_t *declaring_class = target_class;
+                        if (!declaring_class && found_method->scope) {
+                            declaring_class = found_method->scope->owner;
+                        }
+                        return_type = resolve_unresolved_type_full_for_method(
+                            ut, sem->shared_registry, sem->classpath,
+                            declaring_class, found_method);
                         found_method->type = return_type;
                     }
                     
@@ -12191,7 +12255,16 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         found_method->ast->type == AST_METHOD_DECL) {
                         ast_node_t *ret_type_node = found_method->ast->data.node.extra;
                         if (ret_type_node) {
+                            scope_t *saved_scope = sem->current_scope;
+                            symbol_t *decl = target_class;
+                            if (!decl && found_method->scope) {
+                                decl = found_method->scope->owner;
+                            }
+                            if (decl && decl->data.class_data.members) {
+                                sem->current_scope = decl->data.class_data.members;
+                            }
                             return_type = semantic_resolve_type(sem, ret_type_node);
+                            sem->current_scope = saved_scope;
                             /* Cache for future calls - this is safe because:
                              * 1. All threads resolve to equivalent types
                              * 2. Assignment is atomic for pointers on most platforms
