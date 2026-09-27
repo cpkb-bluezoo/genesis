@@ -2530,8 +2530,32 @@ static bool method_ast_matches_signature(ast_node_t *method_ast, symbol_t *paren
                 ast_name ? ast_name : "(null)", ast_dims, sym_type->kind);
         }
         
-        /* Handle arrays */
+        /* Handle arrays (including varargs parameters stored as array types) */
         if (sym_type->kind == TYPE_ARRAY) {
+            bool sym_varargs = (sym_param->modifiers & MOD_VARARGS) != 0;
+            if (sym_varargs && ast_dims == 0) {
+                type_t *elem = sym_type;
+                while (elem && elem->kind == TYPE_ARRAY) {
+                    elem = elem->data.array_type.element_type;
+                }
+                const char *sym_name = NULL;
+                if (elem && elem->kind == TYPE_CLASS) {
+                    sym_name = elem->data.class_type.name;
+                }
+                if (!ast_name || !sym_name) {
+                    return false;
+                }
+                const char *ast_simple = strrchr(ast_name, '.');
+                ast_simple = ast_simple ? ast_simple + 1 : ast_name;
+                const char *sym_simple = strrchr(sym_name, '.');
+                sym_simple = sym_simple ? sym_simple + 1 : sym_name;
+                if (strcmp(ast_simple, sym_simple) != 0) {
+                    return false;
+                }
+                ast_p = ast_p->next;
+                sym_p = sym_p->next;
+                continue;
+            }
             if (ast_dims == 0) return false;  /* AST not array but sym is */
             
             /* Get element type for comparison */
@@ -2586,7 +2610,12 @@ static bool method_ast_matches_signature(ast_node_t *method_ast, symbol_t *paren
                 fprintf(stderr, "    class compare: '%s' vs '%s'\n", ast_simple, sym_simple);
             }
             
-            if (strcmp(ast_simple, sym_simple) != 0) return false;
+            if (strcmp(ast_simple, sym_simple) != 0) {
+                const char *sym_leaf = strchr(sym_simple, '$');
+                if (!sym_leaf || strcmp(ast_simple, sym_leaf + 1) != 0) {
+                    return false;
+                }
+            }
         } else if (sym_type->kind == TYPE_TYPEVAR) {
             /* Type variable - the AST might have the concrete type */
             /* For override purposes, accept any class type as matching */
@@ -6811,6 +6840,20 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                 
                 type_t *arg_type = get_expression_type(sem, arg);
                 type_t *param_type = param->type;
+
+                /* Array creations are never passed where a functional interface is expected */
+                if (param_type && param_type->kind == TYPE_CLASS &&
+                    (arg->type == AST_NEW_ARRAY ||
+                     (arg_type && arg_type->kind == TYPE_ARRAY))) {
+                    symbol_t *param_class = param_type->data.class_type.symbol;
+                    if (!param_class && param_type->data.class_type.name) {
+                        param_class = load_external_class(sem, param_type->data.class_type.name);
+                    }
+                    if (param_class && get_functional_interface_sam(param_class)) {
+                        type_mismatch = true;
+                        break;
+                    }
+                }
                 
                 /* Substitute type arguments from receiver into parameter type.
                  * E.g., for Function<Integer, String>.apply(T t), param_type is T,
@@ -6846,6 +6889,7 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                     
                     /* For class types, check if classes match exactly */
                     bool exact_match = false;
+                    bool array_conversion_scored = false;
                     if (arg_type->kind == TYPE_CLASS && compare_type->kind == TYPE_CLASS) {
                         const char *arg_name = arg_type->data.class_type.name;
                         const char *param_name = compare_type->data.class_type.name;
@@ -6853,8 +6897,19 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                             exact_match = true;
                         }
                     } else if (arg_type->kind == TYPE_ARRAY && compare_type->kind == TYPE_ARRAY) {
-                        /* For arrays, element types must match exactly */
                         exact_match = type_equals(arg_type, compare_type);
+                        if (!exact_match && type_assignable(compare_type, arg_type)) {
+                            score += 85;
+                            array_conversion_scored = true;
+                        } else if (!exact_match &&
+                                   type_assignable(arg_type, compare_type)) {
+                            /* Unchecked array conversion (e.g. Certificate[] to X509Certificate[]) */
+                            score += 75;
+                            array_conversion_scored = true;
+                        } else if (!exact_match) {
+                            type_mismatch = true;
+                            break;
+                        }
                     } else if (arg_type->kind == compare_type->kind && 
                                arg_type->kind != TYPE_ARRAY) {
                         /* For other non-class/non-array types, kind match is exact match */
@@ -6865,7 +6920,7 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                         score += 100;
                     }
                     /* Widening/compatible conversion gets lower score */
-                    else {
+                    else if (!array_conversion_scored) {
                         /* Ensure both source and target symbols are loaded for interface hierarchy checking */
                         if (compare_type->kind == TYPE_CLASS && !compare_type->data.class_type.symbol) {
                             const char *class_name = compare_type->data.class_type.name;
@@ -11293,6 +11348,17 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 if (!target_class && sem->current_class) {
                     target_class = sem->current_class;
                 }
+
+                /* Enum synthetic methods (implicit ClassName.values() in enum bodies) */
+                if (!found_method && target_class && target_class->kind == SYM_ENUM &&
+                    !has_explicit_receiver) {
+                    if (strcmp(method_name, "values") == 0) {
+                        return type_new_array(target_class->type, 1);
+                    }
+                    if (strcmp(method_name, "valueOf") == 0) {
+                        return target_class->type;
+                    }
+                }
                 
                 /* Look up the method in the target class if not already found */
                 /* For methods without explicit receiver, arguments are all children */
@@ -11661,7 +11727,14 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             semantic_error(sem, arg->line, arg->column,
                                 "'void' type not allowed here");
                         }
-                        else if (param_type && arg_type && !type_assignable(param_type, arg_type)) {
+                        else if (param_type && arg_type) {
+                            bool arg_ok = type_assignable(param_type, arg_type);
+                            if (!arg_ok && param_type->kind == TYPE_ARRAY &&
+                                arg_type->kind == TYPE_ARRAY) {
+                                /* Unchecked array conversion for method invocation */
+                                arg_ok = type_assignable(arg_type, param_type);
+                            }
+                            if (!arg_ok) {
                             char *expected = type_to_string(param_type);
                             char *actual = type_to_string(arg_type);
                             semantic_error(sem, arg->line, arg->column,
@@ -11669,6 +11742,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 arg_index + 1, expected, actual);
                             free(expected);
                             free(actual);
+                            }
                         }
                         
                         param_node = param_node->next;
@@ -16360,17 +16434,7 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                     sym->line = decl->line;
                                     sym->column = decl->column;
                                     
-                                    if (sem->source_version >= 22 && is_unnamed_name(name)) {
-                                        /* Unnamed local variable (JEP 456) - allow multiple in scope */
-                                        decl->sem_symbol = sym;
-                                    } else if (!scope_define(sem->current_scope, sym)) {
-                                        semantic_error(sem, decl->line, decl->column,
-                                                      "Variable '%s' already defined", name);
-                                    } else {
-                                        decl->sem_symbol = sym;
-                                    }
-                                    
-                                    /* Check initializer type (for non-var declarations) */
+                                    /* Check initializer before the variable enters scope (JLS 6.3) */
                                     if (!is_var_inference && decl->data.node.children) {
                                         ast_node_t *init_expr = decl->data.node.children->data;
                                         
@@ -16393,15 +16457,11 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                         /* Handle lambda/method reference with target typing */
                                         if (unwrapped->type == AST_LAMBDA_EXPR) {
                                             if (bind_lambda_to_target_type(sem, unwrapped, actual_type)) {
-                                                /* Lambda bound successfully, skip normal type check */
-                                                children = children->next;
-                                                continue;
+                                                goto define_local_var;
                                             }
                                         } else if (unwrapped->type == AST_METHOD_REF) {
                                             if (bind_method_ref_to_target_type(sem, unwrapped, actual_type)) {
-                                                /* Method ref bound successfully, skip normal type check */
-                                                children = children->next;
-                                                continue;
+                                                goto define_local_var;
                                             }
                                         }
                                         
@@ -16423,6 +16483,16 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                             free(expected);
                                             free(actual);
                                         }
+                                    }
+
+define_local_var:
+                                    if (sem->source_version >= 22 && is_unnamed_name(name)) {
+                                        decl->sem_symbol = sym;
+                                    } else if (!scope_define(sem->current_scope, sym)) {
+                                        semantic_error(sem, decl->line, decl->column,
+                                                      "Variable '%s' already defined", name);
+                                    } else {
+                                        decl->sem_symbol = sym;
                                     }
                                 }
                                 children = children->next;

@@ -1051,6 +1051,13 @@ bool type_assignable(type_t *target, type_t *source)
     if (type_equals(target, source)) {
         return true;
     }
+
+    /* Same-named type variables (distinct allocations, same declaration) */
+    if (target->kind == TYPE_TYPEVAR && source->kind == TYPE_TYPEVAR &&
+        target->data.type_var.name && source->data.type_var.name &&
+        strcmp(target->data.type_var.name, source->data.type_var.name) == 0) {
+        return true;
+    }
     
     /* null assignable to any reference type */
     if (source->kind == TYPE_NULL && type_is_reference(target)) {
