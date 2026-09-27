@@ -273,6 +273,8 @@ char *extract_type_name_from_ast(ast_node_t *type_node)
     }
 }
 
+static void ensure_method_type_params(symbol_t *method_sym);
+
 /**
  * Enter methods and fields for a single type symbol from its AST.
  * Type references are stored as unresolved names.
@@ -369,7 +371,12 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
             }
             
             /* Check if already registered with this signature */
-            if (hashtable_lookup(sym->data.class_data.members->symbols, method_key)) continue;
+            symbol_t *existing_method = (symbol_t *)hashtable_lookup(
+                sym->data.class_data.members->symbols, method_key);
+            if (existing_method) {
+                ensure_method_type_params(existing_method);
+                continue;
+            }
             
             symbol_t *method_sym = calloc(1, sizeof(symbol_t));
             if (!method_sym) continue;
@@ -378,6 +385,31 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
             method_sym->name = strdup(name);  /* Store actual method name */
             method_sym->modifiers = member->data.node.flags;
             method_sym->ast = member;  /* Keep AST for type resolution */
+
+            /* Method-level type parameters (e.g. <T> T required(T value, ...)) */
+            for (slist_t *mc = member->data.node.children; mc; mc = mc->next) {
+                ast_node_t *ch = (ast_node_t *)mc->data;
+                if (!ch || ch->type != AST_TYPE_PARAMETER || !ch->data.node.name) {
+                    continue;
+                }
+                symbol_t *tp_sym = calloc(1, sizeof(symbol_t));
+                if (!tp_sym) {
+                    continue;
+                }
+                tp_sym->kind = SYM_TYPE_PARAM;
+                tp_sym->name = strdup(ch->data.node.name);
+                type_t *tv = calloc(1, sizeof(type_t));
+                if (tv) {
+                    tv->kind = TYPE_TYPEVAR;
+                    tv->data.type_var.name = strdup(ch->data.node.name);
+                    tp_sym->type = tv;
+                }
+                if (!method_sym->data.method_data.type_params) {
+                    method_sym->data.method_data.type_params = slist_new(tp_sym);
+                } else {
+                    slist_append(method_sym->data.method_data.type_params, tp_sym);
+                }
+            }
             
             /* Extract return type with type arguments (stored in member->data.node.extra) */
             if (member->data.node.extra) {
@@ -752,11 +784,74 @@ completer_context_t *completer_context_new(type_registry_t *reg, classpath_t *cp
 static symbol_t *symbol_from_classfile_minimal(classfile_t *cf, classpath_t *cp);
 static type_t *resolve_unresolved_type(const char *name, type_registry_t *reg, 
                                        classpath_t *cp, symbol_t *context);
+static type_t *resolve_unresolved_type_full(unresolved_type_t *ut, type_registry_t *reg,
+                                            classpath_t *cp, symbol_t *context);
 
-/**
- * Resolve an unresolved_type_t to a type_t, including type arguments.
- * This properly handles generic types like Map<String, Integer>.
- */
+static void ensure_method_type_params(symbol_t *method_sym)
+{
+    if (!method_sym || method_sym->kind != SYM_METHOD ||
+        method_sym->data.method_data.type_params ||
+        !method_sym->ast || method_sym->ast->type != AST_METHOD_DECL) {
+        return;
+    }
+    ast_node_t *member = method_sym->ast;
+    for (slist_t *mc = member->data.node.children; mc; mc = mc->next) {
+        ast_node_t *ch = (ast_node_t *)mc->data;
+        if (!ch || ch->type != AST_TYPE_PARAMETER || !ch->data.node.name) {
+            continue;
+        }
+        symbol_t *tp_sym = calloc(1, sizeof(symbol_t));
+        if (!tp_sym) {
+            continue;
+        }
+        tp_sym->kind = SYM_TYPE_PARAM;
+        tp_sym->name = strdup(ch->data.node.name);
+        type_t *tv = calloc(1, sizeof(type_t));
+        if (tv) {
+            tv->kind = TYPE_TYPEVAR;
+            tv->data.type_var.name = strdup(ch->data.node.name);
+            tp_sym->type = tv;
+        }
+        if (!method_sym->data.method_data.type_params) {
+            method_sym->data.method_data.type_params = slist_new(tp_sym);
+        } else {
+            slist_append(method_sym->data.method_data.type_params, tp_sym);
+        }
+    }
+}
+
+static type_t *lookup_method_type_param(symbol_t *method, const char *name)
+{
+    if (!method || !name) {
+        return NULL;
+    }
+    ensure_method_type_params(method);
+    for (slist_t *tp = method->data.method_data.type_params; tp; tp = tp->next) {
+        symbol_t *ps = (symbol_t *)tp->data;
+        if (ps && ps->name && strcmp(ps->name, name) == 0 && ps->type) {
+            return ps->type;
+        }
+    }
+    return NULL;
+}
+
+static type_t *resolve_unresolved_type_full_for_method(unresolved_type_t *ut,
+                                                       type_registry_t *reg,
+                                                       classpath_t *cp, symbol_t *class_ctx,
+                                                       symbol_t *method)
+{
+    if (!ut || !ut->name) {
+        return NULL;
+    }
+    if (!ut->type_args) {
+        type_t *mtp = lookup_method_type_param(method, ut->name);
+        if (mtp) {
+            return mtp;
+        }
+    }
+    return resolve_unresolved_type_full(ut, reg, cp, class_ctx);
+}
+
 static type_t *resolve_unresolved_type_full(unresolved_type_t *ut, type_registry_t *reg,
                                             classpath_t *cp, symbol_t *context)
 {
@@ -1159,10 +1254,24 @@ static void resolve_types_for_symbol(symbol_t *sym, type_registry_t *reg,
     if (!sym) return;
     
     if (sym->kind == SYM_METHOD) {
+        ensure_method_type_params(sym);
         /* Resolve return type with full type arguments */
-        if (sym->data.method_data.unresolved_return_type && !sym->type) {
+        if (sym->data.method_data.unresolved_return_type) {
             unresolved_type_t *ut = sym->data.method_data.unresolved_return_type;
-            sym->type = resolve_unresolved_type_full(ut, reg, cp, context);
+            bool reresolve = !sym->type;
+            if (!reresolve && sym->type && sym->type->kind == TYPE_CLASS &&
+                sym->type->data.class_type.name &&
+                !sym->type->data.class_type.symbol &&
+                lookup_method_type_param(sym, sym->type->data.class_type.name)) {
+                reresolve = true;
+            }
+            if (!reresolve && sym->type && sym->type->kind == TYPE_TYPEVAR &&
+                lookup_method_type_param(sym, sym->type->data.type_var.name)) {
+                reresolve = true;
+            }
+            if (reresolve) {
+                sym->type = resolve_unresolved_type_full_for_method(ut, reg, cp, context, sym);
+            }
         }
         
         /* Resolve parameter types with full type arguments */
@@ -1171,7 +1280,7 @@ static void resolve_types_for_symbol(symbol_t *sym, type_registry_t *reg,
             if (param && !param->type && sym->data.method_data.unresolved_param_types &&
                 sym->data.method_data.unresolved_param_types[i]) {
                 unresolved_type_t *ut = sym->data.method_data.unresolved_param_types[i];
-                param->type = resolve_unresolved_type_full(ut, reg, cp, context);
+                param->type = resolve_unresolved_type_full_for_method(ut, reg, cp, context, sym);
                 /* Varargs parameter type needs to be array */
                 if ((param->modifiers & MOD_VARARGS) && param->type && 
                     param->type->kind != TYPE_ARRAY) {
@@ -11080,6 +11189,29 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                         }
                         
+                        /* Same-package types (including package-private) by qualified name */
+                        if (!class_sym && sem->current_package) {
+                            char pkg_qname[512];
+                            snprintf(pkg_qname, sizeof(pkg_qname), "%s.%s",
+                                     sem->current_package, recv_name);
+                            type_t *pkg_type = hashtable_lookup(sem->types, pkg_qname);
+                            if (pkg_type && pkg_type->kind == TYPE_CLASS &&
+                                pkg_type->data.class_type.symbol) {
+                                class_sym = pkg_type->data.class_type.symbol;
+                            }
+                            if (!class_sym && sem->shared_registry) {
+                                symbol_t *reg_sym = type_registry_lookup(
+                                    sem->shared_registry, pkg_qname);
+                                if (reg_sym && reg_sym->type) {
+                                    class_sym = reg_sym;
+                                }
+                            }
+                            if (!class_sym) {
+                                class_sym = scan_package_for_type(sem, recv_name,
+                                                                  sem->current_package);
+                            }
+                        }
+
                         /* Try to load external class if not found locally */
                         if (!class_sym) {
                             /* First try resolving through imports */
@@ -11130,6 +11262,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 }
                             }
                             
+                            symbol_complete(class_sym);
+
                             /* Look up method in the class (use type-based resolution) */
                             if (class_sym->data.class_data.members) {
                                 /* Arguments are children->next since first child is the receiver */
@@ -11736,6 +11870,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 }
                 
                 if (found_method && found_method->kind == SYM_METHOD) {
+                    if (target_class) {
+                        resolve_types_for_symbol(found_method, sem->shared_registry,
+                                                 sem->classpath, target_class);
+                    }
                     /* Lazy resolution: resolve return type if NULL (from interface stubs) */
                     if (!found_method->type && found_method->ast && 
                         found_method->ast->type == AST_METHOD_DECL) {
@@ -12056,27 +12194,46 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     }
 
                     /* <T> T m(T arg) — infer return from the argument when names match */
-                    if (return_type && return_type->kind == TYPE_TYPEVAR && params) {
-                        slist_t *arg_list = has_explicit_receiver ? children->next : children;
-                        slist_t *pnode = params;
-                        slist_t *anode = arg_list;
-                        while (pnode && anode) {
-                            symbol_t *param = (symbol_t *)pnode->data;
-                            ast_node_t *arg = (ast_node_t *)anode->data;
-                            if (param && param->type && param->type->kind == TYPE_TYPEVAR &&
-                                return_type->data.type_var.name &&
-                                param->type->data.type_var.name &&
-                                strcmp(return_type->data.type_var.name,
-                                       param->type->data.type_var.name) == 0 &&
-                                arg) {
-                                type_t *at = get_expression_type(sem, arg);
-                                if (at && at->kind != TYPE_UNKNOWN && at->kind != TYPE_VOID) {
-                                    return_type = type_boxed(at);
-                                    break;
+                    if (return_type && params) {
+                        const char *ret_var = NULL;
+                        if (return_type->kind == TYPE_TYPEVAR &&
+                            return_type->data.type_var.name) {
+                            ret_var = return_type->data.type_var.name;
+                        } else if (return_type->kind == TYPE_CLASS &&
+                                   return_type->data.class_type.name &&
+                                   !return_type->data.class_type.symbol) {
+                            ret_var = return_type->data.class_type.name;
+                        }
+                        if (ret_var) {
+                            slist_t *arg_list = has_explicit_receiver ? children->next : children;
+                            slist_t *pnode = params;
+                            slist_t *anode = arg_list;
+                            while (pnode && anode) {
+                                symbol_t *param = (symbol_t *)pnode->data;
+                                ast_node_t *arg = (ast_node_t *)anode->data;
+                                bool param_matches = false;
+                                if (param && param->type) {
+                                    if (param->type->kind == TYPE_TYPEVAR &&
+                                        param->type->data.type_var.name &&
+                                        strcmp(param->type->data.type_var.name, ret_var) == 0) {
+                                        param_matches = true;
+                                    } else if (param->type->kind == TYPE_CLASS &&
+                                               param->type->data.class_type.name &&
+                                               !param->type->data.class_type.symbol &&
+                                               strcmp(param->type->data.class_type.name, ret_var) == 0) {
+                                        param_matches = true;
+                                    }
                                 }
+                                if (param_matches && arg) {
+                                    type_t *at = get_expression_type(sem, arg);
+                                    if (at && at->kind != TYPE_UNKNOWN && at->kind != TYPE_VOID) {
+                                        return_type = type_boxed(at);
+                                        break;
+                                    }
+                                }
+                                pnode = pnode->next;
+                                anode = anode->next;
                             }
-                            pnode = pnode->next;
-                            anode = anode->next;
                         }
                     }
                     
