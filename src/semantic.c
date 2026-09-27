@@ -579,6 +579,17 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
                         } else {
                             slist_append(sym->data.class_data.unresolved_interfaces, super_name);
                         }
+                        /* Parameterized extends (e.g. ServerSessionProvider<ClientConnected>) */
+                        unresolved_type_t *super_ut = unresolved_type_from_ast(type_node);
+                        if (super_ut && super_ut->type_args &&
+                            !sym->data.class_data.unresolved_superclass_type) {
+                            sym->data.class_data.unresolved_superclass_type = super_ut;
+                            if (!sym->data.class_data.unresolved_superclass) {
+                                sym->data.class_data.unresolved_superclass = strdup(super_name);
+                            }
+                        } else if (super_ut) {
+                            unresolved_type_free(super_ut);
+                        }
                     } else {
                         /* For classes, extends sets the superclass */
                         if (!sym->data.class_data.unresolved_superclass) {
@@ -1612,6 +1623,8 @@ static int check_symbol_population(symbol_t *sym, const char *context)
 static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type_t *target_type);
 static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, type_t *target_type);
 static type_t *substitute_from_receiver(type_t *type, type_t *recv_type);
+static type_t *interface_extends_type_for_subst(semantic_t *sem, symbol_t *iface_sym);
+static type_t *enrich_recv_type_for_subst(semantic_t *sem, type_t *recv_type);
 static void bind_array_init_elements(semantic_t *sem, ast_node_t *init, type_t *array_type);
 static type_t *infer_type_arg(type_t *param_type, type_t *arg_type, const char *var_name);
 static type_t *substitute_type_var(type_t *type, const char *var_name, type_t *replacement);
@@ -10339,30 +10352,52 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     bool in_static = sem->in_static_field_init ||
                         (sem->current_method && (sem->current_method->modifiers & MOD_STATIC));
                     
-                    symbol_t *search_class = sem->current_class->data.class_data.superclass;
-                    while (search_class) {
-                        if (search_class->data.class_data.members) {
-                            symbol_t *inherited = scope_lookup_local(
-                                search_class->data.class_data.members, name);
-                            if (inherited && inherited->kind == SYM_FIELD &&
-                                !(inherited->modifiers & MOD_PRIVATE)) {
-                                /* Skip instance fields in static context */
-                                if ((inherited->modifiers & MOD_STATIC) || !in_static) {
-                                    /* Resolve type if needed */
-                                    if (!inherited->type && inherited->data.var_data.unresolved_type) {
-                                        unresolved_type_t *ut = (unresolved_type_t *)inherited->data.var_data.unresolved_type;
-                                        inherited->type = resolve_unresolved_type(ut->name, 
-                                            sem->shared_registry, sem->classpath, sem->current_class);
-                                    }
-                                    if (inherited->type) {
-                                        expr->sem_symbol = inherited;
-                                        expr->sem_type = inherited->type;
-                                        return inherited->type;
+                    symbol_t *host = sem->current_class;
+                    while (host) {
+                        symbol_t *search_class = host->data.class_data.superclass;
+                        if (!search_class && host->data.class_data.superclass_type &&
+                            host->data.class_data.superclass_type->kind == TYPE_CLASS &&
+                            host->data.class_data.superclass_type->data.class_type.symbol) {
+                            search_class = host->data.class_data.superclass_type->data.class_type.symbol;
+                        }
+                        if (!search_class && host->data.class_data.unresolved_superclass) {
+                            search_class = load_external_class(sem,
+                                host->data.class_data.unresolved_superclass);
+                        }
+                        while (search_class) {
+                            if (!search_class->data.class_data.members &&
+                                search_class->qualified_name) {
+                                symbol_t *loaded = load_external_class(sem,
+                                    search_class->qualified_name);
+                                if (loaded) {
+                                    search_class = loaded;
+                                }
+                            }
+                            if (search_class->data.class_data.members) {
+                                symbol_t *inherited = scope_lookup_local(
+                                    search_class->data.class_data.members, name);
+                                if (inherited && inherited->kind == SYM_FIELD &&
+                                    !(inherited->modifiers & MOD_PRIVATE)) {
+                                    if ((inherited->modifiers & MOD_STATIC) || !in_static) {
+                                        if (!inherited->type &&
+                                            inherited->data.var_data.unresolved_type) {
+                                            unresolved_type_t *ut =
+                                                (unresolved_type_t *)inherited->data.var_data.unresolved_type;
+                                            inherited->type = resolve_unresolved_type(ut->name,
+                                                sem->shared_registry, sem->classpath,
+                                                sem->current_class);
+                                        }
+                                        if (inherited->type) {
+                                            expr->sem_symbol = inherited;
+                                            expr->sem_type = inherited->type;
+                                            return inherited->type;
+                                        }
                                     }
                                 }
                             }
+                            search_class = search_class->data.class_data.superclass;
                         }
-                        search_class = search_class->data.class_data.superclass;
+                        host = host->data.class_data.enclosing_class;
                     }
                 }
 
@@ -11600,7 +11635,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         
                         /* Substitute receiver type arguments into parameter type */
                         if (recv_type_for_subst && param_type) {
-                            param_type = substitute_from_receiver(param_type, recv_type_for_subst);
+                            param_type = substitute_from_receiver(param_type,
+                                enrich_recv_type_for_subst(sem, recv_type_for_subst));
                         }
                         
                         /* Check if this is a varargs parameter */
@@ -11782,17 +11818,18 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             found_method->type = return_type;
                         }
                     }
-                    if (recv_type_for_subst && return_type) {
+                    type_t *subst_recv = enrich_recv_type_for_subst(sem, recv_type_for_subst);
+                    if (subst_recv && return_type) {
                         /* If method returns Object and we have parameterized superclass,
                          * look for generic version of method in superclass hierarchy */
                         if (return_type->kind == TYPE_CLASS && 
                             return_type->data.class_type.name &&
                             strcmp(return_type->data.class_type.name, "java.lang.Object") == 0 &&
-                            recv_type_for_subst->kind == TYPE_CLASS &&
-                            recv_type_for_subst->data.class_type.type_args &&
-                            recv_type_for_subst->data.class_type.symbol) {
+                            subst_recv->kind == TYPE_CLASS &&
+                            subst_recv->data.class_type.type_args &&
+                            subst_recv->data.class_type.symbol) {
                             /* Look for method in superclass with generic return type */
-                            symbol_t *super_sym = recv_type_for_subst->data.class_type.symbol;
+                            symbol_t *super_sym = subst_recv->data.class_type.symbol;
                             if (super_sym && super_sym->data.class_data.members) {
                                 symbol_t *super_method = scope_lookup_method_with_types(sem,
                                     super_sym->data.class_data.members, method_name, children->next);
@@ -11804,9 +11841,34 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                         }
                         
-                        return_type = substitute_from_receiver(return_type, recv_type_for_subst);
+                        return_type = substitute_from_receiver(return_type, subst_recv);
                         /* Ensure the substituted type has its symbol loaded */
                         ensure_type_symbol_loaded(sem, return_type);
+                    }
+
+                    /* <T> T m(T arg) — infer return from the argument when names match */
+                    if (return_type && return_type->kind == TYPE_TYPEVAR && params) {
+                        slist_t *arg_list = has_explicit_receiver ? children->next : children;
+                        slist_t *pnode = params;
+                        slist_t *anode = arg_list;
+                        while (pnode && anode) {
+                            symbol_t *param = (symbol_t *)pnode->data;
+                            ast_node_t *arg = (ast_node_t *)anode->data;
+                            if (param && param->type && param->type->kind == TYPE_TYPEVAR &&
+                                return_type->data.type_var.name &&
+                                param->type->data.type_var.name &&
+                                strcmp(return_type->data.type_var.name,
+                                       param->type->data.type_var.name) == 0 &&
+                                arg) {
+                                type_t *at = get_expression_type(sem, arg);
+                                if (at && at->kind != TYPE_UNKNOWN && at->kind != TYPE_VOID) {
+                                    return_type = type_boxed(at);
+                                    break;
+                                }
+                            }
+                            pnode = pnode->next;
+                            anode = anode->next;
+                        }
                     }
                     
                     /* Substitute inferred type arguments for generic methods.
@@ -13921,6 +13983,55 @@ static type_t *substitute_type_var(type_t *type, const char *var_name, type_t *r
 }
 
 /**
+ * For a subinterface (e.g. Pop3ServerSessionProvider extends ServerSessionProvider<X>),
+ * return the resolved parameterized superinterface type for type-variable substitution.
+ */
+static type_t *interface_extends_type_for_subst(semantic_t *sem, symbol_t *iface_sym)
+{
+    if (!sem || !iface_sym || iface_sym->kind != SYM_INTERFACE || !iface_sym->ast) {
+        return NULL;
+    }
+    for (slist_t *c = iface_sym->ast->data.node.children; c; c = c->next) {
+        ast_node_t *child = (ast_node_t *)c->data;
+        if (!child) {
+            continue;
+        }
+        if ((child->type == AST_CLASS_TYPE || child->type == AST_PRIMITIVE_TYPE) &&
+            child->data.node.flags == 1) {
+            type_t *ext = semantic_resolve_type(sem, child);
+            if (ext && ext->kind == TYPE_CLASS && ext->data.class_type.type_args) {
+                return ext;
+            }
+        }
+    }
+    return NULL;
+}
+
+static type_t *enrich_recv_type_for_subst(semantic_t *sem, type_t *recv_type)
+{
+    if (!recv_type || recv_type->kind != TYPE_CLASS || recv_type->data.class_type.type_args) {
+        return recv_type;
+    }
+    symbol_t *sym = recv_type->data.class_type.symbol;
+    if (!sym && recv_type->data.class_type.name) {
+        sym = load_external_class(sem, recv_type->data.class_type.name);
+        if (sym) {
+            recv_type->data.class_type.symbol = sym;
+        }
+    }
+    if (!sym) {
+        return recv_type;
+    }
+    if (sym->data.class_data.superclass_type &&
+        sym->data.class_data.superclass_type->kind == TYPE_CLASS &&
+        sym->data.class_data.superclass_type->data.class_type.type_args) {
+        return sym->data.class_data.superclass_type;
+    }
+    type_t *ext = interface_extends_type_for_subst(sem, sym);
+    return ext ? ext : recv_type;
+}
+
+/**
  * Substitute type variables in a parameterized type with the receiver's type arguments.
  * This is used for method parameter types where the method's parameter type may reference
  * type parameters of the receiver class (e.g., Stream.map takes Function<? super T, R>
@@ -14004,7 +14115,7 @@ static type_t *substitute_from_receiver(type_t *type, type_t *recv_type)
         
         /* First type argument: T, E, K */
         if (strcmp(var_name, "T") == 0 || strcmp(var_name, "E") == 0 ||
-            strcmp(var_name, "K") == 0) {
+            strcmp(var_name, "K") == 0 || strcmp(var_name, "S") == 0) {
             if (arg) {
                 type_t *result = (type_t *)arg->data;
                 if (getenv("GENESIS_DEBUG_SUBST")) {
