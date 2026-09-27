@@ -5812,10 +5812,24 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             bc_emit_u2(mg->code, sb_init);
             mg_pop(mg, 1);
             
-            /* Get simple class name from internal name */
-            const char *simple_name = cg->internal_name;
-            const char *last_slash = strrchr(cg->internal_name, '/');
-            if (last_slash) simple_name = last_slash + 1;
+            /* Record.toString()'s format (JEP 395) uses the simple name,
+             * e.g. "P[x=1]" for a record P nested in class Outer, not
+             * "Outer$P[x=1]". class_sym->name is that simple name directly;
+             * stripping only the package from internal_name (up to the last
+             * '/') left the "Outer$" prefix on a nested record, since that
+             * separator is '$', not '/'. Fall back to the old parsing if the
+             * symbol is somehow unavailable. */
+            const char *simple_name;
+            if (cg->class_sym && cg->class_sym->name) {
+                simple_name = cg->class_sym->name;
+            } else {
+                simple_name = cg->internal_name;
+                const char *last_sep = strrchr(cg->internal_name, '$');
+                if (!last_sep) {
+                    last_sep = strrchr(cg->internal_name, '/');
+                }
+                if (last_sep) simple_name = last_sep + 1;
+            }
             
             /* Build prefix: "ClassName[" */
             string_t *prefix = string_new("");

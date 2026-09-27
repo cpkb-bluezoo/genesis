@@ -162,3 +162,11 @@ supports the language through Java 25.
   "Test.sfield += x" additionally had no compound-assignment support at
   all. Both now match the identifier-target forms ("this.field = x",
   a bare field name, an inherited field, one in an enclosing class).
+
+  A record nested in another class printed its binary name from
+  toString() ("Outer$Point[x=1, y=2]") instead of its simple name
+  ("Point[x=1, y=2]"), since the name was parsed out of the class file's
+  own internal name by stripping only a package separator ('/'), not the
+  '$' that separates a nested class's simple name from its enclosing
+  class. It is now taken directly from the class's own simple name
+  instead.

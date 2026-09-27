@@ -149,6 +149,15 @@ UNRELEASED  Chris Burdess  <dog@gnu.org>
 	the by-class-name static case, which had none at all.
 	* test/src/java8/FieldAssignChainTest.java: New.
 
+	Record toString() simple name.
+	* src/codegen.c (codegen_class, record toString()): Take the class
+	name from class_sym->name (already the simple name) instead of
+	parsing it out of internal_name by stripping up to the last '/'.
+	That left the enclosing class's name in place for a nested record,
+	whose only separator from its own simple name is '$', not '/'
+	("Outer$Point[x=1]" instead of "Point[x=1]").
+	* test/src/java16/NestedRecordToStringTest.java: New.
+
 2016-2020  Chris Burdess  <dog@gnu.org>
 
 	Earlier development; see the git history.

@@ -92,8 +92,12 @@ KNOWN BUGS
    the lexer's normal '>' + '=' -> GE merge combines the *last* '>' of the
    run with a following '=', which the old reconstruction did not expect.
 
-10. A nested record's toString() prints the binary name ("T$P[x=1]") rather
-    than the simple name ("P[x=1]").
+10. [FIXED] A nested record's toString() printed the binary name
+    ("T$P[x=1]") rather than the simple name ("P[x=1]"): the class file's
+    own internal name has package and enclosing-class separators ('/' and
+    '$') that look alike once stripped only up to the last '/'. Now taken
+    from the class symbol's own (already-simple) name instead of parsed
+    out of the internal name at all.
 
 11. A boxed-LHS compound assignment (Integer i; i += 1;) unboxes, promotes
     and reboxes correctly for a local variable, field or array element, but
