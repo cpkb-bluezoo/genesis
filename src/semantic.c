@@ -1809,13 +1809,23 @@ static bool check_access(uint32_t member_mods, symbol_t *member_class, symbol_t 
         return true;
     }
     
-    /* Check if accessing class is a subclass of member's class */
-    symbol_t *current = accessing_class;
-    while (current) {
-        if (current == member_class) {
-            return true;
+    /* Check if accessing class (or an enclosing class) is a subclass of member's class.
+     * Nested classes inherit the access rights of their enclosing class (JLS 6.6.1). */
+    for (symbol_t *access_ctx = accessing_class; access_ctx;
+         access_ctx = access_ctx->data.class_data.enclosing_class) {
+        symbol_t *current = access_ctx;
+        while (current) {
+            if (current == member_class) {
+                return true;
+            }
+            symbol_t *next = current->data.class_data.superclass;
+            if (!next && current->data.class_data.superclass_type &&
+                current->data.class_data.superclass_type->kind == TYPE_CLASS &&
+                current->data.class_data.superclass_type->data.class_type.symbol) {
+                next = current->data.class_data.superclass_type->data.class_type.symbol;
+            }
+            current = next;
         }
-        current = current->data.class_data.superclass;
     }
     
     return false;
@@ -2037,6 +2047,29 @@ const char *symbol_kind_name(symbol_kind_t kind)
 }
 
 /**
+ * True when a class member scope has fields or methods (not just nested type stubs).
+ * Phase 3 pre-registration may insert nested classes only; the completer must still run.
+ */
+static bool class_has_fields_or_methods(symbol_t *sym)
+{
+    if (!sym || !sym->data.class_data.members ||
+        !sym->data.class_data.members->symbols) {
+        return false;
+    }
+    hashtable_t *ht = sym->data.class_data.members->symbols;
+    for (size_t i = 0; i < ht->size; i++) {
+        for (hashtable_entry_t *e = ht->buckets[i]; e; e = e->next) {
+            symbol_t *m = (symbol_t *)e->value;
+            if (m && (m->kind == SYM_FIELD || m->kind == SYM_METHOD ||
+                      m->kind == SYM_CONSTRUCTOR)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
  * Complete a symbol by invoking its completer (if set).
  * This follows javac's lazy completion pattern - members are populated on demand.
  * After completion, the completer is set to NULL to prevent re-entry.
@@ -2050,12 +2083,10 @@ void symbol_complete(symbol_t *sym)
         return;
     }
     
-    /* If members already populated by Phase 3, just clear the completer */
+    /* If fields/methods already populated by Phase 3/5, just clear the completer */
     if ((sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || 
          sym->kind == SYM_ENUM || sym->kind == SYM_RECORD) &&
-        sym->data.class_data.members != NULL &&
-        sym->data.class_data.members->symbols != NULL &&
-        sym->data.class_data.members->symbols->count > 0) {
+        class_has_fields_or_methods(sym)) {
         sym->completer = NULL;
         sym->completer_context = NULL;
         return;
@@ -2077,9 +2108,7 @@ void symbol_complete(symbol_t *sym)
     if (!sym->completer ||
         ((sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || 
           sym->kind == SYM_ENUM || sym->kind == SYM_RECORD) &&
-         sym->data.class_data.members != NULL &&
-         sym->data.class_data.members->symbols != NULL &&
-         sym->data.class_data.members->symbols->count > 0)) {
+         class_has_fields_or_methods(sym))) {
         sym->completer = NULL;
         sym->completer_context = NULL;
         if (mutex) pthread_mutex_unlock(mutex);
@@ -10365,6 +10394,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 host->data.class_data.unresolved_superclass);
                         }
                         while (search_class) {
+                            symbol_complete(search_class);
                             if (!search_class->data.class_data.members &&
                                 search_class->qualified_name) {
                                 symbol_t *loaded = load_external_class(sem,
@@ -10383,19 +10413,25 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                             inherited->data.var_data.unresolved_type) {
                                             unresolved_type_t *ut =
                                                 (unresolved_type_t *)inherited->data.var_data.unresolved_type;
-                                            inherited->type = resolve_unresolved_type(ut->name,
+                                            inherited->type = resolve_unresolved_type_full(ut,
                                                 sem->shared_registry, sem->classpath,
-                                                sem->current_class);
+                                                search_class);
                                         }
-                                        if (inherited->type) {
-                                            expr->sem_symbol = inherited;
-                                            expr->sem_type = inherited->type;
-                                            return inherited->type;
+                                        if (!inherited->type) {
+                                            inherited->type = type_new_primitive(TYPE_UNKNOWN);
                                         }
+                                        expr->sem_symbol = inherited;
+                                        expr->sem_type = inherited->type;
+                                        return inherited->type;
                                     }
                                 }
                             }
-                            search_class = search_class->data.class_data.superclass;
+                            symbol_t *next_super = search_class->data.class_data.superclass;
+                            if (!next_super && search_class->data.class_data.unresolved_superclass) {
+                                next_super = load_external_class(sem,
+                                    search_class->data.class_data.unresolved_superclass);
+                            }
+                            search_class = next_super;
                         }
                         host = host->data.class_data.enclosing_class;
                     }
@@ -10540,20 +10576,43 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             
                             /* Then check superclass chain */
                             symbol_t *search_class = class_sym->data.class_data.superclass;
+                            if (!search_class && class_sym->data.class_data.unresolved_superclass) {
+                                search_class = load_external_class(sem,
+                                    class_sym->data.class_data.unresolved_superclass);
+                            }
                             while (search_class) {
+                                symbol_complete(search_class);
+                                if (!search_class->data.class_data.members &&
+                                    search_class->qualified_name) {
+                                    symbol_t *loaded = load_external_class(sem,
+                                        search_class->qualified_name);
+                                    if (loaded) {
+                                        search_class = loaded;
+                                    }
+                                }
                                 if (search_class->data.class_data.members) {
                                     symbol_t *field = scope_lookup_local(
                                         search_class->data.class_data.members, name);
                                     if (field && field->kind == SYM_FIELD) {
                                         /* Check access - inherited fields must be accessible */
-                                        if (!(field->modifiers & MOD_PRIVATE)) {
+                                        if (!(field->modifiers & MOD_PRIVATE) &&
+                                            check_access(field->modifiers, search_class,
+                                                         sem->current_class)) {
+                                            if (!field->type) {
+                                                field->type = type_new_primitive(TYPE_UNKNOWN);
+                                            }
                                             expr->sem_symbol = field;
                                             expr->sem_type = field->type;
                                             return field->type;
                                         }
                                     }
                                 }
-                                search_class = search_class->data.class_data.superclass;
+                                symbol_t *next_super = search_class->data.class_data.superclass;
+                                if (!next_super && search_class->data.class_data.unresolved_superclass) {
+                                    next_super = load_external_class(sem,
+                                        search_class->data.class_data.unresolved_superclass);
+                                }
+                                search_class = next_super;
                             }
                         }
                         
@@ -17325,6 +17384,13 @@ define_local_var:
                             if (sem->source_version >= 22 && is_unnamed_name(name)) {
                                 semantic_error(sem, node->line, node->column,
                                     "unnamed variable '_' cannot be used as an expression");
+                                break;
+                            }
+
+                            /* Nested classes need enclosing-class superclass field lookup. */
+                            if (sem->current_class &&
+                                sem->current_class->data.class_data.enclosing_class) {
+                                get_expression_type(sem, node);
                                 break;
                             }
                             
