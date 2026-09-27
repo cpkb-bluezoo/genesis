@@ -850,9 +850,15 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
         if (!catch_children || !catch_children->next) {
             continue;  /* Malformed catch */
         }
-        
-        ast_node_t *exc_type_node = (ast_node_t *)catch_children->data;
-        ast_node_t *catch_block = (ast_node_t *)catch_children->next->data;
+
+        /* Multi-catch: types then block (same layout as regular try/catch) */
+        int child_count = slist_length(catch_children);
+        int exc_type_count = child_count - 1;
+        slist_t *last = catch_children;
+        for (int i = 0; i < child_count - 1; i++) {
+            last = last->next;
+        }
+        ast_node_t *catch_block = (ast_node_t *)last->data;
         const char *exc_var_name = catch_clause->data.node.name;
         
         /* Get catch handler start position */
@@ -863,26 +869,49 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
             stackmap_restore_state(mg->stackmap, try_entry_state);
         }
         
-        /* Get exception class name from semantic type */
-        const char *exc_class_internal = "java/lang/Throwable";
-        if (exc_type_node->sem_type && exc_type_node->sem_type->kind == TYPE_CLASS &&
-            exc_type_node->sem_type->data.class_type.name) {
-            char *internal = class_to_internal_name(exc_type_node->sem_type->data.class_type.name);
-            if (internal) {
-                exc_class_internal = internal;
+        const char *first_exc_class = "java/lang/Throwable";
+        bool is_multi_catch = (exc_type_count > 1);
+        slist_t *type_node = catch_children;
+        for (int i = 0; i < exc_type_count; i++) {
+            ast_node_t *exc_type = (ast_node_t *)type_node->data;
+            const char *exc_class_name = "java/lang/Throwable";
+            if (exc_type->sem_type && exc_type->sem_type->kind == TYPE_CLASS &&
+                exc_type->sem_type->data.class_type.name) {
+                exc_class_name = exc_type->sem_type->data.class_type.name;
+            } else if (exc_type->type == AST_CLASS_TYPE) {
+                exc_class_name = resolve_exception_class(exc_type->data.node.name);
             }
+            if (i == 0) {
+                first_exc_class = exc_class_name;
+            }
+            type_node = type_node->next;
         }
-        
-        /* Record frame at catch handler */
-        mg_record_exception_handler_frame(mg, exc_class_internal);
-        
-        /* Add exception handler entry - catch from entire TWR (try_start to exc_handler_pc+re-throw) */
-        uint16_t exc_class_idx = cp_add_class(mg->cp, exc_class_internal);
-        mg_add_exception_handler(mg, try_start, (uint16_t)mg->code->length, catch_handler_pc, exc_class_idx);
+
+        const char *stackmap_exc_class = is_multi_catch ? "java/lang/Throwable" : first_exc_class;
+        char *stackmap_exc_internal = class_to_internal_name(stackmap_exc_class);
+        mg_record_exception_handler_frame(mg, stackmap_exc_internal);
+
+        type_node = catch_children;
+        for (int i = 0; i < exc_type_count; i++) {
+            ast_node_t *exc_type = (ast_node_t *)type_node->data;
+            const char *exc_class_name = "java/lang/Throwable";
+            if (exc_type->sem_type && exc_type->sem_type->kind == TYPE_CLASS &&
+                exc_type->sem_type->data.class_type.name) {
+                exc_class_name = exc_type->sem_type->data.class_type.name;
+            } else if (exc_type->type == AST_CLASS_TYPE) {
+                exc_class_name = resolve_exception_class(exc_type->data.node.name);
+            }
+            char *exc_internal_name = class_to_internal_name(exc_class_name);
+            uint16_t exc_class_idx = cp_add_class(mg->cp, exc_internal_name);
+            free(exc_internal_name);
+            mg_add_exception_handler(mg, try_start, (uint16_t)mg->code->length,
+                                     catch_handler_pc, exc_class_idx);
+            type_node = type_node->next;
+        }
+        free(stackmap_exc_internal);
         
         /* Allocate local for exception variable */
-        type_t *exc_type = exc_type_node->sem_type ? exc_type_node->sem_type : 
-                          type_new_class(exc_class_internal);
+        type_t *exc_type = type_new_class(first_exc_class);
         uint16_t exc_slot = mg_allocate_local(mg, exc_var_name, exc_type);
         
         /* JVM pushes exception onto stack at handler entry */
@@ -921,11 +950,6 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
             catch_gotos = slist_prepend(catch_gotos, goto_pos);
             bc_emit(mg->code, OP_GOTO);
             bc_emit_u2(mg->code, 0);  /* Placeholder */
-        }
-        
-        /* Free internal name if we allocated it */
-        if (strcmp(exc_class_internal, "java/lang/Throwable") != 0) {
-            free((char *)exc_class_internal);
         }
     }
     

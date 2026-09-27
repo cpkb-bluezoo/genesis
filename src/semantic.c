@@ -6010,6 +6010,40 @@ static void ensure_type_symbol_loaded(semantic_t *sem, type_t *type)
     }
 }
 
+static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, const char *package_name);
+
+/**
+ * Top-level type in the current compilation unit's package, if any.
+ * Used so package-local types are not shadowed by nested types on imports
+ * (e.g. ldap.client.Control vs java.util.ResourceBundle.Control).
+ */
+static symbol_t *lookup_same_package_type(semantic_t *sem, const char *simple_name)
+{
+    if (!sem || !simple_name || !sem->current_package || strchr(simple_name, '.') != NULL) {
+        return NULL;
+    }
+    char pkg_qname[512];
+    snprintf(pkg_qname, sizeof(pkg_qname), "%s.%s", sem->current_package, simple_name);
+    type_t *pkg_type = hashtable_lookup(sem->types, pkg_qname);
+    if (pkg_type && pkg_type->kind == TYPE_CLASS && pkg_type->data.class_type.symbol) {
+        return pkg_type->data.class_type.symbol;
+    }
+    if (sem->shared_registry) {
+        symbol_t *reg = type_registry_lookup(sem->shared_registry, pkg_qname);
+        if (reg && (reg->kind == SYM_CLASS || reg->kind == SYM_INTERFACE ||
+                    reg->kind == SYM_ENUM || reg->kind == SYM_RECORD)) {
+            return reg;
+        }
+    }
+    if (sem->classpath) {
+        symbol_t *loaded = load_external_class(sem, pkg_qname);
+        if (loaded) {
+            return loaded;
+        }
+    }
+    return scan_package_for_type(sem, simple_name, sem->current_package);
+}
+
 /**
  * Resolve a simple class name to a fully qualified name using imports.
  * Returns a newly allocated string or NULL if not found.
@@ -6038,6 +6072,18 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
     if (cached) {
         sem->resolve_import_depth--;
         return strdup(cached);
+    }
+
+    /* Same-package top-level types before import-based resolution (JLS 6.5).
+     * Must run before nested-type lookup on imports (e.g. ResourceBundle.Control). */
+    if (sem->current_package && strchr(simple_name, '.') == NULL) {
+        symbol_t *pkg_sym = lookup_same_package_type(sem, simple_name);
+        if (pkg_sym && pkg_sym->qualified_name) {
+            hashtable_insert(sem->resolved_imports, simple_name,
+                             (void *)intern(pkg_sym->qualified_name));
+            sem->resolve_import_depth--;
+            return strdup(pkg_sym->qualified_name);
+        }
     }
     
     /* Check if this is a qualified inner class name like "Map.Entry" */
@@ -6156,6 +6202,9 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
                 }
             if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
                            nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
+                if (lookup_same_package_type(sem, simple_name)) {
+                    continue;
+                }
                 /* Found nested type - return qualified name with $ separator */
                 size_t result_len = strlen(import_name) + 1 + strlen(simple_name) + 1;
                 char *result = malloc(result_len);
@@ -6406,6 +6455,22 @@ static char *resolve_type_name_with_imports(const char *simple_name,
             return strdup(import_name);
         }
     }
+
+    /* Same-package top-level types before nested types on imports (JLS 6.5). */
+    if (package) {
+        char same_package[512];
+        snprintf(same_package, sizeof(same_package), "%s.%s", package, simple_name);
+
+        if (classpath) {
+            classfile_t *cf = classpath_load_class(classpath, same_package);
+            if (cf) {
+                return strdup(same_package);
+            }
+        }
+        if (class_exists_on_sourcepath(same_package, sourcepath_list)) {
+            return strdup(same_package);
+        }
+    }
     
     /* Check if simple_name is a nested type in any single-type-imported class
      * e.g., "import javax.tools.JavaFileManager;" allows using "Location" 
@@ -6485,22 +6550,6 @@ static char *resolve_type_name_with_imports(const char *simple_name,
             if (class_exists_on_sourcepath(qualified, sourcepath_list)) {
                 return strdup(qualified);
             }
-        }
-    }
-    
-    /* Try same-package resolution */
-    if (package) {
-        char same_package[512];
-        snprintf(same_package, sizeof(same_package), "%s.%s", package, simple_name);
-        
-        if (classpath) {
-            classfile_t *cf = classpath_load_class(classpath, same_package);
-            if (cf) {
-                return strdup(same_package);
-            }
-        }
-        if (class_exists_on_sourcepath(same_package, sourcepath_list)) {
-            return strdup(same_package);
         }
     }
     
@@ -7960,6 +8009,40 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     }
                     type_node->sem_type = cached;
                     return cached;
+                }
+
+                /* Same-package top-level types take precedence over nested types
+                 * discovered through single-type imports (JLS 6.5). Without this,
+                 * import java.util.ResourceBundle makes simple name Control resolve to
+                 * ResourceBundle.Control instead of a package-local Control class. */
+                if (sem->current_package && strchr(name, '.') == NULL) {
+                    symbol_t *pkg_sym = lookup_same_package_type(sem, name);
+                    if (pkg_sym && pkg_sym->type) {
+                        if (!hashtable_lookup(sem->unit_types, name)) {
+                            hashtable_insert(sem->unit_types, name, pkg_sym->type);
+                        }
+                        slist_t *children = type_node->data.node.children;
+                        if (children && pkg_sym->type->kind == TYPE_CLASS) {
+                            const char *pkg_name = pkg_sym->type->data.class_type.name ?
+                                pkg_sym->type->data.class_type.name : name;
+                            type_t *param_type = type_new_class(pkg_name);
+                            param_type->data.class_type.symbol =
+                                pkg_sym->type->data.class_type.symbol ?
+                                pkg_sym->type->data.class_type.symbol : pkg_sym;
+                            for (slist_t *c = children; c; c = c->next) {
+                                type_t *arg_type = semantic_resolve_type(sem, c->data);
+                                if (!param_type->data.class_type.type_args) {
+                                    param_type->data.class_type.type_args = slist_new(arg_type);
+                                } else {
+                                    slist_append(param_type->data.class_type.type_args, arg_type);
+                                }
+                            }
+                            type_node->sem_type = param_type;
+                            return param_type;
+                        }
+                        type_node->sem_type = pkg_sym->type;
+                        return pkg_sym->type;
+                    }
                 }
                 
                 /* Resolve simple name to qualified name using imports */
@@ -10745,6 +10828,16 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     }
                 }
                 
+                /* Same-package top-level type before import-nested aliases in unit_types */
+                {
+                    symbol_t *pkg_sym = lookup_same_package_type(sem, name);
+                    if (pkg_sym && pkg_sym->type) {
+                        expr->sem_symbol = pkg_sym;
+                        expr->sem_type = pkg_sym->type;
+                        return pkg_sym->type;
+                    }
+                }
+
                 /* Could be a class reference - check per-compilation-unit scope first,
                  * then global types cache */
                 type_t *type = hashtable_lookup(sem->unit_types, name);

@@ -226,5 +226,19 @@ check_target_error TargetRecord -target 11
 check_target_error TargetSealed -target 16
 
 echo
+echo "--- Same-package type vs import nested type ---"
+printf "%-30s ... " "ResourceBundleControlShadowTest"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/shadowtest/Control.java" \
+       "$TEST_SRC/src/java8/shadowtest/ResourceBundleControlShadowTest.java" \
+       >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]
