@@ -1627,6 +1627,9 @@ static type_t *interface_extends_type_for_subst(semantic_t *sem, symbol_t *iface
 static type_t *enrich_recv_type_for_subst(semantic_t *sem, type_t *recv_type);
 static void bind_array_init_elements(semantic_t *sem, ast_node_t *init, type_t *array_type);
 static type_t *infer_type_arg(type_t *param_type, type_t *arg_type, const char *var_name);
+static type_t *infer_type_arg_from_expression(semantic_t *sem, type_t *param_type,
+                                              ast_node_t *arg, type_t *arg_type,
+                                              const char *var_name);
 static type_t *substitute_type_var(type_t *type, const char *var_name, type_t *replacement);
 /* get_functional_interface_sam() is declared in genesis.h */
 static char *resolve_import(semantic_t *sem, const char *simple_name);
@@ -11756,16 +11759,16 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                             
                             if (!inferred_T) {
-                                inferred_T = infer_type_arg(infer_from, arg_type, "T");
+                                inferred_T = infer_type_arg_from_expression(sem, infer_from, arg, arg_type, "T");
                             }
                             if (!inferred_E) {
-                                inferred_E = infer_type_arg(infer_from, arg_type, "E");
+                                inferred_E = infer_type_arg_from_expression(sem, infer_from, arg, arg_type, "E");
                             }
                             if (!inferred_R) {
-                                inferred_R = infer_type_arg(infer_from, arg_type, "R");
+                                inferred_R = infer_type_arg_from_expression(sem, infer_from, arg, arg_type, "R");
                             }
                             if (!inferred_A) {
-                                inferred_A = infer_type_arg(infer_from, arg_type, "A");
+                                inferred_A = infer_type_arg_from_expression(sem, infer_from, arg, arg_type, "A");
                             }
                         }
                         
@@ -13970,6 +13973,44 @@ static type_t *infer_type_arg(type_t *param_type, type_t *arg_type, const char *
 }
 
 /**
+ * Infer a method type argument from an argument expression, including
+ * {@code new Callable<Foo>() {}} where the runtime class is anonymous.
+ */
+static type_t *infer_type_arg_from_expression(semantic_t *sem, type_t *param_type,
+                                              ast_node_t *arg, type_t *arg_type,
+                                              const char *var_name)
+{
+    if (!sem || !param_type || !arg || !var_name) {
+        return NULL;
+    }
+
+    type_t *inferred = infer_type_arg(param_type, arg_type, var_name);
+    if (inferred) {
+        return inferred;
+    }
+
+    if (arg->type == AST_NEW_OBJECT && arg->data.node.children) {
+        for (slist_t *c = arg->data.node.children; c; c = c->next) {
+            ast_node_t *child = (ast_node_t *)c->data;
+            if (!child) {
+                continue;
+            }
+            if (child->type == AST_CLASS_TYPE || child->type == AST_ARRAY_TYPE ||
+                child->type == AST_PRIMITIVE_TYPE) {
+                type_t *declared = semantic_resolve_type(sem, child);
+                inferred = infer_type_arg(param_type, declared, var_name);
+                if (inferred) {
+                    return inferred;
+                }
+                break;
+            }
+        }
+    }
+
+    return NULL;
+}
+
+/**
  * Substitute a type variable in a type with a concrete type.
  * This creates a new type with the type variable replaced.
  * 
@@ -14185,9 +14226,21 @@ static type_t *substitute_from_receiver(type_t *type, type_t *recv_type)
                 return result;
             }
         }
-        /* Second type argument: R (for Function), U, V */
-        else if (strcmp(var_name, "R") == 0 || strcmp(var_name, "U") == 0 ||
-                 strcmp(var_name, "V") == 0) {
+        /* V: first type param for IntObjectHashMap<V>; second for Map<K,V> */
+        else if (strcmp(var_name, "V") == 0) {
+            int nargs = 0;
+            for (slist_t *a = recv_type_args; a; a = a->next) {
+                nargs++;
+            }
+            if (nargs == 1 && arg) {
+                return (type_t *)arg->data;
+            }
+            if (arg && arg->next) {
+                return (type_t *)arg->next->data;
+            }
+        }
+        /* Second type argument: R (for Function), U */
+        else if (strcmp(var_name, "R") == 0 || strcmp(var_name, "U") == 0) {
             if (arg && arg->next) {
                 type_t *result = (type_t *)arg->next->data;
                 if (getenv("GENESIS_DEBUG_SUBST")) {
