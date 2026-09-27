@@ -1786,6 +1786,7 @@ static type_t *substitute_type_var(type_t *type, const char *var_name, type_t *r
 static char *resolve_import(semantic_t *sem, const char *simple_name);
 static symbol_t *load_class_from_source(semantic_t *sem, const char *name);
 static void preregister_nested_types(semantic_t *sem, ast_node_t *decl, symbol_t *sym, scope_t *class_scope);
+static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_node_t *decl);
 
 /**
  * Check if a narrowing primitive conversion is allowed for a constant expression.
@@ -3232,6 +3233,20 @@ static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sy
         iface = interface_symbol_for_lookup(sem, iface);
         if (!iface) continue;
 
+        if (iface->kind == SYM_INTERFACE && iface->ast && !iface->data.class_data.interfaces) {
+            bool has_extends = false;
+            for (slist_t *mc = iface->ast->data.node.children; mc; mc = mc->next) {
+                ast_node_t *c = (ast_node_t *)mc->data;
+                if (c && c->type == AST_CLASS_TYPE && c->data.node.flags == 1) {
+                    has_extends = true;
+                    break;
+                }
+            }
+            if (has_extends) {
+                add_interface_extends_from_ast(sem, iface, iface->ast);
+            }
+        }
+
         /* Check if interface is just a name (not fully loaded) */
         if (iface->kind != SYM_INTERFACE && iface->kind != SYM_CLASS) {
             /* Try to load the interface */
@@ -4515,6 +4530,66 @@ typedef struct nested_type_info {
  * This ensures that all nested classes, interfaces, enums, etc. are available
  * for type resolution before their declarations are fully processed.
  * 
+ * Populate super-interfaces from {@code extends} clauses on an interface AST.
+ * Needed for nested interfaces loaded via preregister (not full compilation unit pass).
+ */
+static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_node_t *decl)
+{
+    if (!sem || !sym || !decl || sym->kind != SYM_INTERFACE) {
+        return;
+    }
+    for (slist_t *member = decl->data.node.children; member; member = member->next) {
+        ast_node_t *m = (ast_node_t *)member->data;
+        if (!m || m->type != AST_CLASS_TYPE || m->data.node.flags != 1) {
+            continue;
+        }
+        const char *iface_name = m->data.node.name;
+        if (!iface_name) {
+            continue;
+        }
+        symbol_t *iface_sym = NULL;
+        if (sym->data.class_data.members) {
+            iface_sym = scope_lookup_local(sym->data.class_data.members, iface_name);
+        }
+        if (!iface_sym && sym->data.class_data.enclosing_class &&
+            sym->data.class_data.enclosing_class->data.class_data.members) {
+            iface_sym = scope_lookup_local(
+                sym->data.class_data.enclosing_class->data.class_data.members, iface_name);
+        }
+        if (!iface_sym) {
+            iface_sym = scope_lookup(sem->current_scope, iface_name);
+        }
+        if (!iface_sym) {
+            char *qualified = resolve_import(sem, iface_name);
+            if (qualified) {
+                iface_sym = load_external_class(sem, qualified);
+                free(qualified);
+            }
+        }
+        if (!iface_sym) {
+            iface_sym = load_external_class(sem, iface_name);
+        }
+        if (!iface_sym) {
+            continue;
+        }
+        bool dup = false;
+        for (slist_t *i = sym->data.class_data.interfaces; i; i = i->next) {
+            if (i->data == iface_sym) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            if (!sym->data.class_data.interfaces) {
+                sym->data.class_data.interfaces = slist_new(iface_sym);
+            } else {
+                slist_append(sym->data.class_data.interfaces, iface_sym);
+            }
+        }
+    }
+}
+
+/**
  * This uses a two-pass approach:
  * Pass 1: Register all nested type names/symbols (no type resolution)
  * Pass 2: Populate methods/fields with resolved types (all siblings now visible)
@@ -7855,10 +7930,13 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     free(outer_name);
                 }
                 
-                /* Check if it's a nested class of the enclosing class (for inner classes) */
-                if (sem->current_class && sem->current_class->data.class_data.enclosing_class) {
-                    symbol_t *enclosing = sem->current_class->data.class_data.enclosing_class;
-                    if (enclosing->data.class_data.members) {
+                /* Nested types declared in an enclosing class (sibling types for inner classes) */
+                if (sem->current_class) {
+                    for (symbol_t *enclosing = sem->current_class->data.class_data.enclosing_class;
+                         enclosing; enclosing = enclosing->data.class_data.enclosing_class) {
+                        if (!enclosing->data.class_data.members) {
+                            continue;
+                        }
                         symbol_t *sibling = scope_lookup_local(
                             enclosing->data.class_data.members, name);
                         if (sibling && (sibling->kind == SYM_CLASS || sibling->kind == SYM_INTERFACE ||
@@ -11979,6 +12057,15 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             check_class = check_class->data.class_data.superclass;
                         }
                     }
+
+                    /* Instance methods inherited from java.lang.Object (getClass, etc.) */
+                    if (!found_method) {
+                        symbol_t *obj_class = load_external_class(sem, "java.lang.Object");
+                        if (obj_class && obj_class->data.class_data.members) {
+                            found_method = scope_lookup_method_with_types(sem,
+                                obj_class->data.class_data.members, method_name, method_args);
+                        }
+                    }
                 }
                 
                 /* If not found and we're in a nested class without explicit receiver,
@@ -12182,7 +12269,12 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             bind_method_ref_to_target_type(sem, unwrapped_arg, bind_type_for_lambda);
                         }
                         
+                        type_t *saved_arg_target = sem->target_type;
+                        if (param_type) {
+                            sem->target_type = param_type;
+                        }
                         type_t *arg_type = get_expression_type(sem, arg);
+                        sem->target_type = saved_arg_target;
                         
                         /* Infer type arguments from argument types for generic methods */
                         type_t *infer_from = param->type;
@@ -12289,6 +12381,26 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 arg_type->kind == TYPE_ARRAY) {
                                 /* Unchecked array conversion for method invocation */
                                 arg_ok = type_assignable(arg_type, param_type);
+                            }
+                            if (!arg_ok && param_type->kind == TYPE_TYPEVAR) {
+                                const char *tv = param_type->data.type_var.name;
+                                if (tv && infer_type_arg_from_expression(sem, param_type, arg,
+                                                                        arg_type, tv)) {
+                                    arg_ok = true;
+                                }
+                            }
+                            if (!arg_ok && param_type->kind == TYPE_CLASS &&
+                                param_type->data.class_type.type_args &&
+                                arg_type->kind == TYPE_CLASS &&
+                                arg_type->data.class_type.type_args) {
+                                type_t *p0 = (type_t *)param_type->data.class_type.type_args->data;
+                                type_t *a0 = (type_t *)arg_type->data.class_type.type_args->data;
+                                if (p0 && p0->kind == TYPE_TYPEVAR && a0) {
+                                    const char *tv = p0->data.type_var.name;
+                                    if (tv && infer_type_arg(p0, a0, tv)) {
+                                        arg_ok = true;
+                                    }
+                                }
                             }
                             if (!arg_ok) {
                             char *expected = type_to_string(param_type);
@@ -12407,12 +12519,23 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             infer_from_target = true;
                         } else if (return_type->kind == TYPE_CLASS &&
                                    return_type->data.class_type.name &&
-                                   !return_type->data.class_type.symbol) {
+                                   !return_type->data.class_type.symbol &&
+                                   !return_type->data.class_type.type_args) {
+                            /* Only bare type-variable names (e.g. selectFirst's T), not
+                             * parameterized types like List<X509Certificate> whose element
+                             * type might still be unresolved. */
                             const char *rn = return_type->data.class_type.name;
                             if (strcmp(rn, "V") == 0 || strcmp(rn, "T") == 0 ||
                                 strcmp(rn, "E") == 0 || strcmp(rn, "R") == 0) {
                                 infer_from_target = true;
                             }
+                        }
+                        if (infer_from_target && return_type &&
+                            return_type->kind == TYPE_CLASS &&
+                            return_type->data.class_type.type_args) {
+                            /* Never replace a parameterized return (e.g. List<X>) with a
+                             * single-type target (e.g. X509Certificate from List.add). */
+                            infer_from_target = false;
                         }
                         if (infer_from_target) {
                             return_type = sem->target_type;
@@ -12469,8 +12592,14 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 if (param_matches && arg) {
                                     type_t *at = get_expression_type(sem, arg);
                                     if (at && at->kind != TYPE_UNKNOWN && at->kind != TYPE_VOID) {
-                                        return_type = type_boxed(at);
-                                        break;
+                                        /* Do not replace a declared parameterized return type
+                                         * (e.g. List<X509Certificate>) with the argument type
+                                         * of a single parameter (e.g. List<byte[]>). */
+                                        if (!(return_type && return_type->kind == TYPE_CLASS &&
+                                              return_type->data.class_type.type_args)) {
+                                            return_type = type_boxed(at);
+                                            break;
+                                        }
                                     }
                                 }
                                 pnode = pnode->next;
@@ -13134,10 +13263,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                              * file with different imports, so using semantic_resolve_type would
                              * use the wrong import context and generate spurious errors.
                              * Instead, use resolve_unresolved_type for external classes. */
-                            if (!field->type) {
-                                /* Check if this is an external class field */
-                                bool is_external = (search_class != sem->current_class);
-                                
+                            if (!field->type ||
+                                (field->type && field->type->kind == TYPE_UNKNOWN)) {
                                 /* Try unresolved type first (works for both internal and external) */
                                 if (field->data.var_data.unresolved_type) {
                                     unresolved_type_t *ut = (unresolved_type_t *)field->data.var_data.unresolved_type;
@@ -13147,22 +13274,50 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     }
                                 }
                                 
-                                /* Fall back to AST-based resolution only for current class fields */
-                                if (!field->type && field->ast && !is_external) {
-                                    ast_node_t *field_decl = NULL;
-                                    if (field->ast->type == AST_VAR_DECLARATOR) {
-                                        /* Field's ast is the declarator - need parent for type */
-                                        /* For now, skip to avoid incorrect superclass lookup */
-                                    } else if (field->ast->type == AST_FIELD_DECL) {
-                                        field_decl = field->ast;
+                                /* Re-resolve field types that reference sibling nested types */
+                                if (field->type && field->ast && field->ast->type == AST_FIELD_DECL &&
+                                    field->ast->data.node.children) {
+                                    ast_node_t *type_node = (ast_node_t *)field->ast->data.node.children->data;
+                                    const char *tn = NULL;
+                                    if (type_node && type_node->type == AST_CLASS_TYPE &&
+                                        type_node->data.node.name &&
+                                        strchr(type_node->data.node.name, '.') == NULL) {
+                                        tn = type_node->data.node.name;
+                                    } else if (field->type->kind == TYPE_CLASS &&
+                                               field->type->data.class_type.name &&
+                                               !field->type->data.class_type.symbol &&
+                                               strchr(field->type->data.class_type.name, '.') == NULL) {
+                                        tn = field->type->data.class_type.name;
                                     }
-                                    
-                                    if (field_decl && field_decl->data.node.children) {
-                                        ast_node_t *type_node = (ast_node_t *)field_decl->data.node.children->data;
-                                        if (type_node && (type_node->type == AST_CLASS_TYPE ||
-                                                          type_node->type == AST_PRIMITIVE_TYPE ||
-                                                          type_node->type == AST_ARRAY_TYPE)) {
-                                            field->type = semantic_resolve_type(sem, type_node);
+                                    if (tn && (field->type->kind == TYPE_UNKNOWN ||
+                                               (field->type->kind == TYPE_CLASS &&
+                                                !field->type->data.class_type.symbol))) {
+                                        for (symbol_t *encl = search_class; encl;
+                                             encl = encl->data.class_data.enclosing_class) {
+                                            if (!encl->data.class_data.members) {
+                                                continue;
+                                            }
+                                            symbol_t *sib = scope_lookup_local(
+                                                encl->data.class_data.members, tn);
+                                            if (sib && sib->type &&
+                                                (sib->kind == SYM_CLASS || sib->kind == SYM_INTERFACE ||
+                                                 sib->kind == SYM_ENUM || sib->kind == SYM_RECORD)) {
+                                                field->type = sib->type;
+                                                break;
+                                            }
+                                        }
+                                        if (field->type->kind == TYPE_CLASS &&
+                                            !field->type->data.class_type.symbol &&
+                                            search_class->data.class_data.enclosing_class &&
+                                            search_class->data.class_data.enclosing_class->qualified_name) {
+                                            char nested_fqn[512];
+                                            snprintf(nested_fqn, sizeof(nested_fqn), "%s$%s",
+                                                search_class->data.class_data.enclosing_class->qualified_name,
+                                                tn);
+                                            symbol_t *loaded = load_external_class(sem, nested_fqn);
+                                            if (loaded && loaded->type) {
+                                                field->type = loaded->type;
+                                            }
                                         }
                                     }
                                 }
@@ -17878,7 +18033,10 @@ define_local_var:
                                     }
                                 }
                                 
+                                type_t *saved_assign_target = sem->target_type;
+                                sem->target_type = left_type;
                                 type_t *right_type = get_expression_type(sem, right);
+                                sem->target_type = saved_assign_target;
                                 
                                 /* Ensure symbols loaded for proper subtype checking */
                                 ensure_type_symbol_loaded(sem, right_type);

@@ -1682,6 +1682,32 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
     if (strcmp(field_name, "this") == 0 && receiver->type == AST_IDENTIFIER) {
         const char *enclosing_class_name = receiver->data.leaf.name;
 
+        /* EnclosingType.this in an instance method of EnclosingType is just this */
+        if (mg->class_gen && mg->class_gen->class_sym && !mg->is_static) {
+            symbol_t *cur = mg->class_gen->class_sym;
+            bool same_class = false;
+            if (cur->name && strcmp(cur->name, enclosing_class_name) == 0) {
+                same_class = true;
+            } else if (cur->qualified_name) {
+                const char *simple = cur->qualified_name;
+                const char *dot = strrchr(cur->qualified_name, '.');
+                if (dot) {
+                    simple = dot + 1;
+                }
+                if (strcmp(simple, enclosing_class_name) == 0) {
+                    same_class = true;
+                }
+            }
+            if (receiver->sem_symbol && receiver->sem_symbol == cur) {
+                same_class = true;
+            }
+            if (same_class) {
+                bc_emit(mg->code, OP_ALOAD_0);
+                mg_push_object(mg, mg->class_gen->internal_name);
+                return true;
+            }
+        }
+
         if (mg->class_gen && mg->class_gen->this_dollar_zero_ref &&
             mg->class_gen->class_sym) {
             symbol_t *enc = mg->class_gen->class_sym->data.class_data.enclosing_class;
