@@ -154,3 +154,11 @@ supports the language through Java 25.
   account for the lexer's ordinary '>' + '=' merge combining the *last* '>'
   of the run with a trailing '=' into one GE token, rather than leaving a
   separate '=' token the reconstruction could look for.
+
+  Assigning through an explicit receiver ("obj.field = x" or, for a static
+  field named by its class, "Test.sfield = x") left nothing on the stack
+  for the assignment expression's value (JLS 15.26): using it as a
+  sub-expression, such as "int r = (obj.field = 5);", corrupted the stack.
+  "Test.sfield += x" additionally had no compound-assignment support at
+  all. Both now match the identifier-target forms ("this.field = x",
+  a bare field name, an inherited field, one in an enclosing class).

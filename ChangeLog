@@ -87,20 +87,6 @@ UNRELEASED  Chris Burdess  <dog@gnu.org>
 	test/src/java8/{NestedGenericTest,BoundedTypeVarCallTest,
 	TypeVarBoxingTest}.java: New.
 
-	String concatenation and anonymous classes.
-	* src/codegen_expr.c (get_append_descriptor): Trust the resolved type
-	first; append wrappers and other references as Object.
-	(codegen_string_concat): Take the argument slot count from the append
-	overload chosen, not from the operand's unboxed kind.
-	(codegen_method_call): Compute the argument slot count once, from the
-	parameter types, before emitting the call; use it for the invokeinterface
-	count operand.
-	* src/semantic.c (declared_inside_current_class): New.  Do not treat a
-	parameter or local of a local/anonymous class's own method as captured.
-	* src/codegen.c (codegen_anonymous_class): Generate superclass and
-	interface bridge methods, as codegen_class does.
-	* test/src/java8/{StringConcatBoxedTest,AnonymousParamTest}.java: New.
-
 	Primitive conversions: widening, boxing, unboxing, promotion.
 	* src/codegen_expr.c (emit_widen_primitive, coerce_stack_value,
 	descriptor_kind_and_class, value_kind_and_class,
@@ -153,6 +139,15 @@ UNRELEASED  Chris Burdess  <dog@gnu.org>
 	parser_consume_double_gt/parser_consume_triple_gt (deleted).
 	* test/src/java8/{PrimitiveWideningTest,CompoundAssignmentTest,
 	BinaryPromotionTest}.java: New.
+
+	Assignment through an explicit receiver.
+	* src/codegen_expr.c (codegen_assignment, obj.field = x and
+	Test.sfield = x): DUP_X1/DUP2_X1 (receiver case) or DUP/DUP2 (static,
+	by class name) the stored value so the assignment expression can be
+	used as a sub-expression, as every identifier-target case already
+	could. Add compound-assignment support (via codegen_compound_rhs) to
+	the by-class-name static case, which had none at all.
+	* test/src/java8/FieldAssignChainTest.java: New.
 
 2016-2020  Chris Burdess  <dog@gnu.org>
 

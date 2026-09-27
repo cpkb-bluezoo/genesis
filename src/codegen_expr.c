@@ -7206,17 +7206,49 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     return false;
                 }
                 
-                /* Generate value */
-                if (!codegen_expr(mg, value, cp)) {
-                    return false;
+                bool static_field_is_wide = (field_desc[0] == 'J' || field_desc[0] == 'D');
+
+                if (compound) {
+                    /* Load current value, generate the RHS, apply the
+                     * operator and narrow back (JLS 15.26.2) */
+                    uint16_t getref = cp_add_fieldref(cp, class_name, field_name, field_desc);
+                    bc_emit(mg->code, OP_GETSTATIC);
+                    bc_emit_u2(mg->code, getref);
+                    switch (field_desc[0]) {
+                        case 'J': mg_push_long(mg); break;
+                        case 'D': mg_push_double(mg); break;
+                        case 'F': mg_push_float(mg); break;
+                        case 'L':
+                        case '[': mg_push_object_from_descriptor(mg, field_desc); break;
+                        default:  mg_push_int(mg); break;
+                    }
+
+                    type_kind_t field_kind;
+                    char field_class_name[512];
+                    descriptor_kind_and_class(field_desc, &field_kind,
+                                              field_class_name, sizeof(field_class_name));
+                    if (!codegen_compound_rhs(mg, cp, value, field_kind,
+                                              field_class_name[0] ? field_class_name : NULL, op)) {
+                        return false;
+                    }
+                } else {
+                    /* Generate value, then box, unbox or widen to the field's type */
+                    if (!codegen_expr(mg, value, cp)) {
+                        return false;
+                    }
+                    coerce_value_to_descriptor(mg, cp, value, field_desc);
                 }
-                coerce_value_to_descriptor(mg, cp, value, field_desc);
+
+                /* DUP the value so the assignment expression can be chained
+                 * (a = Test.sfield = 0), as the identifier-target branches do */
+                bc_emit(mg->code, static_field_is_wide ? OP_DUP2 : OP_DUP);
+                mg_push(mg, static_field_is_wide ? 2 : 1);
 
                 /* Emit putstatic */
                 uint16_t fieldref = cp_add_fieldref(cp, class_name, field_name, field_desc);
                 bc_emit(mg->code, OP_PUTSTATIC);
                 bc_emit_u2(mg->code, fieldref);
-                mg_pop_typed(mg, (field_desc[0] == 'J' || field_desc[0] == 'D') ? 2 : 1);
+                mg_pop_typed(mg, static_field_is_wide ? 2 : 1);  /* PUTSTATIC consumes the original, DUP's copy remains */
 
                 return true;
             }
@@ -7271,9 +7303,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         if (compound) {
             /* Duplicate the receiver for getfield, then load the current
              * value, generate the RHS, apply the operator and narrow back
-             * to field_desc's type (JLS 15.26.2). This target does not
-             * support chaining (obj.field = x as a sub-expression) even for
-             * a simple assignment, so neither does this. */
+             * to field_desc's type (JLS 15.26.2). */
             bc_emit(mg->code, OP_DUP);
             mg_push(mg, 1);
             uint16_t getref = cp_add_fieldref(cp, recv_class, field_name, field_desc);
@@ -7307,11 +7337,26 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             coerce_value_to_descriptor(mg, cp, value, field_desc);
         }
 
+        /* DUP_X1 to keep a copy of the value for chained assignments
+         * (a = obj.field = 0), as the this.field/inherited-field branches
+         * above do.
+         * Stack before: [receiver, value]
+         * Stack after:  [value, receiver, value]
+         * Then PUTFIELD consumes [receiver, value], leaving [value] */
+        if (field_is_wide) {
+            bc_emit(mg->code, OP_DUP2_X1);
+            mg_push(mg, 2);
+        } else {
+            bc_emit(mg->code, OP_DUP_X1);
+            mg_push(mg, 1);
+        }
+
         /* Emit putfield */
         uint16_t fieldref = cp_add_fieldref(cp, recv_class, field_name, field_desc);
         bc_emit(mg->code, OP_PUTFIELD);
         bc_emit_u2(mg->code, fieldref);
-        /* putfield consumes ref (1) + value (1 or 2 slots) */
+        /* putfield consumes ref (1) + value (1 or 2 slots); the DUP_X1/
+         * DUP2_X1 copy remains */
         mg_pop_typed(mg, field_is_wide ? 3 : 2);
 
         if (field_desc_owned) free((char *)field_desc);
