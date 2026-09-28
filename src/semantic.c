@@ -1020,6 +1020,32 @@ static type_t *resolve_unresolved_type(const char *name, type_registry_t *reg,
         }
     }
 
+    /* Sibling nested types declared in enclosing class(es) (e.g. GreasePreSharedKey for ClientHelloParams) */
+    if (context) {
+        for (symbol_t *encl = context->data.class_data.enclosing_class; encl;
+             encl = encl->data.class_data.enclosing_class) {
+            if (encl->data.class_data.members) {
+                symbol_t *sibling = scope_lookup_local(encl->data.class_data.members, name);
+                if (sibling && sibling->type &&
+                    (sibling->kind == SYM_CLASS || sibling->kind == SYM_INTERFACE ||
+                     sibling->kind == SYM_ENUM || sibling->kind == SYM_RECORD)) {
+                    return sibling->type;
+                }
+            }
+            if (encl->qualified_name) {
+                char *sibling_qname = malloc(strlen(encl->qualified_name) + 1 + strlen(name) + 1);
+                if (sibling_qname) {
+                    sprintf(sibling_qname, "%s$%s", encl->qualified_name, name);
+                    sym = type_registry_lookup(reg, sibling_qname);
+                    free(sibling_qname);
+                    if (sym && sym->type) {
+                        return sym->type;
+                    }
+                }
+            }
+        }
+    }
+
     /* Try as nested type of context */
     if (context && context->qualified_name) {
         char *nested = malloc(strlen(context->qualified_name) + 1 + strlen(name) + 1);
@@ -3233,17 +3259,14 @@ static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sy
         iface = interface_symbol_for_lookup(sem, iface);
         if (!iface) continue;
 
-        if (iface->kind == SYM_INTERFACE && iface->ast && !iface->data.class_data.interfaces) {
-            bool has_extends = false;
-            for (slist_t *mc = iface->ast->data.node.children; mc; mc = mc->next) {
-                ast_node_t *c = (ast_node_t *)mc->data;
-                if (c && c->type == AST_CLASS_TYPE && c->data.node.flags == 1) {
-                    has_extends = true;
-                    break;
-                }
+        if (iface->kind == SYM_INTERFACE) {
+            ast_node_t *iface_ast = iface->ast;
+            if (!iface_ast && sem->shared_registry && iface->qualified_name) {
+                iface_ast = type_registry_get_ast(sem->shared_registry, iface->qualified_name);
             }
-            if (has_extends) {
-                add_interface_extends_from_ast(sem, iface, iface->ast);
+            if (iface_ast && (!iface->data.class_data.interfaces ||
+                              iface->data.class_data.unresolved_interfaces)) {
+                add_interface_extends_from_ast(sem, iface, iface_ast);
             }
         }
 
@@ -4574,7 +4597,13 @@ static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_n
         }
         bool dup = false;
         for (slist_t *i = sym->data.class_data.interfaces; i; i = i->next) {
-            if (i->data == iface_sym) {
+            symbol_t *existing = (symbol_t *)i->data;
+            if (existing == iface_sym) {
+                dup = true;
+                break;
+            }
+            if (existing && iface_sym && existing->qualified_name && iface_sym->qualified_name &&
+                strcmp(existing->qualified_name, iface_sym->qualified_name) == 0) {
                 dup = true;
                 break;
             }
@@ -6125,8 +6154,10 @@ static symbol_t *lookup_same_package_type(semantic_t *sem, const char *simple_na
  * 
  * Import resolution order:
  * 1. Single-type imports (import java.util.List;)
- * 2. On-demand imports (import java.util.*;)
- * 3. java.lang.* (implicit)
+ * 2. Nested types of single-type imports (e.g. JavaFileManager.Location)
+ * 3. On-demand imports (import java.util.*;)
+ * 4. Same-package types (implicit)
+ * 5. java.lang.* (implicit)
  */
 static char *resolve_import(semantic_t *sem, const char *simple_name)
 {
@@ -6149,18 +6180,6 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         return strdup(cached);
     }
 
-    /* Same-package top-level types before import-based resolution (JLS 6.5).
-     * Must run before nested-type lookup on imports (e.g. ResourceBundle.Control). */
-    if (sem->current_package && strchr(simple_name, '.') == NULL) {
-        symbol_t *pkg_sym = lookup_same_package_type(sem, simple_name);
-        if (pkg_sym && pkg_sym->qualified_name) {
-            hashtable_insert(sem->resolved_imports, simple_name,
-                             (void *)intern(pkg_sym->qualified_name));
-            sem->resolve_import_depth--;
-            return strdup(pkg_sym->qualified_name);
-        }
-    }
-    
     /* Check if this is a qualified inner class name like "Map.Entry" */
     const char *dot = strchr(simple_name, '.');
     if (dot != NULL) {
@@ -9853,15 +9872,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                     super = super->data.class_data.superclass;
                                 }
                                 
-                                /* Also check implemented interfaces for bridge method needs.
-                                 * When implementing a generic interface like Callable<Map>,
-                                 * the interface method T call() erases to Object call(),
-                                 * but our method Map call() needs a bridge Object call().
-                                 * 
-                                 * Use lookup_method_in_interfaces which recursively searches
-                                 * the interface hierarchy (important for interfaces that extend
-                                 * other interfaces, e.g., Locator2 extends Locator). */
-                                if (!sym->data.method_data.overridden_method) {
+                                if (!actually_overrides) {
                                     if (getenv("GENESIS_DEBUG_OVERRIDE")) {
                                         fprintf(stderr, "DEBUG @Override: checking interfaces for method '%s' in class '%s'\n",
                                                 name, sem->current_class->name ? sem->current_class->name : "<null>");
@@ -9888,49 +9899,39 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                             }
                                         }
                                     }
-                                    
-                                    /* Ensure interfaces are resolved before checking */
+
                                     ensure_interfaces_resolved(sem, sem->current_class);
-                                    
-                                        symbol_t *iface_method = lookup_method_in_interfaces(sem, 
+
+                                    symbol_t *iface_method = lookup_method_in_interfaces(sem,
                                         sem->current_class, name);
-                                    
+
                                     if (getenv("GENESIS_DEBUG_OVERRIDE")) {
                                         fprintf(stderr, "DEBUG @Override: lookup_method_in_interfaces for '%s' returned %p\n",
                                                 name, (void*)iface_method);
                                     }
-                                    
+
                                     if (iface_method && iface_method->kind == SYM_METHOD) {
-                                        /* Found matching method in interface hierarchy */
                                         actually_overrides = true;
-                                        
-                                        /* Check if return types differ after erasure.
-                                         * Interface method with type variable returns Object after erasure.
-                                         * Our concrete method returns the actual type. */
-                                        if (iface_method->type && sym->type) {
-                                            /* Check if interface method has type variable return */
-                                            type_t *iface_ret = iface_method->type;
-                                            
-                                            if (iface_ret->kind == TYPE_TYPEVAR) {
-                                                /* Interface returns type variable - erases to Object or bound */
-                                                /* Our method returns concrete type - need bridge */
-                                                if (sym->type->kind == TYPE_CLASS || 
-                                                    sym->type->kind == TYPE_ARRAY) {
-                                                    /* Different erasure - need bridge */
-                                                    
-                                                    /* Create a synthetic "overridden" method symbol 
-                                                     * with Object return type for the bridge */
-                                                    symbol_t *bridge_target = calloc(1, sizeof(symbol_t));
-                                                    bridge_target->kind = SYM_METHOD;
-                                                    bridge_target->name = strdup(name);
-                                                    bridge_target->modifiers = iface_method->modifiers;
-                                                    bridge_target->type = type_new_class("java.lang.Object");
-                                                    bridge_target->data.method_data.parameters = 
-                                                        iface_method->data.method_data.parameters;
-                                                    sym->data.method_data.overridden_method = bridge_target;
-                                                }
-                                            }
-                                        }
+                                    }
+                                }
+
+                                /* Bridge methods for generic interface implementations */
+                                if (!sym->data.method_data.overridden_method && actually_overrides) {
+                                    symbol_t *iface_method = lookup_method_in_interfaces(sem,
+                                        sem->current_class, name);
+                                    if (iface_method && iface_method->kind == SYM_METHOD &&
+                                        iface_method->type && sym->type &&
+                                        iface_method->type->kind == TYPE_TYPEVAR &&
+                                        (sym->type->kind == TYPE_CLASS ||
+                                         sym->type->kind == TYPE_ARRAY)) {
+                                        symbol_t *bridge_target = calloc(1, sizeof(symbol_t));
+                                        bridge_target->kind = SYM_METHOD;
+                                        bridge_target->name = strdup(name);
+                                        bridge_target->modifiers = iface_method->modifiers;
+                                        bridge_target->type = type_new_class("java.lang.Object");
+                                        bridge_target->data.method_data.parameters =
+                                            iface_method->data.method_data.parameters;
+                                        sym->data.method_data.overridden_method = bridge_target;
                                     }
                                 }
                             }
@@ -12629,6 +12630,24 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         }
                     }
                     
+                    /* Enum.valueOf(String) erases to Enum in classpath stubs; use the enum type. */
+                    if (method_name && strcmp(method_name, "valueOf") == 0) {
+                        if (target_class && target_class->kind == SYM_ENUM && target_class->type) {
+                            return_type = target_class->type;
+                        } else if (has_explicit_receiver && children) {
+                            ast_node_t *recv_expr = (ast_node_t *)children->data;
+                            type_t *recv_t = recv_expr ? recv_expr->sem_type : NULL;
+                            if (!recv_t && recv_expr) {
+                                recv_t = get_expression_type(sem, recv_expr);
+                            }
+                            if (recv_t && recv_t->kind == TYPE_CLASS &&
+                                recv_t->data.class_type.symbol &&
+                                recv_t->data.class_type.symbol->kind == SYM_ENUM) {
+                                return_type = recv_t;
+                            }
+                        }
+                    }
+
                     /* Store the resolved return type for use by outer expressions.
                      * This is critical for method overload resolution - e.g., println(obj.get())
                      * needs to know the actual return type of get() to select the right println. */
@@ -13266,12 +13285,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             if (!field->type ||
                                 (field->type && field->type->kind == TYPE_UNKNOWN)) {
                                 /* Try unresolved type first (works for both internal and external) */
-                                if (field->data.var_data.unresolved_type) {
+                                if (field->data.var_data.unresolved_type && sem->shared_registry) {
                                     unresolved_type_t *ut = (unresolved_type_t *)field->data.var_data.unresolved_type;
-                                    if (ut && ut->name) {
-                                        field->type = resolve_unresolved_type(ut->name,
-                                            sem->shared_registry, sem->classpath, search_class);
-                                    }
+                                    field->type = resolve_unresolved_type_full(ut, sem->shared_registry,
+                                        sem->classpath, search_class);
                                 }
                                 
                                 /* Re-resolve field types that reference sibling nested types */

@@ -1173,6 +1173,12 @@ static void register_type_decl(type_registry_t *reg, ast_node_t *decl,
     /* Create symbol stub and register it */
     symbol_t *sym = create_type_stub(qname, decl, package);
     if (sym) {
+        if (parent_qname) {
+            symbol_t *parent_sym = type_registry_lookup(reg, parent_qname);
+            if (parent_sym) {
+                sym->data.class_data.enclosing_class = parent_sym;
+            }
+        }
         /* Set the completer for lazy member population (javac-style) */
         if (completer_ctx) {
             symbol_set_completer(sym, class_symbol_completer, completer_ctx);
