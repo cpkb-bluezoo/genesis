@@ -16557,7 +16557,60 @@ static void scan_lambda_body_for_this_capture(semantic_t *sem, ast_node_t *node,
             }
         }
     }
-    
+
+    /* Check if identifier references a local variable or parameter captured
+     * from an enclosing scope. get_expression_type()'s own AST_IDENTIFIER
+     * case already does this (see the matching block there, keyed off
+     * sem->current_lambda) - but that function is only ever called on a
+     * block-bodied lambda's RETURN-statement expressions, never on the
+     * rest of its statements (an expression-bodied lambda instead runs its
+     * single body expression through get_expression_type directly, which
+     * is why only block bodies were affected). Without this, any local
+     * captured solely by a non-return statement (e.g. inside a
+     * synchronized block, an assignment, or a bare method/field access)
+     * was silently missing from lambda_captures, and genesis's own
+     * codegen then had no local slot to resolve it against. */
+    if (node->type == AST_IDENTIFIER && sem->current_scope) {
+        const char *name = node->data.leaf.name;
+        if (name) {
+            symbol_t *sym = scope_lookup(sem->current_scope, name);
+            if (sym && (sym->kind == SYM_LOCAL_VAR || sym->kind == SYM_PARAMETER)) {
+                scope_t *var_scope = NULL;
+                for (scope_t *s = sem->current_scope; s; s = s->parent) {
+                    if (scope_lookup_local(s, name) == sym) {
+                        var_scope = s;
+                        break;
+                    }
+                }
+                bool is_capture = false;
+                if (var_scope && sem->lambda_enclosing_scope) {
+                    for (scope_t *s = sem->lambda_enclosing_scope; s; s = s->parent) {
+                        if (s == var_scope) {
+                            is_capture = true;
+                            break;
+                        }
+                    }
+                }
+                if (is_capture) {
+                    bool already_captured = false;
+                    for (slist_t *lc = lambda->lambda_captures; lc; lc = lc->next) {
+                        if (lc->data == sym) {
+                            already_captured = true;
+                            break;
+                        }
+                    }
+                    if (!already_captured) {
+                        if (!lambda->lambda_captures) {
+                            lambda->lambda_captures = slist_new(sym);
+                        } else {
+                            slist_append(lambda->lambda_captures, sym);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /* Check if method call is to an instance method without explicit receiver */
     if (node->type == AST_METHOD_CALL && sem->current_class) {
         const char *method_name = node->data.node.name;
