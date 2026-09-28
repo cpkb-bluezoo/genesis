@@ -1294,6 +1294,7 @@ char *generate_class_signature(ast_node_t *class_decl, symbol_t *class_sym)
     /* Check if superclass is parameterized */
     bool has_parameterized_super = false;
     type_t *super_type = NULL;
+    bool is_interface = class_sym && class_sym->kind == SYM_INTERFACE;
     if (class_sym && class_sym->data.class_data.superclass_type) {
         super_type = class_sym->data.class_data.superclass_type;
         if (super_type->kind == TYPE_CLASS && super_type->data.class_type.type_args) {
@@ -1318,8 +1319,19 @@ char *generate_class_signature(ast_node_t *class_decl, symbol_t *class_sym)
         slist_free(type_params);
     }
     
-    /* Superclass signature */
-    if (super_type) {
+    /* Class signature: SuperclassSignature [SuperinterfaceSignature*]
+     * Interfaces always have java.lang.Object as the superclass slot; parameterized
+     * extends clauses go in the superinterface signature list. */
+    if (is_interface) {
+        string_append(sig, "Ljava/lang/Object;");
+        if (has_parameterized_super && super_type) {
+            char *iface_sig = type_to_signature(super_type);
+            if (iface_sig) {
+                string_append(sig, iface_sig);
+                free(iface_sig);
+            }
+        }
+    } else if (super_type) {
         char *super_sig = type_to_signature(super_type);
         if (super_sig) {
             string_append(sig, super_sig);

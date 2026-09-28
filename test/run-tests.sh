@@ -157,6 +157,29 @@ else
 fi
 
 echo
+echo "--- RUNTIME-retention annotation defined outside the JDK builtins ---"
+# The annotation type is compiled first, then the client is compiled
+# against its class file only (-cp, no -sourcepath), so its RUNTIME
+# retention must be discovered from ITS classfile's own @Retention
+# meta-annotation - exactly like an externally-defined annotation such as
+# JUnit's @Test.
+printf "%-30s ... " "AnnotationRetentionTest"
+anno_lib="$TEST_BUILD/annotest-lib"
+anno_out="$TEST_BUILD/annotest-out"
+rm -rf "$anno_lib" "$anno_out"
+mkdir -p "$anno_lib" "$anno_out"
+if "$GENESIS" -d "$anno_lib" "$TEST_SRC"/external/annotest/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$anno_lib" -d "$anno_out" \
+       "$TEST_SRC/external/AnnotationRetentionTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$anno_out:$anno_lib" AnnotationRetentionTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "--- Class file version (-source/-target/-release) ---"
 # With no -target the version is computed from the features used (floor 52,
 # Java 8). An explicit -target is a ceiling: needing more is an error.
@@ -231,6 +254,111 @@ printf "%-30s ... " "ResourceBundleControlShadowTest"
 if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
        "$TEST_SRC/src/java8/shadowtest/Control.java" \
        "$TEST_SRC/src/java8/shadowtest/ResourceBundleControlShadowTest.java" \
+       >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "NestedInterfaceExtends"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/NestedInterfaceExtends.java" \
+       >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Package scan must not recurse into a file still being loaded ---"
+printf "%-30s ... " "PackageScanSelfLoadCycle"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/pkgscantest/SiblingWithNestedType.java" \
+       "$TEST_SRC/src/java8/pkgscantest/HasFieldOfSibling.java" \
+       >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- @Override against a forward-referenced supertype in the same file ---"
+printf "%-30s ... " "ForwardIfaceOverrideTest"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/overridetest/ForwardIfaceOverrideTest.java" \
+       >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "ForwardSuperMethodOverrideTest"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/overridetest/ForwardSuperMethodOverrideTest.java" \
+       >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Nested class implementing a classfile-loaded interface's nested type ---"
+printf "%-30s ... " "NestedClassIfaceNestedType"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/pkgscantest/HandlerWithNestedType.java" \
+       >/dev/null 2>&1 && \
+   "$GENESIS" -source 8 -d "$TEST_BUILD" -classpath "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/pkgscantest/NestedClassImplementsInterfaceWithNestedType.java" \
+       >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Varargs call as a nested argument to another call ---"
+printf "%-30s ... " "VarargsForwardingNestedCall"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/varargstest/Concatenator.java" \
+       "$TEST_SRC/src/java8/varargstest/VarargsForwardingNestedCallTest.java" \
+       >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Chained field access through a doubly-nested generic call ---"
+printf "%-30s ... " "NestedGenericFieldAccess"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/generictest/NestedGenericFieldAccessTest.java" \
+       >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Array value passed as a single element to an unrelated varargs type ---"
+printf "%-30s ... " "ArrayValueAsVarargsElement"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/varargstest/ArrayValueAsVarargsElementTest.java" \
        >/dev/null 2>&1; then
     echo PASS
     passed=$((passed + 1))

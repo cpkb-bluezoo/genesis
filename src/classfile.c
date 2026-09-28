@@ -929,6 +929,182 @@ char **classfile_get_module_exports(classfile_t *cf, int *count_out)
 }
 
 /* ========================================================================
+ * Annotation Retention Parsing (JVMS 4.7.16)
+ * ======================================================================== */
+
+/*
+ * Small bounds-checked cursor readers for scanning raw attribute bytes.
+ * Unlike the reader_t used during full classfile parsing, these operate on
+ * an already-loaded attribute_info_t's info/attribute_length and report
+ * failure (rather than silently returning 0) so callers can bail out of a
+ * malformed or truncated annotation without reading past the buffer.
+ */
+static bool cf_read_u1(const uint8_t **p, const uint8_t *end, uint8_t *out)
+{
+    if (*p + 1 > end) return false;
+    *out = **p;
+    *p += 1;
+    return true;
+}
+
+static bool cf_read_u2(const uint8_t **p, const uint8_t *end, uint16_t *out)
+{
+    if (*p + 2 > end) return false;
+    *out = ((uint16_t)(*p)[0] << 8) | (uint16_t)(*p)[1];
+    *p += 2;
+    return true;
+}
+
+static bool skip_annotation(const uint8_t **p, const uint8_t *end);
+
+/* Skip one element_value, per JVMS 4.7.16.1. */
+static bool skip_element_value(const uint8_t **p, const uint8_t *end)
+{
+    uint8_t tag;
+    if (!cf_read_u1(p, end, &tag)) return false;
+
+    switch (tag) {
+        case 'B': case 'C': case 'D': case 'F': case 'I': case 'J':
+        case 'S': case 'Z': case 's': case 'c': {
+            uint16_t idx;
+            return cf_read_u2(p, end, &idx);
+        }
+        case 'e': {
+            uint16_t type_name_idx, const_name_idx;
+            return cf_read_u2(p, end, &type_name_idx) &&
+                   cf_read_u2(p, end, &const_name_idx);
+        }
+        case '@':
+            return skip_annotation(p, end);
+        case '[': {
+            uint16_t num_values;
+            if (!cf_read_u2(p, end, &num_values)) return false;
+            for (uint16_t i = 0; i < num_values; i++) {
+                if (!skip_element_value(p, end)) return false;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+/* Skip one annotation structure, per JVMS 4.7.16. */
+static bool skip_annotation(const uint8_t **p, const uint8_t *end)
+{
+    uint16_t type_index, num_pairs;
+    if (!cf_read_u2(p, end, &type_index)) return false;
+    if (!cf_read_u2(p, end, &num_pairs)) return false;
+    for (uint16_t i = 0; i < num_pairs; i++) {
+        uint16_t name_idx;
+        if (!cf_read_u2(p, end, &name_idx)) return false;
+        if (!skip_element_value(p, end)) return false;
+    }
+    return true;
+}
+
+/**
+ * Find this annotation type's own @java.lang.annotation.Retention
+ * meta-annotation (recorded in ITS class-level RuntimeVisibleAnnotations
+ * attribute, since Retention itself has RUNTIME retention) and return the
+ * RetentionPolicy enum constant name it declares ("RUNTIME", "CLASS", or
+ * "SOURCE"). Returns NULL if absent - callers should treat that as the JLS
+ * default, RetentionPolicy.CLASS. Caller must free() a non-NULL result.
+ */
+char *classfile_get_retention_policy_name(classfile_t *cf)
+{
+    if (!cf) return NULL;
+
+    attribute_info_t *annots_attr = NULL;
+    for (uint16_t i = 0; i < cf->attributes_count; i++) {
+        char *aname = classfile_get_utf8(cf, cf->attributes[i].attribute_name_index);
+        bool match = aname && strcmp(aname, "RuntimeVisibleAnnotations") == 0;
+        free(aname);
+        if (match) {
+            annots_attr = &cf->attributes[i];
+            break;
+        }
+    }
+    if (!annots_attr || !annots_attr->info) return NULL;
+
+    const uint8_t *p = annots_attr->info;
+    const uint8_t *end = p + annots_attr->attribute_length;
+
+    uint16_t num_annotations;
+    if (!cf_read_u2(&p, end, &num_annotations)) return NULL;
+
+    for (uint16_t i = 0; i < num_annotations; i++) {
+        uint16_t type_index, num_pairs;
+        if (!cf_read_u2(&p, end, &type_index)) return NULL;
+
+        char *type_desc = classfile_get_utf8(cf, type_index);
+        bool is_retention = type_desc &&
+            strcmp(type_desc, "Ljava/lang/annotation/Retention;") == 0;
+        free(type_desc);
+
+        if (!cf_read_u2(&p, end, &num_pairs)) return NULL;
+
+        char *result = NULL;
+        for (uint16_t j = 0; j < num_pairs; j++) {
+            uint16_t name_idx;
+            if (!cf_read_u2(&p, end, &name_idx)) { free(result); return NULL; }
+
+            char *pair_name = is_retention ? classfile_get_utf8(cf, name_idx) : NULL;
+            bool is_value = pair_name && strcmp(pair_name, "value") == 0;
+            free(pair_name);
+
+            if (is_retention && is_value && !result) {
+                /* Expect an enum_const_value; peek the tag ourselves so we
+                 * can extract the constant name instead of just skipping. */
+                uint8_t tag;
+                if (!cf_read_u1(&p, end, &tag)) return NULL;
+                if (tag == 'e') {
+                    uint16_t etype_idx, econst_idx;
+                    if (!cf_read_u2(&p, end, &etype_idx) ||
+                        !cf_read_u2(&p, end, &econst_idx)) {
+                        return NULL;
+                    }
+                    result = classfile_get_utf8(cf, econst_idx);
+                } else {
+                    /* Malformed (not actually an enum) - already consumed
+                     * the tag byte, so skip the rest of this element_value. */
+                    switch (tag) {
+                        case 'B': case 'C': case 'D': case 'F': case 'I': case 'J':
+                        case 'S': case 'Z': case 's': case 'c': {
+                            uint16_t idx;
+                            if (!cf_read_u2(&p, end, &idx)) return NULL;
+                            break;
+                        }
+                        case '@':
+                            if (!skip_annotation(&p, end)) return NULL;
+                            break;
+                        case '[': {
+                            uint16_t num_values;
+                            if (!cf_read_u2(&p, end, &num_values)) return NULL;
+                            for (uint16_t k = 0; k < num_values; k++) {
+                                if (!skip_element_value(&p, end)) return NULL;
+                            }
+                            break;
+                        }
+                        default:
+                            return NULL;
+                    }
+                }
+            } else {
+                if (!skip_element_value(&p, end)) { free(result); return NULL; }
+            }
+        }
+
+        if (is_retention) {
+            return result;
+        }
+        free(result);
+    }
+
+    return NULL;
+}
+
+/* ========================================================================
  * Generic Signature Parsing
  * JVMS 4.7.9.1
  * ======================================================================== */

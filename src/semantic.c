@@ -32,6 +32,19 @@
 /* Forward declarations for functions used in ensure_interfaces_resolved */
 static char *resolve_import(semantic_t *sem, const char *simple_name);
 symbol_t *load_external_class(semantic_t *sem, const char *name);
+static void nested_class_dots_to_dollars(char *name_with_dollars);
+static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_node_t *decl);
+static symbol_t *resolve_super_interface_symbol(semantic_t *sem, symbol_t *declaring_iface,
+                                                const char *iface_name);
+static symbol_t *registry_lookup_nested_members(semantic_t *sem, const char *outer_simple,
+                                                const char *inner_simple);
+static symbol_t *lookup_same_package_type(semantic_t *sem, const char *simple_name);
+static const char *semantic_package_name(semantic_t *sem, char *buf, size_t buf_len);
+static symbol_t *resolve_iface_member_type(semantic_t *sem, symbol_t *iface_sym,
+                                           const char *simple_name);
+static symbol_t *lookup_superclass_nested_type(semantic_t *sem, symbol_t *start_class,
+                                               const char *simple_name);
+static void ensure_interface_parameterized_extends(semantic_t *sem, symbol_t *sym);
 
 /* ========================================================================
  * Type Registry Implementation (for parallel compilation)
@@ -171,7 +184,7 @@ unresolved_type_t *unresolved_type_from_ast(ast_node_t *type_node)
     
     if (type_node->type == AST_CLASS_TYPE) {
         ut->name = type_node->data.node.name ? strdup(type_node->data.node.name) : NULL;
-        
+
         /* Extract type arguments from children */
         if (type_node->data.node.children) {
             for (slist_t *child = type_node->data.node.children; child; child = child->next) {
@@ -857,21 +870,21 @@ static type_t *resolve_unresolved_type_full(unresolved_type_t *ut, type_registry
                                             classpath_t *cp, symbol_t *context)
 {
     if (!ut || !ut->name) return NULL;
-    
+
     /* First resolve the base type */
     type_t *base_type = resolve_unresolved_type(ut->name, reg, cp, context);
     if (!base_type) return NULL;
-    
+
     /* If no type arguments, return the base type as-is */
     if (!ut->type_args) return base_type;
-    
+
     /* Clone the type and add type arguments */
     type_t *result = calloc(1, sizeof(type_t));
     if (!result) return base_type;
-    
+
     *result = *base_type;  /* Shallow copy */
     result->data.class_type.type_args = NULL;
-    
+
     /* Resolve each type argument and add to the result */
     for (slist_t *arg = ut->type_args; arg; arg = arg->next) {
         unresolved_type_t *arg_ut = (unresolved_type_t *)arg->data;
@@ -884,8 +897,32 @@ static type_t *resolve_unresolved_type_full(unresolved_type_t *ut, type_registry
             }
         }
     }
-    
+
     return result;
+}
+
+/**
+ * Package name for a type symbol during registry resolution (Phase 4).
+ * Uses class_data.package when set, otherwise derives from qualified_name.
+ */
+static const char *context_package_name(symbol_t *context, char *buf, size_t buf_len)
+{
+    if (!context) {
+        return NULL;
+    }
+    if (context->data.class_data.package) {
+        return context->data.class_data.package;
+    }
+    if (context->qualified_name && buf && buf_len > 0) {
+        const char *last = strrchr(context->qualified_name, '.');
+        if (last && last > context->qualified_name &&
+            (size_t)(last - context->qualified_name) < buf_len) {
+            memcpy(buf, context->qualified_name, (size_t)(last - context->qualified_name));
+            buf[last - context->qualified_name] = '\0';
+            return buf;
+        }
+    }
+    return NULL;
 }
 
 /**
@@ -897,6 +934,9 @@ static type_t *resolve_unresolved_type(const char *name, type_registry_t *reg,
                                        classpath_t *cp, symbol_t *context)
 {
     if (!name) return NULL;
+
+    char ctx_pkg_buf[512];
+    const char *ctx_pkg = context_package_name(context, ctx_pkg_buf, sizeof(ctx_pkg_buf));
     
     /* Handle array types */
     size_t len = strlen(name);
@@ -928,16 +968,16 @@ static type_t *resolve_unresolved_type(const char *name, type_registry_t *reg,
     }
     
     /* Try with context package prefix */
-    if (context && context->data.class_data.package) {
+    if (ctx_pkg) {
         /* For nested types like "Outer.Inner", convert to "Outer$Inner" first */
         char *name_copy = strdup(name);
         if (name_copy) {
             for (char *p = name_copy; *p; p++) {
                 if (*p == '.') *p = '$';
             }
-            char *qualified = malloc(strlen(context->data.class_data.package) + 1 + strlen(name_copy) + 1);
+            char *qualified = malloc(strlen(ctx_pkg) + 1 + strlen(name_copy) + 1);
             if (qualified) {
-                sprintf(qualified, "%s.%s", context->data.class_data.package, name_copy);
+                sprintf(qualified, "%s.%s", ctx_pkg, name_copy);
                 sym = type_registry_lookup(reg, qualified);
                 free(qualified);
                 if (sym && sym->type) {
@@ -951,7 +991,7 @@ static type_t *resolve_unresolved_type(const char *name, type_registry_t *reg,
         /* Try parent packages - e.g., if context is in org.foo.bar, try org.foo.Name and org.Name.
          * Note: This is only called for unresolved types from registry (Phase 3/4).
          * Types with explicit imports are qualified in Phase 2b before extraction. */
-        char *pkg_copy = strdup(context->data.class_data.package);
+        char *pkg_copy = strdup(ctx_pkg);
         if (pkg_copy) {
             char *last_dot = strrchr(pkg_copy, '.');
             while (last_dot) {
@@ -1062,8 +1102,7 @@ static type_t *resolve_unresolved_type(const char *name, type_registry_t *reg,
     /* Handle qualified nested type names like "OuterClass.NestedClass".
      * Convert dots to $ for registry lookup within the context package. */
     if (strchr(name, '.')) {
-        const char *pkg = (context && context->data.class_data.package) 
-                         ? context->data.class_data.package : NULL;
+        const char *pkg = ctx_pkg;
         
         /* Try converting the dots in the type name to $ for nested lookup.
          * For "A.B.C", try:
@@ -1237,10 +1276,10 @@ static type_t *resolve_unresolved_type(const char *name, type_registry_t *reg,
     }
     
     /* Try simple name with context package on classpath */
-    if (context && context->data.class_data.package && cp) {
-        char *qualified = malloc(strlen(context->data.class_data.package) + 1 + strlen(name) + 1);
+    if (ctx_pkg && cp) {
+        char *qualified = malloc(strlen(ctx_pkg) + 1 + strlen(name) + 1);
         if (qualified) {
-            sprintf(qualified, "%s.%s", context->data.class_data.package, name);
+            sprintf(qualified, "%s.%s", ctx_pkg, name);
             classfile_t *cf = classpath_load_class(cp, qualified);
             if (cf) {
                 type_t *type = type_new_class(qualified);
@@ -1248,6 +1287,14 @@ static type_t *resolve_unresolved_type(const char *name, type_registry_t *reg,
                 return type;
             }
             free(qualified);
+        }
+    }
+
+    /* Default-package simple name on classpath (no package declaration) */
+    if (cp && !strchr(name, '.')) {
+        classfile_t *cf = classpath_load_class(cp, name);
+        if (cf) {
+            return type_new_class(name);
         }
     }
     
@@ -1281,6 +1328,73 @@ static bool field_type_has_unresolved_typevar(type_t *t)
         return field_type_has_unresolved_typevar(t->data.array_type.element_type);
     }
     return false;
+}
+
+/**
+ * True if `ut`'s nested type-argument structure carries more detail than
+ * `resolved` currently reflects - e.g. resolved is "List<Box>" (Box's own
+ * type_args are empty) while ut is "List<Box<byte[]>>" (Box's ut does have
+ * a type argument). This happens when a field symbol gets resolved via a
+ * duplicate/less-complete class symbol (e.g. a shared-registry stub built
+ * before pass1 fully processed the declaring class) before the fully
+ * resolved one is available; the resolved type isn't NULL and has no bare
+ * type variable, so field_type_has_unresolved_typevar() alone can't detect
+ * the gap. Used to force resolve_types_for_symbol() to redo the resolution
+ * instead of treating an already-non-NULL type as complete.
+ */
+static bool unresolved_type_more_detailed(type_t *resolved, unresolved_type_t *ut)
+{
+    if (!ut || !ut->type_args) {
+        return false;
+    }
+    if (!resolved || resolved->kind != TYPE_CLASS) {
+        return false;
+    }
+    if (!resolved->data.class_type.type_args) {
+        return true;
+    }
+    slist_t *ra = resolved->data.class_type.type_args;
+    slist_t *ua = ut->type_args;
+    while (ra && ua) {
+        if (unresolved_type_more_detailed((type_t *)ra->data, (unresolved_type_t *)ua->data)) {
+            return true;
+        }
+        ra = ra->next;
+        ua = ua->next;
+    }
+    return false;
+}
+
+/**
+ * True if `t` contains a nested class type argument that is itself
+ * declared generic (has its own type parameters) but appears here without
+ * any type arguments of its own - e.g. "List<Box>" where Box is really
+ * "Box<T>". Unlike unresolved_type_more_detailed(), this needs no
+ * unresolved_type_t to compare against, so it also catches field symbols
+ * populated via a path that never recorded one (e.g. a field looked up
+ * through a class symbol reached independently of the one pass1 fully
+ * resolved - see the AST_FIELD_ACCESS caller). A field's own declared
+ * type should never legitimately use a raw nested type argument this way,
+ * so this is safe to treat as "needs re-resolution" rather than
+ * deliberate raw-type usage.
+ */
+static bool type_is_under_parameterized(type_t *t)
+{
+    if (!t) return false;
+    if (t->kind == TYPE_ARRAY) {
+        return type_is_under_parameterized(t->data.array_type.element_type);
+    }
+    if (t->kind != TYPE_CLASS) return false;
+    if (t->data.class_type.type_args) {
+        for (slist_t *a = t->data.class_type.type_args; a; a = a->next) {
+            if (type_is_under_parameterized((type_t *)a->data)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    symbol_t *sym = t->data.class_type.symbol;
+    return sym && sym->data.class_data.type_params != NULL;
 }
 
 /**
@@ -1341,6 +1455,9 @@ static void resolve_types_for_symbol(symbol_t *sym, type_registry_t *reg,
                 reresolve = true;
             }
             if (!reresolve && field_type_has_unresolved_typevar(sym->type)) {
+                reresolve = true;
+            }
+            if (!reresolve && unresolved_type_more_detailed(sym->type, ut)) {
                 reresolve = true;
             }
             if (reresolve) {
@@ -1495,18 +1612,87 @@ void registry_resolve_types(type_registry_t *reg, classpath_t *cp)
                         }
                     }
                     
-                    /* Resolve superclass_type with type arguments (for generic inheritance).
-                     * This enables type variable substitution when calling inherited methods.
-                     * e.g., class EntityStack extends ArrayDeque<EntityStackEntry> */
-                    if (sym->data.class_data.unresolved_superclass_type && !sym->data.class_data.superclass_type) {
-                        unresolved_type_t *ut = sym->data.class_data.unresolved_superclass_type;
-                        type_t *full_super_type = resolve_unresolved_type_full(ut, reg, cp, sym);
-                        if (full_super_type && full_super_type->kind == TYPE_CLASS) {
+                }
+
+                /* Resolve superclass_type with type arguments (for generic inheritance).
+                 * This enables type variable substitution when calling inherited methods.
+                 * e.g., class EntityStack extends ArrayDeque<EntityStackEntry>, or
+                 * ImapServerSessionProvider extends ServerSessionProvider<ClientConnected>. */
+                if (sym->data.class_data.unresolved_superclass_type && !sym->data.class_data.superclass_type) {
+                    unresolved_type_t *ut = sym->data.class_data.unresolved_superclass_type;
+                    type_t *full_super_type = resolve_unresolved_type_full(ut, reg, cp, sym);
+                    if (full_super_type && full_super_type->kind == TYPE_CLASS) {
+                        bool store_super_type = true;
+                        if (sym->kind == SYM_INTERFACE && ut && ut->type_args &&
+                            !full_super_type->data.class_type.type_args) {
+                            store_super_type = false;
+                        }
+                        if (store_super_type) {
                             sym->data.class_data.superclass_type = full_super_type;
                             /* Ensure the symbol reference is set */
-                            if (!full_super_type->data.class_type.symbol && sym->data.class_data.superclass) {
-                                full_super_type->data.class_type.symbol = sym->data.class_data.superclass;
+                            if (!full_super_type->data.class_type.symbol &&
+                                sym->data.class_data.superclass) {
+                                full_super_type->data.class_type.symbol =
+                                    sym->data.class_data.superclass;
+                            } else if (!full_super_type->data.class_type.symbol &&
+                                       sym->data.class_data.interfaces) {
+                                for (slist_t *ie = sym->data.class_data.interfaces; ie;
+                                     ie = ie->next) {
+                                    symbol_t *iface = (symbol_t *)ie->data;
+                                    if (iface && full_super_type->data.class_type.name &&
+                                        iface->qualified_name &&
+                                        strcmp(iface->qualified_name,
+                                               full_super_type->data.class_type.name) == 0) {
+                                        full_super_type->data.class_type.symbol = iface;
+                                        break;
+                                    }
+                                }
                             }
+                            changed = true;
+                        }
+                    }
+                }
+
+                if (sym->kind == SYM_INTERFACE && sym->data.class_data.superclass_type &&
+                    sym->data.class_data.superclass_type->kind == TYPE_CLASS &&
+                    !sym->data.class_data.superclass_type->data.class_type.type_args) {
+                    unresolved_type_t *pending_ut =
+                        sym->data.class_data.unresolved_superclass_type;
+                    if (pending_ut && pending_ut->type_args) {
+                        sym->data.class_data.superclass_type = NULL;
+                    }
+                }
+
+                if (sym->kind == SYM_INTERFACE && !sym->data.class_data.superclass_type) {
+                    ast_node_t *decl = type_registry_get_ast(reg, entry->key);
+                    if (decl) {
+                        for (slist_t *ic = decl->data.node.children; ic; ic = ic->next) {
+                            ast_node_t *child = (ast_node_t *)ic->data;
+                            if (!child || child->type != AST_CLASS_TYPE ||
+                                child->data.node.flags != 1) {
+                                continue;
+                            }
+                            unresolved_type_t *ut = unresolved_type_from_ast(child);
+                            if (!ut || !ut->type_args) {
+                                if (ut) {
+                                    unresolved_type_free(ut);
+                                }
+                                continue;
+                            }
+                            type_t *full = resolve_unresolved_type_full(ut, reg, cp, sym);
+                            if (full && full->kind == TYPE_CLASS &&
+                                full->data.class_type.type_args) {
+                                sym->data.class_data.superclass_type = full;
+                                if (!sym->data.class_data.unresolved_superclass_type) {
+                                    sym->data.class_data.unresolved_superclass_type = ut;
+                                } else {
+                                    unresolved_type_free(ut);
+                                }
+                                changed = true;
+                            } else if (ut) {
+                                unresolved_type_free(ut);
+                            }
+                            break;
                         }
                     }
                 }
@@ -1666,6 +1852,17 @@ void ensure_interfaces_resolved(void *sem_ptr, symbol_t *sym)
     if (sym->kind != SYM_CLASS && sym->kind != SYM_INTERFACE && sym->kind != SYM_ENUM) {
         return;
     }
+
+    /* Interface extends clauses may not be in unresolved_interfaces yet (nested types). */
+    if (sym->kind == SYM_INTERFACE) {
+        ast_node_t *decl = sym->ast;
+        if (!decl && sem->shared_registry && sym->qualified_name) {
+            decl = type_registry_get_ast(sem->shared_registry, sym->qualified_name);
+        }
+        if (decl) {
+            add_interface_extends_from_ast(sem, sym, decl);
+        }
+    }
     
     /* Count current resolved and unresolved interfaces */
     int resolved_count = 0;
@@ -1687,26 +1884,7 @@ void ensure_interfaces_resolved(void *sem_ptr, symbol_t *sym)
         symbol_t *iface_sym = NULL;
         
         if (iface_name) {
-            /* Try resolved import first */
-            char *resolved = resolve_import(sem, iface_name);
-            if (resolved) {
-                iface_sym = load_external_class(sem, resolved);
-                free(resolved);
-            }
-            
-            /* Try direct name */
-            if (!iface_sym) {
-                iface_sym = load_external_class(sem, iface_name);
-            }
-            
-            /* Try same package if still not found and name is simple */
-            if (!iface_sym && pkg && !strchr(iface_name, '.')) {
-                char buf[512];
-                snprintf(buf, sizeof(buf), "%s.%s", pkg, iface_name);
-                iface_sym = load_external_class(sem, buf);
-            }
-            
-            /* Try common subpackages */
+            iface_sym = resolve_super_interface_symbol(sem, sym, iface_name);
             if (!iface_sym && pkg && !strchr(iface_name, '.')) {
                 const char *sub_pkgs[] = {"session", "manager", "http", "client", "handler", NULL};
                 for (int i = 0; sub_pkgs[i] && !iface_sym; i++) {
@@ -1715,7 +1893,6 @@ void ensure_interfaces_resolved(void *sem_ptr, symbol_t *sym)
                     iface_sym = load_external_class(sem, buf);
                 }
             }
-            
         }
         
         if (iface_sym) {
@@ -1811,6 +1988,7 @@ static type_t *substitute_type_var(type_t *type, const char *var_name, type_t *r
 /* get_functional_interface_sam() is declared in genesis.h */
 static char *resolve_import(semantic_t *sem, const char *simple_name);
 static symbol_t *load_class_from_source(semantic_t *sem, const char *name);
+static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name);
 static void preregister_nested_types(semantic_t *sem, ast_node_t *decl, symbol_t *sym, scope_t *class_scope);
 static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_node_t *decl);
 
@@ -2870,16 +3048,81 @@ static bool method_ast_matches_signature(ast_node_t *method_ast, symbol_t *paren
 }
 
 /**
+ * Compare two method declaration ASTs' parameter lists by simple type name
+ * and array depth only (no symbol needed on either side). Used as a
+ * last-resort @Override sanity check against a superclass declared later in
+ * the same file, whose own AST_METHOD_DECL nodes haven't been turned into
+ * SYM_METHOD symbols yet by pass1's top-down walk - see
+ * find_method_decl_in_class_ast() below.
+ */
+static bool ast_method_decls_match_params(ast_node_t *a, ast_node_t *b)
+{
+    if (!a || !b) return false;
+
+    slist_t *ap = NULL, *bp = NULL;
+    int an = 0, bn = 0;
+    for (slist_t *c = a->data.node.children; c; c = c->next) {
+        ast_node_t *ch = (ast_node_t *)c->data;
+        if (ch && ch->type == AST_PARAMETER) { an++; if (!ap) ap = c; }
+    }
+    for (slist_t *c = b->data.node.children; c; c = c->next) {
+        ast_node_t *ch = (ast_node_t *)c->data;
+        if (ch && ch->type == AST_PARAMETER) { bn++; if (!bp) bp = c; }
+    }
+    if (an != bn) return false;
+
+    while (ap && bp) {
+        ast_node_t *pa = (ast_node_t *)ap->data;
+        ast_node_t *pb = (ast_node_t *)bp->data;
+        if (pa && pa->type == AST_PARAMETER && pb && pb->type == AST_PARAMETER) {
+            ast_node_t *ta = pa->data.node.children ? (ast_node_t *)pa->data.node.children->data : NULL;
+            ast_node_t *tb = pb->data.node.children ? (ast_node_t *)pb->data.node.children->data : NULL;
+            const char *na = ta ? get_ast_type_name(ta) : NULL;
+            const char *nb = tb ? get_ast_type_name(tb) : NULL;
+            const char *sa = na ? (strrchr(na, '.') ? strrchr(na, '.') + 1 : na) : NULL;
+            const char *sb = nb ? (strrchr(nb, '.') ? strrchr(nb, '.') + 1 : nb) : NULL;
+            if (!sa || !sb || strcmp(sa, sb) != 0 ||
+                get_ast_array_dims(ta) != get_ast_array_dims(tb)) {
+                return false;
+            }
+        }
+        ap = ap->next;
+        bp = bp->next;
+    }
+    return true;
+}
+
+/**
+ * Find a direct AST_METHOD_DECL in a class's own declaration matching
+ * `name` and `method_node`'s parameter signature. See
+ * ast_method_decls_match_params() for why this AST-only comparison exists.
+ */
+static ast_node_t *find_method_decl_in_class_ast(ast_node_t *class_ast, const char *name,
+                                                  ast_node_t *method_node)
+{
+    if (!class_ast || !name) return NULL;
+    for (slist_t *c = class_ast->data.node.children; c; c = c->next) {
+        ast_node_t *m = (ast_node_t *)c->data;
+        if (m && m->type == AST_METHOD_DECL && m->data.node.name &&
+            strcmp(m->data.node.name, name) == 0 && m != method_node &&
+            ast_method_decls_match_params(m, method_node)) {
+            return m;
+        }
+    }
+    return NULL;
+}
+
+/**
  * Look up a method considering argument types for proper overload resolution.
  * This is the preferred method for method lookup when argument AST nodes are available.
- * 
+ *
  * @param sem Semantic analyzer context
  * @param scope The scope to search in
  * @param name The method name
  * @param args The argument list (slist of ast_node_t*)
  * @return The best matching method, or NULL if not found
  */
-symbol_t *scope_lookup_method_with_types(struct semantic *sem, scope_t *scope, 
+symbol_t *scope_lookup_method_with_types(struct semantic *sem, scope_t *scope,
                                          const char *name, slist_t *args)
 {
     return scope_lookup_method_with_types_and_recv(sem, scope, name, args, NULL);
@@ -3014,6 +3257,194 @@ static symbol_t *interface_symbol_for_lookup(semantic_t *sem, symbol_t *iface)
     }
     symbol_complete(canonical);
     return canonical;
+}
+
+/**
+ * Find Outer.Inner in the shared type registry by simple names (e.g.
+ * HandshakeAsyncOffload.BatchProcessor in org.bluezoo.gumdrop.tls).
+ */
+static symbol_t *registry_lookup_nested_members(semantic_t *sem, const char *outer_simple,
+                                                const char *inner_simple)
+{
+    if (!sem || !sem->shared_registry || !outer_simple || !inner_simple) {
+        return NULL;
+    }
+    size_t outer_len = strlen(outer_simple);
+    pthread_mutex_t *mutex = (pthread_mutex_t *)sem->shared_registry->mutex;
+    symbol_t *result = NULL;
+
+    if (mutex) {
+        pthread_mutex_lock(mutex);
+    }
+    for (size_t i = 0; i < sem->shared_registry->types->size && !result; i++) {
+        for (hashtable_entry_t *e = sem->shared_registry->types->buckets[i]; e; e = e->next) {
+            const char *qname = e->key;
+            if (!qname) {
+                continue;
+            }
+            const char *last_dot = strrchr(qname, '.');
+            const char *last_dollar = strrchr(qname, '$');
+            const char *seg;
+            if (last_dot && (!last_dollar || last_dot > last_dollar)) {
+                seg = last_dot + 1;
+            } else if (last_dollar) {
+                seg = last_dollar + 1;
+            } else {
+                seg = qname;
+            }
+            if (strlen(seg) != outer_len || strcmp(seg, outer_simple) != 0) {
+                continue;
+            }
+            symbol_t *outer_sym = (symbol_t *)e->value;
+            if (!outer_sym) {
+                continue;
+            }
+            symbol_complete(outer_sym);
+            if (!outer_sym->data.class_data.members) {
+                continue;
+            }
+            symbol_t *inner_sym = scope_lookup_local(
+                outer_sym->data.class_data.members, inner_simple);
+            if (inner_sym && (inner_sym->kind == SYM_INTERFACE || inner_sym->kind == SYM_CLASS ||
+                              inner_sym->kind == SYM_ENUM || inner_sym->kind == SYM_RECORD)) {
+                result = interface_symbol_for_lookup(sem, inner_sym);
+                break;
+            }
+        }
+    }
+    if (mutex) {
+        pthread_mutex_unlock(mutex);
+    }
+    return result;
+}
+
+/**
+ * Resolve a super-interface name from an interface declaration, including
+ * qualified nested types (e.g. Handshake.BatchProcessor in the same outer class).
+ */
+static symbol_t *resolve_super_interface_symbol(semantic_t *sem, symbol_t *declaring_iface,
+                                                const char *iface_name)
+{
+    if (!sem || !iface_name || !iface_name[0]) {
+        return NULL;
+    }
+
+    const char *dot = strchr(iface_name, '.');
+    if (!dot) {
+        if (declaring_iface && declaring_iface->data.class_data.members) {
+            symbol_t *local = scope_lookup_local(
+                declaring_iface->data.class_data.members, iface_name);
+            if (local && (local->kind == SYM_INTERFACE || local->kind == SYM_CLASS)) {
+                return interface_symbol_for_lookup(sem, local);
+            }
+        }
+        if (declaring_iface && declaring_iface->data.class_data.enclosing_class &&
+            declaring_iface->data.class_data.enclosing_class->data.class_data.members) {
+            symbol_t *local = scope_lookup_local(
+                declaring_iface->data.class_data.enclosing_class->data.class_data.members,
+                iface_name);
+            if (local && (local->kind == SYM_INTERFACE || local->kind == SYM_CLASS)) {
+                return interface_symbol_for_lookup(sem, local);
+            }
+        }
+        symbol_t *scope_sym = scope_lookup(sem->current_scope, iface_name);
+        if (scope_sym && (scope_sym->kind == SYM_INTERFACE || scope_sym->kind == SYM_CLASS)) {
+            return interface_symbol_for_lookup(sem, scope_sym);
+        }
+        char *qualified = resolve_import(sem, iface_name);
+        if (qualified) {
+            symbol_t *loaded = load_external_class(sem, qualified);
+            free(qualified);
+            if (loaded) {
+                return interface_symbol_for_lookup(sem, loaded);
+            }
+        }
+        symbol_t *direct = load_external_class(sem, iface_name);
+        if (direct) {
+            return interface_symbol_for_lookup(sem, direct);
+        }
+        const char *pkg = declaring_iface && declaring_iface->data.class_data.package ?
+            declaring_iface->data.class_data.package : sem->current_package;
+        if (pkg) {
+            char buf[512];
+            snprintf(buf, sizeof(buf), "%s.%s", pkg, iface_name);
+            direct = load_external_class(sem, buf);
+            if (direct) {
+                return interface_symbol_for_lookup(sem, direct);
+            }
+        }
+        return NULL;
+    }
+
+    size_t outer_len = (size_t)(dot - iface_name);
+    if (outer_len == 0 || outer_len >= 256) {
+        return NULL;
+    }
+    char outer_name[256];
+    memcpy(outer_name, iface_name, outer_len);
+    outer_name[outer_len] = '\0';
+    const char *inner_name = dot + 1;
+    if (!inner_name[0]) {
+        return NULL;
+    }
+
+    for (symbol_t *encl = declaring_iface ? declaring_iface->data.class_data.enclosing_class : NULL;
+         encl; encl = encl->data.class_data.enclosing_class) {
+        if (!encl->data.class_data.members) {
+            continue;
+        }
+        symbol_t *outer_sym = scope_lookup_local(encl->data.class_data.members, outer_name);
+        if (!outer_sym) {
+            continue;
+        }
+        symbol_complete(outer_sym);
+        if (outer_sym->data.class_data.members) {
+            symbol_t *inner_sym = scope_lookup_local(
+                outer_sym->data.class_data.members, inner_name);
+            if (inner_sym && (inner_sym->kind == SYM_INTERFACE || inner_sym->kind == SYM_CLASS ||
+                              inner_sym->kind == SYM_ENUM || inner_sym->kind == SYM_RECORD)) {
+                return interface_symbol_for_lookup(sem, inner_sym);
+            }
+        }
+    }
+
+    char *qualified_outer = resolve_import(sem, outer_name);
+    symbol_t *outer_sym = NULL;
+    if (qualified_outer) {
+        outer_sym = load_external_class(sem, qualified_outer);
+        free(qualified_outer);
+    }
+    if (!outer_sym) {
+        outer_sym = load_external_class(sem, outer_name);
+    }
+    if (outer_sym) {
+        symbol_complete(outer_sym);
+        if (outer_sym->data.class_data.members) {
+            symbol_t *inner_sym = scope_lookup_local(
+                outer_sym->data.class_data.members, inner_name);
+            if (inner_sym) {
+                return interface_symbol_for_lookup(sem, inner_sym);
+            }
+        }
+    }
+
+    symbol_t *reg_nested = registry_lookup_nested_members(sem, outer_name, inner_name);
+    if (reg_nested) {
+        return reg_nested;
+    }
+
+    char nested_fqn[512];
+    snprintf(nested_fqn, sizeof(nested_fqn), "%s$%s", outer_name, inner_name);
+    symbol_t *nested = load_external_class(sem, nested_fqn);
+    if (nested) {
+        return interface_symbol_for_lookup(sem, nested);
+    }
+    nested_class_dots_to_dollars(nested_fqn);
+    nested = load_external_class(sem, nested_fqn);
+    if (nested) {
+        return interface_symbol_for_lookup(sem, nested);
+    }
+    return load_external_class(sem, iface_name);
 }
 
 /**
@@ -3220,12 +3651,94 @@ static symbol_t *lookup_interface_constant_field(semantic_t *sem, symbol_t *clas
 }
 
 /**
+ * Resolve a class's own "extends"/"implements" clauses on demand.
+ *
+ * Normally this happens inline when pass1_collect_declarations's top-down
+ * walk reaches a class's own AST_CLASS_DECL node (see the "DEBUG implements"
+ * block there, and the later "Process extends and implements" block that
+ * sets `superclass`). That is too late for code declared *earlier* in the
+ * same file that needs to know this class's supertypes already - e.g. an
+ * anonymous subclass of a nested class declared further down in the same
+ * file: @Override checking for the anonymous class's method walks up to
+ * the not-yet-visited superclass, finds no interfaces and no further
+ * superclass to continue to, and wrongly reports "does not override".
+ * Insertion below is duplicate-safe (matches the inline version), so it is
+ * harmless if the real walk later repeats the same work when it reaches
+ * this class's declaration.
+ */
+static void ensure_class_implements_prescanned(semantic_t *sem, symbol_t *sym)
+{
+    if (!sym || sym->kind != SYM_CLASS || sym->data.class_data.implements_prescanned ||
+        !sym->ast) {
+        return;
+    }
+    sym->data.class_data.implements_prescanned = true;
+
+    scope_t *saved_scope = sem->current_scope;
+    if (sym->data.class_data.enclosing_class &&
+        sym->data.class_data.enclosing_class->data.class_data.members) {
+        sem->current_scope = sym->data.class_data.enclosing_class->data.class_data.members;
+    }
+
+    for (slist_t *prescan = sym->ast->data.node.children; prescan; prescan = prescan->next) {
+        ast_node_t *child = (ast_node_t *)prescan->data;
+        if (!child || child->type != AST_CLASS_TYPE ||
+            (child->data.node.flags != 1 && child->data.node.flags != 2)) {
+            continue;
+        }
+        const char *type_name = child->data.node.name;
+        if (!type_name) {
+            continue;
+        }
+        symbol_t *type_sym = scope_lookup(sem->current_scope, type_name);
+        if (!type_sym) {
+            char *qualified = resolve_import(sem, type_name);
+            if (qualified) {
+                type_sym = load_external_class(sem, qualified);
+                free(qualified);
+            }
+            if (!type_sym) {
+                type_sym = load_external_class(sem, type_name);
+            }
+        }
+        if (type_sym && !child->sem_symbol) {
+            child->sem_symbol = type_sym;
+        }
+        if (!type_sym || (type_sym->kind != SYM_INTERFACE && type_sym->kind != SYM_CLASS)) {
+            continue;
+        }
+        if (child->data.node.flags == 1) {
+            /* extends - only set superclass if the real walk hasn't already */
+            if (!sym->data.class_data.superclass) {
+                sym->data.class_data.superclass = type_sym;
+            }
+        } else {
+            bool dup = false;
+            for (slist_t *i = sym->data.class_data.interfaces; i; i = i->next) {
+                if (i->data == type_sym) { dup = true; break; }
+            }
+            if (!dup) {
+                if (!sym->data.class_data.interfaces) {
+                    sym->data.class_data.interfaces = slist_new(type_sym);
+                } else {
+                    slist_append(sym->data.class_data.interfaces, type_sym);
+                }
+            }
+        }
+    }
+
+    sem->current_scope = saved_scope;
+}
+
+/**
  * Recursively look up a method in an interface hierarchy.
  * Checks the interface and all its super-interfaces.
  */
-static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sym, 
+static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sym,
                                               const char *method_name)
 {
+    ensure_class_implements_prescanned(sem, class_sym);
+
     if (!class_sym || !method_name) {
         return NULL;
     }
@@ -3598,6 +4111,7 @@ void semantic_free(semantic_t *sem)
     hashtable_free(sem->unit_types);  /* Per-compilation-unit types, don't free values */
     hashtable_free(sem->packages);
     hashtable_free(sem->resolved_imports);  /* Values are interned, don't free */
+    hashtable_free(sem->loading_names);  /* Values are sentinels, don't free */
     slist_free(sem->imports);
     slist_free_full(sem->sourcepath, free);
     slist_free_full(sem->source_dependencies, free);
@@ -3942,9 +4456,30 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
                 }
             }
         }
-        /* Convert superclass from signature if available */
-        if (csig && csig->superclass) {
-            sym->data.class_data.superclass_type = generic_type_to_type(csig->superclass);
+        /* Class: parameterized superclass. Interface: extends clauses are in
+         * superinterface signatures (superclass slot is always Object). */
+        if (csig) {
+            if (kind == SYM_INTERFACE && csig->interfaces) {
+                type_t *best = NULL;
+                for (generic_type_t *gi = csig->interfaces; gi; gi = gi->next) {
+                    type_t *it = generic_type_to_type(gi);
+                    if (!it || it->kind != TYPE_CLASS) {
+                        continue;
+                    }
+                    if (it->data.class_type.type_args) {
+                        best = it;
+                        break;
+                    }
+                    if (!best) {
+                        best = it;
+                    }
+                }
+                if (best) {
+                    sym->data.class_data.superclass_type = best;
+                }
+            } else if (csig->superclass) {
+                sym->data.class_data.superclass_type = generic_type_to_type(csig->superclass);
+            }
         }
         /* Free the parsed signature */
         if (csig) {
@@ -4204,6 +4739,18 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
                     }
                     free(iface_binary);
                 }
+            }
+        }
+    }
+    
+    if (sym->data.class_data.superclass_type &&
+        sym->data.class_data.superclass_type->kind == TYPE_CLASS &&
+        !sym->data.class_data.superclass_type->data.class_type.symbol) {
+        const char *ext_name = sym->data.class_data.superclass_type->data.class_type.name;
+        if (ext_name) {
+            symbol_t *ext_sym = load_external_class(sem, ext_name);
+            if (ext_sym) {
+                sym->data.class_data.superclass_type->data.class_type.symbol = ext_sym;
             }
         }
     }
@@ -4570,28 +5117,7 @@ static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_n
         if (!iface_name) {
             continue;
         }
-        symbol_t *iface_sym = NULL;
-        if (sym->data.class_data.members) {
-            iface_sym = scope_lookup_local(sym->data.class_data.members, iface_name);
-        }
-        if (!iface_sym && sym->data.class_data.enclosing_class &&
-            sym->data.class_data.enclosing_class->data.class_data.members) {
-            iface_sym = scope_lookup_local(
-                sym->data.class_data.enclosing_class->data.class_data.members, iface_name);
-        }
-        if (!iface_sym) {
-            iface_sym = scope_lookup(sem->current_scope, iface_name);
-        }
-        if (!iface_sym) {
-            char *qualified = resolve_import(sem, iface_name);
-            if (qualified) {
-                iface_sym = load_external_class(sem, qualified);
-                free(qualified);
-            }
-        }
-        if (!iface_sym) {
-            iface_sym = load_external_class(sem, iface_name);
-        }
+        symbol_t *iface_sym = resolve_super_interface_symbol(sem, sym, iface_name);
         if (!iface_sym) {
             continue;
         }
@@ -4613,6 +5139,26 @@ static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_n
                 sym->data.class_data.interfaces = slist_new(iface_sym);
             } else {
                 slist_append(sym->data.class_data.interfaces, iface_sym);
+            }
+        }
+        unresolved_type_t *super_ut = unresolved_type_from_ast(m);
+        if (super_ut && super_ut->type_args &&
+            !sym->data.class_data.unresolved_superclass_type) {
+            sym->data.class_data.unresolved_superclass_type = super_ut;
+            if (!sym->data.class_data.unresolved_superclass && iface_name) {
+                sym->data.class_data.unresolved_superclass = strdup(iface_name);
+            }
+        } else if (super_ut) {
+            unresolved_type_free(super_ut);
+        }
+        if (!sym->data.class_data.superclass_type) {
+            type_t *ext_type = semantic_resolve_type(sem, m);
+            if (ext_type && ext_type->kind == TYPE_CLASS &&
+                ext_type->data.class_type.type_args) {
+                if (!ext_type->data.class_type.symbol && iface_sym) {
+                    ext_type->data.class_type.symbol = iface_sym;
+                }
+                sym->data.class_data.superclass_type = ext_type;
             }
         }
     }
@@ -4913,18 +5459,45 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
  * Try to load a class from a source file on the sourcepath.
  * Parses the source file and extracts class declarations.
  */
+/**
+ * Guarded entry point for load_class_from_source_impl(): breaks reentrant
+ * cycles where resolving one type (e.g. scanning a package for a type that
+ * turns out not to exist anywhere) walks into a source file that is itself
+ * still being parsed higher up the call stack (e.g. a nested class whose
+ * supertype isn't registered yet). Without this, the reentrant call finds
+ * nothing cached, re-parses the same file from scratch, hits the same
+ * unresolved reference, and recurses again -- growing the stack until the
+ * process segfaults instead of simply failing this one lookup.
+ */
 static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
+{
+    if (!sem || !name) {
+        return NULL;
+    }
+    if (!sem->loading_names) {
+        sem->loading_names = hashtable_new();
+    }
+    if (hashtable_contains(sem->loading_names, name)) {
+        return NULL;
+    }
+    hashtable_insert(sem->loading_names, name, (void *)1);
+    symbol_t *result = load_class_from_source_impl(sem, name);
+    hashtable_remove(sem->loading_names, name);
+    return result;
+}
+
+static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
 {
     if (!sem->sourcepath || !name) {
         return NULL;
     }
-    
+
     /* First check the type cache to avoid reloading the same class multiple times */
     type_t *cached = hashtable_lookup(sem->types, name);
     if (cached && cached->kind == TYPE_CLASS && cached->data.class_type.symbol) {
         return cached->data.class_type.symbol;
     }
-    
+
     /* Check if this is a nested class (contains $).
      * For nested classes, we need to load the outer class first,
      * then find the nested type in its members. */
@@ -5084,7 +5657,8 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
             /* Resolve type names to qualified names immediately after parsing.
              * This ensures all type references use consistent qualified names
              * from the dependency file's own imports. */
-            resolve_types_in_compilation_unit(ast, sem->classpath, sem->sourcepath);
+            resolve_types_in_compilation_unit(ast, sem->classpath, sem->sourcepath,
+                                              sem->shared_registry);
             
             /* Extract the package from this dependency file and temporarily
              * switch to it so that type resolution uses the correct package
@@ -5277,6 +5851,22 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
                                         } else {
                                             slist_append(sym->data.class_data.interfaces, iface_sym);
                                         }
+                                    }
+                                    type_t *ext_type = semantic_resolve_type(sem, m);
+                                    if (ext_type && ext_type->kind == TYPE_CLASS &&
+                                        ext_type->data.class_type.type_args &&
+                                        !sym->data.class_data.superclass_type) {
+                                        if (!ext_type->data.class_type.symbol && iface_sym) {
+                                            ext_type->data.class_type.symbol = iface_sym;
+                                        } else if (!ext_type->data.class_type.symbol &&
+                                                   ext_type->data.class_type.name) {
+                                            symbol_t *ext_sym = load_external_class(sem,
+                                                ext_type->data.class_type.name);
+                                            if (ext_sym) {
+                                                ext_type->data.class_type.symbol = ext_sym;
+                                            }
+                                        }
+                                        sym->data.class_data.superclass_type = ext_type;
                                     }
                                 } else {
                                     /* Class extends a class - resolve the parameterized superclass type */
@@ -5848,13 +6438,44 @@ static symbol_t *load_class_from_source(semantic_t *sem, const char *name)
  * since class names can be lowercase (e.g., javax.servlet.http.HttpSession where
  * 'http' is a package, not a class).
  */
+static symbol_t *load_external_class_impl(semantic_t *sem, const char *name);
+
+/**
+ * Guarded entry point for load_external_class_impl(): the shared-registry
+ * stub path below re-resolves each of a class's nested simple names via
+ * lookup_same_package_type(), which (through scan_package_for_type()) can
+ * call back into load_external_class() for the very same qualified `name`
+ * while the first call is still on the stack -- e.g. a nested class whose
+ * simple name isn't found anywhere else sends the package scanner back to
+ * the outer class's own file. That reentrant call hits the same registry
+ * stub again (the stub short-circuit never populates sem->types locally),
+ * re-runs the same nested-name loop, and recurses forever instead of
+ * simply failing this one lookup.
+ */
 symbol_t *load_external_class(semantic_t *sem, const char *name)
+{
+    if (!sem || !name) {
+        return NULL;
+    }
+    if (!sem->loading_names) {
+        sem->loading_names = hashtable_new();
+    }
+    if (hashtable_contains(sem->loading_names, name)) {
+        return NULL;
+    }
+    hashtable_insert(sem->loading_names, name, (void *)1);
+    symbol_t *result = load_external_class_impl(sem, name);
+    hashtable_remove(sem->loading_names, name);
+    return result;
+}
+
+static symbol_t *load_external_class_impl(semantic_t *sem, const char *name)
 {
     /* First check the type cache to avoid reloading the same class multiple times */
     type_t *cached = hashtable_lookup(sem->types, name);
     if (cached && cached->kind == TYPE_CLASS && cached->data.class_type.symbol) {
         symbol_t *cached_sym = cached->data.class_type.symbol;
-        
+
         /* Ensure symbol is completed before checking members (lazy completion) */
         symbol_complete(cached_sym);
         
@@ -5904,10 +6525,12 @@ symbol_t *load_external_class(semantic_t *sem, const char *name)
         symbol_t *registry_sym = type_registry_lookup(sem->shared_registry, name);
         
         /* Try with current package prefix for simple names */
-        if (!registry_sym && !strchr(name, '.') && sem->current_package) {
-            char *qualified = malloc(strlen(sem->current_package) + 1 + strlen(name) + 1);
-            if (qualified) {
-                sprintf(qualified, "%s.%s", sem->current_package, name);
+        if (!registry_sym && !strchr(name, '.')) {
+            char pkg_buf[512];
+            const char *pkg = semantic_package_name(sem, pkg_buf, sizeof(pkg_buf));
+            char *qualified = pkg ? malloc(strlen(pkg) + 1 + strlen(name) + 1) : NULL;
+            if (qualified && pkg) {
+                sprintf(qualified, "%s.%s", pkg, name);
                 registry_sym = type_registry_lookup(sem->shared_registry, qualified);
                 free(qualified);
             }
@@ -5940,8 +6563,13 @@ symbol_t *load_external_class(semantic_t *sem, const char *name)
             
             /* Import nested types from this class by simple name into unit_types.
              * This allows code like "class C implements I { Type t; }" where Type
-             * is a nested type in I. */
-            if (sem->shared_registry && sem->unit_types) {
+             * is a nested type in I. Skip JDK/platform classes: registering
+             * java.util.ResourceBundle$Control as "Control" shadows same-package
+             * types such as org.bluezoo.gumdrop.ldap.client.Control. */
+            if (sem->shared_registry && sem->unit_types &&
+                strncmp(name, "java.", 5) != 0 &&
+                strncmp(name, "javax.", 6) != 0 &&
+                strncmp(name, "jakarta.", 8) != 0) {
                 /* Look for nested types with prefix "name$" */
                 const char *prefix = name;
                 size_t prefix_len = strlen(prefix);
@@ -5964,6 +6592,10 @@ symbol_t *load_external_class(semantic_t *sem, const char *name)
                                 symbol_t *nested_sym = (symbol_t *)entry->value;
                                 if (nested_sym && nested_sym->type && 
                                     !hashtable_lookup(sem->unit_types, simple)) {
+                                    if (lookup_same_package_type(sem, simple)) {
+                                        entry = entry->next;
+                                        continue;
+                                    }
                                     hashtable_insert(sem->unit_types, simple, nested_sym->type);
                                     if (getenv("GENESIS_DEBUG_LOAD")) {
                                         fprintf(stderr, "DEBUG load_external_class: registered nested type '%s' as '%s'\n",
@@ -6117,17 +6749,48 @@ static void ensure_type_symbol_loaded(semantic_t *sem, type_t *type)
 static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, const char *package_name);
 
 /**
+ * Package for the compilation unit being analyzed (parallel workers may set
+ * package on the class symbol before current_package is assigned).
+ */
+static const char *semantic_package_name(semantic_t *sem, char *buf, size_t buf_len)
+{
+    if (!sem) {
+        return NULL;
+    }
+    if (sem->current_package) {
+        return sem->current_package;
+    }
+    if (sem->current_class) {
+        if (sem->current_class->data.class_data.package) {
+            return sem->current_class->data.class_data.package;
+        }
+        const char *q = sem->current_class->qualified_name;
+        if (q && buf && buf_len > 0) {
+            const char *last = strrchr(q, '.');
+            if (last && last > q && (size_t)(last - q) < buf_len) {
+                memcpy(buf, q, (size_t)(last - q));
+                buf[last - q] = '\0';
+                return buf;
+            }
+        }
+    }
+    return NULL;
+}
+
+/**
  * Top-level type in the current compilation unit's package, if any.
  * Used so package-local types are not shadowed by nested types on imports
  * (e.g. ldap.client.Control vs java.util.ResourceBundle.Control).
  */
 static symbol_t *lookup_same_package_type(semantic_t *sem, const char *simple_name)
 {
-    if (!sem || !simple_name || !sem->current_package || strchr(simple_name, '.') != NULL) {
+    char pkg_buf[512];
+    const char *pkg = semantic_package_name(sem, pkg_buf, sizeof(pkg_buf));
+    if (!sem || !simple_name || !pkg || strchr(simple_name, '.') != NULL) {
         return NULL;
     }
     char pkg_qname[512];
-    snprintf(pkg_qname, sizeof(pkg_qname), "%s.%s", sem->current_package, simple_name);
+    snprintf(pkg_qname, sizeof(pkg_qname), "%s.%s", pkg, simple_name);
     type_t *pkg_type = hashtable_lookup(sem->types, pkg_qname);
     if (pkg_type && pkg_type->kind == TYPE_CLASS && pkg_type->data.class_type.symbol) {
         return pkg_type->data.class_type.symbol;
@@ -6145,7 +6808,95 @@ static symbol_t *lookup_same_package_type(semantic_t *sem, const char *simple_na
             return loaded;
         }
     }
-    return scan_package_for_type(sem, simple_name, sem->current_package);
+    return scan_package_for_type(sem, simple_name, pkg);
+}
+
+/**
+ * Nested type declared on an implemented interface (e.g. ObjectInputFilter.FilterInfo).
+ * Classpath stubs may omit nested interfaces from members; load by binary name if needed.
+ */
+static symbol_t *resolve_iface_member_type(semantic_t *sem, symbol_t *iface_sym,
+                                           const char *simple_name)
+{
+    if (!sem || !iface_sym || !simple_name) {
+        return NULL;
+    }
+    if (iface_sym->data.class_data.members) {
+        symbol_t *n = scope_lookup_local(iface_sym->data.class_data.members, simple_name);
+        if (n && (n->kind == SYM_CLASS || n->kind == SYM_INTERFACE ||
+                  n->kind == SYM_ENUM || n->kind == SYM_RECORD)) {
+            return n;
+        }
+    }
+    const char *qn = iface_sym->qualified_name;
+    if (!qn && iface_sym->type && iface_sym->type->kind == TYPE_CLASS) {
+        qn = iface_sym->type->data.class_type.name;
+    }
+    if (!qn) {
+        return NULL;
+    }
+    char nested_qn[512];
+    snprintf(nested_qn, sizeof(nested_qn), "%s$%s", qn, simple_name);
+    symbol_t *loaded = load_external_class(sem, nested_qn);
+    if (loaded && (loaded->kind == SYM_CLASS || loaded->kind == SYM_INTERFACE ||
+                   loaded->kind == SYM_ENUM || loaded->kind == SYM_RECORD)) {
+        return loaded;
+    }
+    return NULL;
+}
+
+/**
+ * Nested type visible through the superclass chain (e.g. WebSocketConnection.WebSocketTransport
+ * inside a subclass, or ByteStreamLexer.Handler in a lexer subclass).
+ */
+static symbol_t *lookup_superclass_nested_type(semantic_t *sem, symbol_t *start_class,
+                                             const char *simple_name)
+{
+    if (!sem || !start_class || !simple_name || strchr(simple_name, '.') != NULL) {
+        return NULL;
+    }
+    for (symbol_t *check_class = start_class; check_class;
+         check_class = check_class->data.class_data.enclosing_class) {
+        for (slist_t *iface = check_class->data.class_data.interfaces; iface;
+             iface = iface->next) {
+            symbol_t *iface_sym = (symbol_t *)iface->data;
+            symbol_t *nested = resolve_iface_member_type(sem, iface_sym, simple_name);
+            if (nested) {
+                return nested;
+            }
+        }
+        for (symbol_t *super = check_class->data.class_data.superclass; super;
+             super = super->data.class_data.superclass) {
+            if (super->data.class_data.members) {
+                symbol_t *nested = scope_lookup_local(super->data.class_data.members, simple_name);
+                if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
+                               nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
+                    return nested;
+                }
+            }
+            for (slist_t *iface = super->data.class_data.interfaces; iface; iface = iface->next) {
+                symbol_t *iface_sym = (symbol_t *)iface->data;
+                symbol_t *nested = resolve_iface_member_type(sem, iface_sym, simple_name);
+                if (nested) {
+                    return nested;
+                }
+            }
+            const char *qn = super->qualified_name;
+            if (!qn && super->type && super->type->kind == TYPE_CLASS) {
+                qn = super->type->data.class_type.name;
+            }
+            if (qn) {
+                char nested_qn[512];
+                snprintf(nested_qn, sizeof(nested_qn), "%s$%s", qn, simple_name);
+                symbol_t *loaded = load_external_class(sem, nested_qn);
+                if (loaded && (loaded->kind == SYM_CLASS || loaded->kind == SYM_INTERFACE ||
+                               loaded->kind == SYM_ENUM || loaded->kind == SYM_RECORD)) {
+                    return loaded;
+                }
+            }
+        }
+    }
+    return NULL;
 }
 
 /**
@@ -6248,6 +6999,19 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         }
     }
     
+    /* Same-package top-level types beat nested types on single-type imports
+     * (e.g. ldap.client.Control vs ResourceBundle.Control). Must run before
+     * the nested-import scan and must not rely on current_package alone. */
+    {
+        symbol_t *pkg_sym = lookup_same_package_type(sem, simple_name);
+        if (pkg_sym && pkg_sym->qualified_name) {
+            hashtable_insert(sem->resolved_imports, simple_name,
+                              (void *)intern(pkg_sym->qualified_name));
+            sem->resolve_import_depth--;
+            return strdup(pkg_sym->qualified_name);
+        }
+    }
+    
     /* Check if simple_name is a nested type in any single-type-imported class
      * e.g., "import javax.tools.JavaFileManager;" allows using "Location" 
      * to refer to JavaFileManager.Location 
@@ -6273,6 +7037,12 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         /* Skip wildcard imports */
         size_t len = strlen(import_name);
         if (len > 2 && import_name[len-1] == '*' && import_name[len-2] == '.') {
+            continue;
+        }
+        
+        /* Skip java.* nested aliases only when a same-package type would shadow them. */
+        if (strncmp(import_name, "java.", 5) == 0 &&
+            lookup_same_package_type(sem, simple_name)) {
             continue;
         }
             
@@ -6359,45 +7129,6 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         }
     }
     
-    /* Try same-package resolution (implicit import of current package) */
-    if (sem->current_package) {
-        char same_package[512];
-        snprintf(same_package, sizeof(same_package), "%s.%s", 
-                 sem->current_package, simple_name);
-        
-        /* Try shared registry first (for parallel compilation) */
-        if (sem->shared_registry) {
-            symbol_t *reg_sym = type_registry_lookup(sem->shared_registry, same_package);
-            if (reg_sym) {
-                hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(same_package));
-                sem->resolve_import_depth--;
-                return strdup(same_package);
-            }
-        }
-        
-        /* Try classpath */
-        if (sem->classpath) {
-            classfile_t *cf = classpath_load_class(sem->classpath, same_package);
-            if (cf) {
-                /* Cache and return */
-                hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(same_package));
-                sem->resolve_import_depth--;
-                return strdup(same_package);
-            }
-        }
-        
-        /* Try sourcepath */
-        if (sem->sourcepath) {
-            symbol_t *src_sym = load_class_from_source(sem, same_package);
-            if (src_sym) {
-                /* Cache and return */
-                hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(same_package));
-                sem->resolve_import_depth--;
-                return strdup(same_package);
-            }
-        }
-    }
-    
     /* Try java.lang.* (implicit import) */
     char java_lang[256];
     snprintf(java_lang, sizeof(java_lang), "java.lang.%s", simple_name);
@@ -6414,6 +7145,59 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
     
     sem->resolve_import_depth--;
     return NULL;
+}
+
+/**
+ * Public wrapper around resolve_import(), for callers outside semantic.c
+ * (classwriter.c uses this to qualify an annotation's simple name, both to
+ * write the correct type descriptor and to look up its real retention
+ * policy on the classpath). Returns a malloc'd fully-qualified name, or
+ * NULL if it can't be resolved (e.g. a same-package or unresolvable name).
+ */
+char *semantic_resolve_annotation_type_name(semantic_t *sem, const char *simple_name)
+{
+    if (!sem || !simple_name) {
+        return NULL;
+    }
+    return resolve_import(sem, simple_name);
+}
+
+/**
+ * Determine the real retention policy of an externally-defined annotation
+ * (e.g. org.junit.Test) by resolving its simple name through this file's
+ * imports and inspecting its own @Retention meta-annotation on the
+ * classpath. Returns RETENTION_CLASS (the JLS default) if the annotation
+ * can't be resolved or declares no explicit retention - this is always a
+ * safe fallback, never worse than not calling this function at all.
+ */
+retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const char *annotation_name)
+{
+    if (!sem || !annotation_name || !sem->classpath) {
+        return RETENTION_CLASS;
+    }
+
+    char *qualified = strchr(annotation_name, '.') ?
+        strdup(annotation_name) : resolve_import(sem, annotation_name);
+    if (!qualified) {
+        return RETENTION_CLASS;
+    }
+
+    retention_policy_t result = RETENTION_CLASS;
+    classfile_t *cf = classpath_load_class(sem->classpath, qualified);
+    if (cf) {
+        char *policy_name = classfile_get_retention_policy_name(cf);
+        if (policy_name) {
+            if (strcmp(policy_name, "RUNTIME") == 0) {
+                result = RETENTION_RUNTIME;
+            } else if (strcmp(policy_name, "SOURCE") == 0) {
+                result = RETENTION_SOURCE;
+            }
+            free(policy_name);
+        }
+    }
+
+    free(qualified);
+    return result;
 }
 
 /* ========================================================================
@@ -6478,11 +7262,12 @@ static bool class_exists_on_sourcepath(const char *qualified_name, slist_t *sour
  * @param sourcepath_list List of sourcepath directories for verifying source files
  * @return Newly allocated qualified name, or NULL if not resolved
  */
-static char *resolve_type_name_with_imports(const char *simple_name, 
+static char *resolve_type_name_with_imports(const char *simple_name,
                                             slist_t *imports,
                                             const char *package,
                                             classpath_t *classpath,
-                                            slist_t *sourcepath_list)
+                                            slist_t *sourcepath_list,
+                                            type_registry_t *registry)
 {
     if (!simple_name) {
         return NULL;
@@ -6500,8 +7285,8 @@ static char *resolve_type_name_with_imports(const char *simple_name,
         first_part[first_len] = '\0';
         
         /* Try to resolve just the first part */
-        char *resolved_first = resolve_type_name_with_imports(first_part, imports, 
-            package, classpath, sourcepath_list);
+        char *resolved_first = resolve_type_name_with_imports(first_part, imports,
+            package, classpath, sourcepath_list, registry);
         free(first_part);
         
         if (resolved_first) {
@@ -6555,6 +7340,9 @@ static char *resolve_type_name_with_imports(const char *simple_name,
         char same_package[512];
         snprintf(same_package, sizeof(same_package), "%s.%s", package, simple_name);
 
+        if (registry && type_registry_lookup(registry, same_package)) {
+            return strdup(same_package);
+        }
         if (classpath) {
             classfile_t *cf = classpath_load_class(classpath, same_package);
             if (cf) {
@@ -6591,6 +7379,15 @@ static char *resolve_type_name_with_imports(const char *simple_name,
             continue;
         }
         
+        if (strncmp(import_name, "java.", 5) == 0 && package) {
+            char same_pkg[512];
+            snprintf(same_pkg, sizeof(same_pkg), "%s.%s", package, simple_name);
+            if ((registry && type_registry_lookup(registry, same_pkg)) ||
+                (classpath && classpath_load_class(classpath, same_pkg))) {
+                continue;
+            }
+        }
+        
         /* Try loading the imported class and check for a nested type */
         if (classpath) {
             /* Try to load the imported class from classpath */
@@ -6598,7 +7395,7 @@ static char *resolve_type_name_with_imports(const char *simple_name,
             if (imported_cf) {
                 /* Check if it has an InnerClasses entry for our simple_name */
                 char nested_class_name[512];
-                snprintf(nested_class_name, sizeof(nested_class_name), "%s$%s", 
+                snprintf(nested_class_name, sizeof(nested_class_name), "%s$%s",
                          import_name, simple_name);
                 /* Try to load the nested class directly */
                 classfile_t *nested_cf = classpath_load_class(classpath, nested_class_name);
@@ -6717,6 +7514,7 @@ static void resolve_types_in_node_with_context(ast_node_t *node,
                                                const char *package,
                                                classpath_t *classpath,
                                                slist_t *sourcepath_list,
+                                               type_registry_t *registry,
                                                ast_node_t *enclosing_class)
 {
     if (!node) return;
@@ -6743,7 +7541,7 @@ static void resolve_types_in_node_with_context(ast_node_t *node,
                 }
                 
                 char *qualified = resolve_type_name_with_imports(
-                    name, imports, package, classpath, sourcepath_list);
+                    name, imports, package, classpath, sourcepath_list, registry);
                 if (qualified) {
                     /* Note: name is interned, don't free it - just reassign */
                     node->data.node.name = qualified;
@@ -6767,14 +7565,16 @@ static void resolve_types_in_node_with_context(ast_node_t *node,
         node->type != AST_THIS_EXPR && node->type != AST_SUPER_EXPR &&
         node->type != AST_PRIMITIVE_TYPE && node->type != AST_VAR_TYPE) {
         for (slist_t *child = node->data.node.children; child; child = child->next) {
-            resolve_types_in_node_with_context((ast_node_t *)child->data, imports, package, 
-                                               classpath, sourcepath_list, new_enclosing);
+            resolve_types_in_node_with_context((ast_node_t *)child->data, imports, package,
+                                               classpath, sourcepath_list, registry,
+                                               new_enclosing);
         }
         
         /* Process extra node (e.g., return type) */
         if (node->data.node.extra) {
-            resolve_types_in_node_with_context(node->data.node.extra, imports, package, 
-                                               classpath, sourcepath_list, new_enclosing);
+            resolve_types_in_node_with_context(node->data.node.extra, imports, package,
+                                               classpath, sourcepath_list, registry,
+                                               new_enclosing);
         }
     }
 }
@@ -6786,9 +7586,11 @@ static void resolve_types_in_node(ast_node_t *node,
                                   slist_t *imports,
                                   const char *package,
                                   classpath_t *classpath,
-                                  slist_t *sourcepath_list)
+                                  slist_t *sourcepath_list,
+                                  type_registry_t *registry)
 {
-    resolve_types_in_node_with_context(node, imports, package, classpath, sourcepath_list, NULL);
+    resolve_types_in_node_with_context(node, imports, package, classpath, sourcepath_list,
+                                       registry, NULL);
 }
 
 /**
@@ -6799,8 +7601,9 @@ static void resolve_types_in_node(ast_node_t *node,
  * @param classpath       The classpath for verifying type names
  * @param sourcepath_list List of sourcepath directories for verifying source files
  */
-void resolve_types_in_compilation_unit(ast_node_t *ast, classpath_t *classpath, 
-                                       slist_t *sourcepath_list)
+void resolve_types_in_compilation_unit(ast_node_t *ast, classpath_t *classpath,
+                                       slist_t *sourcepath_list,
+                                       type_registry_t *registry)
 {
     if (!ast || ast->type != AST_COMPILATION_UNIT) {
         return;
@@ -6824,7 +7627,7 @@ void resolve_types_in_compilation_unit(ast_node_t *ast, classpath_t *classpath,
     }
     
     /* Resolve types in the entire AST */
-    resolve_types_in_node(ast, imports, package, classpath, sourcepath_list);
+    resolve_types_in_node(ast, imports, package, classpath, sourcepath_list, registry);
     
     /* Free the imports list (not the AST nodes, just the list) */
     slist_free(imports);
@@ -6913,30 +7716,30 @@ static symbol_t *resolve_static_import_field(semantic_t *sem, const char *field_
 static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates, slist_t *args, type_t *recv_type)
 {
     if (!candidates) return NULL;
-    
+
     /* Count arguments */
     int arg_count = 0;
     for (slist_t *a = args; a; a = a->next) arg_count++;
-    
+
     symbol_t *best_match = NULL;
     int best_score = -1;
     symbol_t *varargs_match = NULL;
-    
+
     for (slist_t *node = candidates; node; node = node->next) {
         symbol_t *method = (symbol_t *)node->data;
         if (!method || (method->kind != SYM_METHOD && method->kind != SYM_CONSTRUCTOR)) {
             continue;
         }
-        
+
         /* Count parameters */
         int param_count = 0;
         slist_t *params = method->data.method_data.parameters;
         for (slist_t *p = params; p; p = p->next) {
             param_count++;
         }
-        
+
         bool is_varargs = (method->modifiers & MOD_VARARGS) != 0;
-        
+
         if (param_count != arg_count && !(is_varargs && arg_count >= param_count - 1)) {
             continue;  /* Wrong number of arguments */
         }
@@ -7233,6 +8036,13 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                 if (is_varargs_param && arg_type && arg_type->kind != TYPE_ARRAY) {
                     /* Individual vararg - compare against element type */
                     compare_type = param_type->data.array_type.element_type;
+                } else if (is_varargs_param && arg_type && arg_type->kind == TYPE_ARRAY &&
+                           !type_assignable(param_type, arg_type)) {
+                    /* Array argument that doesn't fit as "pass the whole array
+                     * directly" (e.g. byte[] passed to Object... args - byte[]
+                     * isn't assignable to Object[]) - treat it as a single
+                     * vararg element instead, matched against the element type. */
+                    compare_type = param_type->data.array_type.element_type;
                 }
                 
                 if (arg_type && compare_type) {
@@ -7346,7 +8156,7 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
         }
         
         if (type_mismatch) continue;
-        
+
         /* For varargs methods, when the argument count equals the parameter count
          * and the last argument is an array compatible with the varargs array,
          * treat it as a direct array pass (not varargs expansion).
@@ -7431,7 +8241,7 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
             }
         }
     }
-    
+
     return best_match ? best_match : varargs_match;
 }
 
@@ -7727,7 +8537,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                         }
                     }
                 }
-                
+
                 /* Check if it's a nested class/enum/record of the current class.
                  * The name might be fully qualified (e.g., "pkg.ExportThread" from
                  * resolve_types_in_compilation_unit), so also check with simple name. */
@@ -7736,13 +8546,16 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     symbol_t *nested = scope_lookup_local(
                         sem->current_class->data.class_data.members, name);
                     
-                    /* If not found, try extracting the simple name (after last dot) */
-                    if (!nested && strchr(name, '.')) {
-                        const char *simple = strrchr(name, '.');
-                        if (simple) {
-                            simple++;  /* Skip the dot */
+                    /* If not found, allow Outer.Inner only when Outer is the current class
+                     * (e.g. MyClass.Nested). Do not strip TlsHandshakeAsyncOffload.BatchProcessor
+                     * to BatchProcessor and bind a same-named member of the enclosing class. */
+                    if (!nested && strchr(name, '.') && sem->current_class->name) {
+                        const char *dotp = strchr(name, '.');
+                        size_t prefix_len = (size_t)(dotp - name);
+                        if (strlen(sem->current_class->name) == prefix_len &&
+                            strncmp(name, sem->current_class->name, prefix_len) == 0) {
                             nested = scope_lookup_local(
-                                sem->current_class->data.class_data.members, simple);
+                                sem->current_class->data.class_data.members, dotp + 1);
                         }
                     }
                     
@@ -7793,11 +8606,47 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     }
                 }
                 
+                /* Nested types declared on a superclass (JLS 6.5). */
+                if (sem->current_class && strchr(name, '.') == NULL) {
+                    symbol_t *inherited = lookup_superclass_nested_type(sem, sem->current_class, name);
+                    if (inherited && inherited->type &&
+                        (inherited->kind == SYM_CLASS || inherited->kind == SYM_INTERFACE ||
+                         inherited->kind == SYM_ENUM || inherited->kind == SYM_RECORD)) {
+                        slist_t *children = type_node->data.node.children;
+                        if (children && inherited->type->kind == TYPE_CLASS) {
+                            type_t *param_type = type_new_class(
+                                inherited->type->data.class_type.name ?
+                                inherited->type->data.class_type.name : name);
+                            param_type->data.class_type.symbol = inherited;
+                            for (slist_t *c = children; c; c = c->next) {
+                                type_t *arg_type = semantic_resolve_type(sem, (ast_node_t *)c->data);
+                                if (!param_type->data.class_type.type_args) {
+                                    param_type->data.class_type.type_args = slist_new(arg_type);
+                                } else {
+                                    slist_append(param_type->data.class_type.type_args, arg_type);
+                                }
+                            }
+                            type_node->sem_type = param_type;
+                            return param_type;
+                        }
+                        if (inherited->type->kind == TYPE_CLASS &&
+                            inherited->type->data.class_type.symbol == NULL) {
+                            inherited->type->data.class_type.symbol = inherited;
+                        }
+                        if (!hashtable_lookup(sem->unit_types, name)) {
+                            hashtable_insert(sem->unit_types, name, inherited->type);
+                        }
+                        type_node->sem_type = inherited->type;
+                        return inherited->type;
+                    }
+                }
+                
                 /* Check if it's a nested type of an implemented interface.
                  * Walk up the enclosing class chain to check their interfaces too. */
                 {
                     symbol_t *check_class = sem->current_class;
                     while (check_class) {
+                        ensure_class_implements_prescanned(sem, check_class);
                         if (getenv("GENESIS_DEBUG_IFACE_NESTED")) {
                             fprintf(stderr, "DEBUG iface_nested: looking for '%s', check_class=%s, interfaces=%p\n",
                                 name, 
@@ -7815,11 +8664,9 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                         iface_sym ? (void*)iface_sym->data.class_data.members : NULL);
                                 }
                                 /* Only check valid interface symbols */
-                                if (iface_sym && (iface_sym->kind == SYM_INTERFACE || 
-                                                  iface_sym->kind == SYM_CLASS) &&
-                                    iface_sym->data.class_data.members) {
-                                    symbol_t *nested = scope_lookup_local(
-                                        iface_sym->data.class_data.members, name);
+                                if (iface_sym && (iface_sym->kind == SYM_INTERFACE ||
+                                                  iface_sym->kind == SYM_CLASS)) {
+                                    symbol_t *nested = resolve_iface_member_type(sem, iface_sym, name);
                                     if (getenv("GENESIS_DEBUG_IFACE_NESTED")) {
                                         fprintf(stderr, "DEBUG iface_nested:   looked up '%s' in '%s' -> %p (kind=%d, type=%p)\n",
                                             name, iface_sym->name ? iface_sym->name : "(null)",
@@ -8041,6 +8888,44 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     }
                 }
 
+                /* Same-package top-level types take precedence over nested types
+                 * discovered through single-type imports (JLS 6.5). Must run before
+                 * unit_types: import java.util.ResourceBundle registers Control as
+                 * ResourceBundle.Control and would shadow ldap.client.Control. */
+                {
+                    char pkg_buf[512];
+                    if (semantic_package_name(sem, pkg_buf, sizeof(pkg_buf)) &&
+                        strchr(name, '.') == NULL) {
+                        symbol_t *pkg_sym = lookup_same_package_type(sem, name);
+                        if (pkg_sym && pkg_sym->type) {
+                            if (!hashtable_lookup(sem->unit_types, name)) {
+                                hashtable_insert(sem->unit_types, name, pkg_sym->type);
+                            }
+                            slist_t *children = type_node->data.node.children;
+                            if (children && pkg_sym->type->kind == TYPE_CLASS) {
+                                const char *pkg_name = pkg_sym->type->data.class_type.name ?
+                                    pkg_sym->type->data.class_type.name : name;
+                                type_t *param_type = type_new_class(pkg_name);
+                                param_type->data.class_type.symbol =
+                                    pkg_sym->type->data.class_type.symbol ?
+                                    pkg_sym->type->data.class_type.symbol : pkg_sym;
+                                for (slist_t *c = children; c; c = c->next) {
+                                    type_t *arg_type = semantic_resolve_type(sem, c->data);
+                                    if (!param_type->data.class_type.type_args) {
+                                        param_type->data.class_type.type_args = slist_new(arg_type);
+                                    } else {
+                                        slist_append(param_type->data.class_type.type_args, arg_type);
+                                    }
+                                }
+                                type_node->sem_type = param_type;
+                                return param_type;
+                            }
+                            type_node->sem_type = pkg_sym->type;
+                            return pkg_sym->type;
+                        }
+                    }
+                }
+
                 /* Check per-compilation-unit type scope first (like javac's toplevelScope).
                  * This contains types defined in the current file and imported types,
                  * keyed by simple name. For parallel compilation, each thread has its own
@@ -8104,42 +8989,22 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                         type_node->sem_type = param_type;
                         return param_type;
                     }
+                    /* unit_types may already hold an import-nested alias (e.g.
+                     * ResourceBundle.Control); prefer a same-package top-level type. */
+                    {
+                        char pkg_buf[512];
+                        if (semantic_package_name(sem, pkg_buf, sizeof(pkg_buf)) &&
+                            strchr(name, '.') == NULL) {
+                            symbol_t *pkg_sym = lookup_same_package_type(sem, name);
+                            if (pkg_sym && pkg_sym->type) {
+                                hashtable_insert(sem->unit_types, name, pkg_sym->type);
+                                type_node->sem_type = pkg_sym->type;
+                                return pkg_sym->type;
+                            }
+                        }
+                    }
                     type_node->sem_type = cached;
                     return cached;
-                }
-
-                /* Same-package top-level types take precedence over nested types
-                 * discovered through single-type imports (JLS 6.5). Without this,
-                 * import java.util.ResourceBundle makes simple name Control resolve to
-                 * ResourceBundle.Control instead of a package-local Control class. */
-                if (sem->current_package && strchr(name, '.') == NULL) {
-                    symbol_t *pkg_sym = lookup_same_package_type(sem, name);
-                    if (pkg_sym && pkg_sym->type) {
-                        if (!hashtable_lookup(sem->unit_types, name)) {
-                            hashtable_insert(sem->unit_types, name, pkg_sym->type);
-                        }
-                        slist_t *children = type_node->data.node.children;
-                        if (children && pkg_sym->type->kind == TYPE_CLASS) {
-                            const char *pkg_name = pkg_sym->type->data.class_type.name ?
-                                pkg_sym->type->data.class_type.name : name;
-                            type_t *param_type = type_new_class(pkg_name);
-                            param_type->data.class_type.symbol =
-                                pkg_sym->type->data.class_type.symbol ?
-                                pkg_sym->type->data.class_type.symbol : pkg_sym;
-                            for (slist_t *c = children; c; c = c->next) {
-                                type_t *arg_type = semantic_resolve_type(sem, c->data);
-                                if (!param_type->data.class_type.type_args) {
-                                    param_type->data.class_type.type_args = slist_new(arg_type);
-                                } else {
-                                    slist_append(param_type->data.class_type.type_args, arg_type);
-                                }
-                            }
-                            type_node->sem_type = param_type;
-                            return param_type;
-                        }
-                        type_node->sem_type = pkg_sym->type;
-                        return pkg_sym->type;
-                    }
                 }
                 
                 /* Resolve simple name to qualified name using imports */
@@ -8352,8 +9217,10 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                 /* Last resort: scan the package directory for the type.
                  * This handles package-private types defined in other files
                  * within the same package (like javac's ClassFinder.fillIn). */
-                if (sem->current_package) {
-                    symbol_t *pkg_sym = scan_package_for_type(sem, name, sem->current_package);
+                {
+                    char pkg_buf[512];
+                    const char *pkg = semantic_package_name(sem, pkg_buf, sizeof(pkg_buf));
+                    symbol_t *pkg_sym = pkg ? scan_package_for_type(sem, name, pkg) : NULL;
                     if (pkg_sym && pkg_sym->type) {
                         /* Cache in per-compilation-unit scope */
                         if (!hashtable_lookup(sem->unit_types, name)) {
@@ -8537,7 +9404,20 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                   "Cannot resolve type from field access");
                     return type_new_primitive(TYPE_UNKNOWN);
                 }
-                
+
+                {
+                    char *imported = resolve_import(sem, fqn);
+                    if (imported) {
+                        symbol_t *isym = load_external_class(sem, imported);
+                        if (isym && isym->type) {
+                            type_node->sem_type = isym->type;
+                            free(imported);
+                            return isym->type;
+                        }
+                        free(imported);
+                    }
+                }
+
                 /* Try to resolve as a class name */
                 symbol_t *sym = load_external_class(sem, fqn);
                 if (sym) {
@@ -9790,6 +10670,8 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                     super = load_external_class(sem, "java.lang.Object");
                                 }
                                 while (super) {
+                                    ensure_class_implements_prescanned(sem, super);
+
                                     /* If superclass has no members, try to fully load it */
                                     if (!super->data.class_data.members && super->qualified_name) {
                                         symbol_t *loaded = load_external_class(sem, super->qualified_name);
@@ -9868,10 +10750,27 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                             }
                                             break;  /* Found the method, stop searching */
                                         }
+
+                                        /* Superclass declared later in the same file: its own
+                                         * AST_METHOD_DECL nodes (like this one) haven't been
+                                         * turned into SYM_METHOD symbols yet by pass1's
+                                         * top-down walk, so the hashtable search above found
+                                         * nothing even though the method really is there.
+                                         * Fall back to a direct AST scan. This only sets
+                                         * actually_overrides - it can't check final/covariant
+                                         * return here since there is no symbol yet, but pass1
+                                         * will re-run this same check once it reaches the
+                                         * superclass's own declaration and reject a genuine
+                                         * mismatch then. */
+                                        if (super->ast &&
+                                            find_method_decl_in_class_ast(super->ast, name, node)) {
+                                            actually_overrides = true;
+                                            break;
+                                        }
                                     }
                                     super = super->data.class_data.superclass;
                                 }
-                                
+
                                 if (!actually_overrides) {
                                     if (getenv("GENESIS_DEBUG_OVERRIDE")) {
                                         fprintf(stderr, "DEBUG @Override: checking interfaces for method '%s' in class '%s'\n",
@@ -10942,10 +11841,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                  iface; iface = iface->next) {
                                 symbol_t *iface_sym = (symbol_t *)iface->data;
                                 if (iface_sym && (iface_sym->kind == SYM_INTERFACE ||
-                                                  iface_sym->kind == SYM_CLASS) &&
-                                    iface_sym->data.class_data.members) {
-                                    symbol_t *nested = scope_lookup_local(
-                                        iface_sym->data.class_data.members, name);
+                                                  iface_sym->kind == SYM_CLASS)) {
+                                    symbol_t *nested = resolve_iface_member_type(sem, iface_sym, name);
                                     if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
                                                    nested->kind == SYM_ENUM || nested->kind == SYM_RECORD) &&
                                         nested->type) {
@@ -10953,20 +11850,24 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                         expr->sem_type = nested->type;
                                         return nested->type;
                                     }
-                                    if (nested && nested->kind == SYM_FIELD &&
-                                        (nested->modifiers & MOD_STATIC)) {
-                                        if (!nested->type &&
-                                            nested->data.var_data.unresolved_type) {
-                                            unresolved_type_t *ut =
-                                                (unresolved_type_t *)nested->data.var_data.unresolved_type;
-                                            nested->type = resolve_unresolved_type_full(ut,
-                                                sem->shared_registry, sem->classpath,
-                                                sem->current_class);
-                                        }
-                                        if (nested->type) {
-                                            expr->sem_symbol = nested;
-                                            expr->sem_type = nested->type;
-                                            return nested->type;
+                                    if (iface_sym->data.class_data.members) {
+                                        symbol_t *iface_field = scope_lookup_local(
+                                            iface_sym->data.class_data.members, name);
+                                        if (iface_field && iface_field->kind == SYM_FIELD &&
+                                            (iface_field->modifiers & MOD_STATIC)) {
+                                            if (!iface_field->type &&
+                                                iface_field->data.var_data.unresolved_type) {
+                                                unresolved_type_t *ut =
+                                                    (unresolved_type_t *)iface_field->data.var_data.unresolved_type;
+                                                iface_field->type = resolve_unresolved_type_full(ut,
+                                                    sem->shared_registry, sem->classpath,
+                                                    sem->current_class);
+                                            }
+                                            if (iface_field->type) {
+                                                expr->sem_symbol = iface_field;
+                                                expr->sem_type = iface_field->type;
+                                                return iface_field->type;
+                                            }
                                         }
                                     }
                                 }
@@ -12117,6 +13018,17 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     put, sem->shared_registry, sem->classpath,
                                     target_class, found_method);
                                 if (pt) {
+                                    /* Varargs parameter type needs to be array (see the
+                                     * matching fixup in resolve_types_for_symbol()) - this
+                                     * re-resolution must not clobber an already-correct
+                                     * array type with just the element type, or a second
+                                     * lookup of the same varargs call (e.g. as a nested
+                                     * call argument, which is type-checked twice) fails to
+                                     * match the varargs parameter. */
+                                    if ((param->modifiers & MOD_VARARGS) &&
+                                        pt->kind != TYPE_ARRAY) {
+                                        pt = type_new_array(pt, 1);
+                                    }
                                     param->type = pt;
                                 }
                             }
@@ -12201,12 +13113,27 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                         args = args->next;
                     }
                     
-                    /* Track inferred type arguments for static generic methods */
-                    type_t *inferred_T = NULL;  /* For type variable T (most common) */
-                    type_t *inferred_R = NULL;  /* For type variable R (Function return type) */
-                    type_t *inferred_E = NULL;  /* For type variable E (collection element) */
-                    type_t *inferred_A = NULL;  /* For type variable A (Files.readAttributes etc) */
-                    
+                    /* Track inferred type arguments for generic methods, one slot per the
+                     * method's own declared type parameter - not a fixed set of
+                     * single-letter names, since e.g. Files.getFileAttributeView's is
+                     * named "V". */
+                    ensure_method_type_params(found_method);
+                    int n_type_params = 0;
+                    for (slist_t *tp = found_method->data.method_data.type_params; tp; tp = tp->next) {
+                        n_type_params++;
+                    }
+                    const char *type_param_names[n_type_params > 0 ? n_type_params : 1];
+                    type_t *inferred_types[n_type_params > 0 ? n_type_params : 1];
+                    {
+                        int tpi = 0;
+                        for (slist_t *tp = found_method->data.method_data.type_params; tp; tp = tp->next) {
+                            symbol_t *ps = (symbol_t *)tp->data;
+                            type_param_names[tpi] = (ps && ps->name) ? ps->name : "";
+                            inferred_types[tpi] = NULL;
+                            tpi++;
+                        }
+                    }
+
                     /* Check each argument type */
                     slist_t *param_node = params;
                     slist_t *arg_node = args;
@@ -12302,17 +13229,11 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 infer_from = infer_from->data.array_type.element_type;
                             }
                             
-                            if (!inferred_T) {
-                                inferred_T = infer_type_arg_from_expression(sem, infer_from, arg, arg_type, "T");
-                            }
-                            if (!inferred_E) {
-                                inferred_E = infer_type_arg_from_expression(sem, infer_from, arg, arg_type, "E");
-                            }
-                            if (!inferred_R) {
-                                inferred_R = infer_type_arg_from_expression(sem, infer_from, arg, arg_type, "R");
-                            }
-                            if (!inferred_A) {
-                                inferred_A = infer_type_arg_from_expression(sem, infer_from, arg, arg_type, "A");
+                            for (int tpi = 0; tpi < n_type_params; tpi++) {
+                                if (!inferred_types[tpi]) {
+                                    inferred_types[tpi] = infer_type_arg_from_expression(
+                                        sem, infer_from, arg, arg_type, type_param_names[tpi]);
+                                }
                             }
                         }
                         
@@ -12328,22 +13249,22 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             if (arg_type && arg_type->kind == TYPE_ARRAY) {
                                 type_t *elem = arg_type->data.array_type.element_type;
                                 type_t *expected_elem = bind_type;
-                                if (param_type && param_type->kind == TYPE_ARRAY) {
-                                    if (!type_assignable(param_type, arg_type)) {
-                                        char *expected = type_to_string(param_type);
-                                        char *actual = type_to_string(arg_type);
-                                        semantic_error(sem, arg->line, arg->column,
-                                            "argument %d: incompatible types - expected %s, got %s",
-                                            arg_index + 1, expected, actual);
-                                        free(expected);
-                                        free(actual);
-                                    }
+                                if (param_type && param_type->kind == TYPE_ARRAY &&
+                                    type_assignable(param_type, arg_type)) {
+                                    /* Direct array pass: the whole array satisfies the
+                                     * varargs parameter directly (e.g. String[] passed
+                                     * to String... args). */
                                     break;
                                 }
                                 if (expected_elem && elem &&
                                     type_assignable(expected_elem, elem)) {
                                     break;
                                 }
+                                /* Not a direct array pass (e.g. byte[] passed to
+                                 * Object... args - byte[] isn't assignable to
+                                 * Object[], but the byte[] value itself is a valid
+                                 * single element). Fall through to the plain element
+                                 * check below instead of erroring here. */
                             }
                             
                             /* Check element type for individual varargs.
@@ -12505,6 +13426,51 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         /* Ensure the substituted type has its symbol loaded */
                         ensure_type_symbol_loaded(sem, return_type);
                     }
+                    if (return_type && return_type->kind == TYPE_CLASS &&
+                        return_type->data.class_type.name &&
+                        strcmp(return_type->data.class_type.name, "java.lang.Object") == 0) {
+                        type_t *param_iface = subst_recv;
+                        if ((!param_iface || param_iface->kind != TYPE_CLASS ||
+                             !param_iface->data.class_type.type_args) &&
+                            recv_type_for_subst && recv_type_for_subst->kind == TYPE_CLASS &&
+                            recv_type_for_subst->data.class_type.type_args) {
+                            param_iface = recv_type_for_subst;
+                        }
+                        if (!param_iface || param_iface->kind != TYPE_CLASS ||
+                            !param_iface->data.class_type.type_args) {
+                            if (recv_type_for_subst && recv_type_for_subst->kind == TYPE_CLASS) {
+                                symbol_t *rs = recv_type_for_subst->data.class_type.symbol;
+                                if (!rs && recv_type_for_subst->data.class_type.name) {
+                                    rs = load_external_class(sem,
+                                        recv_type_for_subst->data.class_type.name);
+                                }
+                                if (rs) {
+                                    ensure_interface_parameterized_extends(sem, rs);
+                                    if (rs->data.class_data.superclass_type &&
+                                        rs->data.class_data.superclass_type->kind == TYPE_CLASS &&
+                                        rs->data.class_data.superclass_type->data.class_type.type_args) {
+                                        param_iface = rs->data.class_data.superclass_type;
+                                    }
+                                }
+                            }
+                        }
+                        if (param_iface && param_iface->kind == TYPE_CLASS &&
+                            param_iface->data.class_type.type_args) {
+                            symbol_t *decl = param_iface->data.class_type.symbol;
+                            int nparams = 0;
+                            if (decl && decl->data.class_data.type_params) {
+                                for (slist_t *tp = decl->data.class_data.type_params; tp;
+                                     tp = tp->next) {
+                                    nparams++;
+                                }
+                            }
+                            if (nparams == 1 ||
+                                !param_iface->data.class_type.type_args->next) {
+                                return_type = (type_t *)param_iface->data.class_type.type_args->data;
+                                ensure_type_symbol_loaded(sem, return_type);
+                            }
+                        }
+                    }
 
                     /* Generic instance method return (e.g. V remove(int)) in a typed
                      * initializer when receiver type args were not substituted.
@@ -12610,23 +13576,23 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     }
                     
                     /* Substitute inferred type arguments for generic methods.
-                     * This handles method-level type params like R in map<R>().
+                     * This handles method-level type params like <V> in
+                     * Files.getFileAttributeView() or <R> in map<R>().
                      * Both static and instance methods may have type parameters. */
-                    if (!return_type && inferred_T) {
-                        return_type = inferred_T;
+                    if (!return_type) {
+                        for (int tpi = 0; tpi < n_type_params; tpi++) {
+                            if (inferred_types[tpi]) {
+                                return_type = inferred_types[tpi];
+                                break;
+                            }
+                        }
                     }
                     if (return_type) {
-                        if (inferred_T) {
-                            return_type = substitute_type_var(return_type, "T", inferred_T);
-                        }
-                        if (inferred_E) {
-                            return_type = substitute_type_var(return_type, "E", inferred_E);
-                        }
-                        if (inferred_R) {
-                            return_type = substitute_type_var(return_type, "R", inferred_R);
-                        }
-                        if (inferred_A) {
-                            return_type = substitute_type_var(return_type, "A", inferred_A);
+                        for (int tpi = 0; tpi < n_type_params; tpi++) {
+                            if (inferred_types[tpi]) {
+                                return_type = substitute_type_var(
+                                    return_type, type_param_names[tpi], inferred_types[tpi]);
+                            }
                         }
                     }
                     
@@ -13201,38 +14167,63 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                             
                             /* If field not found but class has AST, try lazy field population.
-                             * This handles classes that were preregistered but not fully analyzed. */
-                            if (!field && search_class->ast) {
+                             * This handles classes that were preregistered but not fully analyzed.
+                             * Also re-run this when the field WAS found but its type is
+                             * under-parameterized (e.g. "List<Box>" where Box is really
+                             * "Box<T>") - that happens when `field` came from a class symbol
+                             * reached independently of the one pass1 fully resolved (e.g. via
+                             * a shared-registry stub), which never got the full nested
+                             * substitution and has no unresolved_type to redo it from. */
+                            if ((!field || type_is_under_parameterized(field->type)) &&
+                                search_class->ast) {
                                 ast_node_t *class_ast = search_class->ast;
                                 scope_t *class_members = search_class->data.class_data.members;
                                 bool populated = false;
-                                
+
                                 /* Save and set current_class so nested types can be resolved */
                                 symbol_t *saved_class = sem->current_class;
                                 sem->current_class = search_class;
-                                
+
                                 for (slist_t *mc = class_ast->data.node.children; mc; mc = mc->next) {
                                     ast_node_t *member = (ast_node_t *)mc->data;
                                     if (!member || member->type != AST_FIELD_DECL) continue;
-                                    
+
                                     ast_node_t *type_node = NULL;
                                     for (slist_t *fc = member->data.node.children; fc; fc = fc->next) {
                                         ast_node_t *child = (ast_node_t *)fc->data;
                                         if (!child) continue;
-                                        
-                                        if (child->type == AST_CLASS_TYPE || 
+
+                                        if (child->type == AST_CLASS_TYPE ||
                                             child->type == AST_PRIMITIVE_TYPE ||
                                             child->type == AST_ARRAY_TYPE) {
                                             type_node = child;
                                         } else if (child->type == AST_VAR_DECLARATOR && type_node) {
                                             const char *fname = child->data.node.name;
-                                            if (fname && !scope_lookup_local(class_members, fname)) {
+                                            if (!fname) continue;
+                                            symbol_t *existing_fsym = scope_lookup_local(class_members, fname);
+                                            if (!existing_fsym) {
                                                 symbol_t *fsym = symbol_new(SYM_FIELD, fname);
                                                 fsym->modifiers = member->data.node.flags;
                                                 fsym->ast = child;
                                                 fsym->type = semantic_resolve_type(sem, type_node);
                                                 scope_define(class_members, fsym);
                                                 populated = true;
+                                            } else if (strcmp(fname, field_name) == 0 &&
+                                                       type_is_under_parameterized(existing_fsym->type)) {
+                                                /* semantic_resolve_type() doesn't reliably
+                                                 * recurse into nested type arguments in this
+                                                 * on-demand context; unresolved_type_from_ast()
+                                                 * + resolve_unresolved_type_full() does (see
+                                                 * how field types are normally resolved). */
+                                                unresolved_type_t *fresh_ut = unresolved_type_from_ast(type_node);
+                                                type_t *fresh_type = fresh_ut ?
+                                                    resolve_unresolved_type_full(fresh_ut,
+                                                        sem->shared_registry, sem->classpath, search_class) :
+                                                    NULL;
+                                                if (fresh_type) {
+                                                    existing_fsym->type = fresh_type;
+                                                    populated = true;
+                                                }
                                             }
                                         }
                                     }
@@ -13283,7 +14274,9 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                              * use the wrong import context and generate spurious errors.
                              * Instead, use resolve_unresolved_type for external classes. */
                             if (!field->type ||
-                                (field->type && field->type->kind == TYPE_UNKNOWN)) {
+                                (field->type && field->type->kind == TYPE_UNKNOWN) ||
+                                unresolved_type_more_detailed(field->type,
+                                    (unresolved_type_t *)field->data.var_data.unresolved_type)) {
                                 /* Try unresolved type first (works for both internal and external) */
                                 if (field->data.var_data.unresolved_type && sem->shared_registry) {
                                     unresolved_type_t *ut = (unresolved_type_t *)field->data.var_data.unresolved_type;
@@ -14809,7 +15802,15 @@ static type_t *substitute_type_var(type_t *type, const char *var_name, type_t *r
  */
 static type_t *interface_extends_type_for_subst(semantic_t *sem, symbol_t *iface_sym)
 {
-    if (!sem || !iface_sym || iface_sym->kind != SYM_INTERFACE || !iface_sym->ast) {
+    if (!sem || !iface_sym || iface_sym->kind != SYM_INTERFACE) {
+        return NULL;
+    }
+    if (iface_sym->data.class_data.superclass_type &&
+        iface_sym->data.class_data.superclass_type->kind == TYPE_CLASS &&
+        iface_sym->data.class_data.superclass_type->data.class_type.type_args) {
+        return iface_sym->data.class_data.superclass_type;
+    }
+    if (!iface_sym->ast) {
         return NULL;
     }
     for (slist_t *c = iface_sym->ast->data.node.children; c; c = c->next) {
@@ -14828,6 +15829,50 @@ static type_t *interface_extends_type_for_subst(semantic_t *sem, symbol_t *iface
     return NULL;
 }
 
+static void ensure_interface_parameterized_extends(semantic_t *sem, symbol_t *sym)
+{
+    if (!sem || !sym || sym->kind != SYM_INTERFACE || !sem->classpath || !sym->qualified_name) {
+        return;
+    }
+    if (sym->data.class_data.superclass_type &&
+        sym->data.class_data.superclass_type->kind == TYPE_CLASS &&
+        sym->data.class_data.superclass_type->data.class_type.type_args) {
+        return;
+    }
+    classfile_t *cf = classpath_load_class(sem->classpath, sym->qualified_name);
+    if (!cf) {
+        return;
+    }
+    char *class_sig = classfile_get_attribute_signature(cf, cf->attributes, cf->attributes_count);
+    if (!class_sig) {
+        return;
+    }
+    class_signature_t *csig = signature_parse_class(class_sig);
+    free(class_sig);
+    if (!csig || !csig->interfaces) {
+        if (csig) {
+            class_signature_free(csig);
+        }
+        return;
+    }
+    for (generic_type_t *gi = csig->interfaces; gi; gi = gi->next) {
+        type_t *it = generic_type_to_type(gi);
+        if (!it || it->kind != TYPE_CLASS || !it->data.class_type.type_args) {
+            continue;
+        }
+        sym->data.class_data.superclass_type = it;
+        const char *ext_name = it->data.class_type.name;
+        if (ext_name) {
+            symbol_t *ext_sym = load_external_class(sem, ext_name);
+            if (ext_sym) {
+                it->data.class_type.symbol = ext_sym;
+            }
+        }
+        break;
+    }
+    class_signature_free(csig);
+}
+
 static type_t *enrich_recv_type_for_subst(semantic_t *sem, type_t *recv_type)
 {
     if (!recv_type || recv_type->kind != TYPE_CLASS || recv_type->data.class_type.type_args) {
@@ -14843,6 +15888,7 @@ static type_t *enrich_recv_type_for_subst(semantic_t *sem, type_t *recv_type)
     if (!sym) {
         return recv_type;
     }
+    ensure_interface_parameterized_extends(sem, sym);
     if (sym->data.class_data.superclass_type &&
         sym->data.class_data.superclass_type->kind == TYPE_CLASS &&
         sym->data.class_data.superclass_type->data.class_type.type_args) {
@@ -16885,6 +17931,11 @@ static void resolve_type_hierarchy(semantic_t *sem, ast_node_t *ast)
                         if (!sym->data.class_data.superclass_type) {
                             sym->data.class_data.superclass_type = super_type;  /* Store parameterized type */
                         }
+                    } else if (super_sym && super_sym->kind == SYM_INTERFACE &&
+                               super_type && super_type->kind == TYPE_CLASS &&
+                               super_type->data.class_type.type_args &&
+                               !sym->data.class_data.superclass_type) {
+                        sym->data.class_data.superclass_type = super_type;
                     }
                 } else if (child->data.node.flags == 2) {
                     /* implements/extends for interfaces - already handled in pass1 */

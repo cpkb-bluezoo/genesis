@@ -370,7 +370,7 @@ void stackmap_init_object(stack_map_table_t *smt, uint16_t new_offset,
 void stackmap_record_frame(stack_map_table_t *smt, uint16_t offset)
 {
     if (!smt) return;
-    
+
     /* Check for existing frame at this offset */
     for (stack_map_frame_t *f = smt->frames; f; f = f->next) {
         if (f->offset == offset) {

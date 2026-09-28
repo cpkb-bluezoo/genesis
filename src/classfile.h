@@ -427,6 +427,15 @@ int classfile_java_version(int major_version);
 char **classfile_get_module_exports(classfile_t *cf, int *count_out);
 
 /*
+ * Find this annotation type's own @java.lang.annotation.Retention
+ * meta-annotation and return the RetentionPolicy enum constant name it
+ * declares ("RUNTIME", "CLASS", or "SOURCE"), or NULL if absent (the JLS
+ * default is then RetentionPolicy.CLASS). Caller must free() a non-NULL
+ * result.
+ */
+char *classfile_get_retention_policy_name(classfile_t *cf);
+
+/*
  * InnerClasses attribute parsing
  */
 

@@ -1003,6 +1003,36 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
     return true;
 }
 
+/**
+ * Release every monitor currently held by an enclosing synchronized
+ * statement, in innermost-first order, right before a `return` leaves the
+ * method from inside one or more of them. Each release is
+ * "aload lock_slot; monitorexit" - this only touches the top of the
+ * operand stack, so it's safe to emit after the return value (if any) has
+ * already been pushed: the value stays untouched underneath. Without this,
+ * a `return` lexically inside a synchronized block skipped the monitor
+ * exit entirely, leaving the lock held forever (a `return` reaching the
+ * synchronized statement's own normal-exit code never happens, since
+ * `codegen_statement` for AST_RETURN_STMT emits the return instruction
+ * directly at that point in the bytecode stream, not a jump to the
+ * synchronized statement's epilogue).
+ */
+static void emit_pending_monitorexits(method_gen_t *mg)
+{
+    for (slist_t *node = mg->sync_lock_stack; node; node = node->next) {
+        uint16_t lock_slot = (uint16_t)(uintptr_t)node->data;
+        if (lock_slot <= 3) {
+            bc_emit(mg->code, OP_ALOAD_0 + lock_slot);
+        } else {
+            bc_emit(mg->code, OP_ALOAD);
+            bc_emit_u1(mg->code, (uint8_t)lock_slot);
+        }
+        mg_push_object(mg, NULL);
+        bc_emit(mg->code, OP_MONITOREXIT);
+        mg_pop_typed(mg, 1);
+    }
+}
+
 /* ========================================================================
  * Statement Code Generation
  * ======================================================================== */
@@ -1288,6 +1318,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         }
                     }
                     
+                    emit_pending_monitorexits(mg);
                     bc_emit(mg->code, return_op);
                     mg->last_opcode = return_op;
                     /* LRETURN/DRETURN consume a 2-slot value; popping a fixed 1
@@ -1296,6 +1327,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * "if (x) return someLong;" before more statements). */
                     mg_pop_typed(mg, (return_op == OP_LRETURN || return_op == OP_DRETURN) ? 2 : 1);
                 } else {
+                    emit_pending_monitorexits(mg);
                     bc_emit(mg->code, OP_RETURN);
                     mg->last_opcode = OP_RETURN;
                 }
@@ -1786,11 +1818,25 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     }
                     
                     size_t goto_pos = 0;
+                    /* Snapshot the stackmap state as it stands right after the
+                     * then branch, before it gets reset for the else branch
+                     * below. If the else branch terminates (return/throw), the
+                     * goto emitted here is the *only* live edge into the join
+                     * point, so the join frame must reflect what's true at
+                     * this goto - not whatever mg->stackmap happens to track
+                     * after generating (possibly deeply nested) else code,
+                     * which may have reset locals like a blank final assigned
+                     * in the then branch back to Top while framing an inner
+                     * throw/return branch of its own. */
+                    stackmap_state_t *then_exit_state = NULL;
                     if (!then_ends_with_return) {
                         /* Save position for goto past else */
                         goto_pos = mg->code->length;
                         bc_emit(mg->code, OP_GOTO);
                         bc_emit_u2(mg->code, 0);  /* Placeholder */
+                        if (mg->stackmap) {
+                            then_exit_state = stackmap_save_state(mg->stackmap);
+                        }
                     }
                     
                     /* Patch the branch to else */
@@ -1812,6 +1858,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     /* Generate else branch */
                     if (!codegen_statement(mg, else_stmt)) {
                         stackmap_state_free(pre_then_state);
+                        stackmap_state_free(then_exit_state);
                         return false;
                     }
                     
@@ -1838,17 +1885,27 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                          * stackmap local types - variables declared BEFORE the if that are
                          * assigned inside BOTH branches should retain their assigned type,
                          * not revert to Top. The else branch's final state is valid since
-                         * any variables declared inside else will go out of scope anyway. */
+                         * any variables declared inside else will go out of scope anyway -
+                         * UNLESS the else branch itself terminates (return/throw), in which
+                         * case the goto from the then branch is the *only* live edge into
+                         * this join point, and mg->stackmap's current state reflects
+                         * whatever the (possibly nested) else branch left behind while
+                         * framing its own internal control flow - not what's true at the
+                         * goto. Use the then-exit snapshot instead in that case. */
                         if (pre_then_state && mg->stackmap) {
+                            if (else_ends_with_return && then_exit_state) {
+                                stackmap_restore_state(mg->stackmap, then_exit_state);
+                            }
                             /* Only restore the slot allocation, not the stackmap types */
                             mg_restore_locals_count(mg, pre_then_locals_count);
                             mg->next_slot = pre_then_slot;
                         }
-                        
+
                         /* Record frame at end of if-else (join point) */
                         mg_record_frame(mg);
                     }
-                    
+                    stackmap_state_free(then_exit_state);
+
                     /* If both branches terminate, the if-else terminates
                      * Otherwise, reset last_opcode */
                     if (then_ends_with_return && else_ends_with_return) {
@@ -3091,38 +3148,112 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 
                 /* Record start of synchronized region */
                 uint16_t sync_start = (uint16_t)mg->code->length;
-                
+
+                /* Save stackmap state at sync_start - the exception handler's
+                 * protected range starts here, so an exception could occur
+                 * before the body runs at all. Its frame must reflect this
+                 * entry state, not whatever locals the body goes on to
+                 * assign (e.g. a local declared partway through the body),
+                 * exactly like try_entry_state for AST_TRY_STMT. */
+                stackmap_state_t *sync_entry_state = NULL;
+                if (mg->stackmap) {
+                    sync_entry_state = stackmap_save_state(mg->stackmap);
+                }
+
+                /* Push this lock onto the enclosing-synchronized stack so a
+                 * `return` lexically inside the body (directly, or nested in
+                 * further if/try/etc.) can release it before returning -
+                 * mirrors mg->loop_stack for break/continue. */
+                mg->sync_lock_stack = slist_prepend(mg->sync_lock_stack,
+                    (void *)(uintptr_t)lock_slot);
+
                 /* Generate body */
-                if (!codegen_statement(mg, body)) {
+                bool body_ok = codegen_statement(mg, body);
+
+                {
+                    slist_t *old_sync = mg->sync_lock_stack;
+                    mg->sync_lock_stack = mg->sync_lock_stack->next;
+                    free(old_sync);
+                }
+
+                if (!body_ok) {
                     return false;
                 }
-                
+
                 /* Record end of synchronized region */
                 uint16_t sync_end = (uint16_t)mg->code->length;
-                
-                /* Normal exit: monitorexit */
-                if (lock_slot <= 3) {
-                    bc_emit(mg->code, OP_ALOAD_0 + lock_slot);
-                } else {
-                    bc_emit(mg->code, OP_ALOAD);
-                    bc_emit_u1(mg->code, (uint8_t)lock_slot);
+
+                /* If the body terminates on every path (return/throw), the
+                 * "normal exit" epilogue below (monitorexit + goto-past-handler)
+                 * is unreachable dead code - nothing ever falls out of the body
+                 * to reach it. Skip it entirely: emitting it anyway can produce
+                 * a stack-map frame for the goto's target address with no
+                 * actual instruction there when the synchronized statement is
+                 * the last thing in the method (VerifyError: "StackMapTable
+                 * error: bad offset"), since the exception handler's own path
+                 * always rethrows and never falls through to that point either.
+                 * mg->last_opcode (rather than re-scanning bytecode) matches
+                 * the same reliable check used for try/if bodies above. */
+                bool body_ends_with_return = false;
+                {
+                    uint8_t last_op = mg->last_opcode;
+                    if (last_op == OP_RETURN || last_op == OP_IRETURN ||
+                        last_op == OP_LRETURN || last_op == OP_FRETURN ||
+                        last_op == OP_DRETURN || last_op == OP_ARETURN ||
+                        last_op == OP_ATHROW) {
+                        body_ends_with_return = true;
+                    }
                 }
-                mg_push_object(mg, NULL);  /* ALOAD loads object reference */
-                bc_emit(mg->code, OP_MONITOREXIT);
-                mg_pop_typed(mg, 1);
-                
-                /* Jump past exception handler */
-                size_t goto_pos = mg->code->length;
-                bc_emit(mg->code, OP_GOTO);
-                bc_emit_u2(mg->code, 0);  /* Placeholder */
-                
-                /* Save locals count before exception handler - the normal path
-                 * doesn't have the exception slot, only the exception path does */
-                uint16_t saved_locals_for_normal_exit = mg_save_locals_count(mg);
+
+                size_t goto_pos = 0;
+                uint16_t saved_locals_for_normal_exit = 0;
+                stackmap_state_t *sync_body_exit_state = NULL;
+                if (!body_ends_with_return) {
+                    /* Normal exit: monitorexit */
+                    if (lock_slot <= 3) {
+                        bc_emit(mg->code, OP_ALOAD_0 + lock_slot);
+                    } else {
+                        bc_emit(mg->code, OP_ALOAD);
+                        bc_emit_u1(mg->code, (uint8_t)lock_slot);
+                    }
+                    mg_push_object(mg, NULL);  /* ALOAD loads object reference */
+                    bc_emit(mg->code, OP_MONITOREXIT);
+                    mg_pop_typed(mg, 1);
+
+                    /* Jump past exception handler */
+                    goto_pos = mg->code->length;
+                    bc_emit(mg->code, OP_GOTO);
+                    bc_emit_u2(mg->code, 0);  /* Placeholder */
+
+                    /* Save locals count before exception handler - the normal path
+                     * doesn't have the exception slot, only the exception path does */
+                    saved_locals_for_normal_exit = mg_save_locals_count(mg);
+
+                    /* Full snapshot of the body's normal-exit state, taken
+                     * before the handler below restores mg->stackmap back to
+                     * sync_entry_state for its own framing. The "after
+                     * handler" join point is only reachable via this goto
+                     * (the handler always rethrows), so its frame must
+                     * reflect this snapshot, not whatever the handler leaves
+                     * mg->stackmap tracking afterward - the same class of
+                     * bug already fixed for AST_TRY_STMT's try_exit_state. */
+                    if (mg->stackmap) {
+                        sync_body_exit_state = stackmap_save_state(mg->stackmap);
+                    }
+                }
                 
                 /* Exception handler: catch-all */
                 uint16_t handler_pc = (uint16_t)mg->code->length;
-                
+
+                /* Restore stackmap to sync-entry state before recording the
+                 * handler frame - by this point mg->stackmap reflects
+                 * whatever locals the body assigned (e.g. a local declared
+                 * partway through it), but an exception reaching this
+                 * handler could have been thrown before any of that ran. */
+                if (sync_entry_state && mg->stackmap) {
+                    stackmap_restore_state(mg->stackmap, sync_entry_state);
+                }
+
                 /* Record stackmap frame at exception handler entry
                  * The mg_record_exception_handler_frame handles the exception on stack */
                 mg_record_exception_handler_frame(mg, NULL);
@@ -3163,22 +3294,44 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 bc_emit(mg->code, OP_ATHROW);
                 mg_pop_typed(mg, 1);
                 
-                /* Patch goto to jump here (after exception handler) */
-                uint16_t after_handler = (uint16_t)mg->code->length;
-                int16_t goto_offset = (int16_t)(after_handler - goto_pos);
-                mg->code->code[goto_pos + 1] = (goto_offset >> 8) & 0xFF;
-                mg->code->code[goto_pos + 2] = goto_offset & 0xFF;
-                
-                /* Restore locals count to before exception handler state
-                 * The normal path (goto target) doesn't have the exc_slot set */
-                mg_restore_locals_count(mg, saved_locals_for_normal_exit);
-                
-                /* Record frame at goto target (after exception handler) */
-                mg_record_frame(mg);
-                
+                if (!body_ends_with_return) {
+                    /* Patch goto to jump here (after exception handler) */
+                    uint16_t after_handler = (uint16_t)mg->code->length;
+                    int16_t goto_offset = (int16_t)(after_handler - goto_pos);
+                    mg->code->code[goto_pos + 1] = (goto_offset >> 8) & 0xFF;
+                    mg->code->code[goto_pos + 2] = goto_offset & 0xFF;
+
+                    /* This goto is the only live edge into this join point
+                     * (the handler always rethrows) - restore the snapshot
+                     * taken right after the body, not just its locals count,
+                     * since mg->stackmap now reflects sync_entry_state plus
+                     * exc_slot from framing the handler above, not the
+                     * body's actual exit state. */
+                    if (sync_body_exit_state && mg->stackmap) {
+                        stackmap_restore_state(mg->stackmap, sync_body_exit_state);
+                    } else {
+                        mg_restore_locals_count(mg, saved_locals_for_normal_exit);
+                    }
+
+                    /* Record frame at goto target (after exception handler) */
+                    mg_record_frame(mg);
+
+                    /* There's a live path past this statement (the normal exit) */
+                    mg->last_opcode = 0;
+                } else {
+                    /* Body terminates on every path, and the handler always
+                     * rethrows - so this statement itself always terminates,
+                     * exactly like the body would have on its own. No dead
+                     * "after" code was emitted, so there's nothing to patch or
+                     * frame here. */
+                    mg->last_opcode = OP_ATHROW;
+                }
+                stackmap_state_free(sync_body_exit_state);
+                stackmap_state_free(sync_entry_state);
+
                 /* Add exception handler entry (catch-all: catch_type = 0) */
                 mg_add_exception_handler(mg, sync_start, sync_end, handler_pc, 0);
-                
+
                 return true;
             }
         
@@ -3427,6 +3580,16 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 size_t try_exit_goto = 0;
                 bool has_try_exit_goto = false;  /* Track whether we emitted a try exit goto */
                 uint16_t try_exit_locals_count = 0;  /* Remember try path's locals for merging */
+                /* Full stackmap snapshot as of the try block's normal exit, before
+                 * the catch-handler loop below restores mg->stackmap to
+                 * try_entry_state for each handler. If every catch clause
+                 * terminates (return/throw), this goto is the *only* live edge
+                 * into the join point after all handlers, so the join frame
+                 * must reflect this snapshot - not whatever state the last
+                 * catch handler left mg->stackmap in while framing its own
+                 * entry (see the matching fix in AST_IF_STMT for the same
+                 * class of bug). */
+                stackmap_state_t *try_exit_state = NULL;
                 if (!try_ends_with_return) {
                     try_exit_goto = mg->code->length;
                     has_try_exit_goto = true;
@@ -3435,6 +3598,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     /* Remember the try path's locals count for later comparison */
                     if (mg->stackmap) {
                         try_exit_locals_count = mg->stackmap->current_locals_count;
+                        try_exit_state = stackmap_save_state(mg->stackmap);
                     }
                 }
                 
@@ -3644,14 +3808,28 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 uint16_t finally_handler_pc = 0;
                 if (finally_clause) {
                     finally_handler_pc = (uint16_t)mg->code->length;
-                    
+
+                    /* Restore stackmap to try block entry state before recording the
+                     * handler frame, exactly like the catch-clause handlers above do.
+                     * By this point mg->stackmap reflects locals from the end of the
+                     * try block (and any catch blocks), which may include locals
+                     * declared inside them (e.g. a local assigned partway through the
+                     * try body) - but an exception reaching this handler could have
+                     * been thrown before any of those assignments executed, so the
+                     * frame here must not claim them as initialized. try_entry_state's
+                     * locals are also a valid (guaranteed) subset at entry to every
+                     * catch block, since those handlers restore to the same state. */
+                    if (try_entry_state && mg->stackmap) {
+                        stackmap_restore_state(mg->stackmap, try_entry_state);
+                    }
+
                     /* Record frame at finally handler (exception handler target)
                      * At exception handler, JVM clears stack and pushes exception. */
                     mg_record_exception_handler_frame(mg, "java/lang/Throwable");
-                    
+
                     /* Add exception handler for try block -> finally */
                     mg_add_exception_handler(mg, try_start, try_end, finally_handler_pc, 0);
-                    
+
                     /* Exception is on stack (pushed by JVM at handler entry) - store it */
                     mg_push(mg, 1);
                     if (exc_slot <= 3) {
@@ -3725,10 +3903,20 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * removed by restore. So current_locals_count reflects what's valid on ALL
                  * catch paths that flow to this point. */
                 if (has_try_exit_goto || catch_gotos) {
-                    /* If try block didn't exit (no try_exit_goto), only catch paths
-                     * reach here, so use current stackmap state as-is.
-                     * If try block exited, we need to merge with try path's locals. */
-                    if (mg->stackmap && has_try_exit_goto && try_exit_locals_count > 0) {
+                    if (has_try_exit_goto && !catch_gotos && try_exit_state && mg->stackmap) {
+                        /* Every catch clause terminates (return/throw), so the try
+                         * block's own exit goto is the only live edge reaching this
+                         * join point. mg->stackmap currently reflects the last catch
+                         * handler's entry state (restored to try_entry_state while
+                         * framing that handler), not the try block's actual exit
+                         * state - restore the snapshot taken right after the try
+                         * block instead of just trimming the locals count. */
+                        stackmap_restore_state(mg->stackmap, try_exit_state);
+                    } else if (mg->stackmap && has_try_exit_goto && try_exit_locals_count > 0) {
+                        /* If try block didn't exit (no try_exit_goto), only catch paths
+                         * reach here, so use current stackmap state as-is.
+                         * If try block exited and at least one catch path is also live,
+                         * we need to merge with try path's locals. */
                         /* Take minimum of try and catch locals counts */
                         if (try_exit_locals_count < mg->stackmap->current_locals_count) {
                             /* Try path had fewer locals (e.g., catch block added vars) */
@@ -3738,6 +3926,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     }
                     mg_record_frame(mg);
                 }
+                stackmap_state_free(try_exit_state);
                 
                 /* Patch try exit goto (only if we emitted one) */
                 if (has_try_exit_goto) {

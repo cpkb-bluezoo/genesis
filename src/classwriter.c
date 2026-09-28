@@ -32,8 +32,42 @@
 #include "genesis.h"
 
 /* Forward declarations */
-static void preadd_annotations_list_cp(const_pool_t *cp, slist_t *annotations, 
+static void preadd_annotations_list_cp(const_pool_t *cp, slist_t *annotations,
                                         retention_policy_t retention);
+
+/*
+ * The semantic_t for the file currently being written to a classfile, so
+ * that get_annotation_retention() and write_annotation() can resolve a
+ * bare annotation name (e.g. "Test") against that file's imports and the
+ * classpath, without threading a sem parameter through every annotation
+ * helper below. Set at the top of write_class_bytes(); thread-local since
+ * compile_parallel() writes multiple classes concurrently on different
+ * threads, each with its own semantic_t (mirrors g_current_semantic in
+ * semantic.c).
+ */
+static __thread semantic_t *g_classwriter_sem = NULL;
+
+/**
+ * Resolve an annotation type name (as parsed from source, e.g. "Test" or
+ * already-qualified "java.lang.Override") to a fully qualified, dot-
+ * separated class name using the current file's imports. Falls back to
+ * returning the input unchanged if it's already qualified, or if no
+ * semantic_t/resolution is available - callers must tolerate an
+ * unqualified result either way.
+ */
+static const char *resolve_annotation_qualified_name(const char *name)
+{
+    if (!name || strchr(name, '.') != NULL || !g_classwriter_sem) {
+        return name;
+    }
+    char *qualified = semantic_resolve_annotation_type_name(g_classwriter_sem, name);
+    if (!qualified) {
+        return name;
+    }
+    const char *interned = intern(qualified);
+    free(qualified);
+    return interned;
+}
 
 /* ========================================================================
  * Big-Endian Write Helpers
@@ -104,7 +138,15 @@ retention_policy_t get_annotation_retention(const char *annotation_name)
         strcmp(annotation_name, "java.lang.annotation.Repeatable") == 0) {
         return RETENTION_RUNTIME;
     }
-    
+
+    /* Unknown annotation - for one defined outside the JDK builtins above
+     * (e.g. JUnit's @Test), consult its own @Retention meta-annotation via
+     * the classpath rather than assuming the CLASS default outright, since
+     * most third-party annotations meant for reflective use declare RUNTIME. */
+    if (g_classwriter_sem) {
+        return semantic_resolve_annotation_retention(g_classwriter_sem, annotation_name);
+    }
+
     /* Default: CLASS retention */
     return RETENTION_CLASS;
 }
@@ -152,6 +194,31 @@ static int write_annotation_value(uint8_t **p, const_pool_t *cp, ast_node_t *val
         *(*p)++ = 's';
         uint16_t idx = cp_add_utf8(cp, value->data.leaf.name ? value->data.leaf.name : "");
         write_be_u2(p, idx);
+    } else if (value->type == AST_FIELD_ACCESS && value->data.node.name &&
+               value->data.node.children) {
+        /* Qualified enum constant, e.g. RetentionPolicy.RUNTIME - the
+         * ordinary way to write an enum-typed annotation element. Without
+         * this, the element_value_pair's value was silently skipped
+         * (0 bytes written), desyncing the rest of the annotation's binary
+         * layout relative to its declared num_element_value_pairs. */
+        ast_node_t *receiver = (ast_node_t *)value->data.node.children->data;
+        const char *enum_type_name = (receiver && receiver->type == AST_IDENTIFIER) ?
+            receiver->data.leaf.name : NULL;
+        if (!enum_type_name) {
+            return 0;
+        }
+        *(*p)++ = 'e';  /* tag for enum constant */
+        const char *qualified = resolve_annotation_qualified_name(enum_type_name);
+        char *type_desc = calloc(strlen(qualified) + 4, 1);
+        sprintf(type_desc, "L%s;", qualified);
+        for (char *c = type_desc; *c; c++) {
+            if (*c == '.') *c = '/';
+        }
+        uint16_t type_idx = cp_add_utf8(cp, type_desc);
+        free(type_desc);
+        write_be_u2(p, type_idx);
+        uint16_t const_idx = cp_add_utf8(cp, value->data.node.name);
+        write_be_u2(p, const_idx);
     } else {
         /* Unknown value type - skip */
         return 0;
@@ -169,10 +236,11 @@ static int write_annotation(uint8_t **p, const_pool_t *cp, ast_node_t *annot)
     if (!annot || annot->type != AST_ANNOTATION) return 0;
     
     uint8_t *start = *p;
-    
+
     /* type_index - descriptor for annotation type */
-    char *type_desc = calloc(strlen(annot->data.node.name) + 4, 1);
-    sprintf(type_desc, "L%s;", annot->data.node.name);
+    const char *qualified_name = resolve_annotation_qualified_name(annot->data.node.name);
+    char *type_desc = calloc(strlen(qualified_name) + 4, 1);
+    sprintf(type_desc, "L%s;", qualified_name);
     /* Convert dots to slashes */
     for (char *c = type_desc; *c; c++) {
         if (*c == '.') *c = '/';
@@ -813,25 +881,29 @@ static void preadd_parameter_annotations_cp(const_pool_t *cp, ast_node_t *method
 static void preadd_annotation_cp_entries(const_pool_t *cp, ast_node_t *annot)
 {
     if (!annot || annot->type != AST_ANNOTATION) return;
-    
-    /* Annotation type descriptor */
+
+    /* Annotation type descriptor. Must match write_annotation()'s resolved
+     * name exactly - the constant pool is serialized before write_annotation()
+     * runs, so any string it needs (like the fully-qualified descriptor) has
+     * to already exist by the time this pre-add pass is done. */
     if (annot->data.node.name) {
-        char *type_desc = calloc(strlen(annot->data.node.name) + 4, 1);
-        sprintf(type_desc, "L%s;", annot->data.node.name);
+        const char *qualified_name = resolve_annotation_qualified_name(annot->data.node.name);
+        char *type_desc = calloc(strlen(qualified_name) + 4, 1);
+        sprintf(type_desc, "L%s;", qualified_name);
         for (char *c = type_desc; *c; c++) {
             if (*c == '.') *c = '/';
         }
         cp_add_utf8(cp, type_desc);
         free(type_desc);
     }
-    
+
     /* Element names and values */
     slist_t *children = annot->data.node.children;
     for (slist_t *n = children; n; n = n->next) {
         ast_node_t *pair = (ast_node_t *)n->data;
         if (pair && pair->type == AST_ANNOTATION_VALUE && pair->data.node.name) {
             cp_add_utf8(cp, pair->data.node.name);
-            
+
             /* Value - add string or integer constant */
             if (pair->data.node.children) {
                 ast_node_t *value = (ast_node_t *)pair->data.node.children->data;
@@ -846,6 +918,24 @@ static void preadd_annotation_cp_entries(const_pool_t *cp, ast_node_t *annot)
                     }
                 } else if (value && value->type == AST_IDENTIFIER && value->data.leaf.name) {
                     cp_add_utf8(cp, value->data.leaf.name);
+                } else if (value && value->type == AST_FIELD_ACCESS && value->data.node.name &&
+                           value->data.node.children) {
+                    /* Qualified enum constant, e.g. RetentionPolicy.RUNTIME -
+                     * see write_annotation_value()'s matching 'e' tag case. */
+                    ast_node_t *receiver = (ast_node_t *)value->data.node.children->data;
+                    const char *enum_type_name = (receiver && receiver->type == AST_IDENTIFIER) ?
+                        receiver->data.leaf.name : NULL;
+                    if (enum_type_name) {
+                        const char *qualified = resolve_annotation_qualified_name(enum_type_name);
+                        char *type_desc = calloc(strlen(qualified) + 4, 1);
+                        sprintf(type_desc, "L%s;", qualified);
+                        for (char *c = type_desc; *c; c++) {
+                            if (*c == '.') *c = '/';
+                        }
+                        cp_add_utf8(cp, type_desc);
+                        free(type_desc);
+                        cp_add_utf8(cp, value->data.node.name);
+                    }
                 }
             }
         }
@@ -1001,7 +1091,12 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         fprintf(stderr, "write_class_bytes: invalid input (cg=%p, size=%p)\n", (void*)cg, (void*)size);
         return NULL;
     }
-    
+
+    /* Make this file's semantic_t (imports, classpath) available to
+     * get_annotation_retention()/write_annotation() for the duration of
+     * this call, so they can resolve bare annotation names like "Test". */
+    g_classwriter_sem = cg->sem;
+
     bool emit_nest = false;
     int target_major = choose_class_version(cg, &emit_nest);
     if (target_major == 0) {

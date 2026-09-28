@@ -376,6 +376,11 @@ typedef struct method_gen
     
     /* Loop context stack for break/continue */
     slist_t *loop_stack;
+
+    /* Stack of lock-object local slots for synchronized statements currently
+     * being generated (innermost last), so a `return` lexically inside one
+     * or more of them can release each held monitor before returning. */
+    slist_t *sync_lock_stack;
     
     /* Exception handlers */
     slist_t *exception_handlers;

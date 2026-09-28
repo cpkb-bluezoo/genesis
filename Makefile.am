@@ -10,7 +10,7 @@ SUBDIRS = src
 ## Only user-facing documentation is distributed.  Everything under test/
 ## (regression tests, jtreg glue) is development-only and is
 ## intentionally absent from EXTRA_DIST.
-EXTRA_DIST = CONTRIBUTING TODO README bench/compare-compilers.sh
+EXTRA_DIST = CONTRIBUTING TODO README bench/compare-compilers.sh bench/gumdrop-ant-test.sh
 
 if HAVE_TESTS
 
@@ -28,6 +28,12 @@ bench: all
 	$(AM_V_at)GENESIS="$(abs_top_builddir)/src/genesis" \
 	  JAVA_HOME="$(JAVA_HOME)" \
 	  $(SHELL) $(top_srcdir)/bench/compare-compilers.sh
+
+## Gumdrop functional smoke: ant clean test with genesis as forked javac (unit tests only)
+gumdrop-smoke: all
+	$(AM_V_at)GENESIS="$(abs_top_builddir)/src/genesis" \
+	  JAVA_HOME="$(JAVA_HOME)" \
+	  $(SHELL) $(top_srcdir)/bench/gumdrop-ant-test.sh
 
 check-local: all
 	$(AM_V_at)$(TEST_ENV) $(SHELL) $(top_srcdir)/test/run-tests.sh

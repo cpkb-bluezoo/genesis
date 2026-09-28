@@ -55,6 +55,22 @@ a large real-world project (644 source files, 942 class files) shows:
 `bench/compare-compilers.sh` checks functional parity: every genesis `.class` must
 appear in the javac output; javac-only enum-switch synthetics are allowed.
 
+For a runtime smoke on gumdrop, `bench/gumdrop-ant-test.sh` (or `make gumdrop-smoke`)
+runs `ant clean test` with genesis as the compiler (JUnit unit tests only; integration
+tests are separate). Ant has no global javac executable property; the script patches
+`fork="true" executable="…"` onto each `<javac>` in a disposable gumdrop work copy
+(`GUMDROP_DIR` is copied, not edited in place). Example:
+
+```sh
+export JAVA_HOME=/path/to/jdk-25
+export GENESIS=/usr/local/bin/genesis
+./bench/gumdrop-ant-test.sh
+```
+
+Use `GUMDROP_DIR=/path/to/gumdrop` to reuse a local checkout instead of cloning.
+The script checks that `build/` lacks javac-only enum-switch synthetics (`Outer$1.class`).
+Set `SMOKE_ANT_VERBOSE=1` for Ant `-verbose` (look for `Using external javac compiler`).
+
 ## Performance
 
 Genesis is approximately **2x faster** than javac, with parallel compilation enabled by default.

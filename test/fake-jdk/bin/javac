@@ -62,6 +62,14 @@ for arg in "$@"; do
             SOURCE_FILES+=("$arg")
             ARGS+=("$arg")
             ;;
+        # Debug aid: preserve @argfiles before Ant deletes them on exit, so a
+        # crash (no diagnostic output) can still be reproduced afterward.
+        @*)
+            if [ -n "$GENESIS_DEBUG_SAVE_ARGFILE" ] && [ -f "${arg#@}" ]; then
+                cp "${arg#@}" "$GENESIS_DEBUG_SAVE_ARGFILE"
+            fi
+            ARGS+=("$arg")
+            ;;
         # Pass through everything else
         *)
             ARGS+=("$arg")

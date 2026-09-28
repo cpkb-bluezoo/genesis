@@ -600,7 +600,7 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
     /* Resolve type names to fully qualified names immediately after parsing.
      * This ensures all type references use consistent qualified names. */
     slist_t *sp_list = sourcepath_parse(opts->sourcepath);
-    resolve_types_in_compilation_unit(ast, g_classpath, sp_list);
+    resolve_types_in_compilation_unit(ast, g_classpath, sp_list, NULL);
     sourcepath_list_free(sp_list);
     
     if (opts->verbose) {
@@ -1614,7 +1614,8 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
     slist_t *sp_list = sourcepath_parse(opts->sourcepath);
     for (i = 0; i < file_count; i++) {
         if (parse_results[i].ast && !parse_results[i].error_msg) {
-            resolve_types_in_compilation_unit(parse_results[i].ast, g_classpath, sp_list);
+            resolve_types_in_compilation_unit(parse_results[i].ast, g_classpath, sp_list,
+                                              registry);
         }
     }
     sourcepath_list_free(sp_list);

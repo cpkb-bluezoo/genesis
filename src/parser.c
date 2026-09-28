@@ -2853,13 +2853,13 @@ ast_node_t *parse_type(parser_t *parser)
                 if (!parser_check(parser, TOK_GT)) {
                     /* Not a valid type argument list - restore and return without generics.
                      * This happens when < is actually a comparison operator. */
-                    
+
                     /* Free the parsed type arguments */
                     for (slist_t *node = parsed_type_args; node; node = node->next) {
                         ast_free((ast_node_t *)node->data);
                     }
                     slist_free(parsed_type_args);
-                    
+
                     lexer_restore_pos(parser->lexer, save_generic);
                     return type_node;
                 }
@@ -4087,30 +4087,19 @@ static ast_node_t *parse_annotation(parser_t *parser)
         if (!parser_check(parser, TOK_RPAREN)) {
             do {
                 /* Check for name=value pair or just value */
-                if (parser_check(parser, TOK_IDENTIFIER)) {
+                if (parser_check(parser, TOK_IDENTIFIER) &&
+                    parser_peek_type(parser) == TOK_ASSIGN) {
                     const char *first_text = (char *)intern(parser_current_text(parser));
                     int first_line = parser_current_line(parser);
                     int first_col = parser_current_column(parser);
                     parser_advance(parser);
-                    
-                    if (parser_match(parser, TOK_ASSIGN)) {
-                        /* name=value pair */
-                        ast_node_t *pair = ast_new(AST_ANNOTATION_VALUE, first_line, first_col);
-                        pair->data.node.name = (char *)first_text;
-                        
-                        parse_annotation_element_value(parser, pair);
-                        ast_add_child(annot, pair);
-                    } else {
-                        /* Single value - first token was the value, need to handle as identifier */
-                        /* Actually this is tricky - we already consumed it. For now, create identifier */
-                        ast_node_t *pair = ast_new(AST_ANNOTATION_VALUE, first_line, first_col);
-                        pair->data.node.name = (char *)intern("value");  /* Default element name */
-                        ast_node_t *val = ast_new_leaf(AST_IDENTIFIER, first_text, first_line, first_col);
-                        free((void *)first_text);
-                        ast_add_child(pair, val);
-                        ast_add_child(annot, pair);
-                    }
-                } else if (parser_check(parser, TOK_STRING_LITERAL) ||
+                    parser_match(parser, TOK_ASSIGN);
+                    ast_node_t *pair = ast_new(AST_ANNOTATION_VALUE, first_line, first_col);
+                    pair->data.node.name = (char *)first_text;
+                    parse_annotation_element_value(parser, pair);
+                    ast_add_child(annot, pair);
+                } else if (parser_check(parser, TOK_IDENTIFIER) ||
+                           parser_check(parser, TOK_STRING_LITERAL) ||
                            parser_check(parser, TOK_INTEGER_LITERAL) ||
                            parser_check(parser, TOK_TRUE) ||
                            parser_check(parser, TOK_FALSE) ||

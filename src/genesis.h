@@ -642,6 +642,14 @@ struct symbol
             char *unresolved_superclass; /* Unresolved superclass name (for phased compilation) */
             void *unresolved_superclass_type; /* unresolved_type_t* with type args (e.g., extends List<String>) */
             slist_t *unresolved_interfaces; /* Unresolved interface names (list of char*) */
+            bool implements_prescanned; /* True once this class's own "implements"
+                                         * clause has been resolved into `interfaces`
+                                         * (normally happens when pass1's top-down walk
+                                         * reaches this class's own declaration; set early
+                                         * by ensure_class_implements_prescanned() when a
+                                         * class declared earlier in the same file needs
+                                         * it first, e.g. for @Override checking against
+                                         * a not-yet-visited superclass). */
         } class_data;
         
         /* SYM_METHOD, SYM_CONSTRUCTOR */
@@ -794,7 +802,22 @@ typedef struct semantic
     
     /* Recursion guards to prevent stack overflow */
     int resolve_import_depth;   /* Tracks nesting in resolve_import calls */
+    hashtable_t *loading_names; /* Qualified names currently mid-load via
+                                  * load_class_from_source; guards against a
+                                  * package scan walking back into a source
+                                  * file that is itself still being parsed. */
 } semantic_t;
+
+/* Resolve an annotation's simple name to its fully qualified name using the
+ * current compilation unit's imports. Returns a malloc'd string, or NULL if
+ * unresolvable. Defined in semantic.c; used by classwriter.c. */
+char *semantic_resolve_annotation_type_name(semantic_t *sem, const char *simple_name);
+
+/* Resolve the real retention policy of an externally-defined annotation
+ * (e.g. one loaded from a jar on the classpath) by inspecting its own
+ * @Retention meta-annotation. Returns RETENTION_CLASS if unresolvable or
+ * unannotated. Defined in semantic.c; used by classwriter.c. */
+retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const char *annotation_name);
 
 /*
  * Shared Type Registry for Parallel Compilation
@@ -860,8 +883,9 @@ symbol_t *load_external_class(semantic_t *sem, const char *name);
 
 /* Early type resolution (post-parse) - resolves type names to qualified names */
 struct classpath;  /* Forward declaration */
-void resolve_types_in_compilation_unit(ast_node_t *ast, struct classpath *classpath, 
-                                       slist_t *sourcepath_list);
+void resolve_types_in_compilation_unit(ast_node_t *ast, struct classpath *classpath,
+                                       slist_t *sourcepath_list,
+                                       type_registry_t *registry);
 
 /* Sourcepath parsing helpers (for use before semantic_t is created) */
 slist_t *sourcepath_parse(const char *sourcepath);
