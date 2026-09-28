@@ -185,12 +185,54 @@ write_manifest() {
     wc -l <"$out" | tr -d ' '
 }
 
-compare_manifests() {
+# javac emits synthetic Outer$N holders with static $SwitchMap$... int[] fields for enum
+# switches. Genesis uses ordinal()+lookupswitch (faster compile, same behavior).
+is_enum_switch_synthetic_class() {
+    javac_root=$1
+    relpath=$2
+    qname=$(echo "$relpath" | sed 's|\.class$||' | tr '/' '.')
+    javap_bin=${JAVAP:-${JAVA_HOME:+$JAVA_HOME/bin/javap}}
+    javap_bin=${javap_bin:-javap}
+    out=$("$javap_bin" -classpath "$javac_root" -p "$qname" 2>/dev/null) || return 1
+    case "$out" in
+        *'$SwitchMap'*) ;;
+        *) return 1 ;;
+    esac
+    case "$out" in
+        *' implements '*|*' extends '*) return 1 ;;
+    esac
+    return 0
+}
+
+compare_manifests_functional() {
     ref=$1
     other=$2
-    label=$3
-    if ! diff -q "$ref" "$other" >/dev/null 2>&1; then
+    javac_root=$3
+    label=$4
+    only_gen=$(LC_ALL=C comm -13 "$ref" "$other")
+    if [ -n "$only_gen" ]; then
+        echo "error: $label emitted class files not produced by javac:" >&2
+        echo "$only_gen" | head -20 >&2
+        return 1
+    fi
+    only_ref=$(LC_ALL=C comm -23 "$ref" "$other")
+    if [ -z "$only_ref" ]; then
+        return 0
+    fi
+    bad=
+    while IFS= read -r path; do
+        [ -z "$path" ] && continue
+        if ! is_enum_switch_synthetic_class "$javac_root" "$path"; then
+            bad=$path
+            break
+        fi
+    done <<EOF
+$only_ref
+EOF
+    if [ -n "$bad" ]; then
         echo "error: class file list mismatch ($label vs reference)" >&2
+        echo "Genesis is missing a class javac emitted that is not an enum-switch synthetic:" >&2
+        echo "  $bad" >&2
         diff -u "$ref" "$other" | head -50 >&2
         return 1
     fi
@@ -247,7 +289,7 @@ run_compile() {
 
 REF_MANIFEST=$META/classes.javac.ref
 verify_outputs() {
-    echo "Verifying class output (names and counts) across compilers..."
+    echo "Verifying class output (functional parity with javac)..."
     javac_out=$OUT/verify-javac
     gen_out=$OUT/verify-genesis
     gen1_out=$OUT/verify-genesis-j1
@@ -258,11 +300,13 @@ verify_outputs() {
 
     run_compile genesis "" "$gen_out" || return 1
     write_manifest "$gen_out" "$META/classes.genesis"
-    compare_manifests "$REF_MANIFEST" "$META/classes.genesis" "genesis (parallel)" || return 1
+    compare_manifests_functional "$REF_MANIFEST" "$META/classes.genesis" \
+        "$javac_out" "genesis (parallel)" || return 1
 
     run_compile genesis "-j1" "$gen1_out" || return 1
     write_manifest "$gen1_out" "$META/classes.genesis-j1"
-    compare_manifests "$REF_MANIFEST" "$META/classes.genesis-j1" "genesis -j1" || return 1
+    compare_manifests_functional "$REF_MANIFEST" "$META/classes.genesis-j1" \
+        "$javac_out" "genesis -j1" || return 1
 
     echo "Reference: $JAVAC_CLASS_COUNT class files (javac)"
     echo
@@ -298,7 +342,8 @@ run_timed_mode() {
     while [ "$w" -lt "$BENCH_WARMUP" ]; do
         run_compile "$compiler" "$extra" "$outdir" || return 1
         write_manifest "$outdir" "$META/check.$mode_id.w$w"
-        compare_manifests "$REF_MANIFEST" "$META/check.$mode_id.w$w" "$name warmup" || return 1
+        compare_manifests_functional "$REF_MANIFEST" "$META/check.$mode_id.w$w" \
+            "$OUT/verify-javac" "$name warmup" || return 1
         w=$((w + 1))
     done
 
@@ -306,7 +351,8 @@ run_timed_mode() {
     while [ "$i" -lt "$BENCH_ITERATIONS" ]; do
         if run_compile "$compiler" "$extra" "$outdir"; then
             write_manifest "$outdir" "$META/check.$mode_id.$i"
-            compare_manifests "$REF_MANIFEST" "$META/check.$mode_id.$i" "$name" || return 1
+            compare_manifests_functional "$REF_MANIFEST" "$META/check.$mode_id.$i" \
+                "$OUT/verify-javac" "$name" || return 1
             echo "$real" >>"$real_file"
             echo "$user" >>"$user_file"
             echo "$sys" >>"$sys_file"

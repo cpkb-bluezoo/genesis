@@ -47,8 +47,13 @@ a large real-world project (644 source files, 942 class files) shows:
 - **Bytecode verification passes** : all generated classes are valid
 
 **Minor differences** (all functionally equivalent):
-- Genesis uses `ordinal()` for enum switches; javac generates synthetic `$SwitchMap` classes
+- Genesis lowers enum `switch` with `ordinal()` and `lookupswitch` instead of emitting
+  javac's synthetic `$SwitchMap` holder classes (`Outer$N`). That skips extra class
+  files and `<clinit>` work during compilation, which fits the goal of a fast compiler.
 - Genesis uses `<clinit>` for constant initialization; javac uses `ConstantValue` attributes
+
+`bench/compare-compilers.sh` checks functional parity: every genesis `.class` must
+appear in the javac output; javac-only enum-switch synthetics are allowed.
 
 ## Performance
 
