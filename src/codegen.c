@@ -2533,6 +2533,38 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                 param_info->is_ref = is_ref;
                 param_info->is_array = is_array;
                 
+                /* For a varargs parameter (T... name), param_kind was already
+                 * switched to TYPE_ARRAY above so this local's own *element*
+                 * type is what needs recording, in array_elem_class/kind -
+                 * mg_local_array_elem_class()/_kind() (used by codegen for a
+                 * call that forwards this parameter's value directly to
+                 * another varargs call, e.g. "return Other.m(a, options);")
+                 * otherwise silently default to "no class, int", which made
+                 * a perfectly valid array-to-array forward look
+                 * incompatible and get wrongly re-wrapped as a single
+                 * vararg element - producing an ArrayStoreException at
+                 * runtime for storing a String[] into a String[1]. */
+                if (is_array && is_varargs && param_info && param_type_node &&
+                    param_type_node->type == AST_CLASS_TYPE) {
+                    const char *elem_class_name = NULL;
+                    if (param_type_node->sem_type) {
+                        type_t *resolved = param_type_node->sem_type;
+                        if (resolved->kind == TYPE_TYPEVAR && resolved->data.type_var.bound) {
+                            resolved = resolved->data.type_var.bound;
+                        }
+                        if (resolved->kind == TYPE_CLASS) {
+                            elem_class_name = resolved->data.class_type.name;
+                        }
+                    }
+                    if (!elem_class_name) {
+                        elem_class_name = param_type_node->data.node.name;
+                    }
+                    if (elem_class_name) {
+                        param_info->array_elem_class = class_to_internal_name(elem_class_name);
+                        param_info->array_elem_kind = TYPE_CLASS;
+                    }
+                }
+
                 /* For class types, also store the class name */
                 const char *class_name = NULL;
                 if (is_ref && param_kind == TYPE_CLASS && param_type_node && param_type_node->type == AST_CLASS_TYPE) {

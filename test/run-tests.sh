@@ -368,5 +368,49 @@ else
 fi
 
 echo
+echo "--- Circular constructor type dependency across two files (parallel batch) ---"
+printf "%-30s ... " "CircularCtorDependency"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/circulartest/CircularCtorHelper.java" \
+       "$TEST_SRC/src/java8/circulartest/CircularCtorDependencyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" CircularCtorDependencyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Varargs forwarded to another varargs method across files (parallel batch) ---"
+printf "%-30s ... " "VarargsForwardCrossFile"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/varargstest/VarargsForwardCrossFileHelper.java" \
+       "$TEST_SRC/src/java8/varargstest/VarargsForwardCrossFileTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" VarargsForwardCrossFileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Self-referential instanceof needs package-qualified class name ---"
+printf "%-30s ... " "InstanceofSelfQualify"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/instanceoftest/InstanceofSelfQualifyVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" instanceoftest.InstanceofSelfQualifyVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

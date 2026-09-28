@@ -288,12 +288,14 @@ char *extract_type_name_from_ast(ast_node_t *type_node)
 
 static void ensure_method_type_params(symbol_t *method_sym);
 static void ensure_method_return_from_descriptor(symbol_t *method);
+static type_t *resolve_unresolved_type_full(unresolved_type_t *ut, type_registry_t *reg,
+                                            classpath_t *cp, symbol_t *context);
 
 /**
  * Enter methods and fields for a single type symbol from its AST.
  * Type references are stored as unresolved names.
  */
-static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registry_t *reg)
+static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registry_t *reg, classpath_t *cp)
 {
     if (!sym || !decl || !decl->data.node.children) {
         return;
@@ -353,10 +355,25 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
             continue;  /* Already linked in prescan above */
         }
         
-        if (member->type == AST_METHOD_DECL) {
+        if (member->type == AST_METHOD_DECL || member->type == AST_CONSTRUCTOR_DECL) {
+            /* Constructors share this whole block with methods: same
+             * parameter-list shape, same overload-key convention (the
+             * parser records a constructor's own name as the class's
+             * simple name, exactly like scope_lookup's target_class->name
+             * fallback below expects). Without this, a shared-registry
+             * stub completed lazily via this function (a class being
+             * compiled concurrently in the same parallel batch) never got
+             * its constructors registered at all - only its fields and
+             * methods - so a circular type dependency between two files
+             * (A's constructor takes a B, B's constructor takes an A)
+             * silently failed constructor overload resolution for
+             * whichever side completed second, and codegen fell back to
+             * inferring the invokespecial descriptor from the argument
+             * expression instead of the constructor's real parameter type. */
+            bool is_ctor = (member->type == AST_CONSTRUCTOR_DECL);
             const char *name = member->data.node.name;
             if (!name) continue;
-            
+
             /* Build method key with parameter types for overload resolution.
              * Include parameter type names to distinguish overloads. */
             char method_key[512];
@@ -395,7 +412,7 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
             symbol_t *method_sym = calloc(1, sizeof(symbol_t));
             if (!method_sym) continue;
             
-            method_sym->kind = SYM_METHOD;
+            method_sym->kind = is_ctor ? SYM_CONSTRUCTOR : SYM_METHOD;
             method_sym->name = strdup(name);  /* Store actual method name */
             method_sym->modifiers = member->data.node.flags;
             method_sym->ast = member;  /* Keep AST for type resolution */
@@ -434,8 +451,10 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
                 }
             }
             
-            /* For interfaces, methods are implicitly public abstract */
-            if (sym->kind == SYM_INTERFACE) {
+            /* For interfaces, methods are implicitly public abstract
+             * (interfaces cannot declare constructors, so is_ctor is
+             * always false here in valid Java, but guard anyway). */
+            if (!is_ctor && sym->kind == SYM_INTERFACE) {
                 if (!(method_sym->modifiers & MOD_PRIVATE)) {
                     method_sym->modifiers |= MOD_PUBLIC;
                 }
@@ -491,8 +510,37 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
                                 if (param->data.node.children) {
                                     ast_node_t *ptype = (ast_node_t *)param->data.node.children->data;
                                     /* Use unresolved_type_from_ast to preserve generic type arguments */
+                                    unresolved_type_t *put = unresolved_type_from_ast(ptype);
                                         method_sym->data.method_data.unresolved_param_types[idx] =
-                                        unresolved_type_from_ast(ptype);
+                                        put;
+                                    /* Also resolve eagerly, not just leave the unresolved
+                                     * form for some later phase to pick up - a symbol
+                                     * completed lazily via this function (e.g. a
+                                     * shared-registry stub for a class being compiled
+                                     * concurrently in the same parallel batch) has no
+                                     * such later phase coming for it, so param_sym->type
+                                     * would otherwise stay NULL forever, and any caller
+                                     * building a call-site descriptor from these
+                                     * parameters (e.g. a constructor call's invokespecial)
+                                     * would silently see an empty parameter list. */
+                                    if (put) {
+                                        param_sym->type = resolve_unresolved_type_full(put, reg, cp, sym);
+                                        /* A varargs parameter's own written type is
+                                         * its *element* type (T in T... name) - the
+                                         * declared type is really T[]. Every other
+                                         * varargs-aware resolution path in this file
+                                         * wraps for exactly this reason (search
+                                         * MOD_VARARGS); this eager one needs the same
+                                         * treatment, or a varargs parameter registered
+                                         * via this lazy path ends up typed as its bare
+                                         * element type instead of an array, breaking
+                                         * array-to-array (pass-through) argument
+                                         * matching against it. */
+                                        if (param_sym->type && (param_sym->modifiers & MOD_VARARGS) &&
+                                            param_sym->type->kind != TYPE_ARRAY) {
+                                            param_sym->type = type_new_array(param_sym->type, 1);
+                                        }
+                                    }
                                 }
                             }
                             idx++;
@@ -686,7 +734,7 @@ void registry_enter_members(type_registry_t *reg, classpath_t *cp)
                 if (ast) {
                     int count_before = sym->data.class_data.members ? 
                         (int)sym->data.class_data.members->symbols->count : 0;
-                    enter_members_for_type(sym, ast, reg);
+                    enter_members_for_type(sym, ast, reg, cp);
                     int count_after = sym->data.class_data.members ? 
                         (int)sym->data.class_data.members->symbols->count : 0;
                     types_processed++;
@@ -724,8 +772,6 @@ void registry_enter_members(type_registry_t *reg, classpath_t *cp)
             entry = entry->next;
         }
     }
-    
-    (void)cp;  /* For future use with classpath resolution */
 }
 
 /* ========================================================================
@@ -765,7 +811,7 @@ void class_symbol_completer(symbol_t *sym, void *ctx)
     ast_node_t *ast = type_registry_get_ast(reg, qname);
     if (ast) {
         /* Enter members from AST */
-        enter_members_for_type(sym, ast, reg);
+        enter_members_for_type(sym, ast, reg, cp);
         
         if (getenv("GENESIS_DEBUG_COMPLETER")) {
             int member_count = sym->data.class_data.members ? 
@@ -776,8 +822,6 @@ void class_symbol_completer(symbol_t *sym, void *ctx)
     } else if (getenv("GENESIS_DEBUG_COMPLETER")) {
         fprintf(stderr, "DEBUG class_symbol_completer: no AST found for '%s'\n", qname);
     }
-    
-    (void)cp;  /* For future: resolve supertypes/interfaces from classpath */
 }
 
 /**
@@ -9486,6 +9530,7 @@ typedef struct walk_frame
     scope_t *saved_scope;   /* Scope to restore on exit */
     symbol_t *saved_class;  /* Class to restore on exit */
     symbol_t *saved_method; /* Method to restore on exit */
+    bool saved_static_field_init; /* in_static_field_init to restore on exit */
     void *extra;            /* Extra data for specific passes */
 } walk_frame_t;
 
@@ -10409,15 +10454,39 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                     
                     case AST_FIELD_DECL:
                         {
+                            /* Track in_static_field_init for this field's subtree (its
+                             * initializer, several levels down) too, not just during
+                             * pass2's later, deferred field-initializer type-checking
+                             * pass. This iterative walker's generic child traversal
+                             * (below, via WALK_CHILDREN) descends into the initializer
+                             * expression here in pass1 as well - and if that reaches a
+                             * "new SomeInterface() { ... }" anonymous-class expression,
+                             * pass1's own AST_NEW_OBJECT case creates and permanently
+                             * caches that anonymous class's symbol (on anon_body-
+                             * >sem_symbol), including its is-static classification. If
+                             * in_static_field_init were left false (its default) here,
+                             * an anonymous class inside a *static* field's initializer
+                             * (e.g. "private static final Executor X = new Executor()
+                             * {...}") would be permanently misclassified as an *instance*
+                             * inner class - given a this$0 field and constructor
+                             * parameter by codegen's class-generation side - while the
+                             * separate call-site codegen (generating the "new"
+                             * expression itself) correctly treats it as static and
+                             * invokes a no-arg constructor, producing a classfile with
+                             * mismatched constructor descriptors between the two sides:
+                             * NoSuchMethodError at class-init time. */
+                            frame->saved_static_field_init = sem->in_static_field_init;
+                            sem->in_static_field_init = (node->data.node.flags & MOD_STATIC) != 0;
+
                             /* Get field type */
                             slist_t *children = node->data.node.children;
                             type_t *field_type = NULL;
-                            
+
                             if (children && ((ast_node_t *)children->data)->type != AST_VAR_DECLARATOR) {
                                 field_type = semantic_resolve_type(sem, children->data);
                                 children = children->next;
                             }
-                            
+
                             /* Process each declarator */
                             while (children) {
                                 ast_node_t *decl = children->data;
@@ -10469,7 +10538,26 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             }
                         }
                         break;
-                    
+
+                    case AST_INITIALIZER_BLOCK:
+                        /* Same reasoning as AST_FIELD_DECL just above: this
+                         * iterative walker's generic descent (via
+                         * WALK_CHILDREN, below) reaches a "static { ... }"
+                         * block's own body here in pass1, well before
+                         * pass2's later, separate handling of it - and an
+                         * anonymous class expression inside a *static*
+                         * initializer block needs sem->in_static_field_init
+                         * set for exactly the same reason a static field's
+                         * inline initializer does (e.g. a ThreadFactory
+                         * built by "static { pool = new ThreadPoolExecutor(
+                         * ..., new ThreadFactory() {...}); }"). An instance
+                         * initializer block ("{ ... }", no static modifier)
+                         * needs the flag left false, same as an instance
+                         * field's initializer. */
+                        frame->saved_static_field_init = sem->in_static_field_init;
+                        sem->in_static_field_init = (node->data.node.flags & MOD_STATIC) != 0;
+                        break;
+
                     case AST_ENUM_CONSTANT:
                         {
                             /* Enum constants are public static final fields of the enum type */
@@ -11368,7 +11456,12 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                         sem->current_scope = frame->saved_scope;
                         sem->current_class = frame->saved_class;
                         break;
-                    
+
+                    case AST_FIELD_DECL:
+                    case AST_INITIALIZER_BLOCK:
+                        sem->in_static_field_init = frame->saved_static_field_init;
+                        break;
+
                     case AST_METHOD_DECL:
                     case AST_CONSTRUCTOR_DECL:
                         sem->current_scope = frame->saved_scope;
@@ -11572,6 +11665,75 @@ static bool declared_inside_current_class(semantic_t *sem, symbol_t *sym, const 
 }
 
 /**
+ * Same check as declared_inside_current_class(), but against an arbitrary
+ * class rather than always sem->current_class - used to test each ancestor
+ * in propagate_capture_to_enclosing_classes() below.
+ */
+static bool declared_inside_class(semantic_t *sem, symbol_t *sym, const char *name, symbol_t *cls)
+{
+    for (scope_t *s = sem->current_scope; s; s = s->parent) {
+        if (s->owner == cls) {
+            break;
+        }
+        if (scope_lookup_local(s, name) == sym) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * A variable captured by a local/anonymous class nested inside *another*
+ * local/anonymous class isn't necessarily reachable from that outer class's
+ * own method body or fields - if the variable's home scope is further out
+ * still (e.g. a parameter of the method that the *outer* class itself is
+ * defined in, but which the outer class's own body never happens to
+ * reference directly), the outer class has no local, parameter or captured
+ * field to relay it from at the point it constructs the inner class. Each
+ * enclosing local/anonymous class between the variable's true home scope
+ * and the class that actually captured it must therefore also capture it
+ * itself, purely to relay it down through its own constructor - exactly
+ * the same "does this class need it" question already answered above for
+ * start_class, asked again for each ancestor in turn, walking outward only
+ * as long as an ancestor doesn't already have direct access (declared
+ * inside it) and is itself a local/anonymous class (once we reach a
+ * top-level or a plain non-capturing nested class, the chain stops: the
+ * variable is directly available there already, the same way it always
+ * was for a single level of nesting). Without this, codegen's own capture
+ * pushing at each "new InnerClass(...)" call site silently dropped an
+ * argument it had nowhere to load from, producing a classfile whose
+ * constructor invocation pushed fewer arguments than the constructor's own
+ * descriptor declared - a stack-shape mismatch the verifier rejects.
+ */
+static void propagate_capture_to_enclosing_classes(semantic_t *sem, symbol_t *sym,
+                                                     const char *name, symbol_t *start_class)
+{
+    symbol_t *anc = start_class->data.class_data.enclosing_class;
+    while (anc && (anc->data.class_data.is_local_class || anc->data.class_data.is_anonymous_class) &&
+           !declared_inside_class(sem, sym, name, anc)) {
+        slist_t *captured = anc->data.class_data.captured_vars;
+        bool already = false;
+        for (slist_t *n = captured; n; n = n->next) {
+            if (n->data == sym) {
+                already = true;
+                break;
+            }
+        }
+        if (already) {
+            /* Already propagated this far by an earlier reference - every
+             * further ancestor must already have it too. */
+            break;
+        }
+        if (!captured) {
+            anc->data.class_data.captured_vars = slist_new(sym);
+        } else {
+            slist_append(captured, sym);
+        }
+        anc = anc->data.class_data.enclosing_class;
+    }
+}
+
+/**
  * Get the type of an expression (iterative).
  */
 type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
@@ -11648,6 +11810,11 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     slist_append(captured, sym);
                                 }
                             }
+                            /* sym may not be directly reachable from every
+                             * class between here and its true home scope -
+                             * see propagate_capture_to_enclosing_classes()'s
+                             * own comment. */
+                            propagate_capture_to_enclosing_classes(sem, sym, name, sem->current_class);
                         }
                     }
                     
@@ -12185,7 +12352,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 }
                 return type_new_primitive(TYPE_UNKNOWN);
             }
-        
+
         case AST_METHOD_CALL:
             {
                 const char *method_name = expr->data.node.name;
@@ -14799,7 +14966,25 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     if (!target_class && base_type->data.class_type.name) {
                         target_class = load_external_class(sem, base_type->data.class_type.name);
                     }
-                    
+
+                    /* base_type->data.class_type.symbol may be a shared-registry
+                     * stub attached by semantic_resolve_type() directly (not via
+                     * load_external_class(), which would have completed it) - a
+                     * class being compiled concurrently in the same parallel
+                     * batch, whose members (including its constructors) aren't
+                     * populated yet. Without this, a circular type dependency
+                     * between two files (A's constructor takes a B, B's
+                     * constructor takes an A) silently failed to resolve
+                     * whichever side finished second, falling back to inferring
+                     * the invokespecial descriptor from the argument expression
+                     * instead of the constructor's own declared parameter type -
+                     * producing a NoSuchMethodError at runtime for a descriptor
+                     * that was never the real one. symbol_complete() is a safe
+                     * no-op for an already-complete or non-stub symbol. */
+                    if (target_class) {
+                        symbol_complete(target_class);
+                    }
+
                     if (target_class && target_class->data.class_data.members) {
                         /* Check for explicit outer instance (qualified new: outer.new Inner()) */
                         ast_node_t *explicit_outer = (ast_node_t *)expr->data.node.extra;
@@ -14911,13 +15096,27 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     }
                     
                     type_t *array_type = type_new_array(elem, dims);
-                    
+
+                    /* Self-annotate, like most other cases here - a caller
+                     * that reads expr->sem_type directly off this node
+                     * (rather than through get_expression_type()'s return
+                     * value) needs it set too. codegen_expr.c's ternary
+                     * codegen does exactly this for each branch, to decide
+                     * whether a boxing/unboxing conversion is needed
+                     * (coerce_stack_value(), via value_kind_and_class());
+                     * without it, an array-creation branch's type silently
+                     * fell back to a hardcoded default (TYPE_INT), and
+                     * "cond ? null : new byte[0]" ended up with a bogus
+                     * Integer.valueOf(I) call spliced in right after the
+                     * new byte[0] array was pushed. */
+                    expr->sem_type = array_type;
+
                     /* If there's an initializer, bind lambda/method ref elements */
                     if (initializer && array_type) {
                         initializer->sem_type = array_type;
                         bind_array_init_elements(sem, initializer, array_type);
                     }
-                    
+
                     return array_type;
                 }
                 return type_new_primitive(TYPE_UNKNOWN);
@@ -14961,6 +15160,31 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             if (then_kind == TYPE_FLOAT || else_kind == TYPE_FLOAT) return type_float();
                             if (then_kind == TYPE_LONG || else_kind == TYPE_LONG) return type_long();
                             return type_int();
+                        }
+                    }
+
+                    /* Reference conditional (JLS 15.25): prefer whichever
+                     * branch's type is the wider one, when one is simply a
+                     * subtype of the other (e.g. "cond ? this : someMethod()"
+                     * where `this` is a MemoryPath and the method declares
+                     * Path) - not a full LUB computation for the general
+                     * case (unrelated types still fall back to then_type,
+                     * as before), but enough to avoid narrowing the
+                     * ternary's type to whichever branch happens to be more
+                     * specific. Getting this wrong isn't just a type-
+                     * checking nicety: codegen uses this exact type to
+                     * correct the stack-map frame at the ternary's join
+                     * point (see codegen_expr.c's AST_CONDITIONAL_EXPR
+                     * handling), so a too-narrow type here produced a
+                     * classfile the verifier rejected outright whenever the
+                     * other branch's real value didn't fit that narrower
+                     * declared frame. */
+                    if (then_type && else_type && then_type != else_type) {
+                        if (type_assignable(else_type, then_type)) {
+                            return else_type;
+                        }
+                        if (type_assignable(then_type, else_type)) {
+                            return then_type;
                         }
                     }
 
@@ -15121,6 +15345,20 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 slist_t *children = expr->data.node.children;
                 if (children) {
                     get_expression_type(sem, (ast_node_t *)children->data);
+                    /* Resolve (and cache onto type_node->sem_type) the
+                     * right-hand type, the same way AST_CAST_EXPR does for
+                     * its target type. Without this, codegen_expr.c's
+                     * AST_INSTANCEOF_EXPR handling has nothing but the
+                     * type's bare, unqualified AST source name to build the
+                     * instanceof instruction's class constant from - fine
+                     * for an imported type, but wrong for a same-package
+                     * (and especially a self-referential, "p instanceof
+                     * Thing" inside Thing itself) type, which needs no
+                     * import and so is never otherwise looked up. */
+                    if (children->next) {
+                        ast_node_t *type_node = (ast_node_t *)children->next->data;
+                        semantic_resolve_type(sem, type_node);
+                    }
                 }
                 /* instanceof always returns boolean */
                 return type_new_primitive(TYPE_BOOLEAN);
@@ -15135,6 +15373,34 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     type_t *cast_type = semantic_resolve_type(sem, type_node);
                     expr->sem_type = cast_type;  /* Store for codegen wrapper detection */
                     
+                    /* Resolve (and, via each expression kind's own case, self-
+                     * annotate onto its own node) the operand's own type. Unlike
+                     * a plain statement or a variable initializer, nothing else
+                     * naturally visits a cast's operand during semantic analysis
+                     * - the cast's own result type is already known from its
+                     * target type node, so this call exists purely so the
+                     * operand ends up with its own sem_type set, for codegen to
+                     * read directly off the node (e.g. AST_CAST_EXPR's own
+                     * codegen, deciding whether a primitive cast like "(int)
+                     * (pos + n)" needs an l2i conversion, checks
+                     * operand->sem_type - and without this call it stayed NULL,
+                     * silently defaulting to "assume int", so an actual long
+                     * value was stored with istore instead of being narrowed
+                     * first). A harmless no-op for a lambda/method-ref operand,
+                     * whose own case just returns its (not yet bound) sem_type
+                     * unchanged. Some expression kinds (e.g. a bare literal)
+                     * compute and return their type without self-annotating
+                     * expr->sem_type at all, so also set it defensively from
+                     * the return value here rather than relying on every
+                     * such case to do it itself. */
+                    if (children->next) {
+                        ast_node_t *operand_for_type = (ast_node_t *)children->next->data;
+                        type_t *operand_type = get_expression_type(sem, operand_for_type);
+                        if (operand_type && !operand_for_type->sem_type) {
+                            operand_for_type->sem_type = operand_type;
+                        }
+                    }
+
                     /* If the operand is a lambda or method reference, bind it to the cast type.
                      * This handles cases like: (SAM)() -> { } where the cast provides the target type. */
                     if (children->next && cast_type) {

@@ -393,6 +393,9 @@ static void process_local_classes(semantic_t *sem, class_gen_t *outer_cg,
                                   compiler_options_t *opts, int target_major);
 static void process_anonymous_classes(semantic_t *sem, class_gen_t *outer_cg,
                                       compiler_options_t *opts, int target_major);
+static void collect_nest_members_recursive(semantic_t *sem, class_gen_t *scan_cg,
+                                           const_pool_t *host_cp, slist_t **nest_members,
+                                           int target_major);
 
 /**
  * Recursively process nested classes (nested classes of nested classes, etc.)
@@ -531,6 +534,119 @@ static void process_anonymous_classes(semantic_t *sem, class_gen_t *outer_cg,
         }
         
         class_gen_free(anon_cg);
+    }
+}
+
+/**
+ * The JVM's nest-based access control (Java 11+) requires the nest HOST
+ * (always the outermost top-level class, however deep the nesting) to
+ * declare every nest member - every nested, local and anonymous class at
+ * every depth - in its own NestMembers attribute; each member in turn
+ * declares the host in its own NestHost attribute. Without a class
+ * actually being listed there, a JVM refuses private-member access between
+ * it and the host at runtime (IllegalAccessError: "current type is not
+ * listed as a nest member"), even though the classfile otherwise verifies
+ * fine - nest membership isn't checked by the bytecode verifier, only by
+ * the access-control check the first time such an access actually runs.
+ *
+ * The host's own classfile bytes are finalized and written by
+ * output_class() immediately after codegen_class() returns, but nested,
+ * local and anonymous classes below the *first* level are only discovered
+ * later, by the process_nested_classes()/process_local_classes()/
+ * process_anonymous_classes() calls that follow - each of which discovers
+ * one more level down only once it runs. So by the time any of those
+ * deeper descendants are known, the host's own bytes (and its
+ * NestMembers attribute) have already been written out.
+ *
+ * This walks the same discovery structure those functions do - reusing
+ * codegen_class()/codegen_anonymous_class() themselves on throwaway,
+ * never-written class_gen_t instances purely to populate each level's own
+ * nested_classes/local_classes/anonymous_classes lists exactly the way
+ * the real pass later will - to build the host's complete, correct
+ * nest_members list before the host itself is ever written out.
+ */
+static void collect_nest_members_recursive(semantic_t *sem, class_gen_t *scan_cg,
+                                           const_pool_t *host_cp, slist_t **nest_members,
+                                           int target_major)
+{
+    for (slist_t *anon = scan_cg->anonymous_classes; anon; anon = anon->next) {
+        symbol_t *anon_sym = (symbol_t *)anon->data;
+        if (!anon_sym || !anon_sym->data.class_data.anonymous_body ||
+            !anon_sym->qualified_name) {
+            continue;
+        }
+        char *internal = class_to_internal_name(anon_sym->qualified_name);
+        uint16_t *idx = malloc(sizeof(uint16_t));
+        *idx = cp_add_class(host_cp, internal);
+        free(internal);
+        if (*nest_members) {
+            slist_append(*nest_members, idx);
+        } else {
+            *nest_members = slist_new(idx);
+        }
+
+        class_gen_t *tmp_cg = class_gen_new(sem, anon_sym);
+        if (tmp_cg) {
+            class_gen_set_target_version(tmp_cg, target_major);
+            if (codegen_anonymous_class(tmp_cg, anon_sym)) {
+                collect_nest_members_recursive(sem, tmp_cg, host_cp, nest_members, target_major);
+            }
+            class_gen_free(tmp_cg);
+        }
+    }
+
+    for (slist_t *local = scan_cg->local_classes; local; local = local->next) {
+        ast_node_t *local_decl = (ast_node_t *)local->data;
+        symbol_t *local_sym = local_decl->sem_symbol;
+        if (!local_sym || !local_sym->qualified_name) {
+            continue;
+        }
+        char *internal = class_to_internal_name(local_sym->qualified_name);
+        uint16_t *idx = malloc(sizeof(uint16_t));
+        *idx = cp_add_class(host_cp, internal);
+        free(internal);
+        if (*nest_members) {
+            slist_append(*nest_members, idx);
+        } else {
+            *nest_members = slist_new(idx);
+        }
+
+        class_gen_t *tmp_cg = class_gen_new(sem, local_sym);
+        if (tmp_cg) {
+            class_gen_set_target_version(tmp_cg, target_major);
+            if (codegen_class(tmp_cg, local_decl)) {
+                collect_nest_members_recursive(sem, tmp_cg, host_cp, nest_members, target_major);
+            }
+            class_gen_free(tmp_cg);
+        }
+    }
+
+    for (slist_t *nested = scan_cg->nested_classes; nested; nested = nested->next) {
+        ast_node_t *nested_decl = (ast_node_t *)nested->data;
+        const char *nested_name = nested_decl->data.node.name;
+        symbol_t *nested_sym = scan_cg->class_sym && scan_cg->class_sym->data.class_data.members ?
+            scope_lookup_local(scan_cg->class_sym->data.class_data.members, nested_name) : NULL;
+        if (!nested_sym || !nested_sym->qualified_name) {
+            continue;
+        }
+        char *internal = class_to_internal_name(nested_sym->qualified_name);
+        uint16_t *idx = malloc(sizeof(uint16_t));
+        *idx = cp_add_class(host_cp, internal);
+        free(internal);
+        if (*nest_members) {
+            slist_append(*nest_members, idx);
+        } else {
+            *nest_members = slist_new(idx);
+        }
+
+        class_gen_t *tmp_cg = class_gen_new(sem, nested_sym);
+        if (tmp_cg) {
+            class_gen_set_target_version(tmp_cg, target_major);
+            if (codegen_class(tmp_cg, nested_decl)) {
+                collect_nest_members_recursive(sem, tmp_cg, host_cp, nest_members, target_major);
+            }
+            class_gen_free(tmp_cg);
+        }
     }
 }
 
@@ -846,8 +962,16 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
                 
                 /* Generate bytecode */
                 if (codegen_class(cg, child)) {
+                    /* Discover every nested/local/anonymous class at every
+                     * depth below this one and add them all to this class's
+                     * own NestMembers attribute before it's written out -
+                     * see collect_nest_members_recursive()'s own comment. */
+                    if (cg->nest_host == 0) {
+                        collect_nest_members_recursive(sem, cg, cg->cp, &cg->nest_members, target_major);
+                    }
+
                     /* Output the class */
-                    const char *qname = class_sym->qualified_name ? 
+                    const char *qname = class_sym->qualified_name ?
                                         class_sym->qualified_name : class_name;
                     if (!output_class(cg, qname, opts)) {
                         fprintf(stderr, "error: failed to write class file: %s\n", qname);
@@ -1397,6 +1521,14 @@ static void *codegen_phase_worker(void *arg)
                     continue;
                 }
                 
+                /* Discover every nested/local/anonymous class at every
+                 * depth below this one and add them all to this class's
+                 * own NestMembers attribute before it's written out - see
+                 * collect_nest_members_recursive()'s own comment. */
+                if (cg->nest_host == 0) {
+                    collect_nest_members_recursive(sem, cg, cg->cp, &cg->nest_members, target_major);
+                }
+
                 /* Write class file */
                 const char *qname = class_sym ? class_sym->qualified_name : class_name;
                 pthread_mutex_lock(&state->output_mutex);

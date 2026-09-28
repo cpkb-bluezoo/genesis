@@ -1462,6 +1462,31 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                     class_name = class_to_internal_name(
                                         first->sem_type->data.class_type.name);
                                 }
+                            } else if (first->sem_type && first->sem_type->kind == TYPE_TYPEVAR) {
+                                /* A generic type parameter (e.g. "T result = ...;")
+                                 * is not a class at all - it must be erased to its
+                                 * bound (or java.lang.Object if unbounded), exactly
+                                 * as type_to_descriptor() already does for every
+                                 * other TYPE_TYPEVAR use in codegen. Without this
+                                 * branch, this fell straight through to the "sem_type
+                                 * not available" fallback below, which used the
+                                 * type variable's own bare source name ("T") as a
+                                 * literal class name - the resulting classfile
+                                 * referenced a nonexistent class "T", failing with
+                                 * NoClassDefFoundError the first time that code
+                                 * actually ran (bytecode verification doesn't check
+                                 * that a referenced class exists, so this was never
+                                 * caught until runtime class-loading). */
+                                char *desc = type_to_descriptor(first->sem_type);
+                                if (desc) {
+                                    size_t len = strlen(desc);
+                                    if (len >= 2 && desc[0] == 'L' && desc[len - 1] == ';') {
+                                        char *erased_name = strdup(desc + 1);
+                                        erased_name[len - 2] = '\0';
+                                        class_name = erased_name;
+                                    }
+                                    free(desc);
+                                }
                             }
                             /* Fall back to AST name if sem_type not available */
                             if (!class_name && first->data.node.name) {
@@ -2839,11 +2864,27 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     }
                 }
                 
-                /* Check if this is an enum switch (selector has sem_type of enum) */
-                bool is_enum_switch = (selector->sem_type && 
-                                       selector->sem_type->kind == TYPE_CLASS &&
-                                       selector->sem_type->data.class_type.symbol &&
-                                       selector->sem_type->data.class_type.symbol->kind == SYM_ENUM);
+                /* Check if this is an enum switch (selector has sem_type of enum).
+                 * selector->sem_type isn't set for every selector expression
+                 * shape - get_expression_type()'s AST_ARRAY_ACCESS case (among
+                 * others) never stores its result back onto the node it
+                 * resolved, unlike AST_IDENTIFIER, so `switch (modes[i])`
+                 * left selector->sem_type NULL even though `switch (aLocal)`
+                 * worked fine. Semantic analysis's own switch-statement
+                 * handling always stores the resolved enum type on the switch
+                 * statement node itself (stmt->sem_type) whenever the
+                 * selector genuinely is an enum, regardless of its expression
+                 * shape - fall back to that. */
+                type_t *enum_switch_type = selector->sem_type;
+                if (!enum_switch_type || enum_switch_type->kind != TYPE_CLASS ||
+                    !enum_switch_type->data.class_type.symbol ||
+                    enum_switch_type->data.class_type.symbol->kind != SYM_ENUM) {
+                    enum_switch_type = stmt->sem_type;
+                }
+                bool is_enum_switch = (enum_switch_type &&
+                                       enum_switch_type->kind == TYPE_CLASS &&
+                                       enum_switch_type->data.class_type.symbol &&
+                                       enum_switch_type->data.class_type.symbol->kind == SYM_ENUM);
                 
                 /* Check if this is a String switch */
                 bool is_string_switch = (selector->sem_type && 
@@ -2868,6 +2909,25 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 size_t switch_pos = mg->code->length;
                 bc_emit(mg->code, OP_LOOKUPSWITCH);
                 mg_pop_typed(mg, 1);
+
+                /* Save stackmap state at switch entry (selector consumed,
+                 * no case body run yet) - every case label is a jump
+                 * target reached *only* from the lookupswitch dispatch
+                 * itself (assuming no fallthrough between cases), so each
+                 * one's frame must reflect this entry state, not whatever
+                 * mg->stackmap happens to track after generating whichever
+                 * earlier case in AST order was compiled last. Without
+                 * this, a local declared before the switch and assigned in
+                 * every case (e.g. "PosixFilePermission needed;") looked
+                 * assigned to every case *after* the first one that
+                 * actually assigns it, but still unassigned (Top) at the
+                 * first case's own declared frame - the same class of bug
+                 * already fixed for AST_TRY_STMT/AST_SYNCHRONIZED_STMT's
+                 * exception handlers. */
+                stackmap_state_t *switch_entry_state = NULL;
+                if (mg->stackmap) {
+                    switch_entry_state = stackmap_save_state(mg->stackmap);
+                }
                 
                 /* Pad to 4-byte alignment */
                 while ((mg->code->length) % 4 != 0) {
@@ -2948,18 +3008,37 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* Third pass: generate case bodies */
                 size_t default_code_pos = 0;
                 ast_idx = 0;
-                
+                /* Whether the previously-generated case body is guaranteed
+                 * not to fall through into the next one (ends in break's
+                 * goto, or return/throw) - true before the first case,
+                 * since nothing precedes it. Only restore to switch-entry
+                 * state when this holds: a genuinely falling-through case
+                 * (no break) reaches the next label with real, more-
+                 * specific state than switch entry (e.g. a local the
+                 * previous case just assigned), and resetting that to
+                 * "unassigned" would be wrong for that path - the existing
+                 * (unfixed) merge behavior is left alone for that case. */
+                bool prev_case_terminates = true;
+
                 for (slist_t *node = children->next; node; node = node->next, ast_idx++) {
                     ast_node_t *case_label = (ast_node_t *)node->data;
                     if (case_label->type != AST_CASE_LABEL) {
                         continue;
                     }
-                    
-                    bool is_default = case_label->data.node.name && 
+
+                    bool is_default = case_label->data.node.name &&
                                      strcmp(case_label->data.node.name, "default") == 0;
-                    
+
                     size_t current_code_pos = mg->code->length;
-                    
+
+                    /* Restore to switch-entry state before framing and
+                     * generating this case - it's reached only from the
+                     * lookupswitch dispatch, not by falling through from
+                     * whichever case preceded it in AST order. */
+                    if (prev_case_terminates && switch_entry_state && mg->stackmap) {
+                        stackmap_restore_state(mg->stackmap, switch_entry_state);
+                    }
+
                     /* Record frame at case label (branch target) */
                     mg_record_frame(mg);
                     
@@ -2991,8 +3070,22 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         }
                         stmts = stmts->next;
                     }
+
+                    /* Does this case fall through to the next (no break,
+                     * return, or throw at the end)? mg->last_opcode is set
+                     * to OP_GOTO by AST_BREAK_STMT specifically for this
+                     * kind of check (see its "Track for dead code
+                     * detection" comment). */
+                    {
+                        uint8_t last_op = mg->last_opcode;
+                        prev_case_terminates = (last_op == OP_GOTO ||
+                            last_op == OP_RETURN || last_op == OP_IRETURN ||
+                            last_op == OP_LRETURN || last_op == OP_FRETURN ||
+                            last_op == OP_DRETURN || last_op == OP_ARETURN ||
+                            last_op == OP_ATHROW);
+                    }
                 }
-                
+
                 free(case_to_ast_idx);
                 free(ast_to_sorted_idx);
                 
@@ -3023,10 +3116,11 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 
                 /* Reset last_opcode - switch doesn't guarantee method termination */
                 mg->last_opcode = 0;
-                
+
+                stackmap_state_free(switch_entry_state);
                 free(case_values);
                 free(case_offset_positions);
-                
+
                 return true;
             }
         
@@ -3544,13 +3638,33 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     return false;
                 }
                 
-                /* If finally exists, inline finally code at end of try block */
+                /* If finally exists, inline finally code at end of try block.
+                 *
+                 * The finally block's own AST is re-walked once per exit
+                 * edge from the try (this normal-completion copy, one per
+                 * catch block below, and the uncaught-exception escape
+                 * handler further down) - each occurrence is a fully
+                 * separate codegen_statement() call over the identical
+                 * subtree. Any temp local the finally block allocates
+                 * itself (e.g. a nested `synchronized` statement's lock-
+                 * object slot) must therefore start from the SAME
+                 * mg->next_slot baseline every time, or two copies assign
+                 * the same logical temp to two different slot numbers -
+                 * and since all copies' control flow reconverges (a
+                 * fall-through/goto to the same point after the whole
+                 * try-catch-finally), the JVM verifier sees one incoming
+                 * edge with that slot holding an Object and another with
+                 * it untouched ("top"), which it rejects as inconsistent
+                 * stack map frames. Saving/restoring next_slot around each
+                 * copy keeps every copy's slot numbering identical. */
+                uint16_t finally_saved_slot = mg->next_slot;
                 if (finally_clause && finally_clause->data.node.children) {
                     ast_node_t *finally_block = (ast_node_t *)finally_clause->data.node.children->data;
                     if (!codegen_statement(mg, finally_block)) {
                         slist_free(catch_clauses);
                         return false;
                     }
+                    mg->next_slot = finally_saved_slot;
                 }
                 
                 /* Check if try block (+ inlined finally) ended with a terminating instruction
@@ -3740,17 +3854,23 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     
                     uint16_t catch_end = (uint16_t)mg->code->length;
                     
-                    /* If finally exists, inline finally code */
+                    /* If finally exists, inline finally code.
+                     * See finally_saved_slot's comment above: each inlined
+                     * copy of the finally block must start temp-local
+                     * allocation from the same baseline as every other
+                     * copy. */
                     if (finally_clause && finally_clause->data.node.children) {
                         ast_node_t *finally_block = (ast_node_t *)finally_clause->data.node.children->data;
+                        uint16_t catch_finally_saved_slot = mg->next_slot;
                         if (!codegen_statement(mg, finally_block)) {
                             slist_free(catch_clauses);
                             slist_free(catch_gotos);
                             slist_free_full(catch_ranges, free);
                             return false;
                         }
+                        mg->next_slot = catch_finally_saved_slot;
                     }
-                    
+
                     /* Save catch range for finally exception handler (before inlined finally) */
                     if (finally_clause) {
                         uint32_t *range = malloc(sizeof(uint32_t) * 2);
@@ -3839,23 +3959,61 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         bc_emit_u1(mg->code, (uint8_t)exc_slot);
                     }
                     mg_pop_typed(mg, 1);
-                    
-                    /* Generate finally block */
+                    /* Track exc_slot's type in the stackmap, mirroring
+                     * AST_SYNCHRONIZED_STMT's own lock_slot tracking right
+                     * after its astore. Without this, mg->stackmap never
+                     * learns that exc_slot holds a Throwable, so any frame
+                     * recorded later in this handler (e.g. at the re-throw
+                     * below, once the finally block's own codegen - such as
+                     * a nested synchronized statement - has saved/restored
+                     * frames of its own) sees exc_slot as still unassigned
+                     * ("top"), and the re-throw's own aload of exc_slot
+                     * fails verification. */
+                    if (mg->stackmap) {
+                        stackmap_set_local_object(mg->stackmap, exc_slot, mg->cp, "java/lang/Throwable");
+                    }
+
+                    /* Generate finally block.
+                     * See finally_saved_slot's comment above: each inlined
+                     * copy of the finally block must start temp-local
+                     * allocation from the same baseline as every other
+                     * copy. */
                     if (finally_clause->data.node.children) {
                         ast_node_t *finally_block = (ast_node_t *)finally_clause->data.node.children->data;
+                        uint16_t escape_finally_saved_slot = mg->next_slot;
                         if (!codegen_statement(mg, finally_block)) {
                             slist_free(catch_clauses);
                             slist_free(catch_gotos);
                             slist_free_full(catch_ranges, free);
                             return false;
                         }
+                        mg->next_slot = escape_finally_saved_slot;
                     }
-                    
-                    /* Check if finally block ended with a terminating instruction
-                     * If it did, we don't need to re-throw the exception */
+
+                    /* Check if finally block ended with a terminating instruction.
+                     * If it did, we don't need to re-throw the exception.
+                     *
+                     * Use mg->last_opcode (set by statement codegen to
+                     * reflect the last opcode on the actually-reachable
+                     * normal-completion path), not the raw last byte in
+                     * mg->code's buffer. The finally block's last
+                     * *textual* statement can itself emit bytecode after
+                     * its own normal-path exit - e.g. a `synchronized`
+                     * statement's own exception handler (ending in athrow)
+                     * is appended after the synchronized statement's
+                     * normal monitorexit+goto - so the physically-last
+                     * byte written is unrelated to whether the finally
+                     * block's normal-completion path actually returns or
+                     * throws. Peeking at that byte previously misread an
+                     * unrelated trailing athrow as "the finally block
+                     * always throws" and skipped the re-throw entirely,
+                     * silently swallowing any exception the try block
+                     * threw whenever the finally block's last statement
+                     * was a synchronized block (or anything else with its
+                     * own trailing exception-handler bytecode). */
                     bool finally_ends_with_return = false;
-                    if (mg->code->length > 0) {
-                        uint8_t last_op = mg->code->code[mg->code->length - 1];
+                    {
+                        uint8_t last_op = mg->last_opcode;
                         if (last_op == OP_RETURN || last_op == OP_IRETURN ||
                             last_op == OP_LRETURN || last_op == OP_FRETURN ||
                             last_op == OP_DRETURN || last_op == OP_ARETURN ||
@@ -3863,7 +4021,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             finally_ends_with_return = true;
                         }
                     }
-                    
+
                     /* Re-throw exception (only if finally didn't return/throw) */
                     if (!finally_ends_with_return) {
                         if (exc_slot <= 3) {

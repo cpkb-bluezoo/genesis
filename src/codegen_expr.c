@@ -2130,18 +2130,37 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
         if (!recv_class) {
             recv_class = "java/lang/Object";
         }
-        
-        /* Default field descriptor - assume Object reference */
-        field_desc = "Ljava/lang/Object;";
-        
+
+        /* The field's own descriptor - use this expression's own sem_type
+         * (semantic analysis already resolves and substitutes it correctly,
+         * same as it does for a single-level field access), not a
+         * hardcoded Object. Without this, a chained access (a.b.c) always
+         * treated .c as an Object field regardless of its real declared
+         * type (e.g. boolean, TreeMap<...>), leaving the wrong descriptor
+         * in the classfile and the verifier rejecting whatever used the
+         * result as anything other than a plain reference. */
+        char *owned_field_desc = NULL;
+        if (expr->sem_type) {
+            owned_field_desc = type_to_descriptor(expr->sem_type);
+        }
+        field_desc = owned_field_desc ? owned_field_desc : "Ljava/lang/Object;";
+
         /* Emit getfield */
         uint16_t fieldref = cp_add_fieldref(cp, recv_class, field_name, field_desc);
         bc_emit(mg->code, OP_GETFIELD);
         bc_emit_u2(mg->code, fieldref);
         /* getfield pops ref, pushes value with proper type tracking */
         mg_pop_typed(mg, 1);  /* Pop the object reference */
-        mg_push_object_from_descriptor(mg, field_desc);  /* Push the field value (Object type) */
-        
+        switch (field_desc[0]) {
+            case 'J': mg_push_long(mg); break;
+            case 'D': mg_push_double(mg); break;
+            case 'F': mg_push_float(mg); break;
+            case 'L':
+            case '[': mg_push_object_from_descriptor(mg, field_desc); break;
+            default:  mg_push_int(mg); break;
+        }
+
+        free(owned_field_desc);
         return true;
     }
     
@@ -5138,7 +5157,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 
                 if (is_array_arg && elem_type) {
                     bool compatible = false;
-                    
+
                     /* Handle type variable (e.g., T in Stream.of(T...)) - any reference array is compatible */
                     if (elem_type->kind == TYPE_TYPEVAR) {
                         /* Type variable accepts any reference type */
@@ -5472,6 +5491,31 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
             bc_emit(mg->code, OP_CHECKCAST);
             bc_emit_u2(mg->code, class_idx);
         }
+    } else if (!is_void_return && expr->sem_type && expr->sem_type->kind == TYPE_ARRAY &&
+               method_sym && method_sym->type && method_sym->type->kind == TYPE_ARRAY &&
+               method_sym->type->data.array_type.element_type &&
+               method_sym->type->data.array_type.element_type->kind == TYPE_TYPEVAR) {
+        /* Same idea, for a method that returns T[] (e.g.
+         * Collection<T>.toArray(T[] a)) - this erases to Object[] (or the
+         * type variable's bound array) at the JVM level, same as a bare
+         * type-variable return above. If semantic analysis determined a
+         * more specific array type at this call site (e.g. String[] for
+         * list.toArray(new String[0])), narrow it with a checkcast -
+         * without this, the erased Object[] was left on the stack
+         * wherever the result was used, and the verifier rejected it
+         * ("Bad type on operand stack ... not assignable to
+         * '[Ljava/lang/String;'"). Unlike a plain class checkcast, an
+         * array checkcast's constant-pool entry is the full descriptor
+         * (e.g. "[Ljava/lang/String;"), not an unwrapped internal name. */
+        char *actual_desc = type_to_descriptor(expr->sem_type);
+        char *erased_desc = type_to_descriptor(method_sym->type);
+        if (actual_desc && erased_desc && strcmp(actual_desc, erased_desc) != 0) {
+            uint16_t class_idx = cp_add_class(cp, actual_desc);
+            bc_emit(mg->code, OP_CHECKCAST);
+            bc_emit_u2(mg->code, class_idx);
+        }
+        free(actual_desc);
+        free(erased_desc);
     }
     
     /* Update stack: pop receiver (if any) and args, push return value.
@@ -5869,6 +5913,37 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     bc_emit(mg->code, OP_ILOAD);
                     bc_emit_u1(mg->code, (uint8_t)slot);
                     mg_push_int(mg);
+                }
+            } else if (mg->class_gen) {
+                /* Not a plain local of the *current* method - this happens
+                 * for a variable captured by a class nested inside another
+                 * local/anonymous class, where the variable's true home
+                 * scope is further out than the immediately enclosing
+                 * method (e.g. a parameter of the class that the current
+                 * one is itself defined inside, relayed here via semantic
+                 * analysis's propagate_capture_to_enclosing_classes()).
+                 * The current class captured it too for exactly this
+                 * reason, so it's available as this.val$<name> - load it
+                 * from there instead. */
+                char field_name[300];
+                snprintf(field_name, sizeof(field_name), "val$%s", var_sym->name);
+                field_gen_t *cap_field = hashtable_lookup(mg->class_gen->field_map, field_name);
+                if (cap_field) {
+                    bc_emit(mg->code, OP_ALOAD_0);
+                    mg_push_null(mg);
+                    uint16_t fieldref = cp_add_fieldref(mg->cp, mg->class_gen->internal_name,
+                                                         cap_field->name, cap_field->descriptor);
+                    bc_emit(mg->code, OP_GETFIELD);
+                    bc_emit_u2(mg->code, fieldref);
+                    mg_pop_typed(mg, 1);  /* getfield consumed the aload_0 ref */
+                    switch (cap_field->descriptor[0]) {
+                        case 'J': mg_push_long(mg); break;
+                        case 'D': mg_push_double(mg); break;
+                        case 'F': mg_push_float(mg); break;
+                        case 'L':
+                        case '[': mg_push_object_from_descriptor(mg, cap_field->descriptor); break;
+                        default:  mg_push_int(mg); break;
+                    }
                 }
             }
         }
@@ -7144,8 +7219,32 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     case TYPE_DOUBLE: stackmap_set_local_double(mg->stackmap, slot); break;
                     case TYPE_FLOAT:  stackmap_set_local_float(mg->stackmap, slot); break;
                     case TYPE_CLASS:
-                    case TYPE_ARRAY:
                         if (local_info->class_name) {
+                            stackmap_set_local_object(mg->stackmap, slot, mg->cp, local_info->class_name);
+                        }
+                        break;
+                    case TYPE_ARRAY:
+                        /* local_info->class_name is only ever populated for
+                         * TYPE_CLASS locals (see local_var_info_t's own
+                         * comment: "Class internal name (for class types,
+                         * NULL otherwise)") - an array-typed local's element
+                         * kind/class aren't tracked there at all outside the
+                         * parameter-registration path, so that check always
+                         * failed here and this slot's stackmap tracking was
+                         * silently never updated for a plain "arr = new
+                         * T[n];" assignment. Build the real array descriptor
+                         * from the right-hand side's own semantic type
+                         * instead - reliable now that semantic.c's
+                         * AST_EXPR_STMT and AST_ASSIGNMENT_EXPR cases ensure
+                         * value->sem_type gets computed for exactly this
+                         * shape. */
+                        if (value->sem_type && value->sem_type->kind == TYPE_ARRAY) {
+                            char *arr_desc = type_to_descriptor(value->sem_type);
+                            if (arr_desc) {
+                                stackmap_set_local_object(mg->stackmap, slot, mg->cp, arr_desc);
+                                free(arr_desc);
+                            }
+                        } else if (local_info->class_name) {
                             stackmap_set_local_object(mg->stackmap, slot, mg->cp, local_info->class_name);
                         }
                         break;
@@ -7225,9 +7324,34 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                                                              field->name, field->descriptor);
                         bc_emit(mg->code, OP_GETFIELD);
                         bc_emit_u2(mg->code, fieldref);
-                        /* getfield pops ref, pushes value - net 0 */
+                        /* getfield consumes the duplicated ref (1 slot) and
+                         * pushes the field's value - 1 slot for most kinds,
+                         * but 2 for a wide (long/double) field, so this is
+                         * NOT unconditionally a net-zero change to the
+                         * tracked stack depth as a stale comment here used
+                         * to claim. Mirror the sibling this.field/inherited-
+                         * field and static-field compound-assignment
+                         * branches, which both already do this correctly:
+                         * pop the consumed ref, then push by the field's
+                         * actual kind. Missing this for a wide field left
+                         * mg->stack_depth undercounting the real bytecode
+                         * stack by one slot from here on, so a later
+                         * expression-statement's "pop vs pop2" choice
+                         * (AST_EXPR_STMT, sized from stack_depth deltas)
+                         * used a single POP for what was actually a 2-slot
+                         * long/double value - which the verifier rejects
+                         * outright, since POP requires a category-1 type. */
+                        mg_pop_typed(mg, 1);
+                        switch (field->descriptor[0]) {
+                            case 'J': mg_push_long(mg); break;
+                            case 'D': mg_push_double(mg); break;
+                            case 'F': mg_push_float(mg); break;
+                            case 'L':
+                            case '[': mg_push_object_from_descriptor(mg, field->descriptor); break;
+                            default:  mg_push_int(mg); break;
+                        }
                     }
-                    
+
                     /* Generate right-hand side */
                     if (compound) {
                         type_kind_t field_kind;
@@ -9180,7 +9304,25 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 bool needs_free = false;
                 
                 if (type_node->type == AST_CLASS_TYPE) {
-                    const char *class_name = type_node->data.node.name;
+                    /* Prefer the semantically resolved (and properly
+                     * package-qualified) type, the same way AST_CAST_EXPR
+                     * does below - the bare AST source name is only right
+                     * for an already-qualified or java.lang name; a
+                     * same-package type (needing no import, e.g. a
+                     * self-referential "p instanceof Thing" inside Thing
+                     * itself) has no qualification in the source at all. */
+                    const char *class_name = NULL;
+                    if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS) {
+                        if (type_node->sem_type->data.class_type.symbol &&
+                            type_node->sem_type->data.class_type.symbol->qualified_name) {
+                            class_name = type_node->sem_type->data.class_type.symbol->qualified_name;
+                        } else if (type_node->sem_type->data.class_type.name) {
+                            class_name = type_node->sem_type->data.class_type.name;
+                        }
+                    }
+                    if (!class_name) {
+                        class_name = type_node->data.node.name;
+                    }
                     const char *resolved = resolve_java_lang_class(class_name);
                     class_ref = class_to_internal_name(resolved);
                     needs_free = true;
@@ -9473,7 +9615,31 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 /* Patch goto to jump here (end) */
                 uint16_t end_offset = (uint16_t)(mg->code->length - goto_pos);
                 bc_patch_u2(mg->code, goto_pos + 1, end_offset);
-                
+
+                /* mg->stackmap's tracked stack-top type at this point just
+                 * reflects whichever branch was generated last (the else
+                 * branch) - not a real merge of both incoming edges. The
+                 * then branch's goto also reaches this exact merge point,
+                 * possibly with a different reference type on the stack
+                 * (e.g. a concrete class vs. a bare `null` literal in the
+                 * other branch) - recording the frame from just one side
+                 * left the *other* side's actual value unassignable to the
+                 * declared frame. JLS 15.25 already computed the ternary's
+                 * own overall type as the correct join of both branches
+                 * (expr->sem_type); use that directly for the frame instead,
+                 * mirroring the same correction codegen_identifier() makes
+                 * for a reference-typed local's tracked type. */
+                if (mg->stackmap && expr->sem_type &&
+                    (expr->sem_type->kind == TYPE_CLASS || expr->sem_type->kind == TYPE_ARRAY)) {
+                    char *merged_desc = type_to_descriptor(expr->sem_type);
+                    if (merged_desc) {
+                        stackmap_pop(mg->stackmap, 1);
+                        mg_push_object_from_descriptor(mg, merged_desc);
+                        mg->stack_depth--;  /* mg_push_object_from_descriptor increments, but we already pushed */
+                        free(merged_desc);
+                    }
+                }
+
                 /* Record frame at merge point */
                 mg_record_frame(mg);
                 
