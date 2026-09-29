@@ -728,6 +728,33 @@ type_kind_t get_expr_type_kind(method_gen_t *mg, ast_node_t *expr)
         return TYPE_CLASS;
     }
 
+    /* A chained/nested assignment used as a VALUE, e.g. the inner
+     * "h = compute()" in "hex = h = compute();" - per JLS 15.26, an
+     * assignment expression's own type/value is that of its target
+     * (String here, from local "h"'s declared type), not whatever the
+     * RHS happens to be. Without this, an AST_ASSIGNMENT_EXPR node
+     * reaches none of the cases below (it's not AST_IDENTIFIER, and
+     * nothing else here recognizes it) and fell straight through to
+     * this function's own final "default to TYPE_INT" fallback -
+     * wrongly telling a caller deciding whether to box the value for a
+     * reference-typed target (e.g. the OUTER assignment's own
+     * coerce_value_to_descriptor(), storing into a String field) that
+     * it's a primitive int needing Integer.valueOf() first: an
+     * invokestatic to Integer.valueOf(I) immediately before storing an
+     * actual String reference (VerifyError: "Bad type on operand stack
+     * ... not assignable to integer" - Integer.valueOf(int)'s own
+     * parameter, not the field store, since coerce_stack_value's boxing
+     * call itself needs an int on the stack that was never really
+     * there). Confirmed against gumdrop's own TraceId.toHexString(),
+     * whose double-checked-locking "hex = h = ByteArrays.toHexString
+     * (bytes);" is exactly this shape. */
+    if (expr->type == AST_ASSIGNMENT_EXPR) {
+        slist_t *children = expr->data.node.children;
+        if (children) {
+            return get_expr_type_kind(mg, (ast_node_t *)children->data);
+        }
+    }
+
     /* Check semantic type first */
     if (expr->sem_type) {
         /* Handle wrapper types - return underlying primitive for arithmetic */
@@ -7613,7 +7640,27 @@ static bool codegen_new_array(method_gen_t *mg, ast_node_t *expr, const_pool_t *
         }
     }
     
-    if (dim_count == 1) {
+    /* total_dims (parser.c's own "new Type[n][]..." dimension count,
+     * stashed in the AST node's flags field) can exceed dim_count (the
+     * number of dimensions that actually got a size EXPRESSION) - e.g.
+     * "new byte[n][]" has dim_count=1 (only the outer size is given) but
+     * total_dims=2 (it's still creating a 2-D array, just leaving the
+     * inner arrays unallocated). Falling into the dim_count==1 branch
+     * below unconditionally, as this used to, treated it as a TRUE
+     * single-dimensional array of the LEAF element type - NEWARRAY byte,
+     * producing a bare "[B" instead of "[[B" - which then broke every
+     * later use of the value as the 2-D array it was declared as (e.g.
+     * an AASTORE storing a byte[] into "values[i]" needs an arrayref
+     * that's ACTUALLY "[[B", not "[B"): VerifyError the moment a store
+     * or load exposed the mismatch. Confirmed against gumdrop's own
+     * MessageIndexEntry, whose "byte[][] values = new byte[DESCRIPTOR_
+     * COUNT][];" is exactly this shape. */
+    int total_dims = (int)expr->data.node.flags;
+    if (total_dims < dim_count) {
+        total_dims = dim_count;
+    }
+
+    if (dim_count == 1 && total_dims == 1) {
         /* Single-dimensional array */
         if (type_node->type == AST_PRIMITIVE_TYPE) {
             /* Primitive array: use newarray */
@@ -7623,23 +7670,23 @@ static bool codegen_new_array(method_gen_t *mg, ast_node_t *expr, const_pool_t *
                 fprintf(stderr, "codegen: unknown primitive type for array: %s\n", prim_name);
                 return false;
             }
-            
+
             bc_emit(mg->code, OP_NEWARRAY);
             bc_emit_u1(mg->code, (uint8_t)atype);
             /* Stack: size -> arrayref (no net change) */
         } else if (type_node->type == AST_CLASS_TYPE) {
             /* Reference array: use anewarray */
             const char *class_name = type_node->data.node.name;
-            
+
             /* Use resolved type if available */
             if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS) {
                 class_name = type_node->sem_type->data.class_type.name;
             }
-            
+
             char *internal_name = class_to_internal_name(class_name);
             uint16_t class_ref = cp_add_class(cp, internal_name);
             free(internal_name);
-            
+
             bc_emit(mg->code, OP_ANEWARRAY);
             bc_emit_u2(mg->code, class_ref);
             /* Stack: size -> arrayref (no net change) */
@@ -7647,6 +7694,26 @@ static bool codegen_new_array(method_gen_t *mg, ast_node_t *expr, const_pool_t *
             fprintf(stderr, "codegen: unsupported array element type\n");
             return false;
         }
+    } else if (dim_count == 1 && total_dims > 1) {
+        /* "new Type[n][]...[]" (dim_count-many trailing dims left empty):
+         * ANEWARRAY, whose class operand names the COMPONENT type - an
+         * array with (total_dims - dim_count) fewer dimensions than the
+         * whole declared type, e.g. "[B" (byte[]) for "new byte[n][]"'s
+         * component. */
+        char *elem_desc = ast_type_to_descriptor(type_node);
+        int component_extra_dims = total_dims - dim_count;
+        size_t desc_len = strlen(elem_desc) + (size_t)component_extra_dims + 1;
+        char *component_desc = malloc(desc_len);
+        memset(component_desc, '[', (size_t)component_extra_dims);
+        strcpy(component_desc + component_extra_dims, elem_desc);
+        free(elem_desc);
+
+        uint16_t class_ref = cp_add_class(cp, component_desc);
+        free(component_desc);
+
+        bc_emit(mg->code, OP_ANEWARRAY);
+        bc_emit_u2(mg->code, class_ref);
+        /* Stack: size -> arrayref (no net change) */
     } else {
         /* Multi-dimensional array: use multianewarray */
         /* Build the array type descriptor */
@@ -8928,11 +8995,37 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         type_kind_t store_elem_kind = TYPE_INT;
         const char *store_elem_class = NULL;
         if (array_expr->sem_type && array_expr->sem_type->kind == TYPE_ARRAY) {
-            type_t *elem_type = array_expr->sem_type->data.array_type.element_type;
-            if (elem_type) {
-                store_elem_kind = elem_type->kind;
-                if (store_elem_kind == TYPE_CLASS) {
-                    store_elem_class = elem_type->data.class_type.name;
+            /* array_expr->sem_type's own array_type struct stores the
+             * LEAF element type (e.g. "byte" for byte[][]) plus a
+             * separate dimensions count - NOT one type_t per dimension -
+             * so element_type->kind alone only tells you the eventual
+             * SCALAR type, not what ONE level of indexing on THIS array
+             * actually produces. Indexing a multi-dimensional array once
+             * still yields a sub-ARRAY (a reference type, dimensions-1),
+             * not the leaf scalar - e.g. "byte[][] values = ...;
+             * values[i] = someByteArray;" needs AASTORE (storing a
+             * reference), not BASTORE, even though the leaf element type
+             * is byte. Mirrors the identical dimensions>1 check already
+             * used correctly in codegen_array_init() for an array
+             * LITERAL's own element stores. Without this, every
+             * assignment through one level of a >1-dimensional
+             * array emitted the LEAF type's scalar store instead:
+             * VerifyError "Bad type on operand stack ... not assignable
+             * to integer" the moment the actual (reference) value reached
+             * it. Confirmed against gumdrop's own
+             * MessageIndexEntry.buildVariableData(), whose
+             * "values[DESC_LOCATION] = toBytes(location);" on a
+             * byte[][] is exactly this shape. */
+            int dims = array_expr->sem_type->data.array_type.dimensions;
+            if (dims > 1) {
+                store_elem_kind = TYPE_ARRAY;
+            } else {
+                type_t *elem_type = array_expr->sem_type->data.array_type.element_type;
+                if (elem_type) {
+                    store_elem_kind = elem_type->kind;
+                    if (store_elem_kind == TYPE_CLASS) {
+                        store_elem_class = elem_type->data.class_type.name;
+                    }
                 }
             }
         } else if (array_expr->type == AST_IDENTIFIER) {
@@ -9899,45 +9992,100 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                                 /* Now do field++ on the outer instance */
                                                 uint16_t fieldref = cp_add_fieldref(mg->cp, outer_internal,
                                                                                      name, field_desc);
-                                                
+
+                                                /* A long/double outer field is WIDE (2 stack
+                                                 * slots): unconditionally using DUP_X1/ICONST_1/
+                                                 * IADD here (as this branch used to) silently
+                                                 * corrupted the value and DUP_X1 on a wide value
+                                                 * is rejected outright by the verifier ("Type
+                                                 * long_2nd ... not assignable to category1
+                                                 * type") - the same bug already fixed for the
+                                                 * sibling "obj.field++" (AST_FIELD_ACCESS) branch
+                                                 * just below, never applied here too. Confirmed
+                                                 * against gumdrop's own Pop3ProtocolHandler,
+                                                 * whose "failedAuthAttempts++" (a long field of
+                                                 * the OUTER Pop3ProtocolHandler, incremented from
+                                                 * a doubly-nested anonymous callback two this$0
+                                                 * hops away) hits exactly this path. */
+                                                type_kind_t field_kind = outer_field->type ? outer_field->type->kind : TYPE_INT;
+                                                uint8_t const1_op = OP_ICONST_1;
+                                                uint8_t add_op = OP_IADD;
+                                                uint8_t sub_op = OP_ISUB;
+                                                bool is_wide = false;
+                                                switch (field_kind) {
+                                                    case TYPE_LONG:
+                                                        const1_op = OP_LCONST_1; add_op = OP_LADD; sub_op = OP_LSUB;
+                                                        is_wide = true;
+                                                        break;
+                                                    case TYPE_DOUBLE:
+                                                        const1_op = OP_DCONST_1; add_op = OP_DADD; sub_op = OP_DSUB;
+                                                        is_wide = true;
+                                                        break;
+                                                    case TYPE_FLOAT:
+                                                        const1_op = OP_FCONST_1; add_op = OP_FADD; sub_op = OP_FSUB;
+                                                        break;
+                                                    default:
+                                                        break;
+                                                }
+
                                                 if (is_post) {
-                                                    /* Post: dup, getfield, dup_x1, iconst_1, iadd/isub, putfield */
+                                                    /* Post: dup, getfield, dup_x1/dup2_x1, const1, iadd/isub, putfield */
                                                     /* Stack: [outer] -> [outer,outer] -> [outer,old] -> [old,outer,old] -> [old,outer,new] -> [old] */
                                                     bc_emit(mg->code, OP_DUP);
                                                     mg_push_object(mg, outer_internal);  /* [outer,outer] */
                                                     bc_emit(mg->code, OP_GETFIELD);
                                                     bc_emit_u2(mg->code, fieldref);
                                                     mg_pop_typed(mg, 1);
-                                                    mg_push_int(mg);  /* [outer,old] */
-                                                    bc_emit(mg->code, OP_DUP_X1);
-                                                    mg_push_int(mg);  /* [old,outer,old] */
-                                                    bc_emit(mg->code, OP_ICONST_1);
-                                                    mg_push_int(mg);  /* [old,outer,old,1] */
-                                                    bc_emit(mg->code, is_inc ? OP_IADD : OP_ISUB);
-                                                    mg_pop_typed(mg, 1);  /* [old,outer,new] */
+                                                    switch (field_kind) {
+                                                        case TYPE_LONG:   mg_push_long(mg); break;
+                                                        case TYPE_DOUBLE: mg_push_double(mg); break;
+                                                        case TYPE_FLOAT:  mg_push_float(mg); break;
+                                                        default:          mg_push_int(mg); break;
+                                                    }
+                                                    if (is_wide) {
+                                                        bc_emit(mg->code, OP_DUP2_X1);
+                                                        mg_dup2_x1(mg);  /* [old,outer,old] */
+                                                    } else {
+                                                        bc_emit(mg->code, OP_DUP_X1);
+                                                        mg_dup_x1(mg);   /* [old,outer,old] */
+                                                    }
+                                                    bc_emit(mg->code, const1_op);
+                                                    mg_push(mg, is_wide ? 2 : 1);  /* [old,outer,old,1] */
+                                                    bc_emit(mg->code, is_inc ? add_op : sub_op);
+                                                    mg_pop_typed(mg, is_wide ? 2 : 1);  /* [old,outer,new] */
                                                     bc_emit(mg->code, OP_PUTFIELD);
                                                     bc_emit_u2(mg->code, fieldref);
-                                                    mg_pop_typed(mg, 2);  /* [old] */
+                                                    mg_pop_typed(mg, is_wide ? 3 : 2);  /* [old] */
                                                 } else {
-                                                    /* Pre: dup, getfield, iconst_1, iadd/isub, dup_x1, putfield */
+                                                    /* Pre: dup, getfield, const1, iadd/isub, dup_x1/dup2_x1, putfield */
                                                     /* Stack: [outer] -> [outer,outer] -> [outer,old] -> [outer,old,1] -> [outer,new] -> [new,outer,new] -> [new] */
                                                     bc_emit(mg->code, OP_DUP);
                                                     mg_push_object(mg, outer_internal);  /* [outer,outer] */
                                                     bc_emit(mg->code, OP_GETFIELD);
                                                     bc_emit_u2(mg->code, fieldref);
                                                     mg_pop_typed(mg, 1);
-                                                    mg_push_int(mg);  /* [outer,old] */
-                                                    bc_emit(mg->code, OP_ICONST_1);
-                                                    mg_push_int(mg);  /* [outer,old,1] */
-                                                    bc_emit(mg->code, is_inc ? OP_IADD : OP_ISUB);
-                                                    mg_pop_typed(mg, 1);  /* [outer,new] */
-                                                    bc_emit(mg->code, OP_DUP_X1);
-                                                    mg_push_int(mg);  /* [new,outer,new] */
+                                                    switch (field_kind) {
+                                                        case TYPE_LONG:   mg_push_long(mg); break;
+                                                        case TYPE_DOUBLE: mg_push_double(mg); break;
+                                                        case TYPE_FLOAT:  mg_push_float(mg); break;
+                                                        default:          mg_push_int(mg); break;
+                                                    }
+                                                    bc_emit(mg->code, const1_op);
+                                                    mg_push(mg, is_wide ? 2 : 1);  /* [outer,old,1] */
+                                                    bc_emit(mg->code, is_inc ? add_op : sub_op);
+                                                    mg_pop_typed(mg, is_wide ? 2 : 1);  /* [outer,new] */
+                                                    if (is_wide) {
+                                                        bc_emit(mg->code, OP_DUP2_X1);
+                                                        mg_dup2_x1(mg);  /* [new,outer,new] */
+                                                    } else {
+                                                        bc_emit(mg->code, OP_DUP_X1);
+                                                        mg_dup_x1(mg);   /* [new,outer,new] */
+                                                    }
                                                     bc_emit(mg->code, OP_PUTFIELD);
                                                     bc_emit_u2(mg->code, fieldref);
-                                                    mg_pop_typed(mg, 2);  /* [new] */
+                                                    mg_pop_typed(mg, is_wide ? 3 : 2);  /* [new] */
                                                 }
-                                                
+
                                                 free(outer_internal);
                                                 free(field_desc);
                                                 return true;
@@ -10653,10 +10801,30 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     return false;
                 }
                 
-                /* Determine source type from operand's semantic type */
+                /* Determine source type from operand's semantic type. Not
+                 * always already populated at this point - e.g. as an
+                 * array dimension expression, "(int) ((totalBits + 7) /
+                 * 8)" in "new byte[(int) ((totalBits + 7) / 8)]", nothing
+                 * else visits the cast's OWN operand with the general
+                 * expression type-checker first. Without this, source_kind
+                 * fell through to TYPE_UNKNOWN -> defaulted to TYPE_INT
+                 * below (assuming an unknown source is already an int) -
+                 * which, for a genuinely LONG-typed operand cast to int,
+                 * made source_kind == target_kind look like a no-op cast,
+                 * silently DROPPING the cast entirely (no L2I emitted) and
+                 * leaving a long (2 stack words) where newarray's size
+                 * operand needs a single-word int: VerifyError "Bad type
+                 * on operand stack ... long_2nd ... not assignable to
+                 * integer". Confirmed against gumdrop's own
+                 * Huffman.encode(). */
                 type_kind_t source_kind = TYPE_UNKNOWN;
                 if (operand->sem_type) {
                     source_kind = operand->sem_type->kind;
+                } else if (mg->class_gen && mg->class_gen->sem) {
+                    type_t *forced = get_expression_type(mg->class_gen->sem, operand);
+                    if (forced) {
+                        source_kind = forced->kind;
+                    }
                 }
                 
                 /* Reference cast: use checkcast */

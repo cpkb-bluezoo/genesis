@@ -143,6 +143,29 @@ static bool eval_int_constant_expr(ast_node_t *expr, int32_t *out)
         return false;
     }
 
+    /* A named constant used as an OPERAND within a larger constant
+     * expression (e.g. "case SEQUENCE & TAG_MASK:", where SEQUENCE and
+     * TAG_MASK are each "static final int" fields) - semantic analysis
+     * already resolved and populated this identifier leaf's own constant
+     * value, exactly like the sibling bare-identifier case-label handling
+     * at this function's caller does directly. Without this, any operator
+     * combining two (or more) named constants recursed into two bare
+     * AST_IDENTIFIER nodes this function had no case for, silently
+     * returning false and leaving the WHOLE expression's case value at 0
+     * - the same "every case defaults to 0" collision this function was
+     * originally added to fix, just one level deeper (a named-constant
+     * OPERAND instead of the top-level case label itself). Confirmed
+     * against gumdrop's own Asn1Type.getTagName(), whose "case SEQUENCE &
+     * TAG_MASK:" and "case SET & TAG_MASK:" both collapsed to match value
+     * 0 - two lookupswitch pairs with the same key, which is exactly what
+     * "Bad lookupswitch instruction" flags (JVMS 4.9.1's lookupswitch
+     * validity rule: match values must be in strictly increasing order,
+     * so a duplicate is invalid by construction). */
+    if (expr->type == AST_IDENTIFIER) {
+        *out = (int32_t)expr->data.leaf.value.int_val;
+        return true;
+    }
+
     if (expr->type == AST_UNARY_EXPR) {
         slist_t *children = expr->data.node.children;
         int32_t operand;
@@ -1163,7 +1186,38 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
             type_node = type_node->next;
         }
 
-        const char *stackmap_exc_class = is_multi_catch ? "java/lang/Throwable" : first_exc_class;
+        /* For multi-catch, prefer the LUB semantic analysis already
+         * computed across every alternative (catch_clause->sem_type) as
+         * the HANDLER'S OWN ENTRY FRAME type, over a blanket
+         * "java/lang/Throwable". The exact type recorded here for the
+         * exception on the stack becomes, per the ASTORE right below,
+         * the VERIFIED type of the local variable slot from this point
+         * forward - a REAL verifier does not re-derive it from anything
+         * else (not the exception table's own declared catch types, not
+         * any of genesis's own internal bookkeeping). Using Throwable
+         * here while LATER frames in the same catch body (e.g. a nested
+         * try/catch's own handler entry) are built using the LUB
+         * (Exception, say) is therefore a guaranteed mismatch the moment
+         * any such later frame exists: VerifyError "Stack map does not
+         * match the one at exception handler ... Type 'Throwable' ...
+         * not assignable to 'Exception'". Confirmed against gumdrop's own
+         * MessageIndex.save(), whose outer "catch (IOException |
+         * RuntimeException e)" wraps a try-with-resources followed by its
+         * own nested "try { Files.deleteIfExists(tempPath); } catch
+         * (IOException deleteFailed) { e.addSuppressed(...); }" - exactly
+         * this shape. Falls back to Throwable only if semantic analysis
+         * didn't leave a usable class type (defensive; shouldn't happen
+         * in practice, and merely conservative - never itself a
+         * correctness bug - since every real class is assignable to
+         * Throwable). */
+        const char *stackmap_exc_class = first_exc_class;
+        if (is_multi_catch) {
+            stackmap_exc_class = "java/lang/Throwable";
+            if (catch_clause->sem_type && catch_clause->sem_type->kind == TYPE_CLASS &&
+                catch_clause->sem_type->data.class_type.name) {
+                stackmap_exc_class = catch_clause->sem_type->data.class_type.name;
+            }
+        }
         char *stackmap_exc_internal = class_to_internal_name(stackmap_exc_class);
         mg_record_exception_handler_frame(mg, stackmap_exc_internal);
 
@@ -1210,6 +1264,24 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
             bc_emit_u1(mg->code, (uint8_t)exc_slot);
         }
         mg_pop_typed(mg, 1);
+
+        /* mg->stackmap's own ongoing simulated type for this local slot
+         * still reflects whatever was actually pushed by the handler-
+         * entry frame (java/lang/Throwable for a multi-catch - a safe
+         * blanket type valid for every alternative, separate from
+         * exc_type's own LUB computed above) after the ASTORE. Without
+         * re-typing it here, a LATER frame genesis records elsewhere in
+         * this same catch body (e.g. a nested try/catch's own handler
+         * entry, which correctly uses exc_type's real LUB) disagrees with
+         * what mg->stackmap would naturally derive by walking the
+         * bytecode from here - see the identical fix and its full
+         * explanation at the sibling multi-catch site in the main
+         * AST_TRY_STMT catch-clause loop below. */
+        if (mg->stackmap && exc_type->kind == TYPE_CLASS && exc_type->data.class_type.name) {
+            char *exc_local_internal = class_to_internal_name(exc_type->data.class_type.name);
+            stackmap_set_local_object(mg->stackmap, exc_slot, mg->cp, exc_local_internal);
+            free(exc_local_internal);
+        }
 
         uint16_t catch_start = (uint16_t)mg->code->length;
 
@@ -4892,9 +4964,20 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         type_node = type_node->next;
                     }
                     
-                    /* For multi-catch, use Throwable as the stackmap type.
+                    /* For multi-catch, prefer the LUB semantic analysis
+                     * already computed (catch_clause->sem_type) over a
+                     * blanket Throwable - see the identical fix and its
+                     * full explanation at the sibling multi-catch site in
+                     * the try-with-resources catch-clause codegen above.
                      * For single-catch, use the specific exception class. */
-                    const char *stackmap_exc_class = is_multi_catch ? "java/lang/Throwable" : first_exc_class;
+                    const char *stackmap_exc_class = first_exc_class;
+                    if (is_multi_catch) {
+                        stackmap_exc_class = "java/lang/Throwable";
+                        if (catch_clause->sem_type && catch_clause->sem_type->kind == TYPE_CLASS &&
+                            catch_clause->sem_type->data.class_type.name) {
+                            stackmap_exc_class = catch_clause->sem_type->data.class_type.name;
+                        }
+                    }
                     char *stackmap_exc_internal = class_to_internal_name(stackmap_exc_class);
                     
                     /* Record frame at exception handler (catch target)
@@ -4953,6 +5036,37 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         bc_emit_u1(mg->code, (uint8_t)catch_exc_slot);
                     }
                     mg_pop_typed(mg, 1);
+
+                    /* mg->stackmap's OWN handler-entry frame (recorded
+                     * above via mg_record_exception_handler_frame(),
+                     * called with stackmap_exc_class - deliberately
+                     * java/lang/Throwable for a multi-catch, a safe type
+                     * valid for every alternative, NOT the LUB used for
+                     * exc_type_t just above) is a completely separate
+                     * concept from mg->stackmap's ONGOING simulated state.
+                     * The ASTORE just above stored whatever type was
+                     * actually pushed onto that simulated stack (Throwable)
+                     * into this local slot - so unless corrected here, any
+                     * LATER frame genesis records in this same catch body
+                     * (e.g. a nested try/catch's own handler entry, which
+                     * correctly types this slot using exc_type_t's real
+                     * LUB) disagrees with what mg->stackmap would naturally
+                     * derive by walking the bytecode from here - the real
+                     * JVM verifier does exactly that walk, and rejects the
+                     * mismatch: VerifyError "Stack map does not match the
+                     * one at exception handler ... Type 'Throwable' ...
+                     * not assignable to 'Exception'". Confirmed against
+                     * gumdrop's own MessageIndex.save(), whose outer
+                     * "catch (IOException | RuntimeException e)" wraps a
+                     * try-with-resources followed by its own nested
+                     * "try { Files.deleteIfExists(tempPath); } catch
+                     * (IOException deleteFailed) { e.addSuppressed(...); }"
+                     * - exactly this shape. */
+                    if (mg->stackmap && exc_type_t->kind == TYPE_CLASS && exc_type_t->data.class_type.name) {
+                        char *exc_local_internal = class_to_internal_name(exc_type_t->data.class_type.name);
+                        stackmap_set_local_object(mg->stackmap, catch_exc_slot, mg->cp, exc_local_internal);
+                        free(exc_local_internal);
+                    }
 
                     uint16_t catch_start = (uint16_t)mg->code->length;
 

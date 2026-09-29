@@ -19,6 +19,15 @@
 #   SMOKE_ANT_VERBOSE  if set, run ant with -verbose (full log still tee'd)
 #   SMOKE_KEEP_WORKDIR if set, do not delete the temp directory on exit
 #
+# The work copy's <junit> tasks are patched to haltonfailure='no'
+# haltonerror='no' so one run always exercises every suite instead of
+# stopping at the first failure - this costs little extra time and gives
+# a full picture (which suites/error classes to prioritize) instead of
+# just the first blocker. The script itself still reports overall
+# success/failure based on the aggregated JUnit results, not Ant's own
+# exit code (which no longer reflects test failures once halt-on-* is
+# off).
+#
 # Usage: gumdrop-ant-test.sh
 
 set -e
@@ -121,7 +130,27 @@ patch_gumdrop_javac_tasks() {
     echo "Patched $patched <javac> task(s) to fork: $JAVAC_EXECUTABLE"
 }
 
-# javac emits enum-switch synthetics Outer$N; genesis does not.
+# By default gumdrop's own <junit> tasks stop at the first failing suite
+# (haltonfailure='yes' haltonerror='yes'), so a smoke run only ever shows
+# the single blocker in front of you. Disabling both in the work copy
+# lets every suite run every time - a small time cost that turns each
+# smoke run into a full picture of where the compiler still diverges from
+# javac, not just the nearest blocker.
+patch_gumdrop_junit_halt() {
+    repo=$1
+    perl -i -pe "s/haltonfailure='yes'/haltonfailure='no'/g; s/haltonerror='yes'/haltonerror='no'/g" "$repo/build.xml"
+    echo "Patched unit-test <junit> tasks to haltonfailure='no' haltonerror='no'"
+}
+
+# javac emits enum-switch synthetics Outer$N (a static int[] field named
+# $SwitchMap$<enum>); genesis does not. A bare Outer$1.class is NOT by
+# itself evidence of this - it's also the standard JVM name for Outer's
+# own first anonymous/local class, which BOTH compilers legitimately
+# emit (e.g. DnssecValidator's own anonymous Comparator<byte[]>), so the
+# fingerprint has to actually distinguish the two, not just check
+# Outer$1.class's existence - confirmed via strings on a real genesis-
+# compiled DnssecValidator$1.class (a real compare() method, not a
+# $SwitchMap$ field) after the earlier false positive this produced.
 verify_build_tree_is_genesis() {
     root=$1
     failed=0
@@ -134,11 +163,11 @@ verify_build_tree_is_genesis() {
             echo "  skip fingerprint (no $outer_rel)"
             return 0
         fi
-        if [ -f "$synthetic" ]; then
-            echo "  FAIL: $synthetic exists (typical of javac, not genesis)" >&2
+        if [ -f "$synthetic" ] && grep -aq 'SwitchMap' "$synthetic"; then
+            echo "  FAIL: $synthetic has a \$SwitchMap\$ field (typical of javac, not genesis)" >&2
             failed=1
         else
-            echo "  OK: $outer_rel without matching \$1 synthetic (genesis fingerprint)"
+            echo "  OK: $outer_rel without a javac enum-switch-map synthetic (genesis fingerprint)"
             ok=$((ok + 1))
         fi
     }
@@ -155,6 +184,61 @@ verify_build_tree_is_genesis() {
         return 1
     fi
     return 0
+}
+
+# With haltonfailure/haltonerror off, `ant test` itself exits 0 even when
+# JUnit suites failed - so the actual pass/fail signal has to come from
+# aggregating the JUnit result files ourselves, not Ant's exit code.
+# Prints a summary and the list of failing suites; sets
+# JUNIT_TOTAL_PROBLEMS (failures + errors, 0 if all suites passed) as a
+# side effect for the caller to check.
+summarize_junit_results() {
+    repo=$1
+    results_dir="$repo/test/junit/results"
+    JUNIT_TOTAL_PROBLEMS=0
+    if [ ! -d "$results_dir" ]; then
+        echo "warning: no JUnit results directory at $results_dir (did any test run?)" >&2
+        return 0
+    fi
+    total_suites=0
+    total_tests=0
+    total_failures=0
+    total_errors=0
+    failing_suites=""
+    for f in "$results_dir"/TEST-*.txt; do
+        [ -f "$f" ] || continue
+        line=$(grep -m1 '^Tests run:' "$f") || continue
+        run=$(echo "$line" | sed -E 's/.*Tests run: ([0-9]+).*/\1/')
+        fail=$(echo "$line" | sed -E 's/.*Failures: ([0-9]+).*/\1/')
+        err=$(echo "$line" | sed -E 's/.*Errors: ([0-9]+).*/\1/')
+        total_suites=$((total_suites + 1))
+        total_tests=$((total_tests + run))
+        total_failures=$((total_failures + fail))
+        total_errors=$((total_errors + err))
+        if [ "$fail" -gt 0 ] || [ "$err" -gt 0 ]; then
+            suite=$(basename "$f" .txt)
+            suite=${suite#TEST-}
+            failing_suites="$failing_suites $suite"
+        fi
+    done
+    n_failing=0
+    for s in $failing_suites; do n_failing=$((n_failing + 1)); done
+    echo ""
+    echo "---- JUnit summary ----"
+    echo "  Suites run:     $total_suites"
+    echo "  Tests run:      $total_tests"
+    echo "  Failures:       $total_failures"
+    echo "  Errors:         $total_errors"
+    echo "  Failing suites: $n_failing"
+    if [ "$n_failing" -gt 0 ]; then
+        echo ""
+        echo "  Failing suite list:"
+        for s in $failing_suites; do
+            echo "    - $s"
+        done
+    fi
+    echo "------------------------"
+    JUNIT_TOTAL_PROBLEMS=$((total_failures + total_errors))
 }
 
 count_forked_compiler_in_log() {
@@ -194,6 +278,7 @@ echo "Flow: clean removes build/, test compiles with forked genesis, then JUnit.
 : >"$ANT_LOG"
 
 patch_gumdrop_javac_tasks "$REPO"
+patch_gumdrop_junit_halt "$REPO"
 
 cd "$REPO"
 
@@ -203,14 +288,24 @@ run_ant "ant test (compile + JUnit)" test
 
 verify_build_tree_is_genesis "$REPO" || exit 1
 
+summarize_junit_results "$REPO"
+
 forks=$(count_forked_compiler_in_log "$ANT_LOG")
 echo ""
 echo "=============================================="
-echo "  SMOKE PASSED"
+if [ "$JUNIT_TOTAL_PROBLEMS" -eq 0 ]; then
+    echo "  SMOKE PASSED"
+else
+    echo "  SMOKE FAILED ($JUNIT_TOTAL_PROBLEMS JUnit failure/error(s) - see summary above)"
+fi
 echo "  Compile:  genesis forked from Ant ($JAVAC_EXECUTABLE)"
 if [ -n "$SMOKE_ANT_VERBOSE" ] && [ "$forks" -gt 0 ]; then
     echo "            ($forks compiler Executing line(s) in log)"
 fi
-echo "  Tests:    JUnit ant test on classes under build/"
+echo "  Tests:    JUnit ant test on classes under build/ (haltonfailure=no: every suite runs)"
 echo "  Full log: $ANT_LOG"
 echo "=============================================="
+
+if [ "$JUNIT_TOTAL_PROBLEMS" -ne 0 ]; then
+    exit 1
+fi

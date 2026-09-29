@@ -156,6 +156,23 @@ else
     failed=$((failed + 1))
 fi
 
+printf "%-30s ... " "MultiCatchExternalLibException"
+mc_lib="$TEST_BUILD/multicatch-ext-lib"
+mc_out="$TEST_BUILD/multicatch-ext-out"
+rm -rf "$mc_lib" "$mc_out"
+mkdir -p "$mc_lib" "$mc_out"
+if "$GENESIS" -d "$mc_lib" "$TEST_SRC"/external/lib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$mc_lib" -d "$mc_out" \
+       "$TEST_SRC/external/MultiCatchExternalLibExceptionTest.java" \
+       "$TEST_SRC/external/MultiCatchLocalException.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$mc_out:$mc_lib" MultiCatchExternalLibExceptionTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 printf "%-30s ... " "NestedGenericInterfaceBridge"
 if "$GENESIS" -cp "$ext_lib" -d "$ext_out" \
        "$TEST_SRC/external/NestedGenericInterfaceBridgeTest.java" >/dev/null 2>&1 &&

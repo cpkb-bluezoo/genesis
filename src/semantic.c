@@ -12453,6 +12453,25 @@ static void collect_ancestor_symbols(symbol_t *sym, slist_t **out)
         slist_append(*out, sym);
     }
     if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE) {
+        /* A classfile-loaded symbol (e.g. an external JAR type referenced
+         * only by name so far, like a multi-catch alternative that's
+         * never otherwise been assigned to/from) can still be a lazy
+         * stub at this point - completer set, superclass/interfaces both
+         * NULL - if nothing has forced it to resolve yet. Walking it as-
+         * is silently looks like "a class with no ancestors at all",
+         * making the search below find no shared ancestor even though
+         * every real class shares at least Object, and fall back to a
+         * caller-chosen default that's often too wide (e.g. Object) for
+         * what's actually needed. Force completion before reading either
+         * field. Confirmed against gumdrop's own GrpcClient: "catch
+         * (ProtoParseException | ProtobufParseException e)" - the second
+         * alternative is classfile-loaded from lib/jprotobuf-1.0.0.jar -
+         * left the multi-catch variable typed as Object, which isn't
+         * assignable to the actual fail(Exception) method's parameter,
+         * so overload resolution silently invented a nonexistent
+         * fail(Object) descriptor instead: NoSuchMethodError. */
+        symbol_complete(sym);
+
         /* Directly-implemented/extended interfaces first, THEN the
          * superclass chain - so a close, specific shared interface
          * (e.g. two sibling classes both implementing the same
@@ -12489,11 +12508,32 @@ static symbol_t *find_common_ancestor_symbol(symbol_t *a, symbol_t *b)
     collect_ancestor_symbols(a, &a_ancestors);
     collect_ancestor_symbols(b, &b_ancestors);
 
+    /* Compare by qualified name, not pointer identity: a classfile-loaded
+     * ancestor chain (symbol_from_classfile_minimal(), used for e.g. a
+     * multi-catch alternative loaded from an external JAR) allocates its
+     * OWN fresh symbol_t for java.lang.Exception/Throwable/Object as it
+     * walks up - a completely separate instance from whichever one the
+     * OTHER side's chain resolved to (via load_external_class() or the
+     * shared registry). Two symbol_t's for the same logical class are
+     * common throughout this codebase (see the identical lesson already
+     * documented at this function's caller in the conditional-expression
+     * type merge, "two separate resolutions... two distinct type_t
+     * objects with the same name") - pointer equality here made even the
+     * ultimate common ancestor every class shares, Object, never match,
+     * so a multi-catch pairing a source-compiled exception with a JAR-
+     * loaded one always fell through to this function's "no common
+     * ancestor" case instead of finding one. */
     symbol_t *result = NULL;
     for (slist_t *an = a_ancestors; an && !result; an = an->next) {
         symbol_t *candidate = (symbol_t *)an->data;
+        const char *candidate_name = candidate->qualified_name ? candidate->qualified_name : candidate->name;
+        if (!candidate_name) {
+            continue;
+        }
         for (slist_t *bn = b_ancestors; bn; bn = bn->next) {
-            if (bn->data == candidate) {
+            symbol_t *other = (symbol_t *)bn->data;
+            const char *other_name = other->qualified_name ? other->qualified_name : other->name;
+            if (other_name && strcmp(other_name, candidate_name) == 0) {
                 result = candidate;
                 break;
             }
@@ -19261,6 +19301,152 @@ static bool resolve_qualified_constant_case_value(semantic_t *sem, ast_node_t *f
     return false;
 }
 
+static bool resolve_named_int_constant(semantic_t *sem, const char *name, int32_t *out_value);
+
+/**
+ * Fully evaluate a switch case label's constant EXPRESSION to a single
+ * int, e.g. the "SEQUENCE & TAG_MASK" in "case SEQUENCE & TAG_MASK:" -
+ * folding the same operators codegen_stmt.c's own eval_int_constant_expr()
+ * does (unary +/-/~, binary shifts/bitwise/arithmetic, parentheses), but
+ * ALSO resolving a bare AST_IDENTIFIER operand to whichever named
+ * "static final int/char" constant it refers to (mutually recursive with
+ * resolve_named_int_constant() below, since that constant's own
+ * initializer can itself be a compound expression referencing FURTHER
+ * named constants - e.g. SEQUENCE's own initializer might be
+ * "CONSTRUCTED | 0x10"). Nothing else ever resolves a named-constant
+ * OPERAND inside a case label's expression tree (as opposed to the whole
+ * case label being just that one name, already handled separately below)
+ * - without this, "case SEQUENCE & TAG_MASK:" and "case SET & TAG_MASK:"
+ * both silently evaluated to 0 (identifiers this function had no case
+ * for), colliding on the same lookupswitch match value: ClassFormatError
+ * "Bad lookupswitch instruction" (JVMS 4.9.1 requires strictly
+ * increasing match values, so a duplicate is invalid by construction).
+ * Confirmed against gumdrop's own Asn1Type.getTagName(), exactly this
+ * shape.
+ */
+static bool eval_case_constant_operand(semantic_t *sem, ast_node_t *expr, int32_t *out)
+{
+    if (!expr || !out) {
+        return false;
+    }
+    if (expr->type == AST_LITERAL) {
+        if (expr->data.leaf.token_type == TOK_INTEGER_LITERAL) {
+            *out = (int32_t)expr->data.leaf.value.int_val;
+            return true;
+        }
+        if (expr->data.leaf.token_type == TOK_CHAR_LITERAL) {
+            const char *str = expr->data.leaf.value.str_val;
+            *out = (str && str[0]) ? (unsigned char)str[0] : 0;
+            return true;
+        }
+        return false;
+    }
+    if (expr->type == AST_IDENTIFIER) {
+        return resolve_named_int_constant(sem, expr->data.leaf.name, out);
+    }
+    if (expr->type == AST_FIELD_ACCESS) {
+        /* A qualified constant reference, e.g. "Other.EXTENSION_TYPE" -
+         * reachable not just as a case label's own top-level shape
+         * (already handled separately, transforming case_expr in place),
+         * but also as a named constant's OWN initializer, e.g.
+         * "static final int EXT_ENCRYPTED_CLIENT_HELLO =
+         * EncryptedClientHello.EXTENSION_TYPE;" referenced by a bare
+         * "case EXT_ENCRYPTED_CLIENT_HELLO:" - resolve_named_int_constant()
+         * below only looked at ITS init_expr's shape via this same
+         * function, so without this branch a constant declared this way
+         * silently resolved to nothing, defaulting its case label to 0
+         * (colliding with any OTHER case, e.g. a real "case 0:", that
+         * legitimately uses that value) exactly like the sibling
+         * named-constant-operand gap this function was added to fix.
+         * Confirmed against gumdrop's own
+         * HandshakeMessages.parseClientHelloExtension(), whose
+         * EXT_ENCRYPTED_CLIENT_HELLO is declared exactly this way and
+         * collided with the legitimate "EXT_SERVER_NAME = 0x0000". */
+        long long resolved = 0;
+        if (resolve_qualified_constant_case_value(sem, expr, &resolved)) {
+            *out = (int32_t)resolved;
+            return true;
+        }
+        return false;
+    }
+    if (expr->type == AST_PARENTHESIZED) {
+        return expr->data.node.children &&
+            eval_case_constant_operand(sem, (ast_node_t *)expr->data.node.children->data, out);
+    }
+    if (expr->type == AST_UNARY_EXPR) {
+        slist_t *children = expr->data.node.children;
+        int32_t operand;
+        if (!children || !eval_case_constant_operand(sem, (ast_node_t *)children->data, &operand)) {
+            return false;
+        }
+        switch (expr->data.node.op_token) {
+            case TOK_MINUS: *out = -operand; return true;
+            case TOK_PLUS:  *out = operand;  return true;
+            case TOK_TILDE: *out = ~operand; return true;
+            default: return false;
+        }
+    }
+    if (expr->type == AST_BINARY_EXPR) {
+        slist_t *children = expr->data.node.children;
+        if (!children || !children->next) {
+            return false;
+        }
+        int32_t l, r;
+        if (!eval_case_constant_operand(sem, (ast_node_t *)children->data, &l) ||
+            !eval_case_constant_operand(sem, (ast_node_t *)children->next->data, &r)) {
+            return false;
+        }
+        switch (expr->data.node.op_token) {
+            case TOK_LSHIFT:  *out = l << (r & 31); return true;
+            case TOK_RSHIFT:  *out = l >> (r & 31); return true;
+            case TOK_URSHIFT: *out = (int32_t)((uint32_t)l >> (r & 31)); return true;
+            case TOK_BITOR:   *out = l | r; return true;
+            case TOK_BITAND:  *out = l & r; return true;
+            case TOK_CARET:   *out = l ^ r; return true;
+            case TOK_PLUS:    *out = l + r; return true;
+            case TOK_MINUS:   *out = l - r; return true;
+            case TOK_STAR:    *out = l * r; return true;
+            default: return false;
+        }
+    }
+    return false;
+}
+
+/**
+ * Resolve a bare name to a "static final int/char" constant's own value
+ * (scope, then current class members, then implemented interfaces - the
+ * same lookup the top-level bare-identifier case-label branch below
+ * already does), evaluating its initializer via
+ * eval_case_constant_operand() above so a constant whose own initializer
+ * is itself a compound expression (not just a plain literal) still
+ * resolves correctly when referenced as an operand elsewhere.
+ */
+static bool resolve_named_int_constant(semantic_t *sem, const char *name, int32_t *out_value)
+{
+    if (!sem || !name || !out_value) {
+        return false;
+    }
+    symbol_t *sym = scope_lookup(sem->current_scope, name);
+    if (!sym && sem->current_class && sem->current_class->data.class_data.members) {
+        sym = scope_lookup_local(sem->current_class->data.class_data.members, name);
+    }
+    if (!sym && sem->current_class) {
+        slist_t *ifaces = sem->current_class->data.class_data.interfaces;
+        for (slist_t *i = ifaces; i && !sym; i = i->next) {
+            symbol_t *iface = (symbol_t *)i->data;
+            if (iface && iface->data.class_data.members) {
+                sym = scope_lookup_local(iface->data.class_data.members, name);
+            }
+        }
+    }
+    if (!sym || sym->kind != SYM_FIELD || !sym->ast || sym->ast->type != AST_VAR_DECLARATOR ||
+        !sym->ast->data.node.children) {
+        return false;
+    }
+    ast_node_t *init_expr = (ast_node_t *)sym->ast->data.node.children->data;
+    return eval_case_constant_operand(sem, init_expr, out_value);
+}
+
 /**
  * Resolve superclass and interface references for all classes.
  * This runs after pass1 so all class symbols are registered,
@@ -21142,42 +21328,23 @@ define_local_var:
                                                      * match value per case, and for a plain (non-enum)
                                                      * switch over int/char/byte/short, nothing else
                                                      * ever resolves a named "static final int FOO = n;"
-                                                     * case label back to its value n. Handles the common
-                                                     * case of a simple literal initializer directly;
-                                                     * a more complex constant expression (e.g. "= 2 + 2")
-                                                     * isn't evaluated here, matching this file's existing
-                                                     * scope elsewhere of handling the concrete case that's
-                                                     * actually needed rather than a general constant-
-                                                     * folding evaluator. */
+                                                     * case label back to its value n.
+                                                     * eval_case_constant_operand() handles a simple
+                                                     * literal initializer directly, as well as a
+                                                     * compound expression (e.g. "= CONSTRUCTED | 0x10")
+                                                     * or a qualified reference to ANOTHER class's own
+                                                     * constant (e.g. "= Other.EXTENSION_TYPE:", matching
+                                                     * gumdrop's own HandshakeMessages.
+                                                     * EXT_ENCRYPTED_CLIENT_HELLO) - a bare literal
+                                                     * initializer used to be handled inline right here
+                                                     * instead, missing both of those. */
                                                     if (sym->ast && sym->ast->type == AST_VAR_DECLARATOR &&
                                                         sym->ast->data.node.children) {
                                                         ast_node_t *init_expr =
                                                             (ast_node_t *)sym->ast->data.node.children->data;
-                                                        /* A plain integer literal initializer is handled
-                                                         * directly here, as is a char literal one (e.g.
-                                                         * "private static final byte TAG_A = 'a';",
-                                                         * matching gumdrop's own AMQP FieldTable tag
-                                                         * constants) - a switch selector can only be
-                                                         * char/byte/short/int (or their boxed forms) to
-                                                         * begin with, so those are the only literal kinds
-                                                         * actually reachable for a valid case label's
-                                                         * constant. A char literal's own value isn't
-                                                         * stored in this leaf's int_val - it's the
-                                                         * character stored as a string in str_val -
-                                                         * so it needs its own decoding, matching the
-                                                         * existing TOK_CHAR_LITERAL handling already used
-                                                         * elsewhere in this file for the same reason
-                                                         * (narrowing-constant-allowed's own literal
-                                                         * decoding, ~line 2098). */
-                                                        if (init_expr && init_expr->type == AST_LITERAL &&
-                                                            init_expr->data.leaf.token_type == TOK_INTEGER_LITERAL) {
-                                                            case_expr->data.leaf.value.int_val =
-                                                                init_expr->data.leaf.value.int_val;
-                                                        } else if (init_expr && init_expr->type == AST_LITERAL &&
-                                                                   init_expr->data.leaf.token_type == TOK_CHAR_LITERAL) {
-                                                            const char *str = init_expr->data.leaf.value.str_val;
-                                                            case_expr->data.leaf.value.int_val =
-                                                                (str && str[0]) ? (unsigned char)str[0] : 0;
+                                                        int32_t resolved_value;
+                                                        if (eval_case_constant_operand(sem, init_expr, &resolved_value)) {
+                                                            case_expr->data.leaf.value.int_val = resolved_value;
                                                         }
                                                     }
                                                 }
@@ -21243,6 +21410,24 @@ define_local_var:
                                                     case_expr->data.leaf.name = NULL;
                                                     case_expr->data.leaf.token_type = TOK_INTEGER_LITERAL;
                                                     case_expr->data.leaf.value.int_val = (int32_t)resolved_value;
+                                                }
+                                            } else if (case_expr &&
+                                                       (case_expr->type == AST_BINARY_EXPR ||
+                                                        case_expr->type == AST_UNARY_EXPR ||
+                                                        case_expr->type == AST_PARENTHESIZED)) {
+                                                /* A constant EXPRESSION combining named
+                                                 * constants, e.g. "case SEQUENCE & TAG_MASK:"
+                                                 * - see eval_case_constant_operand()'s own
+                                                 * doc comment. Transform in place into a
+                                                 * plain AST_LITERAL, matching the
+                                                 * AST_FIELD_ACCESS/AST_CAST_EXPR branches
+                                                 * just above. */
+                                                int32_t resolved_value = 0;
+                                                if (eval_case_constant_operand(sem, case_expr, &resolved_value)) {
+                                                    case_expr->type = AST_LITERAL;
+                                                    case_expr->data.leaf.name = NULL;
+                                                    case_expr->data.leaf.token_type = TOK_INTEGER_LITERAL;
+                                                    case_expr->data.leaf.value.int_val = resolved_value;
                                                 }
                                             }
                                         }
