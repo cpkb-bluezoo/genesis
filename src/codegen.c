@@ -410,7 +410,9 @@ static loop_context_t *loop_context_new(size_t continue_target, const char *labe
     }
     ctx->continue_target = continue_target;
     ctx->break_offsets = NULL;
+    ctx->continue_offsets = NULL;
     ctx->label = label;
+    ctx->finally_depth = 0;
     return ctx;
 }
 
@@ -419,8 +421,18 @@ static void loop_context_free(loop_context_t *ctx)
     if (!ctx) {
         return;
     }
-    /* Free break_offsets list (just the nodes, data is size_t cast to void*) */
+    /* Free break_offsets/continue_offsets lists (just the nodes, data is
+     * size_t cast to void*). continue_offsets should already be empty by
+     * the time a loop context is popped (every construct that pushes one
+     * also calls mg_patch_continue_offsets() before popping), but free it
+     * defensively in case of an early error-path return. */
     slist_t *node = ctx->break_offsets;
+    while (node) {
+        slist_t *next = node->next;
+        free(node);
+        node = next;
+    }
+    node = ctx->continue_offsets;
     while (node) {
         slist_t *next = node->next;
         free(node);
@@ -433,6 +445,7 @@ void mg_push_loop(method_gen_t *mg, size_t continue_target, const char *label)
 {
     loop_context_t *ctx = loop_context_new(continue_target, label);
     if (ctx) {
+        ctx->finally_depth = slist_length(mg->finally_stack);
         mg->loop_stack = slist_prepend(mg->loop_stack, ctx);
     }
 }
@@ -491,6 +504,54 @@ void mg_add_break_to_context(loop_context_t *ctx, size_t break_pos)
         return;
     }
     ctx->break_offsets = slist_prepend(ctx->break_offsets, (void *)(uintptr_t)break_pos);
+}
+
+/**
+ * Add a continue position to a specific loop context (for later
+ * backpatching once the loop's real continue target is known).
+ */
+void mg_add_continue_to_context(loop_context_t *ctx, size_t continue_pos)
+{
+    if (!ctx) {
+        return;
+    }
+    ctx->continue_offsets = slist_prepend(ctx->continue_offsets, (void *)(uintptr_t)continue_pos);
+}
+
+/**
+ * Finalize a loop context's real continue target and patch every
+ * pending continue `goto` recorded against it to jump there - see
+ * mg_add_continue_to_context()'s comment for why this deferred-patch
+ * scheme is needed (a for-loop/do-while/array-based enhanced-for's real
+ * continue target, the update or condition-recheck point after the
+ * body, is only known once the body has been fully generated, but a
+ * `continue` statement partway through that body must already have
+ * emitted its own `goto` by then).
+ */
+void mg_patch_continue_offsets(method_gen_t *mg, loop_context_t *ctx,
+                                size_t continue_target)
+{
+    if (!ctx) {
+        return;
+    }
+    ctx->continue_target = continue_target;
+    slist_t *node = ctx->continue_offsets;
+    while (node) {
+        size_t pos = (size_t)(uintptr_t)node->data;
+        int16_t offset = (int16_t)(continue_target - pos);
+        mg->code->code[pos + 1] = (offset >> 8) & 0xFF;
+        mg->code->code[pos + 2] = offset & 0xFF;
+        node = node->next;
+    }
+    /* Consumed - free the list so loop_context_free()'s own defensive
+     * cleanup doesn't see stale (already-patched) entries. */
+    node = ctx->continue_offsets;
+    while (node) {
+        slist_t *next = node->next;
+        free(node);
+        node = next;
+    }
+    ctx->continue_offsets = NULL;
 }
 
 /**
@@ -1971,8 +2032,41 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
         /* Set up class info */
         /* Note: ACC_STATIC is only valid in InnerClasses attribute, not in class access_flags
          * Convert MOD_ flags to ACC_ flags (they have different values!) */
-        cg->access_flags = mods_to_access_flags(class_sym->modifiers) & ~ACC_STATIC;
-        
+        /* JLS 9.5: a member type (class, interface, enum, record) of an
+         * interface is implicitly public and static, regardless of what
+         * the source actually wrote - unlike a member of a CLASS, which
+         * stays package-private/non-static/etc. unless explicitly
+         * marked. Two separate, confirmed consequences of NOT treating
+         * it that way: (1) this class's own compiled .class file is
+         * what the JVM's real access-control check at link time
+         * consults (not the InnerClasses attribute, which is
+         * informational only, read by Class.getModifiers()/reflection)
+         * - leaving ACC_PUBLIC off here for a member class of an
+         * interface with no explicit modifier produced "IllegalAccess
+         * Error: failed to access class ..." the moment code outside
+         * the declaring package referenced it, even though such a
+         * reference is perfectly legal Java; (2) NOT implicitly static
+         * made the "is this an inner (non-static) class needing an
+         * outer-this reference" check below wrongly add a synthetic
+         * this$0 field and constructor parameter for a member class of
+         * an interface - which makes no sense in the first place
+         * (there's no interface "instance" to capture) and produced
+         * "NoSuchMethodError" for the constructor everywhere it's
+         * actually called with the ordinary (no-outer-instance) args a
+         * caller would legally use. Confirmed against gumdrop's own
+         * FtpFileSystem (an interface) declaring "class
+         * DirectoryChangeResult { ... }" with no modifiers, used from
+         * BasicFTPFileSystem (implements FtpFileSystem, but that
+         * doesn't matter here - implicit public/static applies
+         * regardless of who's calling). */
+        bool is_interface_member_type = class_sym->data.class_data.enclosing_class &&
+            class_sym->data.class_data.enclosing_class->kind == SYM_INTERFACE;
+        uint16_t effective_mods = class_sym->modifiers;
+        if (is_interface_member_type) {
+            effective_mods |= MOD_PUBLIC | MOD_STATIC;
+        }
+        cg->access_flags = mods_to_access_flags(effective_mods) & ~ACC_STATIC;
+
         /* Check if this is an interface or annotation */
         bool is_interface = (class_sym->kind == SYM_INTERFACE);
         bool is_annotation = (class_sym->kind == SYM_ANNOTATION);
@@ -2032,14 +2126,16 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
         }
         
         /* Check if this is an inner class (non-static nested class)
-         * Note: Interfaces and annotations are implicitly static, so they can't be inner classes
+         * Note: Interfaces and annotations are implicitly static, so they can't be inner classes.
+         * Likewise a member type of an ENCLOSING interface (is_interface_member_type,
+         * computed above) is implicitly static too, per JLS 9.5 - see its own comment.
          * Also: Local classes defined in static methods don't have an outer instance */
         symbol_t *enclosing = class_sym->data.class_data.enclosing_class;
         bool is_local_in_static_method = class_sym->data.class_data.is_local_class &&
                                           class_sym->data.class_data.enclosing_method &&
                                           (class_sym->data.class_data.enclosing_method->modifiers & MOD_STATIC);
         if (enclosing && !(class_sym->modifiers & MOD_STATIC) && !is_interface && !is_annotation &&
-            !is_local_in_static_method) {
+            !is_interface_member_type && !is_local_in_static_method) {
             cg->is_inner_class = true;
             cg->outer_class_internal = class_to_internal_name(enclosing->qualified_name);
             
@@ -3084,6 +3180,32 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                 slist_t *pchildren = child->data.node.children;
                 if (pchildren) {
                     char *param_desc = ast_type_to_descriptor((ast_node_t *)pchildren->data);
+                    /* A varargs parameter's own AST type node is its
+                     * *element* type (T in "T... name") - JLS 8.4.1
+                     * treats the parameter's real type as T[], exactly
+                     * like the local-slot allocation logic a bit above
+                     * this function already does for the same AST shape
+                     * (search MOD_VARARGS). This constructor-descriptor
+                     * loop builds straight from the AST instead of
+                     * going through a symbol's already-array-wrapped
+                     * type (the non-constructor branch just below uses
+                     * method_to_descriptor(method_sym), which does),
+                     * so it independently needs the same array-wrapping
+                     * here or a varargs constructor's own descriptor
+                     * ends up one dimension too narrow - e.g.
+                     * "(Ljava/lang/String;)V" instead of
+                     * "([Ljava/lang/String;)V", which the JVM verifier
+                     * then rejects as "Bad type on operand stack" the
+                     * moment the constructor body passes that parameter
+                     * to anything expecting an actual array (such as
+                     * Arrays.asList(T...)). */
+                    if (child->data.node.flags & MOD_VARARGS) {
+                        string_t *arr_desc = string_new("[");
+                        string_append(arr_desc, param_desc);
+                        free(param_desc);
+                        param_desc = strdup(arr_desc->str);
+                        string_free(arr_desc, true);
+                    }
                     string_append(desc, param_desc);
                     free(param_desc);
                 }
@@ -3548,10 +3670,48 @@ static void generate_superclass_bridges(class_gen_t *cg)
 }
 
 /**
+ * True if candidate_params could be a valid override/implementation of
+ * iface_params: same count, and at each position either the interface's
+ * own parameter is a bare type variable (any concrete candidate type is a
+ * valid instantiation) or the two parameter types have identical erased
+ * descriptors. See generate_interface_bridges()'s own "Find the
+ * implementation" comment for why this - rather than a flat descriptor-
+ * string comparison of the whole parameter list - is needed here.
+ */
+static bool interface_impl_params_match(slist_t *iface_params, slist_t *candidate_params)
+{
+    slist_t *ip = iface_params;
+    slist_t *cp = candidate_params;
+    while (ip && cp) {
+        symbol_t *iparam = (symbol_t *)ip->data;
+        symbol_t *cparam = (symbol_t *)cp->data;
+        if (iparam && iparam->type && iparam->type->kind == TYPE_TYPEVAR) {
+            /* Any concrete candidate type is a valid instantiation. */
+        } else if (iparam && iparam->type && cparam && cparam->type) {
+            char *idesc = type_to_descriptor(iparam->type);
+            char *cdesc = type_to_descriptor(cparam->type);
+            bool match = idesc && cdesc && strcmp(idesc, cdesc) == 0;
+            free(idesc);
+            free(cdesc);
+            if (!match) {
+                return false;
+            }
+        } else if ((iparam && iparam->type) != (cparam && cparam->type)) {
+            /* One side has a resolved type and the other doesn't - can't
+             * confirm a match. */
+            return false;
+        }
+        ip = ip->next;
+        cp = cp->next;
+    }
+    return !ip && !cp;
+}
+
+/**
  * Generate bridge methods for generic interface implementations.
  * When a class implements Comparator<WebFragment> with compare(WebFragment, WebFragment),
  * we need a bridge method compare(Object, Object) that casts and delegates.
- * 
+ *
  * Also generates bridges for interface methods inherited through abstract superclasses.
  */
 static void generate_interface_bridges(class_gen_t *cg)
@@ -3592,28 +3752,39 @@ static void generate_interface_bridges(class_gen_t *cg)
                     continue;
                 }
                 
-                /* Check if method has type variable parameters or return type */
-                bool has_type_var = false;
                 slist_t *params = iface_method->data.method_data.parameters;
-                
-                for (slist_t *p = params; p && !has_type_var; p = p->next) {
-                    symbol_t *param = (symbol_t *)p->data;
-                    if (param && param->type && param->type->kind == TYPE_TYPEVAR) {
-                        has_type_var = true;
-                    }
-                }
-                if (iface_method->type && iface_method->type->kind == TYPE_TYPEVAR) {
-                    has_type_var = true;
-                }
-                
-                if (!has_type_var) {
-                    entry = entry->next;
-                    continue;
-                }
-                
-                /* Find the implementation in the current class (with concrete types) */
+
+                /* Find the implementation in the current class (with concrete types).
+                 * Matching implementation candidates by name + parameter COUNT
+                 * alone (as this used to do) picks the WRONG overload whenever a
+                 * class declares more than one same-arity, same-named method -
+                 * e.g. java.nio.file.Path declares BOTH "Path resolve(String)"
+                 * and "Path resolve(Path)", both 1 parameter. A generated
+                 * bridge for one calling the OTHER's real implementation emits
+                 * a checkcast to the wrong type, throwing ClassCastException at
+                 * runtime for perfectly valid calls (confirmed against
+                 * gumdrop's own in-tree
+                 * org.bluezoo.gumdrop.testsupport.memfs.MemoryPath, which
+                 * covariantly overrides both). Per JLS, overriding (unlike
+                 * overloading) requires each parameter's type to match the
+                 * interface method's own erased parameter type EXACTLY - only
+                 * the return type may be covariant - so match position-by-
+                 * position against the interface method's own parameters via
+                 * interface_impl_params_match() below (mirroring the
+                 * equivalent, already-fixed superclass-side collision in
+                 * generate_covariant_override_bridges(), fixed earlier this
+                 * session for java.nio.file.spi.FileSystemProvider's own two
+                 * same-arity readAttributes() overloads) rather than a flat
+                 * descriptor-string comparison: unlike the superclass case,
+                 * an interface method parameter may itself be a bare type
+                 * variable (e.g. "<T> T get(int)"), which must accept ANY
+                 * concrete implementation parameter type at that position -
+                 * a flat string compare would wrongly reject every generic
+                 * override as "not a match" (an erased type variable's own
+                 * descriptor, e.g. "Ljava/lang/Object;", essentially never
+                 * equals the implementation's real, concrete parameter type). */
                 symbol_t *impl_method = NULL;
-                if (class_sym->data.class_data.members && 
+                if (class_sym->data.class_data.members &&
                     class_sym->data.class_data.members->symbols) {
                     hashtable_t *class_ht = class_sym->data.class_data.members->symbols;
                     for (size_t j = 0; j < class_ht->size && !impl_method; j++) {
@@ -3623,27 +3794,20 @@ static void generate_interface_bridges(class_gen_t *cg)
                             if (class_method && class_method->kind == SYM_METHOD &&
                                 class_method->name && iface_method->name &&
                                 strcmp(class_method->name, iface_method->name) == 0 &&
-                                !(class_method->modifiers & MOD_STATIC)) {
-                                /* Check parameter count matches */
-                                int class_count = 0, iface_count = 0;
-                                for (slist_t *cp = class_method->data.method_data.parameters; cp; cp = cp->next)
-                                    class_count++;
-                                for (slist_t *ip = params; ip; ip = ip->next)
-                                    iface_count++;
-                                if (class_count == iface_count) {
-                                    impl_method = class_method;
-                                }
+                                !(class_method->modifiers & MOD_STATIC) &&
+                                interface_impl_params_match(params, class_method->data.method_data.parameters)) {
+                                impl_method = class_method;
                             }
                             class_entry = class_entry->next;
                         }
                     }
                 }
-                
+
                 /* Also check superclass chain for implementation */
                 if (!impl_method) {
                     symbol_t *super = class_sym->data.class_data.superclass;
                     while (super && !impl_method) {
-                        if (super->data.class_data.members && 
+                        if (super->data.class_data.members &&
                             super->data.class_data.members->symbols) {
                             hashtable_t *super_ht = super->data.class_data.members->symbols;
                             for (size_t j = 0; j < super_ht->size && !impl_method; j++) {
@@ -3654,15 +3818,9 @@ static void generate_interface_bridges(class_gen_t *cg)
                                         super_method->name && iface_method->name &&
                                         strcmp(super_method->name, iface_method->name) == 0 &&
                                         !(super_method->modifiers & MOD_STATIC) &&
-                                        !(super_method->modifiers & MOD_PRIVATE)) {
-                                        int super_count = 0, iface_count = 0;
-                                        for (slist_t *sp = super_method->data.method_data.parameters; sp; sp = sp->next)
-                                            super_count++;
-                                        for (slist_t *ip = params; ip; ip = ip->next)
-                                            iface_count++;
-                                        if (super_count == iface_count) {
-                                            impl_method = super_method;
-                                        }
+                                        !(super_method->modifiers & MOD_PRIVATE) &&
+                                        interface_impl_params_match(params, super_method->data.method_data.parameters)) {
+                                        impl_method = super_method;
                                     }
                                     super_entry = super_entry->next;
                                 }
@@ -3671,7 +3829,7 @@ static void generate_interface_bridges(class_gen_t *cg)
                         super = super->data.class_data.superclass;
                     }
                 }
-                
+
                 if (!impl_method) {
                     entry = entry->next;
                     continue;
@@ -3692,6 +3850,30 @@ static void generate_interface_bridges(class_gen_t *cg)
                     continue;
                 }
                 
+                /* An interface method's own return type is often never
+                 * resolved at all (iface_method->type stays NULL) - nothing
+                 * before this function ever needed it, since an interface's
+                 * OWN abstract methods have no body to codegen. Left
+                 * unresolved, the "else" branch just below would silently
+                 * treat it as void ("V"), producing a bridge whose OWN
+                 * declared descriptor says void while its body (built from
+                 * impl_method's real, resolved type a few lines down) still
+                 * emits e.g. IRETURN - a self-contradictory method
+                 * (VerifyError: "Method does not expect a return value").
+                 * Force it via the same semantic_resolve_type() used when a
+                 * method is first registered (see e.g. the "method_sym->type
+                 * = semantic_resolve_type(sem, ...->data.node.extra)" call
+                 * sites in semantic.c - the return-type AST node lives in a
+                 * method declaration's own .data.node.extra), same as
+                 * several earlier fixes this session forcing a lazily-
+                 * unresolved type on first genuine use. */
+                if (!iface_method->type && iface_method->ast &&
+                    iface_method->ast->type == AST_METHOD_DECL &&
+                    iface_method->ast->data.node.extra && cg->sem) {
+                    iface_method->type = semantic_resolve_type(cg->sem,
+                        (ast_node_t *)iface_method->ast->data.node.extra);
+                }
+
                 /* Check if we already have a bridge with the erased signature.
                  * type_to_descriptor() already erases TYPE_TYPEVAR to its
                  * bound (or Object if unbounded) - do not hardcode Object
@@ -3715,7 +3897,52 @@ static void generate_interface_bridges(class_gen_t *cg)
                 } else {
                     string_append(erased_desc, "V");
                 }
-                
+
+                /* If the implementation's own descriptor already matches the
+                 * interface method's erased one exactly, the implementation
+                 * itself IS already the correct entry point - no bridge
+                 * needed. This is what the old has_type_var-only gate above
+                 * used to shortcut (skipping entirely whenever neither the
+                 * interface method's params nor its return type were a bare
+                 * type variable) - but a PLAIN COVARIANT RETURN override
+                 * (e.g. interface "Delivery send(byte[], String)" implemented
+                 * as "DeliveryImpl send(byte[], String)", no generics
+                 * involved at all) also needs a bridge: the JVM only
+                 * recognizes an implementation as satisfying an interface
+                 * method when their descriptors match EXACTLY, and without a
+                 * bridge here the interface method has no concrete entry
+                 * point at all (java.lang.AbstractMethodError at the call
+                 * site, matching gumdrop's own Amqp1Sender.send()/
+                 * startDelivery() implemented by SenderImpl with a
+                 * covariant OutgoingDeliveryImpl return type). Comparing
+                 * full descriptors here (rather than re-deriving a separate
+                 * "needs bridge" boolean from scratch) covers both cases
+                 * uniformly. */
+                string_t *impl_own_desc = string_new("(");
+                for (slist_t *p = impl_method->data.method_data.parameters; p; p = p->next) {
+                    symbol_t *param = (symbol_t *)p->data;
+                    if (param && param->type) {
+                        char *pdesc = type_to_descriptor(param->type);
+                        string_append(impl_own_desc, pdesc);
+                        free(pdesc);
+                    }
+                }
+                string_append(impl_own_desc, ")");
+                if (impl_method->type) {
+                    char *rdesc = type_to_descriptor(impl_method->type);
+                    string_append(impl_own_desc, rdesc);
+                    free(rdesc);
+                } else {
+                    string_append(impl_own_desc, "V");
+                }
+                if (strcmp(erased_desc->str, impl_own_desc->str) == 0) {
+                    string_free(erased_desc, true);
+                    string_free(impl_own_desc, true);
+                    entry = entry->next;
+                    continue;
+                }
+                string_free(impl_own_desc, true);
+
                 /* Check if we already have this method (don't duplicate) */
                 bool already_has_bridge = false;
                 for (slist_t *m = cg->methods; m && !already_has_bridge; m = m->next) {
@@ -3803,16 +4030,60 @@ static void generate_interface_bridges(class_gen_t *cg)
                 while (iface_param && impl_param) {
                     symbol_t *iparam = (symbol_t *)iface_param->data;
                     symbol_t *cparam = (symbol_t *)impl_param->data;
-                    
-                    /* Load parameter */
-                    if (slot <= 3) {
-                        bc_emit(code, OP_ALOAD_0 + slot);
-                    } else {
-                        bc_emit(code, OP_ALOAD);
-                        bc_emit_u1(code, slot);
+
+                    /* Load parameter. The bridge's own descriptor is the
+                     * interface method's erased one, so the local slot's
+                     * actual type (and hence the correct load opcode/width)
+                     * is the interface parameter's type, not the
+                     * implementation's - a bare type variable erases to a
+                     * reference (aload) same as TYPE_CLASS/TYPE_ARRAY.
+                     * Mirrors the equivalent, already-correct switch in
+                     * generate_superclass_bridges() above; without this,
+                     * every primitive/wide interface parameter (e.g. a
+                     * "boolean" or "long") was wrongly ALOAD'd as if it were
+                     * a reference (VerifyError: "Bad local variable type"),
+                     * confirmed against gumdrop's own Amqp1Sender.
+                     * startDelivery(byte[], MessageHeader, MessageProperties,
+                     * Map, boolean). */
+                    type_kind_t iparam_kind = TYPE_CLASS;
+                    if (iparam && iparam->type && iparam->type->kind != TYPE_TYPEVAR) {
+                        iparam_kind = iparam->type->kind;
                     }
-                    max_stack++;
-                    
+                    int slot_width = 1;
+                    switch (iparam_kind) {
+                        case TYPE_LONG:
+                            bc_emit(code, slot <= 3 ? OP_LLOAD_0 + slot : OP_LLOAD);
+                            if (slot > 3) bc_emit_u1(code, slot);
+                            max_stack += 2;
+                            slot_width = 2;
+                            break;
+                        case TYPE_DOUBLE:
+                            bc_emit(code, slot <= 3 ? OP_DLOAD_0 + slot : OP_DLOAD);
+                            if (slot > 3) bc_emit_u1(code, slot);
+                            max_stack += 2;
+                            slot_width = 2;
+                            break;
+                        case TYPE_FLOAT:
+                            bc_emit(code, slot <= 3 ? OP_FLOAD_0 + slot : OP_FLOAD);
+                            if (slot > 3) bc_emit_u1(code, slot);
+                            max_stack++;
+                            break;
+                        case TYPE_BOOLEAN:
+                        case TYPE_BYTE:
+                        case TYPE_CHAR:
+                        case TYPE_SHORT:
+                        case TYPE_INT:
+                            bc_emit(code, slot <= 3 ? OP_ILOAD_0 + slot : OP_ILOAD);
+                            if (slot > 3) bc_emit_u1(code, slot);
+                            max_stack++;
+                            break;
+                        default:  /* CLASS, ARRAY, TYPEVAR -> aload */
+                            bc_emit(code, slot <= 3 ? OP_ALOAD_0 + slot : OP_ALOAD);
+                            if (slot > 3) bc_emit_u1(code, slot);
+                            max_stack++;
+                            break;
+                    }
+
                     /* If interface param is type var but impl param is concrete, cast */
                     if (iparam && iparam->type && iparam->type->kind == TYPE_TYPEVAR &&
                         cparam && cparam->type && cparam->type->kind == TYPE_CLASS) {
@@ -3828,10 +4099,34 @@ static void generate_interface_bridges(class_gen_t *cg)
                             bc_emit_u2(code, cast_class);
                             free(internal);
                         }
+                    } else if (iparam && iparam->type && iparam->type->kind == TYPE_TYPEVAR &&
+                               cparam && cparam->type && cparam->type->kind == TYPE_ARRAY) {
+                        /* Same erasure gap as just above, for an ARRAY-typed
+                         * type variable instantiation (e.g.
+                         * "Comparator<byte[]>" - erased param is Object,
+                         * concrete implementation param is "byte[]").
+                         * Missing this left the bridge's Object argument
+                         * uncast before its real method call, confirmed
+                         * against gumdrop's own DnssecValidator, whose
+                         * anonymous Comparator<byte[]> bridge's
+                         * compare(Object, Object) call passed an
+                         * uncast Object straight into
+                         * compare([B, [B) (VerifyError: "Bad type on
+                         * operand stack", Object not assignable to [B).
+                         * JVMS 4.4.1: an array type's own CHECKCAST class
+                         * constant is its full descriptor (e.g. "[B"), not
+                         * an unwrapped internal name - mirrors the
+                         * already-correct array CHECKCAST convention used
+                         * elsewhere in this same function. */
+                        char *array_desc = type_to_descriptor(cparam->type);
+                        uint16_t cast_class = cp_add_class(cg->cp, array_desc);
+                        bc_emit(code, OP_CHECKCAST);
+                        bc_emit_u2(code, cast_class);
+                        free(array_desc);
                     }
-                    
-                    slot++;
-                    max_locals++;
+
+                    slot += slot_width;
+                    max_locals += slot_width;
                     iface_param = iface_param->next;
                     impl_param = impl_param->next;
                 }
@@ -4795,7 +5090,40 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 }
             }
         }
-        
+
+        /* An anonymous class instantiated as "new SuperClass(args) { ... }"
+         * must forward those explicit args to SuperClass's own constructor
+         * - appended after any captured variables, matching real javac's
+         * own synthesized-constructor parameter order (confirmed by
+         * compiling an equivalent example with the real javac and
+         * inspecting the result: outer instance, then captures, then the
+         * explicit super-constructor args last, loaded right before the
+         * invokespecial to super() in the generated body below).
+         * semantic.c already collects these onto
+         * anon_sym->data.class_data.super_ctor_args when the anonymous
+         * class is parsed - previously computed but never consumed here,
+         * so an anonymous class extending a superclass with no no-arg
+         * constructor (e.g. gumdrop's own Meter.counterBuilder(), whose
+         * "new LongCounter.Builder(name) { ... }" extends a class whose
+         * only constructor takes a String) got a synthesized constructor
+         * that silently dropped the explicit argument entirely and called
+         * a nonexistent no-arg super() (NoSuchMethodError at the actual
+         * call site, which correctly passed the argument - only the
+         * callee's own signature was wrong). */
+        slist_t *super_ctor_args = (cg->is_anonymous_class && cg->class_sym) ?
+            cg->class_sym->data.class_data.super_ctor_args : NULL;
+        if (super_ctor_args) {
+            for (slist_t *a = super_ctor_args; a; a = a->next) {
+                ast_node_t *arg = (ast_node_t *)a->data;
+                type_t *arg_type = arg->sem_type ? arg->sem_type : get_expression_type(cg->sem, arg);
+                if (arg_type) {
+                    char *arg_desc = type_to_descriptor(arg_type);
+                    string_append(desc, arg_desc);
+                    free(arg_desc);
+                }
+            }
+        }
+
         string_append(desc, ")V");
         init->descriptor_index = cp_add_utf8(cg->cp, desc->str);
         string_free(desc, true);
@@ -4861,14 +5189,28 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             for (slist_t *cap = cg->captured_vars; cap; cap = cap->next) {
                 symbol_t *var_sym = (symbol_t *)cap->data;
                 if (var_sym && var_sym->type) {
-                    int size = (var_sym->type->kind == TYPE_LONG || 
+                    int size = (var_sym->type->kind == TYPE_LONG ||
                                var_sym->type->kind == TYPE_DOUBLE) ? 2 : 1;
                     mg->next_slot += size;
                     mg->max_locals = mg->next_slot;
                 }
             }
         }
-        
+
+        /* Account for explicit super-constructor args (see the matching
+         * descriptor-building comment above) - appended after captured
+         * variables, so their own parameter slots start right here. */
+        uint16_t super_ctor_args_start_slot = mg->next_slot;
+        if (super_ctor_args) {
+            for (slist_t *a = super_ctor_args; a; a = a->next) {
+                ast_node_t *arg = (ast_node_t *)a->data;
+                type_t *arg_type = arg->sem_type ? arg->sem_type : get_expression_type(cg->sem, arg);
+                int size = (arg_type && (arg_type->kind == TYPE_LONG || arg_type->kind == TYPE_DOUBLE)) ? 2 : 1;
+                mg->next_slot += size;
+                mg->max_locals = mg->next_slot;
+            }
+        }
+
         /* Record 'this' in LocalVariableTable (slot 0) */
         if (cg->internal_name) {
             char *this_desc = calloc(1, strlen(cg->internal_name) + 3);
@@ -5109,12 +5451,75 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             if (mg->stackmap && cg->internal_name) {
                 stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
             }
+        } else if (super_ctor_args) {
+            /* Forward this anonymous class's own explicit super-
+             * constructor args (see the matching descriptor-building and
+             * slot-accounting comments above) - load each one from its
+             * own parameter slot (starting right after any captured
+             * variables) and invoke the superclass constructor with the
+             * descriptor those argument types actually build, instead of
+             * the plain always-"()V" call this branch used unconditionally
+             * before. */
+            string_t *super_desc = string_new("(");
+            uint16_t arg_slot = super_ctor_args_start_slot;
+            int explicit_arg_count = 0;
+            for (slist_t *a = super_ctor_args; a; a = a->next) {
+                ast_node_t *arg = (ast_node_t *)a->data;
+                type_t *arg_type = arg->sem_type ? arg->sem_type : get_expression_type(cg->sem, arg);
+                type_kind_t kind = arg_type ? arg_type->kind : TYPE_CLASS;
+                char *arg_desc = type_to_descriptor(arg_type);
+                string_append(super_desc, arg_desc);
+                free(arg_desc);
+
+                if (kind == TYPE_LONG) {
+                    bc_emit(mg->code, OP_LLOAD);
+                    bc_emit_u1(mg->code, (uint8_t)arg_slot);
+                    mg_push(mg, 2);
+                    arg_slot += 2;
+                    explicit_arg_count += 2;
+                } else if (kind == TYPE_DOUBLE) {
+                    bc_emit(mg->code, OP_DLOAD);
+                    bc_emit_u1(mg->code, (uint8_t)arg_slot);
+                    mg_push(mg, 2);
+                    arg_slot += 2;
+                    explicit_arg_count += 2;
+                } else if (kind == TYPE_FLOAT) {
+                    bc_emit(mg->code, OP_FLOAD);
+                    bc_emit_u1(mg->code, (uint8_t)arg_slot);
+                    mg_push(mg, 1);
+                    arg_slot++;
+                    explicit_arg_count++;
+                } else if (kind == TYPE_CLASS || kind == TYPE_ARRAY || kind == TYPE_TYPEVAR) {
+                    bc_emit(mg->code, OP_ALOAD);
+                    bc_emit_u1(mg->code, (uint8_t)arg_slot);
+                    mg_push(mg, 1);
+                    arg_slot++;
+                    explicit_arg_count++;
+                } else {
+                    bc_emit(mg->code, OP_ILOAD);
+                    bc_emit_u1(mg->code, (uint8_t)arg_slot);
+                    mg_push(mg, 1);
+                    arg_slot++;
+                    explicit_arg_count++;
+                }
+            }
+            string_append(super_desc, ")V");
+            uint16_t super_init = cp_add_methodref(cg->cp, cg->superclass, "<init>", super_desc->str);
+            bc_emit(mg->code, OP_INVOKESPECIAL);
+            bc_emit_u2(mg->code, super_init);
+            mg_pop(mg, 1 + explicit_arg_count);  /* pops this + args */
+            string_free(super_desc, true);
+
+            /* Mark 'this' as initialized in stackmap after super() */
+            if (mg->stackmap && cg->internal_name) {
+                stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+            }
         } else {
             uint16_t super_init = cp_add_methodref(cg->cp, cg->superclass, "<init>", "()V");
             bc_emit(mg->code, OP_INVOKESPECIAL);
             bc_emit_u2(mg->code, super_init);
             mg_pop(mg, 1);
-            
+
             /* Mark 'this' as initialized in stackmap after super() */
             if (mg->stackmap && cg->internal_name) {
                 stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
@@ -5366,7 +5771,57 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 /* Build constructor descriptor: (Ljava/lang/String;I<user params>)V */
                 string_t *ctor_desc = string_new("(Ljava/lang/String;I");
                 int arg_count = 2;  /* name + ordinal */
-                
+
+                /* Count this enum constant's own actual argument expressions
+                 * (excluding class-body members) up front, so the declared
+                 * constructor symbol below can be matched by arity BEFORE
+                 * the arguments themselves are generated. */
+                int decl_arg_count = 0;
+                for (slist_t *n = enum_const->data.node.children; n; n = n->next) {
+                    ast_node_t *a = (ast_node_t *)n->data;
+                    if (a->type != AST_METHOD_DECL && a->type != AST_CONSTRUCTOR_DECL &&
+                        a->type != AST_FIELD_DECL && a->type != AST_INITIALIZER_BLOCK) {
+                        decl_arg_count++;
+                    }
+                }
+
+                /* Find the enum's own declared constructor matching this
+                 * arity, so each argument's descriptor byte can be taken
+                 * from the constructor's own DECLARED parameter type -
+                 * not, as this used to do, inferred from each argument
+                 * EXPRESSION's own type. Those only coincidentally agree;
+                 * a `null` literal argument's own inferred type
+                 * (TYPE_NULL) erases to "Ljava/lang/Object;" (type_to_
+                 * descriptor()'s generic fallback for anything it doesn't
+                 * specifically handle), not the target parameter's real
+                 * declared reference type (e.g. "Ljava/lang/String;") -
+                 * producing an invokespecial whose descriptor doesn't
+                 * match the constructor actually compiled for this class
+                 * at all (NoSuchMethodError at class-init time, since the
+                 * verifier doesn't check a referenced method exists).
+                 * Confirmed against gumdrop's own SignatureScheme, an enum
+                 * whose constructor's 3rd parameter is "String pssDigest"
+                 * and whose RSA_PKCS1_* constants pass literal "null" for
+                 * it. Enums practically never overload their constructor,
+                 * but match by parameter count regardless, for safety. */
+                symbol_t *enum_ctor = NULL;
+                if (cg->class_sym && cg->class_sym->data.class_data.members &&
+                    cg->class_sym->data.class_data.members->symbols) {
+                    hashtable_t *mht = cg->class_sym->data.class_data.members->symbols;
+                    for (size_t mi = 0; mi < mht->size && !enum_ctor; mi++) {
+                        hashtable_entry_t *ment = mht->buckets[mi];
+                        while (ment && !enum_ctor) {
+                            symbol_t *msym = (symbol_t *)ment->value;
+                            if (msym && msym->kind == SYM_CONSTRUCTOR &&
+                                (int)slist_length(msym->data.method_data.parameters) == decl_arg_count) {
+                                enum_ctor = msym;
+                            }
+                            ment = ment->next;
+                        }
+                    }
+                }
+                slist_t *ctor_param_node = enum_ctor ? enum_ctor->data.method_data.parameters : NULL;
+
                 /* Generate constructor arguments from enum constant children.
                  * Skip method/field/initializer declarations - those are for enum
                  * constant bodies (anonymous subclasses) not constructor args. */
@@ -5384,20 +5839,20 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     /* Generate the argument expression */
                     codegen_expr(mg, arg, cg->cp);
                     arg_count++;
-                    
-                    /* Get the type descriptor for this argument: prefer
-                     * sem_type if some earlier pass already self-annotated
-                     * it, otherwise ask the semantic analyzer directly
-                     * (e.g. a bare literal argument's own codegen has no
-                     * need to call get_expression_type itself, so its
-                     * sem_type is never set here). This replaces a former
-                     * fallback that guessed a literal's type from its
-                     * source text - "contains '.', 'e', or 'E'" - which
-                     * misdetected any hex literal with 'e'/'E' as one of
-                     * its hex digits (e.g. 0x11ec) and the boolean literal
-                     * "true" (itself containing 'e') as double/float,
-                     * corrupting the invokespecial's own descriptor. */
-                    type_t *arg_type = arg->sem_type ? arg->sem_type : get_expression_type(cg->sem, arg);
+
+                    /* Prefer the matched constructor's own declared
+                     * parameter type (see above); fall back to the
+                     * argument expression's own inferred type only when
+                     * no matching constructor was found. */
+                    type_t *arg_type = NULL;
+                    if (ctor_param_node) {
+                        symbol_t *param_sym = (symbol_t *)ctor_param_node->data;
+                        arg_type = param_sym ? param_sym->type : NULL;
+                        ctor_param_node = ctor_param_node->next;
+                    }
+                    if (!arg_type) {
+                        arg_type = arg->sem_type ? arg->sem_type : get_expression_type(cg->sem, arg);
+                    }
                     if (arg_type) {
                         char *arg_desc = type_to_descriptor(arg_type);
                         string_append(ctor_desc, arg_desc);
@@ -5408,11 +5863,40 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 string_append(ctor_desc, ")V");
                 
                 /* invokespecial EnumClass.<init>(descriptor) */
-                uint16_t init_ref = cp_add_methodref(cg->cp, cg->internal_name, 
+                uint16_t init_ref = cp_add_methodref(cg->cp, cg->internal_name,
                     "<init>", ctor_desc->str);
                 bc_emit(mg->code, OP_INVOKESPECIAL);
                 bc_emit_u2(mg->code, init_ref);
-                mg_pop(mg, arg_count + 1);  /* pops args + new ref */
+                /* The dup'd objref, "name" (ldc) and ordinal (bipush/sipush)
+                 * above were all pushed with the RAW mg_push() (they're
+                 * fixed, compiler-synthesized values, never routed through
+                 * mg->stackmap), but each user-supplied constructor
+                 * argument was generated by codegen_expr(), which DOES push
+                 * typed entries onto mg->stackmap. Popping the whole lot
+                 * with raw mg_pop() left one phantom stackmap entry behind
+                 * per user argument, per enum constant - e.g. for "enum E {
+                 * A(1), B(2), ...; E(int code) {...} }", the actual runtime
+                 * stack is balanced (invokespecial truly consumes
+                 * everything) but mg->stackmap's tracked type list grew by
+                 * one "int" per constant, so any LATER frame recorded in
+                 * the same <clinit> (e.g. a `for (E e : values())` loop
+                 * populating a lookup map, itself needing zero real operand
+                 * stack) got a StackMapTable entry claiming dozens of bogus
+                 * leftover stack items - ClassFormatError "bad type array
+                 * size" the moment the JVM tried to decode a frame that
+                 * large. Confirmed against gumdrop's own HttpStatus, a
+                 * 64-constant enum with exactly this "int code" constructor
+                 * plus a static BY_CODE lookup map built the same way.
+                 * Only the user-arg portion needs a TYPED pop; the rest
+                 * (never added to mg->stackmap) is popped raw exactly as
+                 * before. */
+                int user_arg_count = arg_count - 2;  /* name + ordinal aren't user args */
+                if (user_arg_count > 0) {
+                    mg_pop_typed(mg, user_arg_count);
+                    mg_pop(mg, arg_count + 1 - user_arg_count);
+                } else {
+                    mg_pop(mg, arg_count + 1);  /* pops args + new ref */
+                }
                 
                 string_free(ctor_desc, true);
                 
@@ -5427,6 +5911,106 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             }
         }
         
+        /* Generate $VALUES array initialization for enums - BEFORE any
+         * user-declared static field initializer or static block, matching
+         * javac's own order (confirmed by decompiling a real javac-built
+         * enum): the compiler-synthesized "$values(); $VALUES = ...;"
+         * sequence runs immediately after all enum constants are assigned,
+         * not after them. This used to run LAST (after every user static
+         * field initializer AND static block), so any user code that calls
+         * values() from a static initializer - a common, idiomatic pattern,
+         * e.g. "static { for (E e : values()) BY_CODE.put(...); }" -
+         * observed $VALUES still null: NullPointerException
+         * "Cannot invoke ...clone() because ...$VALUES is null" at
+         * Enum.values()'s synthesized body. Confirmed against gumdrop's
+         * own HttpStatus, whose static block builds a BY_CODE lookup map
+         * exactly this way. */
+        if (is_enum && enum_constants) {
+            char enum_array_desc[256];
+            snprintf(enum_array_desc, sizeof(enum_array_desc), "[L%s;", cg->internal_name);
+
+            /* Add $VALUES field */
+            field_gen_t *values_field = calloc(1, sizeof(field_gen_t));
+            values_field->access_flags = ACC_PRIVATE | ACC_STATIC | ACC_FINAL | ACC_SYNTHETIC;
+            values_field->name = strdup("$VALUES");
+            values_field->descriptor = strdup(enum_array_desc);
+            values_field->name_index = cp_add_utf8(cg->cp, values_field->name);
+            values_field->descriptor_index = cp_add_utf8(cg->cp, values_field->descriptor);
+
+            if (!cg->fields) {
+                cg->fields = slist_new(values_field);
+            } else {
+                slist_append(cg->fields, values_field);
+            }
+            hashtable_insert(cg->field_map, values_field->name, values_field);
+
+            /* Initialize $VALUES array with all enum constants */
+            /* Create array: anewarray num_constants */
+            int num_constants = 0;
+            for (slist_t *ec = enum_constants; ec; ec = ec->next) {
+                num_constants++;
+            }
+
+            if (num_constants <= 127) {
+                bc_emit(mg->code, OP_BIPUSH);
+                bc_emit_u1(mg->code, (uint8_t)num_constants);
+            } else {
+                bc_emit(mg->code, OP_SIPUSH);
+                bc_emit_u2(mg->code, (uint16_t)num_constants);
+            }
+            mg_push(mg, 1);
+
+            /* anewarray EnumClass */
+            uint16_t elem_class_idx = cp_add_class(cg->cp, cg->internal_name);
+            bc_emit(mg->code, OP_ANEWARRAY);
+            bc_emit_u2(mg->code, elem_class_idx);
+            /* Stack: arrayref (no change - replaces count) */
+
+            char enum_desc[256];
+            snprintf(enum_desc, sizeof(enum_desc), "L%s;", cg->internal_name);
+
+            /* Store each enum constant in the array */
+            int idx = 0;
+            for (slist_t *ec = enum_constants; ec; ec = ec->next) {
+                ast_node_t *enum_const = (ast_node_t *)ec->data;
+                const char *const_name = enum_const->data.node.name;
+
+                /* dup - keep arrayref on stack */
+                bc_emit(mg->code, OP_DUP);
+                mg_push(mg, 1);
+
+                /* push index */
+                if (idx <= 127) {
+                    bc_emit(mg->code, OP_BIPUSH);
+                    bc_emit_u1(mg->code, (uint8_t)idx);
+                } else {
+                    bc_emit(mg->code, OP_SIPUSH);
+                    bc_emit_u2(mg->code, (uint16_t)idx);
+                }
+                mg_push(mg, 1);
+
+                /* getstatic EnumClass.CONSTANT */
+                uint16_t field_ref = cp_add_fieldref(cg->cp, cg->internal_name,
+                    const_name, enum_desc);
+                bc_emit(mg->code, OP_GETSTATIC);
+                bc_emit_u2(mg->code, field_ref);
+                mg_push(mg, 1);
+
+                /* aastore */
+                bc_emit(mg->code, OP_AASTORE);
+                mg_pop(mg, 3);  /* arrayref, index, value */
+
+                idx++;
+            }
+
+            /* putstatic $VALUES */
+            uint16_t values_ref = cp_add_fieldref(cg->cp, cg->internal_name,
+                "$VALUES", enum_array_desc);
+            bc_emit(mg->code, OP_PUTSTATIC);
+            bc_emit_u2(mg->code, values_ref);
+            mg_pop(mg, 1);
+        }
+
         /* 1. Generate static field initializers (in declaration order) */
         for (slist_t *node = static_field_inits; node; node = node->next) {
             ast_node_t *assign = (ast_node_t *)node->data;
@@ -5466,93 +6050,6 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 ast_node_t *block = (ast_node_t *)init_block->data.node.children->data;
                 codegen_statement(mg, block);
             }
-        }
-        
-        /* 3. Generate $VALUES array initialization for enums */
-        if (is_enum && enum_constants) {
-            char enum_array_desc[256];
-            snprintf(enum_array_desc, sizeof(enum_array_desc), "[L%s;", cg->internal_name);
-            
-            /* Add $VALUES field */
-            field_gen_t *values_field = calloc(1, sizeof(field_gen_t));
-            values_field->access_flags = ACC_PRIVATE | ACC_STATIC | ACC_FINAL | ACC_SYNTHETIC;
-            values_field->name = strdup("$VALUES");
-            values_field->descriptor = strdup(enum_array_desc);
-            values_field->name_index = cp_add_utf8(cg->cp, values_field->name);
-            values_field->descriptor_index = cp_add_utf8(cg->cp, values_field->descriptor);
-            
-            if (!cg->fields) {
-                cg->fields = slist_new(values_field);
-            } else {
-                slist_append(cg->fields, values_field);
-            }
-            hashtable_insert(cg->field_map, values_field->name, values_field);
-            
-            /* Initialize $VALUES array with all enum constants */
-            /* Create array: anewarray num_constants */
-            int num_constants = 0;
-            for (slist_t *ec = enum_constants; ec; ec = ec->next) {
-                num_constants++;
-            }
-            
-            if (num_constants <= 127) {
-                bc_emit(mg->code, OP_BIPUSH);
-                bc_emit_u1(mg->code, (uint8_t)num_constants);
-            } else {
-                bc_emit(mg->code, OP_SIPUSH);
-                bc_emit_u2(mg->code, (uint16_t)num_constants);
-            }
-            mg_push(mg, 1);
-            
-            /* anewarray EnumClass */
-            uint16_t elem_class_idx = cp_add_class(cg->cp, cg->internal_name);
-            bc_emit(mg->code, OP_ANEWARRAY);
-            bc_emit_u2(mg->code, elem_class_idx);
-            /* Stack: arrayref (no change - replaces count) */
-            
-            char enum_desc[256];
-            snprintf(enum_desc, sizeof(enum_desc), "L%s;", cg->internal_name);
-            
-            /* Store each enum constant in the array */
-            int idx = 0;
-            for (slist_t *ec = enum_constants; ec; ec = ec->next) {
-                ast_node_t *enum_const = (ast_node_t *)ec->data;
-                const char *const_name = enum_const->data.node.name;
-                
-                /* dup - keep arrayref on stack */
-                bc_emit(mg->code, OP_DUP);
-                mg_push(mg, 1);
-                
-                /* push index */
-                if (idx <= 127) {
-                    bc_emit(mg->code, OP_BIPUSH);
-                    bc_emit_u1(mg->code, (uint8_t)idx);
-                } else {
-                    bc_emit(mg->code, OP_SIPUSH);
-                    bc_emit_u2(mg->code, (uint16_t)idx);
-                }
-                mg_push(mg, 1);
-                
-                /* getstatic EnumClass.CONSTANT */
-                uint16_t field_ref = cp_add_fieldref(cg->cp, cg->internal_name,
-                    const_name, enum_desc);
-                bc_emit(mg->code, OP_GETSTATIC);
-                bc_emit_u2(mg->code, field_ref);
-                mg_push(mg, 1);
-                
-                /* aastore */
-                bc_emit(mg->code, OP_AASTORE);
-                mg_pop(mg, 3);  /* arrayref, index, value */
-                
-                idx++;
-            }
-            
-            /* putstatic $VALUES */
-            uint16_t values_ref = cp_add_fieldref(cg->cp, cg->internal_name,
-                "$VALUES", enum_array_desc);
-            bc_emit(mg->code, OP_PUTSTATIC);
-            bc_emit_u2(mg->code, values_ref);
-            mg_pop(mg, 1);
         }
         
         /* 4. Generate assertions initialization if needed */

@@ -96,6 +96,187 @@ static const char *resolve_exception_class(const char *name)
     return name;
 }
 
+/**
+ * Evaluate a switch case label that is a compile-time constant EXPRESSION
+ * (not a bare literal or a named constant, both already handled by the
+ * caller) - e.g. "case ('U' << 24) | ('S' << 16) | ('E' << 8) | 'R':",
+ * the multi-char command-packing idiom gumdrop's own FtpProtocolHandler.
+ * matchCommand() uses for every one of its ~40 case labels. Handles only
+ * the operators actually needed for that idiom (shifts and bitwise/
+ * arithmetic combinations of int/char literals) - matching this file's
+ * existing philosophy elsewhere of handling the concrete case actually
+ * needed rather than a general constant-folding evaluator (see the
+ * "constant expression required" case-label handling in semantic.c for
+ * the same stated approach). Before this, any case label shaped as an
+ * expression (anything other than a bare literal or a plain identifier)
+ * silently fell through the case_values[] collection loop's two
+ * branches entirely, leaving that case's match value at its calloc()
+ * zero-initialized default - so every such case collided on match value
+ * 0, and the JVM verifier rejected the resulting lookupswitch outright
+ * ("Bad lookupswitch instruction") the instant there was more than one
+ * such case (there always is, for this idiom).
+ * Returns true and writes *out on success (a genuinely constant
+ * expression built entirely from literals and these operators); false
+ * for anything else (an identifier, a method call, or an operator not
+ * handled here), leaving *out untouched. */
+static bool eval_int_constant_expr(ast_node_t *expr, int32_t *out)
+{
+    if (!expr) {
+        return false;
+    }
+
+    if (expr->type == AST_PARENTHESIZED) {
+        return expr->data.node.children &&
+            eval_int_constant_expr((ast_node_t *)expr->data.node.children->data, out);
+    }
+
+    if (expr->type == AST_LITERAL) {
+        if (expr->data.leaf.token_type == TOK_CHAR_LITERAL) {
+            const char *sv = expr->data.leaf.value.str_val;
+            *out = sv ? (int32_t)(unsigned char)sv[0] : 0;
+            return true;
+        }
+        if (expr->data.leaf.token_type == TOK_INTEGER_LITERAL) {
+            *out = (int32_t)expr->data.leaf.value.int_val;
+            return true;
+        }
+        return false;
+    }
+
+    if (expr->type == AST_UNARY_EXPR) {
+        slist_t *children = expr->data.node.children;
+        int32_t operand;
+        if (!children || !eval_int_constant_expr((ast_node_t *)children->data, &operand)) {
+            return false;
+        }
+        switch (expr->data.node.op_token) {
+            case TOK_MINUS: *out = -operand; return true;
+            case TOK_PLUS:  *out = operand;  return true;
+            case TOK_TILDE: *out = ~operand; return true;
+            default: return false;
+        }
+    }
+
+    if (expr->type == AST_BINARY_EXPR) {
+        slist_t *children = expr->data.node.children;
+        if (!children || !children->next) {
+            return false;
+        }
+        int32_t l, r;
+        if (!eval_int_constant_expr((ast_node_t *)children->data, &l) ||
+            !eval_int_constant_expr((ast_node_t *)children->next->data, &r)) {
+            return false;
+        }
+        switch (expr->data.node.op_token) {
+            case TOK_LSHIFT:  *out = l << (r & 31); return true;
+            case TOK_RSHIFT:  *out = l >> (r & 31); return true;
+            case TOK_URSHIFT: *out = (int32_t)((uint32_t)l >> (r & 31)); return true;
+            case TOK_BITOR:   *out = l | r; return true;
+            case TOK_BITAND:  *out = l & r; return true;
+            case TOK_CARET:   *out = l ^ r; return true;
+            case TOK_PLUS:    *out = l + r; return true;
+            case TOK_MINUS:   *out = l - r; return true;
+            case TOK_STAR:    *out = l * r; return true;
+            default: return false;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Apply the proper JVM-verifier MERGE of several "reaches this point"
+ * stackmap snapshots to `smt`'s own current tracked state - used for a
+ * switch statement's single shared exit frame (every `break`, from any
+ * case, plus a non-terminating fallthrough off the physically last
+ * case, all jump to or flow into the exact same bytecode offset, so
+ * there is only ever ONE frame possible there in the class file, and it
+ * must be valid for every one of those incoming edges at once).
+ *
+ * Per JVM spec 4.10.1.4, merging two local-variable slots that disagree
+ * on type yields "top" (unusable) at that slot, not an error - callers
+ * differ legitimately, e.g. a local declared inside only one case's
+ * body (no braces needed for it to be "in scope" for later cases, per
+ * JLS 6.3, but it's only ever ASSIGNED along whichever single case
+ * actually declared it) is simply untyped/unusable after the switch,
+ * while a local declared BEFORE the switch and consistently assigned by
+ * EVERY reachable case keeps its real type, exactly matching Java's own
+ * definite-assignment rule for using such a local after the switch.
+ * Slots beyond the shortest snapshot's own tracked count are dropped
+ * entirely rather than padded - the JVM spec allows a frame's locals
+ * array to be shorter than the method's max_locals, with everything
+ * past the end implicitly "top", so this is equivalent to (and simpler
+ * than) padding every snapshot to the same length first.
+ *
+ * `states` must be non-empty; the operand stack is always empty at a
+ * switch statement's exit (unlike a switch expression, no value is
+ * ever left on the stack there), so only locals need merging - callers
+ * are expected to have cleared/never pushed onto smt's current stack
+ * before calling this. */
+static void merge_stackmap_states_into(stack_map_table_t *smt, slist_t *states)
+{
+    if (!smt || !states) {
+        return;
+    }
+
+    stackmap_state_t *first = (stackmap_state_t *)states->data;
+    uint16_t merged_count = first->num_locals;
+    for (slist_t *n = states->next; n; n = n->next) {
+        stackmap_state_t *s = (stackmap_state_t *)n->data;
+        if (s->num_locals < merged_count) {
+            merged_count = s->num_locals;
+        }
+    }
+
+    stackmap_state_t merged;
+    merged.num_locals = merged_count;
+    merged.locals = merged_count ? malloc(merged_count * sizeof(verification_type_t)) : NULL;
+    merged.stack_size = 0;
+    merged.stack = NULL;
+
+    for (uint16_t i = 0; i < merged_count; i++) {
+        verification_type_t t = first->locals[i];
+        bool agree = true;
+        for (slist_t *n = states->next; n && agree; n = n->next) {
+            stackmap_state_t *s = (stackmap_state_t *)n->data;
+            verification_type_t o = s->locals[i];
+            if (o.tag != t.tag ||
+                (t.tag == VT_OBJECT && o.data.cp_index != t.data.cp_index) ||
+                (t.tag == VT_UNINITIALIZED && o.data.offset != t.data.offset)) {
+                agree = false;
+            }
+        }
+        if (merged.locals) {
+            merged.locals[i] = agree ? t : (verification_type_t){.tag = VT_TOP};
+        }
+    }
+
+    stackmap_restore_state(smt, &merged);
+    free(merged.locals);
+}
+
+/**
+ * The boxed wrapper class (internal JVM name) for a primitive type kind,
+ * e.g. TYPE_INT -> "java/lang/Integer". Mirrors emit_boxing()'s own
+ * switch in codegen_expr.c, which maps the same primitive kinds to their
+ * wrapper class for the opposite (box) direction. Returns NULL for a
+ * non-primitive kind.
+ */
+static const char *wrapper_class_for_primitive(type_kind_t kind)
+{
+    switch (kind) {
+        case TYPE_INT:     return "java/lang/Integer";
+        case TYPE_LONG:    return "java/lang/Long";
+        case TYPE_DOUBLE:  return "java/lang/Double";
+        case TYPE_FLOAT:   return "java/lang/Float";
+        case TYPE_BYTE:    return "java/lang/Byte";
+        case TYPE_SHORT:   return "java/lang/Short";
+        case TYPE_CHAR:    return "java/lang/Character";
+        case TYPE_BOOLEAN: return "java/lang/Boolean";
+        default:           return NULL;
+    }
+}
+
 /* ========================================================================
  * String Switch Support (Java 7)
  * ======================================================================== */
@@ -335,24 +516,50 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
     if (mg->stackmap) {
         switch_entry_state = stackmap_save_state(mg->stackmap);
     }
-    
+
+    /* Snapshots of every state that actually reaches the switch's shared
+     * exit point (every `break`, from any case) - collected below as
+     * each case is generated, mirroring AST_SWITCH_STMT's own identical
+     * switch_exit_states/merge_stackmap_states_into() fix for the exact
+     * same bug in that (enum/int selector) sibling switch codegen. This
+     * function - the SEPARATE codegen path for a String selector - had
+     * its own, never-updated copy of the same "record the exit frame
+     * from whatever's live in codegen order" mistake: every case here
+     * ends in `break` to a SHARED exit point, but only a case that
+     * happens to declare its own local (e.g. "case \"map\": FieldDescriptor
+     * mapField = ...; break;") left that local's real type in
+     * mg->stackmap by the time the LAST case in AST order finished, so
+     * the ONE recorded frame at that shared point silently used
+     * whichever case ran last - wrong for every other case's own
+     * break, which never touched that slot. VerifyError: "Inconsistent
+     * stackmap frames ... not assignable" the moment a DIFFERENT case's
+     * break reached the same target. Confirmed against gumdrop's own
+     * ProtoFileParser.parseMessage(), whose "switch (tok) { case
+     * \"option\": ...; break; ... case \"map\": FieldDescriptor
+     * mapField = ...; break; ... }" is exactly this shape. */
+    slist_t *string_switch_exit_states = NULL;
+    bool has_default_label = false;
+
     for (slist_t *node = children->next; node; node = node->next, ast_idx++) {
         ast_node_t *case_label = (ast_node_t *)node->data;
         if (case_label->type != AST_CASE_LABEL) continue;
-        
-        bool is_default = (case_label->data.node.name && 
+
+        bool is_default = (case_label->data.node.name &&
                           strcmp(case_label->data.node.name, "default") == 0);
-        
+        if (is_default) {
+            has_default_label = true;
+        }
+
         /* Restore stackmap state to switch entry state before each case body */
         if (switch_entry_state && mg->stackmap) {
             stackmap_restore_state(mg->stackmap, switch_entry_state);
         }
-        
+
         size_t body_pos = mg->code->length;
-        
+
         /* Record frame at case body (branch target) */
         mg_record_frame(mg);
-        
+
         if (is_default) {
             default_body_pos = body_pos;
         } else {
@@ -367,7 +574,7 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
                 }
             }
         }
-        
+
         /* Generate case body statements */
         slist_t *stmts = case_label->data.node.children;
         if (!is_default && stmts) {
@@ -381,24 +588,93 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
                 free(case_body_positions);
                 slist_free(goto_patches);
                 stackmap_state_free(switch_entry_state);
+                for (slist_t *n = string_switch_exit_states; n; n = n->next) {
+                    stackmap_state_free((stackmap_state_t *)n->data);
+                }
+                slist_free(string_switch_exit_states);
                 return false;
             }
             stmts = stmts->next;
         }
+
+        /* This case's own exit state, captured for the merge below -
+         * either it ends in `break` (OP_GOTO, reaching the shared exit
+         * directly) or, if it's the PHYSICALLY LAST case and falls off
+         * the end without break/return/throw, it reaches the shared
+         * exit via plain fallthrough. A case ending in return/throw
+         * never reaches the shared exit at all and is correctly
+         * excluded. An EMPTY-bodied case label (grouped fallthrough
+         * labels sharing one body, e.g. "case \"Monday\": case \"Tuesday\":
+         * ... case \"Friday\": result = 1; break;" - every label but the
+         * last generates no statements at all) must also be excluded:
+         * it never executes any code of its own, so mg->last_opcode is
+         * just stale leftover state from whatever ran before it, and
+         * capturing an "exit" snapshot for it would wrongly pull in
+         * switch-ENTRY state (unassigned locals) as if it were a real
+         * incoming edge to the merge. */
+        bool has_body = (mg->code->length > body_pos);
+        bool is_last_case = (node->next == NULL);
+        bool ends_in_break = (mg->last_opcode == OP_GOTO);
+        bool ends_in_terminal = (mg->last_opcode == OP_RETURN || mg->last_opcode == OP_IRETURN ||
+            mg->last_opcode == OP_LRETURN || mg->last_opcode == OP_FRETURN ||
+            mg->last_opcode == OP_DRETURN || mg->last_opcode == OP_ARETURN ||
+            mg->last_opcode == OP_ATHROW);
+        if (has_body && (ends_in_break || (is_last_case && !ends_in_terminal)) && mg->stackmap) {
+            stackmap_state_t *exit_snap = stackmap_save_state(mg->stackmap);
+            if (exit_snap) {
+                if (!string_switch_exit_states) {
+                    string_switch_exit_states = slist_new(exit_snap);
+                } else {
+                    slist_append(string_switch_exit_states, exit_snap);
+                }
+            }
+        }
     }
-    
+
+    /* The "no case matched" edge (hash miss, or hash hit but every
+     * equals() check failed) reaches the shared exit directly, carrying
+     * switch-entry state, whenever there's no explicit "default:" label
+     * (see "default_target = default_body_pos ? default_body_pos :
+     * switch_end" below - switch_end IS the shared exit in that case). */
+    if (!has_default_label && switch_entry_state) {
+        stackmap_state_t *entry_snap = calloc(1, sizeof(stackmap_state_t));
+        if (entry_snap) {
+            entry_snap->num_locals = switch_entry_state->num_locals;
+            entry_snap->locals = switch_entry_state->num_locals ?
+                malloc(switch_entry_state->num_locals * sizeof(verification_type_t)) : NULL;
+            if (entry_snap->locals) {
+                memcpy(entry_snap->locals, switch_entry_state->locals,
+                       switch_entry_state->num_locals * sizeof(verification_type_t));
+            }
+            if (!string_switch_exit_states) {
+                string_switch_exit_states = slist_new(entry_snap);
+            } else {
+                slist_append(string_switch_exit_states, entry_snap);
+            }
+        }
+    }
+
     /* Free the saved state */
     stackmap_state_free(switch_entry_state);
-    
+
     /* Switch end position */
     size_t switch_end = mg->code->length;
-    
+
     /* Only record stackmap frame at switch end if there are break statements to patch */
     if (mg->loop_stack) {
         loop_context_t *ctx = (loop_context_t *)mg->loop_stack->data;
         if (ctx->break_offsets) {
+            if (string_switch_exit_states && mg->stackmap) {
+                merge_stackmap_states_into(mg->stackmap, string_switch_exit_states);
+            }
             mg_record_frame(mg);
         }
+    }
+    if (string_switch_exit_states) {
+        for (slist_t *n = string_switch_exit_states; n; n = n->next) {
+            stackmap_state_free((stackmap_state_t *)n->data);
+        }
+        slist_free(string_switch_exit_states);
     }
     
     /* Patch default offset in lookupswitch */
@@ -910,8 +1186,17 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
         }
         free(stackmap_exc_internal);
         
-        /* Allocate local for exception variable */
-        type_t *exc_type = type_new_class(first_exc_class);
+        /* Allocate local for exception variable. Prefer the LUB semantic
+         * analysis already computed across every multi-catch alternative
+         * (catch_clause->sem_type, set in semantic.c's AST_CATCH_CLAUSE
+         * handling) over first_exc_class - using only the FIRST
+         * alternative's type here (as this used to) made a later checkcast
+         * against that type reject any OTHER alternative actually thrown
+         * at runtime: ClassCastException. Falls back to first_exc_class
+         * only if semantic analysis didn't leave a usable class type
+         * (defensive; shouldn't happen in practice). */
+        type_t *exc_type = (catch_clause->sem_type && catch_clause->sem_type->kind == TYPE_CLASS) ?
+            catch_clause->sem_type : type_new_class(first_exc_class);
         uint16_t exc_slot = mg_allocate_local(mg, exc_var_name, exc_type);
         
         /* JVM pushes exception onto stack at handler entry */
@@ -1083,10 +1368,29 @@ static void emit_pending_monitorexits(method_gen_t *mg)
  * Does not (yet) run a finally block for a return from inside a catch
  * clause belonging to the same try/finally - only the try body itself is
  * covered, which is what an early return here can currently reach.
+ *
+ * `stop_depth` bounds how far up mg->finally_stack to walk: only the
+ * innermost (finally_stack length - stop_depth) entries run. A `return`
+ * always leaves the whole method, so it passes 0 (run everything
+ * currently pending). A `break`/`continue` targeting a specific loop must
+ * stop at that loop's own finally_depth (the stack's length when the loop
+ * was entered) - a try statement that wraps the loop itself is never left
+ * by breaking or continuing that loop, so its finally block must not run
+ * here. Without this, `continue` inside a try-finally whose try body
+ * simply CONTAINS the loop (continue's target is still inside the try)
+ * incorrectly ran the finally block on every iteration - see gumdrop's
+ * own HostsFile.parse(), whose "while ((line = reader.readLine()) !=
+ * null) { ... if (line.isEmpty()) { continue; } ... }" sits inside a
+ * "try { ... } finally { reader.close(); }": every `continue` closed the
+ * reader early, so the very next readLine() threw (caught, logged, and
+ * swallowed by the outer catch), silently truncating parse() to whatever
+ * had been read before the first blank/comment line.
  */
-static void emit_pending_finally_blocks(method_gen_t *mg)
+static void emit_pending_finally_blocks(method_gen_t *mg, size_t stop_depth)
 {
-    for (slist_t *node = mg->finally_stack; node; node = node->next) {
+    size_t depth = slist_length(mg->finally_stack);
+    for (slist_t *node = mg->finally_stack; node && depth > stop_depth;
+         node = node->next, depth--) {
         ast_node_t *finally_block = (ast_node_t *)node->data;
         uint16_t saved_slot = mg->next_slot;
         codegen_statement(mg, finally_block);
@@ -1379,7 +1683,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         }
                     }
                     
-                    emit_pending_finally_blocks(mg);
+                    emit_pending_finally_blocks(mg, 0);
                     emit_pending_monitorexits(mg);
                     bc_emit(mg->code, return_op);
                     mg->last_opcode = return_op;
@@ -1389,7 +1693,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * "if (x) return someLong;" before more statements). */
                     mg_pop_typed(mg, (return_op == OP_LRETURN || return_op == OP_DRETURN) ? 2 : 1);
                 } else {
-                    emit_pending_finally_blocks(mg);
+                    emit_pending_finally_blocks(mg, 0);
                     emit_pending_monitorexits(mg);
                     bc_emit(mg->code, OP_RETURN);
                     mg->last_opcode = OP_RETURN;
@@ -1887,24 +2191,70 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     }
                 }
                 
+                /* Reset last_opcode before generating the then branch - it may
+                 * otherwise carry over stale state from whatever code preceded
+                 * this if-statement, which has nothing to do with whether THIS
+                 * branch itself terminates. Mirrors the identical reset used
+                 * before loop bodies and catch blocks. */
+                mg->last_opcode = 0;
+
                 /* Generate then branch */
                 if (then_stmt && !codegen_statement(mg, then_stmt)) {
                     return false;
                 }
-                
+
                 if (else_stmt) {
-                    /* Check if then block ended with a return (don't need goto) */
-                    bool then_ends_with_return = false;
-                    if (mg->code->length > 0) {
-                        uint8_t last_op = mg->code->code[mg->code->length - 1];
-                        if (last_op == OP_RETURN || last_op == OP_IRETURN ||
-                            last_op == OP_LRETURN || last_op == OP_FRETURN ||
-                            last_op == OP_DRETURN || last_op == OP_ARETURN ||
-                            last_op == OP_ATHROW) {
-                            then_ends_with_return = true;
-                        }
-                    }
-                    
+                    /* Check if then block ended with a return (don't need goto).
+                     * Use mg->last_opcode (set correctly by every statement kind
+                     * that can genuinely guarantee termination, e.g. a plain
+                     * return/throw, or explicitly reset to 0 by e.g. an
+                     * if-without-else whose own false path doesn't terminate)
+                     * rather than inspecting the raw last emitted byte: an
+                     * if-without-else whose then-body itself ends in a
+                     * return/throw has NO bytecode at all for its own (empty)
+                     * false path, so the literal last byte in the code array
+                     * is still that inner return/throw's opcode even though
+                     * the if-without-else AS A WHOLE does not unconditionally
+                     * terminate - falsely marking this (outer) branch as
+                     * terminating and skipping the goto past the else branch
+                     * below, corrupting control flow into the else branch's
+                     * own code (VerifyError: "Control flow falls through code
+                     * end", since the method's own final statement's implicit
+                     * return then never gets generated either). */
+                    bool then_ends_with_return = (mg->last_opcode == OP_RETURN ||
+                                                  mg->last_opcode == OP_IRETURN ||
+                                                  mg->last_opcode == OP_LRETURN ||
+                                                  mg->last_opcode == OP_FRETURN ||
+                                                  mg->last_opcode == OP_DRETURN ||
+                                                  mg->last_opcode == OP_ARETURN ||
+                                                  mg->last_opcode == OP_ATHROW ||
+                                                  /* A `break`/`continue` ending the then
+                                                   * branch (e.g. inside a loop's own
+                                                   * if/else) emits OP_GOTO and, just like
+                                                   * return/throw, never falls through to
+                                                   * after this if-statement either - the
+                                                   * loop-exit/back-edge jump IS its only
+                                                   * exit. Without this, the join-point
+                                                   * "goto past else" below got emitted
+                                                   * anyway, landing directly after that
+                                                   * break's own goto: dead code with no
+                                                   * stack map frame (VerifyError:
+                                                   * "Expecting a stack map frame"),
+                                                   * confirmed against gumdrop's own
+                                                   * DnsMessage.decodeName(), whose
+                                                   * compression-pointer branch of an
+                                                   * if/else ends with `break;`. mg-
+                                                   * >last_opcode is freshly reset to 0
+                                                   * immediately before this branch is
+                                                   * generated (see the reset above), so
+                                                   * an empty/non-terminating branch can
+                                                   * never leave a stale OP_GOTO here by
+                                                   * accident - matching the equivalent,
+                                                   * already-fixed OP_GOTO check for a
+                                                   * catch clause's own ends-with-return
+                                                   * test elsewhere in this file. */
+                                                  mg->last_opcode == OP_GOTO);
+
                     size_t goto_pos = 0;
                     /* Snapshot the stackmap state as it stands right after the
                      * then branch, before it gets reset for the else branch
@@ -1942,25 +2292,34 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     
                     /* Record frame at else branch target */
                     mg_record_frame(mg);
-                    
+
+                    /* Reset last_opcode before generating the else branch - see
+                     * the identical reset (and its full reasoning) before the
+                     * then branch above. */
+                    mg->last_opcode = 0;
+
                     /* Generate else branch */
                     if (!codegen_statement(mg, else_stmt)) {
                         stackmap_state_free(pre_then_state);
                         stackmap_state_free(then_exit_state);
                         return false;
                     }
-                    
-                    /* Check if else block ended with a return */
-                    bool else_ends_with_return = false;
-                    if (mg->code->length > 0) {
-                        uint8_t last_op = mg->code->code[mg->code->length - 1];
-                        if (last_op == OP_RETURN || last_op == OP_IRETURN ||
-                            last_op == OP_LRETURN || last_op == OP_FRETURN ||
-                            last_op == OP_DRETURN || last_op == OP_ARETURN ||
-                            last_op == OP_ATHROW) {
-                            else_ends_with_return = true;
-                        }
-                    }
+
+                    /* Check if else block ended with a return - see the
+                     * identical mg->last_opcode-based check (and its full
+                     * reasoning) for the then branch above. */
+                    bool else_ends_with_return = (mg->last_opcode == OP_RETURN ||
+                                                  mg->last_opcode == OP_IRETURN ||
+                                                  mg->last_opcode == OP_LRETURN ||
+                                                  mg->last_opcode == OP_FRETURN ||
+                                                  mg->last_opcode == OP_DRETURN ||
+                                                  mg->last_opcode == OP_ARETURN ||
+                                                  mg->last_opcode == OP_ATHROW ||
+                                                  /* See then_ends_with_return's identical
+                                                   * OP_GOTO case above - a break/continue
+                                                   * ending the else branch is the same
+                                                   * situation, mirrored. */
+                                                  mg->last_opcode == OP_GOTO);
                     
                     /* Patch goto to end (only if we emitted one) */
                     if (!then_ends_with_return) {
@@ -2070,11 +2429,38 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     return false;
                 }
 
+                /* Reset last_opcode before generating the body - otherwise it
+                 * carries over stale state from whatever code preceded this
+                 * loop (e.g. an earlier if-branch's own OP_IRETURN), which
+                 * has nothing to do with whether THIS body itself ends in a
+                 * jump, and would wrongly mark it as terminal below if the
+                 * body's own last statement doesn't itself set/reset
+                 * last_opcode (as most plain statements don't) - silently
+                 * skipping the back-edge goto and turning the loop into a
+                 * single-iteration fall-through. Mirrors the identical reset
+                 * already used for catch blocks. */
+                mg->last_opcode = 0;
+
                 /* Generate body */
                 if (body && !codegen_statement(mg, body)) {
                     return false;
                 }
-                
+
+                /* Patch every `continue` in the body (each had to emit its
+                 * own placeholder goto before this loop's continue_target
+                 * was knowable to it - see mg_add_continue_to_context()'s
+                 * comment) to jump to loop_start - a while loop's own real
+                 * continue target, unlike a for-loop/do-while/array-based
+                 * enhanced-for, since there's no separate update step: it's
+                 * simply the condition re-check already recorded as
+                 * loop_start at mg_push_loop() above, just confirmed (not
+                 * changed) here now that the real value is safe to patch
+                 * with. */
+                if (mg->loop_stack) {
+                    mg_patch_continue_offsets(mg, (loop_context_t *)mg->loop_stack->data,
+                                               loop_start);
+                }
+
                 /* Check if body ended with an unconditional branch (break/continue/return/throw).
                  * If so, the back-edge is unreachable and should be skipped. */
                 bool body_ends_with_jump = (mg->last_opcode == OP_GOTO ||
@@ -2085,7 +2471,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                            mg->last_opcode == OP_FRETURN ||
                                            mg->last_opcode == OP_DRETURN ||
                                            mg->last_opcode == OP_ATHROW);
-                
+
                 /* Restore locals count before goto back to loop_start.
                  * This ensures the frame at loop_start doesn't include loop-local variables. */
                 mg_restore_locals_count(mg, saved_locals_count);
@@ -2172,11 +2558,16 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* We'll set it after body generation */
                 mg_push_loop(mg, loop_start, mg->pending_label);  /* Temp value, updated below */
                 
+                /* Reset last_opcode before generating the body - see the
+                 * identical reset (and its full reasoning) in AST_WHILE_STMT
+                 * just above. */
+                mg->last_opcode = 0;
+
                 /* Generate body first */
                 if (body && !codegen_statement(mg, body)) {
                     return false;
                 }
-                
+
                 /* Check if body ended with an unconditional branch */
                 bool body_ends_with_terminal = (mg->last_opcode == OP_RETURN ||
                                                 mg->last_opcode == OP_ARETURN ||
@@ -2185,23 +2576,48 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                                 mg->last_opcode == OP_FRETURN ||
                                                 mg->last_opcode == OP_DRETURN ||
                                                 mg->last_opcode == OP_ATHROW);
-                bool body_ends_with_goto = (mg->last_opcode == OP_GOTO);
-                
-                /* Update continue target to condition check point */
-                if (mg->loop_stack) {
-                    ((loop_context_t *)mg->loop_stack->data)->continue_target = mg->code->length;
-                }
-                
-                /* If body ended with goto (break/continue), record frame for continue target */
-                if (body_ends_with_goto) {
-                    mg_record_frame(mg);
-                }
-                
-                /* Restore locals count before condition check (which branches back to loop_start) */
+                /* A `continue` anywhere earlier in the body (on some path
+                 * OTHER than the one that made the body's own last
+                 * physical statement a return/throw) still needs the
+                 * condition check below to actually run -
+                 * body_ends_with_terminal only tells us the FALL-THROUGH
+                 * exit is dead, not that every path through the body is.
+                 * Capture whether any such `continue` was registered
+                 * before mg_patch_continue_offsets() consumes the list. */
+                loop_context_t *do_ctx = mg->loop_stack ? (loop_context_t *)mg->loop_stack->data : NULL;
+                bool has_pending_continue = do_ctx && do_ctx->continue_offsets != NULL;
+
+                /* Restore locals count before recording the continue-target
+                 * frame below - body-declared locals shouldn't appear in
+                 * it (they're never live at this point, no matter which
+                 * incoming edge - fall-through or a `continue` from deeper
+                 * in the body - reaches it), mirroring the identical
+                 * restore-then-record pattern used for loop_start/loop_end
+                 * elsewhere in this file. */
                 mg_restore_locals_count(mg, saved_locals_count);
-                
-                /* Skip condition if body ends with return/throw (condition is unreachable) */
-                if (!body_ends_with_terminal) {
+
+                /* Finalize continue target to condition check point, and
+                 * patch every `continue` in the body (which had to emit
+                 * its own goto before this point was known, from
+                 * potentially deeper in the body than this restore
+                 * reflects - fine, see the restore comment above) to jump
+                 * here - see mg_patch_continue_offsets()'s comment. This is
+                 * now a genuine branch target reachable from anywhere in
+                 * the body via `continue`, not just when the body happens
+                 * to end with its own goto, so the frame below is
+                 * unconditional. */
+                if (do_ctx) {
+                    mg_patch_continue_offsets(mg, do_ctx, mg->code->length);
+                }
+                mg_record_frame(mg);
+
+                /* Skip condition only if body ends with return/throw AND
+                 * no `continue` anywhere in the body needs to reach this
+                 * point - otherwise (see comment above) it's still a real,
+                 * reachable branch target that must run the condition
+                 * check and loop back, even though the immediately
+                 * preceding fall-through into it is itself dead. */
+                if (!body_ends_with_terminal || has_pending_continue) {
                     /* Generate condition */
                     if (condition) {
                         if (!codegen_expr(mg, condition, mg->cp)) {
@@ -2304,11 +2720,16 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 size_t continue_target = loop_start;  /* Will be updated */
                 mg_push_loop(mg, continue_target, mg->pending_label);
                 
+                /* Reset last_opcode before generating the body - see the
+                 * identical reset (and its full reasoning) in AST_WHILE_STMT
+                 * above. */
+                mg->last_opcode = 0;
+
                 /* Generate body */
                 if (body && !codegen_statement(mg, body)) {
                     return false;
                 }
-                
+
                 /* Check if body ended with an unconditional branch.
                  * If it's break/return/throw, the update and back-edge are unreachable.
                  * If it's continue (goto to continue_target), the update/back-edge are still reachable
@@ -2320,33 +2741,69 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                                 mg->last_opcode == OP_FRETURN ||
                                                 mg->last_opcode == OP_DRETURN ||
                                                 mg->last_opcode == OP_ATHROW);
-                /* Note: break ends with goto, which makes following code unreachable,
-                 * but we detect break specifically because it's a forward goto.
-                 * Continue is a backward goto which still makes the following code reachable
-                 * from the continue target. For simplicity, record a frame if body ends with goto. */
-                bool body_ends_with_goto = (mg->last_opcode == OP_GOTO);
-                
-                /* Update continue target to here (before update expression) */
-                if (mg->loop_stack) {
-                    ((loop_context_t *)mg->loop_stack->data)->continue_target = mg->code->length;
+                /* A `continue` anywhere earlier in the body (on some path
+                 * OTHER than the one that made the body's own last
+                 * physical statement a return/throw) still needs the
+                 * update expression and back-edge below to actually run -
+                 * body_ends_with_terminal only tells us the FALL-THROUGH
+                 * exit is dead, not that every path through the body is.
+                 * Capture whether any such `continue` was registered
+                 * before mg_patch_continue_offsets() consumes the list. */
+                loop_context_t *for_ctx = mg->loop_stack ? (loop_context_t *)mg->loop_stack->data : NULL;
+                bool has_pending_continue = for_ctx && for_ctx->continue_offsets != NULL;
+
+                /* Restore locals count before recording the continue-target
+                 * frame below - body-declared locals shouldn't appear in
+                 * it, mirroring the identical restore-then-record pattern
+                 * used for loop_start/loop_end elsewhere in this file (a
+                 * `continue` reached from deeper in the body, where more
+                 * locals may be declared, is still safely "assignable to"
+                 * a target frame declaring fewer locals - the same
+                 * reasoning already relied on for this loop's own break
+                 * target). */
+                mg_restore_locals_count(mg, saved_locals_count);
+
+                /* Finalize continue target to here (before update
+                 * expression), and patch every `continue` in the body to
+                 * jump here - see mg_patch_continue_offsets()'s comment.
+                 * This is now a genuine branch target reachable from
+                 * anywhere in the body via `continue`, not just when the
+                 * body happens to end with its own goto, so the frame
+                 * below is unconditional. */
+                if (for_ctx) {
+                    mg_patch_continue_offsets(mg, for_ctx, mg->code->length);
                 }
-                
-                /* If body ended with goto (break/continue), record frame for continue target
-                 * since the fall-through path is unreachable but continue still jumps here. */
-                if (body_ends_with_goto) {
-                    mg_record_frame(mg);
-                }
-                
-                /* Skip update and back-edge if body ends with return/throw (truly unreachable) */
-                if (!body_ends_with_terminal) {
+                mg_record_frame(mg);
+
+                /* Skip update and back-edge only if body ends with
+                 * return/throw AND no `continue` anywhere in the body
+                 * needs to reach this point - otherwise (see comment
+                 * above) it's still a real, reachable branch target that
+                 * must run the update and loop back, even though the
+                 * immediately preceding fall-through into it is itself
+                 * dead. */
+                if (!body_ends_with_terminal || has_pending_continue) {
                     /* Generate update (skip if empty placeholder) */
                     if (update && update->type != AST_EMPTY_STMT) {
+                        /* Track stack depth before/after, mirroring AST_EXPR_STMT's
+                         * own identical pop logic - an update clause on a long/
+                         * double loop variable (e.g. "for (long i = 0; ...; i++)")
+                         * leaves a category-2 (2-word) value that a single,
+                         * unconditional OP_POP can't fully remove, corrupting the
+                         * rest of the stack (VerifyError: "Bad type on operand
+                         * stack", a stray long_2nd left behind). */
+                        uint16_t stack_before = mg->stack_depth;
                         if (!codegen_expr(mg, update, mg->cp)) {
                             return false;
                         }
-                        /* Pop update result */
-                        bc_emit(mg->code, OP_POP);
-                        mg_pop_typed(mg, 1);
+                        uint16_t slots_to_pop = mg->stack_depth - stack_before;
+                        if (slots_to_pop >= 2) {
+                            bc_emit(mg->code, OP_POP2);
+                            mg_pop_typed(mg, 2);
+                        } else if (slots_to_pop == 1) {
+                            bc_emit(mg->code, OP_POP);
+                            mg_pop_typed(mg, 1);
+                        }
                     }
                     
                     /* Restore locals count before goto back to loop_start.
@@ -2433,7 +2890,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * finally block entirely on this path - the same class of
                  * bug already fixed for `return`, just for a different
                  * exit statement. */
-                emit_pending_finally_blocks(mg);
+                emit_pending_finally_blocks(mg, target_ctx->finally_depth);
 
                 /* Emit goto with placeholder offset */
                 size_t break_pos = mg->code->length;
@@ -2717,11 +3174,18 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         return false;
                     }
                     
-                    /* Update continue target */
-                    if (mg->loop_stack) {
-                        ((loop_context_t *)mg->loop_stack->data)->continue_target = mg->code->length;
+                    /* Finalize continue target to here (before __idx++),
+                     * and patch every `continue` in the body to jump here -
+                     * see mg_patch_continue_offsets()'s comment. */
+                    if (arr_loop_entry_state && mg->stackmap) {
+                        stackmap_restore_state(mg->stackmap, arr_loop_entry_state);
                     }
-                    
+                    if (mg->loop_stack) {
+                        mg_patch_continue_offsets(mg, (loop_context_t *)mg->loop_stack->data,
+                                                   mg->code->length);
+                    }
+                    mg_record_frame(mg);
+
                     /* __idx++ */
                     bc_emit(mg->code, OP_IINC);
                     bc_emit_u1(mg->code, (uint8_t)idx_slot);
@@ -2763,8 +3227,15 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         mg->max_locals = mg->next_slot;
                     }
                     
-                    /* Allocate loop variable - Iterable always returns reference types */
-                    uint16_t var_slot = mg->next_slot++;
+                    /* Allocate loop variable. Usually a single-slot
+                     * reference (what Iterable always yields before any
+                     * unboxing), but a primitive long/double loop variable
+                     * (e.g. "for (long v : list)" auto-unboxing a
+                     * List<Long>) needs the usual two JVM slots once
+                     * unboxed, exactly like any other wide local. */
+                    int var_size = (var_kind == TYPE_LONG || var_kind == TYPE_DOUBLE) ? 2 : 1;
+                    uint16_t var_slot = mg->next_slot;
+                    mg->next_slot += var_size;
                     if (mg->next_slot > mg->max_locals) {
                         mg->max_locals = mg->next_slot;
                     }
@@ -2846,7 +3317,12 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     bc_emit_u1(mg->code, 0);
                     /* Stack: iterator -> Object (no net change) */
                     
-                    /* Add checkcast to the loop variable type (Iterator.next() returns Object) */
+                    /* Add checkcast to the loop variable type (Iterator.next() returns Object).
+                     * "array_desc" holds the loop variable's own full JVM array
+                     * descriptor (e.g. "[B") when it's declared as an array
+                     * type - shared below for the stackmap update too, since
+                     * both need the identical descriptor string. */
+                    char *array_desc = NULL;
                     if (type_node && type_node->type == AST_CLASS_TYPE) {
                         const char *type_name = type_node->data.node.name;
                         /* Use qualified name from semantic type if available */
@@ -2860,31 +3336,149 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             bc_emit_u2(mg->code, class_idx);
                             /* Stack unchanged (still 1 reference) */
                         }
+                    } else if (type_node && type_node->type == AST_ARRAY_TYPE) {
+                        /* Loop variable declared as an array type over a
+                         * plain Iterable/Collection (e.g. "for (byte[] v :
+                         * list)" where list is a List<byte[]>) - "is_array"
+                         * above is about the ITERABLE, not the loop
+                         * variable, so this goes through the Iterator-based
+                         * path here, not the array-source path further up.
+                         * Iterator.next() still only returns Object; without
+                         * a CHECKCAST down to the real array type, a later
+                         * use of the loop variable expecting an exact array
+                         * type (e.g. passing it to "new String(byte[],
+                         * Charset)") finds a bare Object on the stack
+                         * instead (VerifyError: "Bad type on operand
+                         * stack"), confirmed against gumdrop's own
+                         * SearchResultEntry.getAttributeStringValues(),
+                         * which does exactly this over a List<byte[]>.
+                         * JVMS 4.4.1: an array type's own CHECKCAST class
+                         * constant is its full descriptor (e.g. "[B"), not
+                         * an unwrapped internal name.
+                         *
+                         * This loop variable's own type_node is NOT
+                         * semantically annotated with a sem_type the way an
+                         * ordinary local variable declaration's type node is
+                         * (confirmed by instrumenting this exact spot) - so,
+                         * unlike the CLASS_TYPE branch just above, this
+                         * walks the AST_ARRAY_TYPE chain manually (same
+                         * technique as the local-variable-declaration case
+                         * a little earlier in this file) instead of relying
+                         * on it. */
+                        int dims = 0;
+                        ast_node_t *cur = type_node;
+                        while (cur && cur->type == AST_ARRAY_TYPE) {
+                            dims++;
+                            cur = cur->data.node.children ?
+                                (ast_node_t *)cur->data.node.children->data : NULL;
+                        }
+                        char elem_desc[256] = "Ljava/lang/Object;";
+                        if (cur && cur->type == AST_CLASS_TYPE) {
+                            const char *cname = (cur->sem_type && cur->sem_type->kind == TYPE_CLASS &&
+                                                  cur->sem_type->data.class_type.name) ?
+                                cur->sem_type->data.class_type.name : cur->data.node.name;
+                            if (cname) {
+                                const char *resolved = resolve_java_lang_class(cname);
+                                char *internal = class_to_internal_name(resolved);
+                                snprintf(elem_desc, sizeof(elem_desc), "L%s;", internal);
+                                free(internal);
+                            }
+                        } else if (cur && cur->type == AST_PRIMITIVE_TYPE && cur->data.leaf.name) {
+                            const char *p = cur->data.leaf.name;
+                            const char *d = "I";
+                            if (strcmp(p, "byte") == 0) d = "B";
+                            else if (strcmp(p, "short") == 0) d = "S";
+                            else if (strcmp(p, "char") == 0) d = "C";
+                            else if (strcmp(p, "long") == 0) d = "J";
+                            else if (strcmp(p, "float") == 0) d = "F";
+                            else if (strcmp(p, "double") == 0) d = "D";
+                            else if (strcmp(p, "boolean") == 0) d = "Z";
+                            snprintf(elem_desc, sizeof(elem_desc), "%s", d);
+                        }
+                        char full_desc[300];
+                        int i = 0;
+                        for (; i < dims && i < 250; i++) {
+                            full_desc[i] = '[';
+                        }
+                        snprintf(full_desc + i, sizeof(full_desc) - (size_t)i, "%s", elem_desc);
+                        array_desc = strdup(full_desc);
+                        uint16_t class_idx = cp_add_class(mg->cp, array_desc);
+                        bc_emit(mg->code, OP_CHECKCAST);
+                        bc_emit_u2(mg->code, class_idx);
+                    } else if (type_node && type_node->type == AST_PRIMITIVE_TYPE) {
+                        /* Loop variable declared as a primitive type over a
+                         * plain Iterable/Collection (e.g. "for (int v :
+                         * list)" where list is a List<Integer>) - JLS 14.14.2
+                         * requires this to auto-unbox each element, exactly
+                         * like an ordinary assignment of a boxed value to a
+                         * primitive-typed variable. Iterator.next() only
+                         * returns Object, so - unlike the CLASS_TYPE/
+                         * ARRAY_TYPE branches above, which just need a
+                         * reference-to-reference CHECKCAST - this needs a
+                         * CHECKCAST down to the primitive's own wrapper class
+                         * (matching real javac's own emitted bytecode
+                         * exactly: checkcast Integer; invokevirtual
+                         * intValue()) before unboxing, or the JVM verifier
+                         * rejects the wrapper's own unboxing method call
+                         * (intValue()/longValue()/etc) as not being declared
+                         * on Object (VerifyError: "Bad type on operand
+                         * stack"). Without any of this, the previous
+                         * behavior stored the raw boxed reference straight
+                         * into a primitive-typed local slot instead. */
+                        const char *wrapper = wrapper_class_for_primitive(var_kind);
+                        if (wrapper) {
+                            uint16_t class_idx = cp_add_class(mg->cp, wrapper);
+                            bc_emit(mg->code, OP_CHECKCAST);
+                            bc_emit_u2(mg->code, class_idx);
+                            emit_unboxing(mg, mg->cp, var_kind, wrapper);
+                        }
                     }
-                    
-                    /* Store to loop variable (reference type from Iterable) */
+
+                    /* Store to loop variable (reference type from Iterable,
+                     * unless just unboxed to a primitive above) */
                     mg_emit_store_local(mg, var_slot, var_kind);
-                    
+
                     /* Update stackmap for loop variable */
                     if (mg->stackmap) {
-                        /* For Iterable, loop variable is always reference type */
-                        const char *type_name = "java/lang/Object";
-                        if (type_node && type_node->sem_type && 
-                            type_node->sem_type->kind == TYPE_CLASS) {
-                            type_name = type_node->sem_type->data.class_type.name;
-                        } else if (type_node && type_node->type == AST_CLASS_TYPE) {
-                            type_name = type_node->data.node.name;
+                        if (array_desc) {
+                            stackmap_set_local_object(mg->stackmap, var_slot, mg->cp, array_desc);
+                        } else if (var_kind == TYPE_LONG) {
+                            stackmap_set_local_long(mg->stackmap, var_slot);
+                        } else if (var_kind == TYPE_DOUBLE) {
+                            stackmap_set_local_double(mg->stackmap, var_slot);
+                        } else if (var_kind == TYPE_FLOAT) {
+                            stackmap_set_local_float(mg->stackmap, var_slot);
+                        } else if (var_kind == TYPE_INT || var_kind == TYPE_BOOLEAN ||
+                                   var_kind == TYPE_BYTE || var_kind == TYPE_SHORT ||
+                                   var_kind == TYPE_CHAR) {
+                            stackmap_set_local_int(mg->stackmap, var_slot);
+                        } else {
+                            /* For Iterable, a non-array, non-primitive loop
+                             * variable is always reference type */
+                            const char *type_name = "java/lang/Object";
+                            if (type_node && type_node->sem_type &&
+                                type_node->sem_type->kind == TYPE_CLASS) {
+                                type_name = type_node->sem_type->data.class_type.name;
+                            } else if (type_node && type_node->type == AST_CLASS_TYPE) {
+                                type_name = type_node->data.node.name;
+                            }
+                            char *internal = class_to_internal_name(type_name);
+                            stackmap_set_local_object(mg->stackmap, var_slot, mg->cp, internal);
+                            free(internal);
                         }
-                        char *internal = class_to_internal_name(type_name);
-                        stackmap_set_local_object(mg->stackmap, var_slot, mg->cp, internal);
-                        free(internal);
                     }
-                    
+                    free(array_desc);
+
+                    /* Reset last_opcode before generating the body - see the
+                     * identical reset (and its full reasoning) in
+                     * AST_WHILE_STMT. */
+                    mg->last_opcode = 0;
+
                     /* body */
                     if (body && !codegen_statement(mg, body)) {
                         return false;
                     }
-                    
+
                     /* Check if body ended with an unconditional jump */
                     bool body_ends_with_jump = (mg->last_opcode == OP_GOTO ||
                                                mg->last_opcode == OP_RETURN ||
@@ -2895,11 +3489,23 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                                mg->last_opcode == OP_DRETURN ||
                                                mg->last_opcode == OP_ATHROW);
                     
-                    /* Update continue target */
+                    /* Finalize continue target to loop_start (not "here" -
+                     * unlike a for-loop/do-while/array-based enhanced-for,
+                     * there's no separate update step, so the real continue
+                     * target is simply the hasNext()/next() re-check
+                     * already recorded as loop_start at mg_push_loop()
+                     * above - confirmed, not changed, here), and patch
+                     * every `continue` in the body to jump there. Reusing
+                     * the already-framed loop_start (rather than "just
+                     * before the back-edge goto", a position with no frame
+                     * of its own) avoids needing a whole new stack map
+                     * frame here, mirroring AST_WHILE_STMT's identical
+                     * choice. */
                     if (mg->loop_stack) {
-                        ((loop_context_t *)mg->loop_stack->data)->continue_target = mg->code->length;
+                        mg_patch_continue_offsets(mg, (loop_context_t *)mg->loop_stack->data,
+                                                   loop_start);
                     }
-                    
+
                     /* Only generate back-edge if body doesn't end with unconditional jump */
                     if (!body_ends_with_jump) {
                         /* goto loop_start */
@@ -2965,15 +3571,33 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* Run any enclosing try statement's finally block(s)
                  * before actually jumping - see AST_BREAK_STMT's matching
                  * comment and emit_pending_finally_blocks() itself. Must
-                 * happen before computing the branch offset below, since
+                 * happen before computing the branch position below, since
                  * inlining the finally block's own bytecode here shifts
                  * mg->code->length. */
-                emit_pending_finally_blocks(mg);
+                emit_pending_finally_blocks(mg, target_ctx->finally_depth);
 
-                int16_t offset = (int16_t)(target_ctx->continue_target - mg->code->length);
+                /* Emit a placeholder goto and defer patching its real
+                 * offset until the target loop's real continue_target is
+                 * known (mg_patch_continue_offsets(), called by each loop
+                 * construct once its body has been fully generated).
+                 * Computing the offset directly here, against whatever
+                 * target_ctx->continue_target happens to hold right now,
+                 * is only correct for a loop whose continue target is
+                 * simply its own condition re-check (while; the Iterable
+                 * form of an enhanced-for) - a for-loop, do-while, or the
+                 * array form of an enhanced-for all have a separate
+                 * update/re-check step AFTER the body that continue must
+                 * reach instead, whose bytecode position doesn't exist
+                 * yet at this point (we're still generating the body).
+                 * Deferring uniformly, the same way AST_BREAK_STMT already
+                 * defers its own (forward) jump via
+                 * mg_add_break_to_context(), keeps this correct regardless
+                 * of which loop construct is involved. */
+                size_t continue_pos = mg->code->length;
                 bc_emit(mg->code, OP_GOTO);
-                bc_emit_u2(mg->code, offset);
+                bc_emit_u2(mg->code, 0);  /* placeholder, backpatched later */
                 mg->last_opcode = OP_GOTO;  /* Track for dead code detection */
+                mg_add_continue_to_context(target_ctx, continue_pos);
 
                 return true;
             }
@@ -3068,7 +3692,14 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 if (mg->stackmap) {
                     switch_entry_state = stackmap_save_state(mg->stackmap);
                 }
-                
+
+                /* Snapshots of every state that actually reaches the
+                 * switch's shared exit point (every `break`, from any
+                 * case) - collected below as each case is generated, and
+                 * merged into the single frame recorded there. See
+                 * merge_stackmap_states_into()'s own doc comment. */
+                slist_t *switch_exit_states = NULL;
+
                 /* Pad to 4-byte alignment */
                 while ((mg->code->length) % 4 != 0) {
                     bc_emit_u1(mg->code, 0);
@@ -3101,7 +3732,32 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             if (case_children) {
                                 ast_node_t *case_expr = (ast_node_t *)case_children->data;
                                 if (case_expr->type == AST_LITERAL) {
-                                    case_values[case_idx] = (int32_t)case_expr->data.leaf.value.int_val;
+                                    /* A CHAR literal's value lives in
+                                     * value.str_val (a 1-byte string, e.g.
+                                     * "a" - see ast_new_literal_from_lexer(),
+                                     * which never populates value.int_val for
+                                     * TOK_CHAR_LITERAL), not value.int_val -
+                                     * unlike every other numeric literal kind
+                                     * here (int/long, and true/false as 1/0).
+                                     * value is a union, so blindly reading
+                                     * int_val for a char literal case label
+                                     * (e.g. "case '*':") read the str_val
+                                     * pointer's own bit pattern reinterpreted
+                                     * as an int instead of the character's
+                                     * code point - a wildly wrong lookupswitch
+                                     * key that could never match any actual
+                                     * switch value, silently routing every
+                                     * char literal case label straight to
+                                     * default. Confirmed against gumdrop's
+                                     * own LdapRealm.escapeLDAPFilter(), whose
+                                     * switch(char) on '\\', '*', '(', ')' (and
+                                     * '\u0000') never matched any of them. */
+                                    if (case_expr->data.leaf.token_type == TOK_CHAR_LITERAL) {
+                                        const char *sv = case_expr->data.leaf.value.str_val;
+                                        case_values[case_idx] = sv ? (int32_t)(unsigned char)sv[0] : 0;
+                                    } else {
+                                        case_values[case_idx] = (int32_t)case_expr->data.leaf.value.int_val;
+                                    }
                                 } else if (case_expr->type == AST_IDENTIFIER) {
                                     /* semantic.c already resolved this case label's
                                      * own constant value onto its leaf, whether it's
@@ -3113,6 +3769,21 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                      * same way and this needs no different handling
                                      * for either. */
                                     case_values[case_idx] = (int32_t)case_expr->data.leaf.value.int_val;
+                                } else {
+                                    /* A constant EXPRESSION case label (e.g.
+                                     * "case ('U' << 24) | 'S':") - see
+                                     * eval_int_constant_expr()'s own doc
+                                     * comment. A value that fails to
+                                     * evaluate (not actually a compile-time
+                                     * constant - shouldn't happen for code
+                                     * that got this far past semantic
+                                     * analysis) leaves this case's match
+                                     * value at 0, same as before this branch
+                                     * existed. */
+                                    int32_t value;
+                                    if (eval_int_constant_expr(case_expr, &value)) {
+                                        case_values[case_idx] = value;
+                                    }
                                 }
                             }
                             case_to_ast_idx[case_idx] = ast_idx;
@@ -3168,6 +3839,36 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * (unfixed) merge behavior is left alone for that case. */
                 bool prev_case_terminates = true;
 
+                /* Track whether the switch AS A WHOLE unconditionally
+                 * terminates (every entry path ends in return/throw,
+                 * never falling through - or reached via `break` - to
+                 * right after the switch), so mg->last_opcode can reflect
+                 * that below instead of always resetting to 0. Needs a
+                 * `default` case (otherwise the "no label matched" path
+                 * falls straight through to after the switch), no
+                 * `break` ANYWHERE (a break, even in the very last case,
+                 * reaches "after the switch" directly, same as an
+                 * ordinary fall-through would), and the PHYSICALLY LAST
+                 * case body (in source/bytecode order - default included)
+                 * ending in return/throw. An earlier case whose body has
+                 * code but doesn't itself end in return/throw/break is
+                 * NOT disqualifying on its own: falling through with no
+                 * jump at all, into the next case's bytecode, is exactly
+                 * how intentional fallthrough (no `break`) works - that
+                 * case's real termination status is decided by whatever
+                 * it falls through into, not by its own tail. Requiring
+                 * every individual case to end in return/throw (rather
+                 * than just the last one, plus "no break anywhere")
+                 * wrongly treated a switch like "case A: ...; // fall
+                 * through \n case B: ...; return;" as non-terminating
+                 * even though every actual runtime path through it does
+                 * terminate, and the compiler then appended a spurious,
+                 * genuinely unreachable trailing return with no stack map
+                 * frame of its own right after the switch. */
+                bool has_default_case = false;
+                bool any_break = false;
+                bool last_case_had_code = false;
+
                 for (slist_t *node = children->next; node; node = node->next, ast_idx++) {
                     ast_node_t *case_label = (ast_node_t *)node->data;
                     if (case_label->type != AST_CASE_LABEL) {
@@ -3176,6 +3877,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
 
                     bool is_default = case_label->data.node.name &&
                                      strcmp(case_label->data.node.name, "default") == 0;
+                    if (is_default) {
+                        has_default_case = true;
+                    }
 
                     size_t current_code_pos = mg->code->length;
 
@@ -3231,6 +3935,51 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             last_op == OP_LRETURN || last_op == OP_FRETURN ||
                             last_op == OP_DRETURN || last_op == OP_ARETURN ||
                             last_op == OP_ATHROW);
+
+                        /* Fold into the whole-switch termination tracking
+                         * (see has_default_case/any_break/
+                         * last_case_had_code's own comment above) - but
+                         * only for a label that actually emitted bytecode
+                         * of its own. An empty fall-through label (e.g.
+                         * "case RSASHA256:" with no statements before
+                         * "case RSASHA512: return ...;") leaves
+                         * mg->last_opcode exactly as whatever it was
+                         * before this iteration - stale, unrelated state
+                         * that has nothing to do with this label. Any
+                         * label (not just the last) can disqualify the
+                         * whole switch via `break` (OP_GOTO); only the
+                         * LAST label's own termination is otherwise
+                         * tracked (last_case_had_code, checked against
+                         * mg->last_opcode again once the loop is over) -
+                         * an earlier case whose body doesn't end in
+                         * return/throw/break simply falls through into
+                         * the next case's bytecode, which is ordinary,
+                         * non-disqualifying switch fallthrough. */
+                        if (mg->code->length > current_code_pos) {
+                            if (last_op == OP_GOTO) {
+                                any_break = true;
+                                /* This case's `break` reaches the switch's
+                                 * shared exit point directly - capture its
+                                 * own local-variable state as one of the
+                                 * inputs to merge_stackmap_states_into()
+                                 * below, instead of letting whichever case
+                                 * happens to run LAST in the loop silently
+                                 * dictate everyone else's frame. */
+                                if (mg->stackmap) {
+                                    stackmap_state_t *exit_snap = stackmap_save_state(mg->stackmap);
+                                    if (exit_snap) {
+                                        if (!switch_exit_states) {
+                                            switch_exit_states = slist_new(exit_snap);
+                                        } else {
+                                            slist_append(switch_exit_states, exit_snap);
+                                        }
+                                    }
+                                }
+                            }
+                            last_case_had_code = true;
+                        } else {
+                            last_case_had_code = false;
+                        }
                     }
                 }
 
@@ -3269,14 +4018,126 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 if ((mg->loop_stack &&
                      ((loop_context_t *)mg->loop_stack->data)->break_offsets) ||
                     default_code_pos == 0) {
+                    /* This merge point is reached by every `break` (from
+                     * ANY case, already snapshotted into
+                     * switch_exit_states above), PLUS - if applicable -
+                     * a non-terminating fallthrough off the physically
+                     * last case, PLUS - if there's no explicit `default:`
+                     * - the "no case matched" edge straight from switch
+                     * entry. mg->stackmap otherwise still holds whatever
+                     * local-variable state the LAST case processed left
+                     * behind, which is only actually correct when every
+                     * one of these edges happens to agree with it. A
+                     * local variable declared inside just one case (e.g.
+                     * "default: String message = ...;", with no
+                     * enclosing braces) is not definitely assigned on any
+                     * of the OTHER paths reaching this point, so it must
+                     * not appear as a typed local in the shared frame -
+                     * recording it as whatever the last-processed case
+                     * left in that slot (a real type there, "top"/
+                     * unassigned on every other incoming edge) produced
+                     * "VerifyError: Inconsistent stackmap frames ...
+                     * locals[N] ... not assignable" the moment a
+                     * DIFFERENT case's own `break` reached this same
+                     * merge point with that slot still unassigned -
+                     * confirmed against gumdrop's own FtpProtocolHandler.
+                     * dispatchCommand(), whose `default:` is the only one
+                     * of ~44 cases to declare a local ("String message").
+                     * merge_stackmap_states_into() computes the proper
+                     * JVM-spec merge across every actually-reaching edge
+                     * instead (unconditionally restoring switch-ENTRY
+                     * state here instead - the simpler fix tried first -
+                     * is equally wrong the other way: it forgets that a
+                     * local declared BEFORE the switch and consistently
+                     * assigned in EVERY case is legitimately usable
+                     * afterward, breaking SwitchCaseAssignVerifyTest). */
+                    bool last_case_falls_through = !last_case_had_code ||
+                        (mg->last_opcode != OP_GOTO &&
+                         mg->last_opcode != OP_RETURN && mg->last_opcode != OP_IRETURN &&
+                         mg->last_opcode != OP_LRETURN && mg->last_opcode != OP_FRETURN &&
+                         mg->last_opcode != OP_DRETURN && mg->last_opcode != OP_ARETURN &&
+                         mg->last_opcode != OP_ATHROW);
+                    if (last_case_falls_through && mg->stackmap) {
+                        stackmap_state_t *fallthrough_snap = stackmap_save_state(mg->stackmap);
+                        if (fallthrough_snap) {
+                            if (!switch_exit_states) {
+                                switch_exit_states = slist_new(fallthrough_snap);
+                            } else {
+                                slist_append(switch_exit_states, fallthrough_snap);
+                            }
+                        }
+                    }
+                    if (default_code_pos == 0 && switch_entry_state) {
+                        /* A copy of switch_entry_state itself (not just a
+                         * pointer to it) - it's still needed afterward as
+                         * a fallback and gets freed separately from
+                         * everything in switch_exit_states below. */
+                        stackmap_state_t *entry_snap = calloc(1, sizeof(stackmap_state_t));
+                        if (entry_snap) {
+                            entry_snap->num_locals = switch_entry_state->num_locals;
+                            entry_snap->locals = switch_entry_state->num_locals ?
+                                malloc(switch_entry_state->num_locals * sizeof(verification_type_t)) : NULL;
+                            if (entry_snap->locals) {
+                                memcpy(entry_snap->locals, switch_entry_state->locals,
+                                       switch_entry_state->num_locals * sizeof(verification_type_t));
+                            }
+                            if (!switch_exit_states) {
+                                switch_exit_states = slist_new(entry_snap);
+                            } else {
+                                slist_append(switch_exit_states, entry_snap);
+                            }
+                        }
+                    }
+                    if (switch_exit_states && mg->stackmap) {
+                        merge_stackmap_states_into(mg->stackmap, switch_exit_states);
+                    } else if (switch_entry_state && mg->stackmap) {
+                        /* No case ever reaches the exit at all (shouldn't
+                         * normally happen given the guard above, but stay
+                         * safe) - fall back to entry state as before. */
+                        stackmap_restore_state(mg->stackmap, switch_entry_state);
+                    }
                     mg_record_frame(mg);
                 }
-                
+
+                if (switch_exit_states) {
+                    for (slist_t *n = switch_exit_states; n; n = n->next) {
+                        stackmap_state_free((stackmap_state_t *)n->data);
+                    }
+                    slist_free(switch_exit_states);
+                }
+
                 /* Pop switch context and patch breaks */
                 mg_pop_loop(mg, switch_end);
                 
-                /* Reset last_opcode - switch doesn't guarantee method termination */
-                mg->last_opcode = 0;
+                /* A switch statement doesn't generally guarantee
+                 * termination (there may be no default, some case may
+                 * `break` past its end, or the physically last case may
+                 * fall off the end without one) - reset last_opcode to 0
+                 * in that case, same as always before. But when there's
+                 * no `break` anywhere, and the PHYSICALLY LAST case
+                 * (default included) genuinely ends in return/throw (see
+                 * has_default_case/any_break/last_case_had_code's own
+                 * comment above), the switch AS A WHOLE does
+                 * unconditionally terminate - reflect that instead of
+                 * unconditionally resetting, so enclosing code that
+                 * checks mg->last_opcode (e.g. AST_TRY_STMT's own
+                 * try_body_ends_with_return check) doesn't wrongly think
+                 * this switch falls through and append a dead, frame-less
+                 * "normal completion" goto right after it. Confirmed
+                 * against gumdrop's own DnssecValidator.buildPublicKey(),
+                 * whose entire try body is exactly such a switch
+                 * (VerifyError: "Expecting a stack map frame" on the
+                 * spurious goto). mg->last_opcode already holds the last
+                 * case's own final opcode at this point (nothing between
+                 * the loop above and here changes it), so there's no
+                 * separate "which op" value to track. */
+                bool last_case_terminates = last_case_had_code &&
+                    (mg->last_opcode == OP_RETURN || mg->last_opcode == OP_IRETURN ||
+                     mg->last_opcode == OP_LRETURN || mg->last_opcode == OP_FRETURN ||
+                     mg->last_opcode == OP_DRETURN || mg->last_opcode == OP_ARETURN ||
+                     mg->last_opcode == OP_ATHROW);
+                bool switch_terminates = has_default_case && !any_break && last_case_terminates;
+                mg->last_opcode = switch_terminates ? mg->last_opcode : 0;
 
                 stackmap_state_free(switch_entry_state);
                 free(case_values);
@@ -4066,9 +4927,21 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     
                     free(stackmap_exc_internal);
                     
-                    /* Store exception to local variable - for multi-catch, use first type
-                     * (a proper implementation would compute the common supertype) */
-                    type_t *exc_type_t = type_new_class(first_exc_class);
+                    /* Store exception to local variable. Prefer the LUB
+                     * semantic analysis already computed across every
+                     * multi-catch alternative (catch_clause->sem_type, set in
+                     * semantic.c's AST_CATCH_CLAUSE handling) over
+                     * first_exc_class - using only the FIRST alternative's
+                     * type here (as this used to) made a later checkcast
+                     * against that type reject any OTHER alternative
+                     * actually thrown at runtime: ClassCastException.
+                     * Confirmed against gumdrop's own GrpcClient, whose
+                     * "catch (ProtoParseException | ProtobufParseException e)"
+                     * is exactly this shape. Falls back to first_exc_class
+                     * only if semantic analysis didn't leave a usable class
+                     * type (defensive; shouldn't happen in practice). */
+                    type_t *exc_type_t = (catch_clause->sem_type && catch_clause->sem_type->kind == TYPE_CLASS) ?
+                        catch_clause->sem_type : type_new_class(first_exc_class);
                     uint16_t catch_exc_slot = mg_allocate_local(mg, exc_var_name, exc_type_t);
                     
                     /* Exception is on stack (pushed by JVM at handler entry) */
@@ -4106,13 +4979,53 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     }
                     
                     uint16_t catch_end = (uint16_t)mg->code->length;
-                    
-                    /* If finally exists, inline finally code.
-                     * See finally_saved_slot's comment above: each inlined
+
+                    /* If finally exists, inline finally code - but only if
+                     * the catch body doesn't already end with an
+                     * unconditional return/throw/break/continue, mirroring
+                     * try_body_ends_with_return's own identical check above
+                     * for the try block. A `throw` as the catch body's last
+                     * statement emits ATHROW directly (see AST_THROW_STMT)
+                     * without running this finally block first - but that's
+                     * still correct: the catch range is registered below as
+                     * protected by the "any -> finally handler" exception
+                     * table entry (see "Save catch range for finally
+                     * exception handler" just below), so the JVM's own
+                     * exception dispatch already runs the finally block via
+                     * that handler when the throw propagates. Appending a
+                     * SECOND, redundant copy of the finally block directly
+                     * after the ATHROW is therefore always dead code - and,
+                     * being the instruction immediately following an
+                     * unconditional branch, the verifier rejects it outright
+                     * for lacking a stack map frame ("Expecting a stack map
+                     * frame"), confirmed against gumdrop's own
+                     * BasicRealm.setHref(), whose catch clause's last
+                     * statement is `throw new RuntimeException(..., e);`
+                     * wrapped in a try/finally. A `return` inside the catch
+                     * body has the same dead-code placement (see
+                     * emit_pending_finally_blocks()'s own doc comment: it
+                     * does not yet cover a return from inside a catch
+                     * clause), which is a separate, pre-existing gap this
+                     * check does not newly introduce - skipping this
+                     * unreachable copy changes nothing for that case, since
+                     * it already never actually ran at runtime either way. */
+                    bool catch_body_ends_with_return = false;
+                    {
+                        uint8_t body_last_op = mg->last_opcode;
+                        if (body_last_op == OP_RETURN || body_last_op == OP_IRETURN ||
+                            body_last_op == OP_LRETURN || body_last_op == OP_FRETURN ||
+                            body_last_op == OP_DRETURN || body_last_op == OP_ARETURN ||
+                            body_last_op == OP_ATHROW || body_last_op == OP_GOTO) {
+                            catch_body_ends_with_return = true;
+                        }
+                    }
+
+                    /* See finally_saved_slot's comment above: each inlined
                      * copy of the finally block must start temp-local
                      * allocation from the same baseline as every other
                      * copy. */
-                    if (finally_clause && finally_clause->data.node.children) {
+                    if (!catch_body_ends_with_return &&
+                        finally_clause && finally_clause->data.node.children) {
                         ast_node_t *finally_block = (ast_node_t *)finally_clause->data.node.children->data;
                         uint16_t catch_finally_saved_slot = mg->next_slot;
                         if (!codegen_statement(mg, finally_block)) {

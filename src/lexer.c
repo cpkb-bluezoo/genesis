@@ -346,6 +346,7 @@ static void lexer_scan_identifier(lexer_t *lexer);
 static void lexer_scan_number(lexer_t *lexer);
 static void lexer_scan_string(lexer_t *lexer);
 static void lexer_scan_char(lexer_t *lexer);
+static int hex_digit_value(char c);
 
 /**
  * Create a new lexer for a source file.
@@ -1000,6 +1001,68 @@ static void lexer_scan_string(lexer_t *lexer)
                 case '\\': esc = '\\'; break;
                 case '"':  esc = '"'; break;
                 case '\'': esc = '\''; break;
+                case '0': case '1': case '2': case '3':
+                case '4': case '5': case '6': case '7': {
+                    /* Octal escape (JLS 3.10.6: \0 through \377, up to 3
+                     * octal digits, with the first digit limited to 0-3
+                     * when all 3 are used) - mirrors lexer_scan_char's
+                     * identical octal-escape handling below, adapted for
+                     * this loop's single shared "advance past the escape
+                     * designator" at the bottom of the loop (so only the
+                     * 2nd/3rd digits, if present, need an extra explicit
+                     * advance here). Falling through to the default case
+                     * (which kept the literal digit character itself,
+                     * e.g. '0' as byte 48) silently broke any string
+                     * literal using this escape - notably "\0" for a NUL
+                     * byte, as in a SASL PLAIN initial response
+                     * ("\0user\0pass"). */
+                    int value = c - '0';
+                    char d1 = lexer_peek_ahead(lexer, 1);
+                    if (d1 >= '0' && d1 <= '7') {
+                        value = value * 8 + (d1 - '0');
+                        lexer_advance_char(lexer);
+                        char d2 = lexer_peek_ahead(lexer, 1);
+                        if (c <= '3' && d2 >= '0' && d2 <= '7') {
+                            value = value * 8 + (d2 - '0');
+                            lexer_advance_char(lexer);
+                        }
+                    }
+                    esc = (char)value;
+                    break;
+                }
+                case 'u': {
+                    /* Unicode escape \uXXXX (JLS 3.3) - mirrors
+                     * lexer_scan_char's identical handling (only BMP
+                     * characters that fit in a byte are supported, same
+                     * limitation as that existing implementation).
+                     * Falling through to the default case (which kept
+                     * the literal 'u' character, leaving the following
+                     * hex digits as ordinary text - inflating the
+                     * string's length by 5 bytes per escape instead of
+                     * producing the single intended byte) silently
+                     * corrupted any string literal using this escape -
+                     * e.g. gumdrop's own SASL OAUTHBEARER credential
+                     * parsing, which uses "\u0001" (control-A) as its
+                     * RFC 7628 field separator; every indexOf('\u0001')
+                     * against such a corrupted literal (the CHAR literal
+                     * '\u0001' itself was already handled correctly, see
+                     * lexer_scan_char below) failed to find a match. */
+                    lexer_advance_char(lexer);  /* Skip 'u', move to 1st hex digit */
+                    int value = 0;
+                    int digits;
+                    for (digits = 0; digits < 4; digits++) {
+                        int digit = hex_digit_value(lexer_peek(lexer));
+                        if (digit < 0) {
+                            break;
+                        }
+                        value = (value << 4) | digit;
+                        if (digits < 3) {
+                            lexer_advance_char(lexer);
+                        }
+                    }
+                    esc = (digits == 4) ? (char)(value & 0xFF) : 'u';
+                    break;
+                }
                 default:   esc = c; break;
             }
             if (buf_pos < sizeof(lexer->text_buf) - 1) {

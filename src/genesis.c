@@ -1303,6 +1303,32 @@ static void register_type_decl(type_registry_t *reg, ast_node_t *decl,
             symbol_t *parent_sym = type_registry_lookup(reg, parent_qname);
             if (parent_sym) {
                 sym->data.class_data.enclosing_class = parent_sym;
+                /* JLS 9.5: a member type of an interface is implicitly
+                 * public and static, regardless of what the source
+                 * actually wrote. This registry stub is exactly what a
+                 * DIFFERENT file in the same compile batch resolves a
+                 * cross-file reference to this type through - codegen.c's
+                 * own codegen_class() already forces this for the type's
+                 * OWN compiled classfile when the file declaring it is
+                 * compiled directly, but a caller in another file builds
+                 * its "does this nested class need an outer-this
+                 * constructor argument" decision (codegen_expr.c's
+                 * codegen_new_object(), checking target_sym->modifiers &
+                 * MOD_STATIC) from THIS stub's modifiers, not from that
+                 * other file's own compiled output - so leaving this
+                 * stub's modifiers unmodified left every cross-file
+                 * caller still assuming an inner (non-static) class
+                 * layout, constructing a "new DirectoryChangeResult(...)"
+                 * call site with a leading outer-instance argument that
+                 * the actual (correctly-fixed) constructor no longer
+                 * accepts: NoSuchMethodError at runtime. Confirmed
+                 * against gumdrop's own FtpFileSystem (an interface)
+                 * declaring "class DirectoryChangeResult { ... }",
+                 * constructed from BasicFTPFileSystem in a different
+                 * file/package. */
+                if (parent_sym->kind == SYM_INTERFACE) {
+                    sym->modifiers |= MOD_PUBLIC | MOD_STATIC;
+                }
             }
         }
         /* Set the completer for lazy member population (javac-style) */

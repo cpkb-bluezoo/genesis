@@ -144,6 +144,15 @@ static char *build_array_descriptor(type_kind_t base_kind, const char *base_clas
 }
 
 /**
+ * Emit bytecode to load the nearest enclosing instance of type target_owner,
+ * walking the this$0 chain from mg's current class as many levels as needed.
+ * Defined below (with full doc comment); forward-declared here so earlier
+ * call sites in this file (e.g. codegen_identifier's enclosing-field-read
+ * path) can use it too.
+ */
+static void codegen_load_enclosing_this(method_gen_t *mg, const_pool_t *cp, symbol_t *target_owner);
+
+/**
  * Emit ++/-- on an instance field of the current object (this.field).
  * field_owner_internal is the class that declares the field (may be a superclass).
  */
@@ -698,7 +707,27 @@ type_kind_t get_expr_type_kind(method_gen_t *mg, ast_node_t *expr)
     if (!expr) {
         return TYPE_INT;
     }
-    
+
+    /* AST_THIS_EXPR nodes carry no sem_type (confirmed by an existing
+     * comment elsewhere in this file, at the receiver-type-inference call
+     * site for field access) - so without this case, "this" fell through
+     * every other branch below straight to the function's own final
+     * "default to TYPE_INT" fallback, same as an unresolvable expression.
+     * A caller deciding whether an argument needs boxing for a reference-
+     * typed parameter (e.g. Map.put(key, this)) then wrongly treated
+     * "this" as a primitive int needing Integer.valueOf() before the
+     * call - producing an invokestatic to Integer.valueOf(I) right
+     * before passing an object reference, rejected by the verifier
+     * (VerifyError: "Bad type on operand stack", the reference type not
+     * assignable to int). Confirmed against gumdrop's own
+     * DNSResolverIpv6FallbackTest, whose test-only anonymous
+     * DnsClientTransport implementation does exactly
+     * "harness.transports.put(server.getHostAddress(), this);" inside
+     * its own open() override. */
+    if (expr->type == AST_THIS_EXPR) {
+        return TYPE_CLASS;
+    }
+
     /* Check semantic type first */
     if (expr->sem_type) {
         /* Handle wrapper types - return underlying primitive for arithmetic */
@@ -1069,10 +1098,18 @@ static bool codegen_literal(method_gen_t *mg, ast_node_t *lit, const_pool_t *cp)
         case TOK_TEXT_BLOCK:
             {
                 const char *str = lit->data.leaf.value.str_val;
-                if (!str) {
+                size_t len;
+                if (str) {
+                    /* str_len (not strlen(str)) is the literal's true byte
+                     * length - it may contain an embedded NUL of its own
+                     * (JLS 3.10.6 octal escape, e.g. "\0alice\0s3cret"),
+                     * which strlen() would stop at short. */
+                    len = lit->data.leaf.str_len;
+                } else {
                     str = lit->data.leaf.name;
+                    len = str ? strlen(str) : 0;
                 }
-                uint16_t idx = cp_add_string(cp, str ? str : "");
+                uint16_t idx = cp_add_string_len(cp, str ? str : "", str ? len : 0);
                 if (idx <= 255) {
                     bc_emit(mg->code, OP_LDC);
                     bc_emit_u1(mg->code, (uint8_t)idx);
@@ -1107,6 +1144,29 @@ static bool codegen_literal(method_gen_t *mg, ast_node_t *lit, const_pool_t *cp)
 /* ========================================================================
  * Identifier Code Generation
  * ======================================================================== */
+
+/**
+ * Find the AST_VAR_DECLARATOR (and, through it, the initializer
+ * expression) for a specific field name within an AST_FIELD_DECL node -
+ * needed because field_gen_t only keeps a pointer to the whole
+ * declaration (which may declare several fields at once, e.g. "static
+ * final int A = 1, B = 2;"), not to the one declarator matching a given
+ * field_gen_t entry.
+ */
+static ast_node_t *find_field_var_declarator(ast_node_t *field_decl, const char *name)
+{
+    if (!field_decl || !name) {
+        return NULL;
+    }
+    for (slist_t *c = field_decl->data.node.children; c; c = c->next) {
+        ast_node_t *child = (ast_node_t *)c->data;
+        if (child->type == AST_VAR_DECLARATOR && child->data.node.name &&
+            strcmp(child->data.node.name, name) == 0) {
+            return child;
+        }
+    }
+    return NULL;
+}
 
 static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
 {
@@ -1212,6 +1272,75 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
         if (field) {
             /* Check if it's a static field */
             if (field->access_flags & ACC_STATIC) {
+                /* Compile-time constant inlining (JLS 4.12.4/13.1): a
+                 * `static final` field of a primitive or String type,
+                 * initialized with a literal, is a genuine compile-time
+                 * constant - real javac inlines its value at every use
+                 * site instead of emitting a runtime field read, which
+                 * sidesteps any dependence on the declaring class's own
+                 * <clinit> field-initializer ORDER (a constant declared
+                 * LATER in the same class is still safely usable from an
+                 * EARLIER field initializer, since there is no runtime
+                 * read of the field at all - the value is baked in at
+                 * compile time). Without this, an unqualified reference
+                 * to such a constant from an EARLIER static field
+                 * initializer in the same class got a literal GETSTATIC,
+                 * which DOES observe declaration order - the constant's
+                 * own assignment hadn't run yet, so the read silently
+                 * returned the field's default value (null for a
+                 * String, 0/false for a primitive) instead of its real
+                 * one. Confirmed against gumdrop's own
+                 * DnsServerCapabilityCache, whose "WELL_KNOWN =
+                 * wellKnownResolvers()" field initializer (early in the
+                 * class) calls a method reading "DOH_PATH" (a static
+                 * final String declared LATER in the same file) -
+                 * producing no VerifyError at all, just a plain wrong
+                 * runtime value (every well-known public resolver
+                 * silently reported as NOT supporting DoH). */
+                if ((field->access_flags & ACC_FINAL) && field->ast) {
+                    ast_node_t *decl = find_field_var_declarator(field->ast, name);
+                    ast_node_t *init_expr = (decl && decl->data.node.children) ?
+                        (ast_node_t *)decl->data.node.children->data : NULL;
+                    if (init_expr && init_expr->type == AST_LITERAL &&
+                        codegen_literal(mg, init_expr, mg->cp)) {
+                        /* The literal's own natural type (e.g. an int
+                         * literal like "3000") may be narrower than the
+                         * field's own DECLARED type (e.g. "static final
+                         * long ... = 3000;", legal per JLS 5.2's implicit
+                         * widening at the point of assignment) - unlike
+                         * the getstatic path just below, which always got
+                         * this right for free (a field read's pushed type
+                         * comes from the field's own descriptor, not its
+                         * initializer), inlining the bare literal bypasses
+                         * that and needs the same widening applied
+                         * explicitly. Missing this regressed gumdrop's
+                         * own DnsResolver.DDR_TIMEOUT_MS ("private static
+                         * final long DDR_TIMEOUT_MS = 3000;", passed to an
+                         * interface method's own long parameter) the
+                         * moment the constant-inlining fix above landed
+                         * (VerifyError: "Bad type on operand stack", int
+                         * not assignable to long_2nd). */
+                        type_kind_t field_kind;
+                        switch (field->descriptor[0]) {
+                            case 'J': field_kind = TYPE_LONG; break;
+                            case 'D': field_kind = TYPE_DOUBLE; break;
+                            case 'F': field_kind = TYPE_FLOAT; break;
+                            case 'Z': field_kind = TYPE_BOOLEAN; break;
+                            case 'B': field_kind = TYPE_BYTE; break;
+                            case 'C': field_kind = TYPE_CHAR; break;
+                            case 'S': field_kind = TYPE_SHORT; break;
+                            case 'I': field_kind = TYPE_INT; break;
+                            default:  field_kind = TYPE_UNKNOWN; break;
+                        }
+                        if (field_kind != TYPE_UNKNOWN) {
+                            type_kind_t lit_kind = get_expr_type_kind(mg, init_expr);
+                            if (lit_kind != field_kind) {
+                                coerce_stack_value(mg, mg->cp, lit_kind, NULL, field_kind, NULL);
+                            }
+                        }
+                        return true;
+                    }
+                }
                 /* Static field - use getstatic */
                 uint16_t fieldref = cp_add_fieldref(mg->cp, mg->class_gen->internal_name,
                                                      field->name, field->descriptor);
@@ -1296,14 +1425,15 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
                             free(field_desc);
                             return true;
                         } else if (mg->class_gen->is_inner_class) {
-                            /* Instance field - access via this$0 */
-                            bc_emit(mg->code, OP_ALOAD_0);
-                            mg_push_object(mg, mg->class_gen->internal_name);
-                            bc_emit(mg->code, OP_GETFIELD);
-                            bc_emit_u2(mg->code, mg->class_gen->this_dollar_zero_ref);
+                            /* Instance field - access via this$0, walking the full
+                             * this$0 chain (not just one hop) since 'enclosing' may be
+                             * two or more levels of anonymous/inner/local class away
+                             * from the current class (e.g. a class nested inside an
+                             * anonymous class nested inside another anonymous class). */
+                            codegen_load_enclosing_this(mg, mg->cp, enclosing);
                             mg_pop_typed(mg, 1);
                             mg_push_object(mg, outer_internal);
-                            
+
                             /* Get the field using the declaring superclass as owner */
                             uint16_t fieldref = cp_add_fieldref(mg->cp, field_owner_internal,
                                                                  name, field_desc);
@@ -1590,6 +1720,45 @@ static const char *get_known_static_field_type_class(const char *class_name, con
         }
     }
     
+    return NULL;
+}
+
+/**
+ * Look up a field by name in a class's own members, walking UP its
+ * superclass chain if not found directly on `class_sym` itself.
+ *
+ * scope_lookup_local() alone only ever checks a single class's own
+ * members scope, never its ancestors - fine when a field is declared
+ * directly on the receiver's own static type, but wrong for an INHERITED
+ * field (declared on a superclass instead). codegen_field_access() below
+ * has several receiver shapes (a plain local variable, and the general
+ * "receiver is some other expression" fallback) that each independently
+ * re-derive a field's own type here for codegen purposes (to build the
+ * GETFIELD's descriptor and the pushed-value type for stack tracking);
+ * each needs this same walk, mirroring the analogous superclass walk
+ * semantic.c's get_expression_type() AST_FIELD_ACCESS case already does
+ * when resolving a field access expression's type during semantic
+ * analysis. Without it, an inherited field (e.g. `session`, declared on
+ * `LinkImpl`, accessed via a `ReceiverImpl`-typed expression from a third,
+ * unrelated file) is silently not found here, and the caller falls back
+ * to a hardcoded `Ljava/lang/Object;` descriptor - wrong for anything but
+ * a literal Object-typed field, and mismatched against the correct
+ * target class a subsequent method call on the field's value would use
+ * (resolved separately - and correctly, since it already walks
+ * superclasses - by semantic.c) once the verifier compares the two.
+ */
+static symbol_t *lookup_field_with_superclass(symbol_t *class_sym, const char *field_name)
+{
+    for (symbol_t *search_class = class_sym; search_class;
+         search_class = search_class->data.class_data.superclass) {
+        if (!search_class->data.class_data.members) {
+            continue;
+        }
+        symbol_t *field_sym = scope_lookup_local(search_class->data.class_data.members, field_name);
+        if (field_sym && field_sym->kind == SYM_FIELD) {
+            return field_sym;
+        }
+    }
     return NULL;
 }
 
@@ -2064,16 +2233,17 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                     /* Note: we leak this memory, but it's small */
                 }
                 
-                /* Look up the field in the class to get its type */
+                /* Look up the field in the class to get its type - walking
+                 * the superclass chain too, since it may be inherited. */
                 symbol_t *class_sym = receiver->sem_type->data.class_type.symbol;
-                if (class_sym && class_sym->data.class_data.members) {
-                    symbol_t *field_sym = scope_lookup_local(class_sym->data.class_data.members, field_name);
-                    if (field_sym && field_sym->kind == SYM_FIELD && field_sym->type) {
+                if (class_sym) {
+                    symbol_t *field_sym = lookup_field_with_superclass(class_sym, field_name);
+                    if (field_sym && field_sym->type) {
                         field_desc = type_to_descriptor(field_sym->type);
                     }
                 }
             }
-            
+
             /* If we have the local class but no semantic info, look up via semantic analyzer */
             if (local_class && !receiver->sem_type && mg->class_gen && mg->class_gen->sem) {
                 /* Try to find the class symbol by name */
@@ -2089,11 +2259,9 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                 }
                 if (local_type && local_type->kind == TYPE_CLASS && local_type->data.class_type.symbol) {
                     symbol_t *class_sym = local_type->data.class_type.symbol;
-                    if (class_sym->data.class_data.members) {
-                        symbol_t *field_sym = scope_lookup_local(class_sym->data.class_data.members, field_name);
-                        if (field_sym && field_sym->kind == SYM_FIELD && field_sym->type) {
-                            field_desc = type_to_descriptor(field_sym->type);
-                        }
+                    symbol_t *field_sym = lookup_field_with_superclass(class_sym, field_name);
+                    if (field_sym && field_sym->type) {
+                        field_desc = type_to_descriptor(field_sym->type);
                     }
                 }
             }
@@ -2130,14 +2298,16 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
             char *class_internal = class_to_internal_name(class_sym->qualified_name);
             const char *field_desc = NULL;
             
-            /* Look up the field in the class to get its descriptor */
-            if (class_sym->data.class_data.members) {
-                symbol_t *field_sym = scope_lookup_local(class_sym->data.class_data.members, field_name);
+            /* Look up the field in the class to get its descriptor -
+             * walking the superclass chain too, since a static field can
+             * be inherited just like an instance field. */
+            {
+                symbol_t *field_sym = lookup_field_with_superclass(class_sym, field_name);
                 if (field_sym && field_sym->type) {
                     field_desc = type_to_descriptor(field_sym->type);
                 }
             }
-            
+
             if (!field_desc) {
                 /* Default to the enum type itself (common for enum constants) */
                 field_desc = malloc(strlen(class_internal) + 3);
@@ -2287,14 +2457,18 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
         }
     }
     
-    /* Look up the actual field descriptor */
-    if (recv_class_sym && recv_class_sym->data.class_data.members) {
-        symbol_t *field_sym = scope_lookup_local(recv_class_sym->data.class_data.members, field_name);
-        if (field_sym && field_sym->kind == SYM_FIELD && field_sym->type) {
+    /* Look up the actual field descriptor - walking the superclass chain
+     * too, since the field may be inherited rather than declared directly
+     * on the receiver's own static type (e.g. a field declared on a
+     * superclass in one file, accessed via a subclass-typed expression in
+     * a third, unrelated file - see lookup_field_with_superclass()). */
+    if (recv_class_sym) {
+        symbol_t *field_sym = lookup_field_with_superclass(recv_class_sym, field_name);
+        if (field_sym && field_sym->type) {
             field_desc = type_to_descriptor(field_sym->type);
         }
     }
-    
+
     uint16_t fieldref = cp_add_fieldref(cp, recv_class, field_name, field_desc);
     bc_emit(mg->code, OP_GETFIELD);
     bc_emit_u2(mg->code, fieldref);
@@ -4053,11 +4227,20 @@ void emit_widen_primitive(method_gen_t *mg, type_kind_t from_kind, type_kind_t t
  * Convert a value already on top of the stack, of kind/class (from_kind,
  * from_class), to (to_kind, to_class), as an assignment conversion (JLS 5.2):
  * unboxing (optionally followed by widening), widening alone, or boxing.
- * to_class is only consulted when to_kind is TYPE_CLASS, to tell a wrapper
- * or Object target (which a primitive may be boxed to) from some other
- * reference type (which it may not); NULL is treated as such an "any
- * reference" target, matching a type variable's erasure. A mismatch this
- * does not cover (e.g. two unrelated reference types) is left alone, since
+ * When from_kind is primitive and to_kind is a non-primitive TYPE_CLASS/
+ * TYPE_TYPEVAR target, to_class is NOT used to gate whether to box - the
+ * only way Java lets a primitive value reach a reference-typed context at
+ * all is a boxing conversion, optionally followed by a widening reference
+ * conversion (JLS 5.1.7/5.2), so if semantic analysis already accepted the
+ * assignment/return/call, the target can only be the exact wrapper, a
+ * supertype the boxed value widens to (Object, Number, Comparable,
+ * Serializable, ...), or a type variable's erasure - boxing is always the
+ * right move. (Earlier this only recognized the exact wrapper class or
+ * Object as boxable, silently leaving the value as a bare primitive for
+ * any other legal target - e.g. "Number f() { return 1; }" - and emitting
+ * ARETURN on an int: VerifyError "Bad type on operand stack ... integer
+ * ... not assignable to reference type".) A mismatch where from_kind is
+ * ALSO non-primitive (two unrelated reference types) is left alone, since
  * that is either already a reference conversion needing no bytecode, or a
  * genuine type error that semantic analysis, not codegen, should have
  * reported.
@@ -4066,6 +4249,11 @@ void coerce_stack_value(method_gen_t *mg, const_pool_t *cp,
                                type_kind_t from_kind, const char *from_class,
                                type_kind_t to_kind, const char *to_class)
 {
+    /* No longer consulted: boxing a primitive is always correct once
+     * to_kind is a non-primitive target (see the doc comment above).
+     * Kept in the signature since callers already have it on hand and a
+     * future to_kind==TYPE_ARRAY/TYPE_CLASS distinction may want it again. */
+    (void)to_class;
     bool from_is_primitive = (from_kind >= TYPE_BOOLEAN && from_kind <= TYPE_DOUBLE);
     bool to_is_primitive = (to_kind >= TYPE_BOOLEAN && to_kind <= TYPE_DOUBLE);
 
@@ -4088,14 +4276,7 @@ void coerce_stack_value(method_gen_t *mg, const_pool_t *cp,
     }
 
     if (!to_is_primitive && from_is_primitive && to_kind != TYPE_UNKNOWN) {
-        bool boxable_target = !to_class ||
-            get_primitive_for_wrapper(to_class) != TYPE_UNKNOWN ||
-            strcmp(to_class, "java.lang.Object") == 0 ||
-            strcmp(to_class, "java/lang/Object") == 0 ||
-            strcmp(to_class, "Object") == 0;
-        if (boxable_target) {
-            emit_boxing(mg, cp, from_kind);
-        }
+        emit_boxing(mg, cp, from_kind);
     }
 }
 
@@ -4385,13 +4566,42 @@ static void codegen_load_enclosing_this(method_gen_t *mg, const_pool_t *cp, symb
  * for what are actually array-reference elements, rejected by the
  * verifier the moment a real array reference reached that store.
  */
+/**
+ * Erase a (possibly bounded) type variable to its runtime array-component
+ * type, same as javac's own erasure: a bound's own bound if the bound is
+ * itself a type variable, or java.lang.Object if unbounded. Every other
+ * kind is returned unchanged.
+ *
+ * Needed because varargs_element_type() below returns the varargs
+ * parameter's own declared element type verbatim - for a JDK generic
+ * varargs method like `EnumSet.of(E first, E... rest)` (E declared as
+ * `<E extends Enum<E>>`), that element type is TYPE_TYPEVAR, which none
+ * of this element type's callers' TYPE_CLASS/TYPE_ARRAY/primitive
+ * branches match. Left un-erased, the synthetic varargs array got built
+ * (and stackmap-tracked) as the generic "[Ljava/lang/Object;" fallback -
+ * wrong whenever the type variable has a real bound, since the call
+ * site's own invokestatic/invokevirtual descriptor is fixed to the
+ * ERASED bound (e.g. "[Ljava/lang/Enum;" for EnumSet.of), not Object.
+ * Confirmed against gumdrop's own BasicRealm's
+ * `EnumSet.of(SaslMechanism.PLAIN, ...)` (VerifyError: "Bad type on
+ * operand stack", "[Ljava/lang/Object;" not assignable to
+ * "[Ljava/lang/Enum;").
+ */
+static type_t *erase_typevar_for_array(type_t *t)
+{
+    while (t && t->kind == TYPE_TYPEVAR) {
+        t = t->data.type_var.bound;
+    }
+    return t ? t : type_new_class("java.lang.Object");
+}
+
 static type_t *varargs_element_type(type_t *varargs_param_type)
 {
     if (!varargs_param_type || varargs_param_type->kind != TYPE_ARRAY) {
         return NULL;
     }
     int dims = varargs_param_type->data.array_type.dimensions;
-    type_t *base = varargs_param_type->data.array_type.element_type;
+    type_t *base = erase_typevar_for_array(varargs_param_type->data.array_type.element_type);
     if (dims <= 1) {
         return base;
     }
@@ -4640,15 +4850,34 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                     }
                 }
                 
-                /* Look up the method in the class - store in semantic symbol for later use */
-                if (class_sym->data.class_data.members) {
+                /* Look up the method in the class - store in semantic symbol for later use.
+                 * Only as a FALLBACK: semantic analysis's AST_FIELD_ACCESS receiver
+                 * handling (semantic.c) already resolves this exact call shape
+                 * (ClassName.staticMethod(...) via a fully-qualified-name receiver)
+                 * through find_best_method_by_types(), which does real type-based
+                 * overload resolution (including preferring a static varargs method
+                 * over same-arity instance overloads). scope_lookup_method_with_args()
+                 * here does no such thing - it matches by raw argument COUNT alone,
+                 * with no static/instance filtering and no type checking, and simply
+                 * returns whichever same-arity overload it meets first in hashtable
+                 * bucket order. Unconditionally overwriting expr->sem_symbol with its
+                 * result therefore could - and for java.text.MessageFormat.format(...)
+                 * did - clobber an already-correct resolution with a wrong one (e.g.
+                 * picking MessageFormat's instance format(Object[],StringBuffer,
+                 * FieldPosition) over the intended static format(String,Object...)
+                 * varargs method, since both have arity 3 and the varargs call only
+                 * has an "apparent" arity of 3 after argument collapse), producing an
+                 * invokestatic with the wrong owner method's descriptor
+                 * (VerifyError: Bad type on operand stack). Only fall back to the
+                 * naive lookup when semantic analysis didn't already resolve one. */
+                if (!expr->sem_symbol && class_sym->data.class_data.members) {
                     /* Count arguments for overload resolution */
                     int arg_count = 0;
                     for (slist_t *a = args; a; a = a->next) arg_count++;
-                    
+
                     symbol_t *fqn_method = scope_lookup_method_with_args(
                         class_sym->data.class_data.members, method_name, arg_count);
-                    
+
                     /* Check superclass chain if not found */
                     if (!fqn_method || fqn_method->kind != SYM_METHOD) {
                         symbol_t *super = class_sym->data.class_data.superclass;
@@ -4966,11 +5195,33 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         /* Prefer semantic analysis result for correct overload */
                         if (!method_sym) method_sym = found_method;
                         is_static = (method_sym->modifiers & MOD_STATIC) != 0;
-                        /* Use the class where method is declared for target */
-                        target_class = owner_class->qualified_name ?
-                            class_to_internal_name(owner_class->qualified_name) :
+                        /* Reference the RECEIVER's own static type in the
+                         * invoke's constant-pool entry, not owner_class (the
+                         * class that actually DECLARES the method, found by
+                         * walking the superclass chain) - matching what
+                         * javac always does. The JVM resolves invokevirtual/
+                         * invokeinterface through the full runtime hierarchy
+                         * regardless of which valid ancestor class the
+                         * symbolic reference names, so recv_class_sym is
+                         * always a safe, correct choice when known - and
+                         * using owner_class instead breaks the moment a
+                         * method is inherited (not overridden) from an
+                         * INACCESSIBLE ancestor while the receiver's own
+                         * type is accessible, e.g. StringBuilder.setLength()
+                         * is only ever declared on the package-private
+                         * java.lang.AbstractStringBuilder - genesis emitted
+                         * "invokevirtual AbstractStringBuilder.setLength"
+                         * from calling code outside java.lang, which is
+                         * illegal even though setLength() itself is public
+                         * (IllegalAccessError: "failed to access class
+                         * java.lang.AbstractStringBuilder"), confirmed
+                         * against gumdrop's own SaslUtils.parseDigestParams()
+                         * ("key.setLength(0); value.setLength(0);"). */
+                        symbol_t *target_owner = recv_class_sym ? recv_class_sym : owner_class;
+                        target_class = target_owner->qualified_name ?
+                            class_to_internal_name(target_owner->qualified_name) :
                             mg->class_gen->internal_name;
-                        is_interface_call = (owner_class->kind == SYM_INTERFACE);
+                        is_interface_call = (target_owner->kind == SYM_INTERFACE);
                     }
                 }
                 
@@ -5026,10 +5277,29 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                             /* Prefer semantic analysis result for correct overload */
                             if (!method_sym) method_sym = found_method;
                             is_static = (method_sym->modifiers & MOD_STATIC) != 0;
-                            target_class = owner_class && owner_class->qualified_name ?
-                                class_to_internal_name(owner_class->qualified_name) :
+                            /* Reference the FIELD's own declared type in the
+                             * invoke's constant-pool entry, not owner_class
+                             * (the class that actually DECLARES the method) -
+                             * same fix, and same reasoning, as the plain
+                             * local-variable receiver case above: javac
+                             * always binds an invoke to the receiver
+                             * expression's static type, and using the
+                             * actual (possibly less accessible) declaring
+                             * ancestor instead breaks the moment a method is
+                             * inherited but not overridden from an
+                             * INACCESSIBLE ancestor - e.g. an implicit-this
+                             * field access to a StringBuilder field calling
+                             * setLength() (declared only on the package-
+                             * private java.lang.AbstractStringBuilder).
+                             * Confirmed against gumdrop's own
+                             * FtpProtocolHandler.resetLineState()'s
+                             * "argsBuilder.setLength(0);", argsBuilder being
+                             * an instance field. */
+                            symbol_t *target_owner = recv_class_sym ? recv_class_sym : owner_class;
+                            target_class = target_owner->qualified_name ?
+                                class_to_internal_name(target_owner->qualified_name) :
                                 class_to_internal_name(recv_class_sym->qualified_name);
-                            is_interface_call = owner_class && (owner_class->kind == SYM_INTERFACE);
+                            is_interface_call = (target_owner->kind == SYM_INTERFACE);
                         }
                     }
                 }
@@ -5470,6 +5740,30 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                     }
                 }
                 
+                /* A real resolved type_t for the argument's own element
+                 * type, when available (semantic analysis annotates most
+                 * expressions with sem_type regardless of which branch
+                 * above actually set is_array_arg/arg_elem_class) - used
+                 * below for a genuine assignability check (does the
+                 * argument's element type IMPLEMENT/EXTEND the varargs
+                 * parameter's element type), not just an exact-name
+                 * match. Without this, passing a "StandardOpenOption[]"
+                 * array directly to a "OpenOption... options" varargs
+                 * parameter (StandardOpenOption implements OpenOption -
+                 * exactly java.nio.file.channels.FileChannel.open()'s
+                 * own signature) never counted as "compatible" (the
+                 * class-name strings "StandardOpenOption" and
+                 * "OpenOption" are simply different), so the array got
+                 * wrapped as a single vararg element instead of passed
+                 * through - "ArrayStoreException:
+                 * [Ljava.nio.file.StandardOpenOption;" the moment the
+                 * call actually ran (storing the whole array into a
+                 * slot that expects one OpenOption). Confirmed against
+                 * gumdrop's own BasicFTPFileSystem.openForWriting()'s
+                 * "FileChannel.open(filePath, options)". */
+                type_t *arg_elem_type_full = (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) ?
+                    arg->sem_type->data.array_type.element_type : NULL;
+
                 if (is_array_arg && elem_type) {
                     bool compatible = false;
 
@@ -5496,6 +5790,15 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                             }
                             compatible = (strcmp(simple, arg_simple) == 0 ||
                                          strcmp(expected, arg_elem_class) == 0);
+                        }
+                        /* Exact name match failed - fall back to a real
+                         * assignability check (does the argument's
+                         * element type implement/extend the parameter's
+                         * element type), when a resolved type_t for it
+                         * is available. See arg_elem_type_full's own
+                         * comment above for why this is needed at all. */
+                        if (!compatible && arg_elem_type_full) {
+                            compatible = type_assignable(elem_type, arg_elem_type_full);
                         }
                     } else {
                         /* Primitive array - check exact type match */
@@ -5632,6 +5935,25 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 if (!va_array_is_primitive &&
                     va_kind >= TYPE_BOOLEAN && va_kind <= TYPE_DOUBLE) {
                     emit_boxing(mg, cp, va_kind);
+                } else if (va_array_is_primitive && va_kind >= TYPE_BOOLEAN && va_kind <= TYPE_DOUBLE &&
+                           va_kind != elem_type->kind) {
+                    /* Widen a narrower primitive argument to the varargs
+                     * array's own declared primitive element type (JLS
+                     * 5.1.2) - e.g. an int literal argument like "1" or
+                     * "1000" passed for a "double... buckets" parameter
+                     * (Arrays.asList-style mixed literals, matching
+                     * gumdrop's own DoubleHistogram.Builder.
+                     * setExplicitBuckets(0.5, 1, 2, 5, ..., 1000)) leaves a
+                     * plain int on the stack, never widened to double -
+                     * the subsequent DASTORE (selected from elem_type,
+                     * correctly DOUBLE) then rejected it (VerifyError:
+                     * "Bad type on operand stack", "Type integer ... is
+                     * not assignable to double"). coerce_stack_value()
+                     * already implements exactly this widening for
+                     * ordinary (non-varargs) arguments via
+                     * coerce_arg_to_param() below - reuse it here instead
+                     * of duplicating the widen-opcode selection logic. */
+                    coerce_stack_value(mg, cp, va_kind, NULL, elem_type->kind, NULL);
                 }
 
                 /* Store into array */
@@ -5650,6 +5972,27 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         default: store_op = OP_AASTORE;
                     }
                     bc_emit(mg->code, store_op);
+                    if (elem_type->kind == TYPE_LONG || elem_type->kind == TYPE_DOUBLE) {
+                        /* A long/double value occupies an extra word beyond
+                         * the uniform "1 word" the shared pop below
+                         * accounts for - mirrors the identical extra pop
+                         * already done for LASTORE/DASTORE in ordinary
+                         * (non-varargs) array-element assignment codegen
+                         * a little later in this file. Without it,
+                         * mg->stack_depth (and the stackmap's own mirrored
+                         * word count, both tracked in real JVM words, not
+                         * per-value entries - confirmed via
+                         * stackmap_push_long/double(), which each push
+                         * TWO entries) under-popped by one word per wide
+                         * varargs element, drifting further out of sync
+                         * with the actual bytecode on every iteration of
+                         * a multi-element wide-typed varargs array (e.g.
+                         * a "double... buckets" call with several
+                         * elements) until a later stack-depth-sensitive
+                         * check (an ifeq's own stack-size verification)
+                         * finally caught the accumulated mismatch. */
+                        mg_pop_typed(mg, 1);
+                    }
                 } else {
                     bc_emit(mg->code, OP_AASTORE);
                 }
@@ -5744,9 +6087,49 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
     
     /* Get method reference */
     if (!target_class) {
-        target_class = mg->class_gen ? mg->class_gen->internal_name : "java/lang/Object";
+        /* Before defaulting to the CURRENT class (correct only for an
+         * implicit, receiver-less call), prefer the actual receiver's own
+         * resolved type when this is an explicit-receiver instance call -
+         * mirrors the same "use the receiver's type, not the enclosing
+         * class" preference already applied a few branches above for
+         * other receiver expression kinds (AST_IDENTIFIER/AST_NEW_OBJECT/
+         * etc.), just missing here for the case this fell through to
+         * (notably a receiver that is ITSELF a method call, e.g.
+         * "q.getType().name()" - AST_METHOD_CALL as a receiver sets
+         * "receiver" but never target_class). Left unfixed, a method with
+         * no symbol resolvable in genesis's own symbol tables - such as
+         * an ENUM's inherited java.lang.Enum built-ins (name(), which
+         * unlike ordinal() had no dedicated handling anywhere) - silently
+         * defaulted to an invokevirtual whose owner is the ENCLOSING
+         * class instead of the receiver's real type, confirmed against
+         * gumdrop's own DoQStreamHandler, whose "q.getType().name()"
+         * (getType() returning the cross-file enum DnsType) produced
+         * "invokevirtual DoQStreamHandler.name()" (VerifyError: "Bad
+         * type on operand stack", the real DnsType receiver not
+         * assignable to DoQStreamHandler). JVMS 5.4.3.3: invokevirtual's
+         * own method resolution already walks the receiver class's
+         * superclass chain, so naming the receiver's own class here is
+         * correct even for an inherited method never redeclared there -
+         * exactly what real javac itself emits for this shape. */
+        if (!is_static && receiver) {
+            type_t *recv_type = receiver->sem_type;
+            if (!recv_type && mg->class_gen && mg->class_gen->sem) {
+                recv_type = get_expression_type(mg->class_gen->sem, receiver);
+            }
+            if (recv_type && recv_type->kind == TYPE_TYPEVAR && recv_type->data.type_var.bound) {
+                recv_type = recv_type->data.type_var.bound;
+            }
+            if (recv_type && recv_type->kind == TYPE_CLASS && recv_type->data.class_type.name) {
+                target_class = class_to_internal_name(recv_type->data.class_type.name);
+                symbol_t *recv_sym = recv_type->data.class_type.symbol;
+                is_interface_call = (recv_sym && recv_sym->kind == SYM_INTERFACE);
+            }
+        }
+        if (!target_class) {
+            target_class = mg->class_gen ? mg->class_gen->internal_name : "java/lang/Object";
+        }
     }
-    
+
     /* Use interface methodref for interface calls (both instance and static) */
     uint16_t methodref;
     if (is_interface_call) {
@@ -5763,7 +6146,41 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
      * conversions (e.g., int -> long) have already updated the stack to
      * match the parameter types. */
     int arg_slots;
-    if (is_varargs_method && varargs_param) {
+    if (custom_descriptor) {
+        /* custom_descriptor is the AUTHORITATIVE descriptor actually
+         * emitted for this call (e.g. an enum's synthetic values()/
+         * valueOf(String), or a resolved print-method overload) - built
+         * independently of method_sym just below, which can be a stale
+         * or outright mismatched symbol for exactly these synthetic
+         * cases: nothing in genesis's own symbol tables actually
+         * declares "valueOf"/"values" on an enum (they're compiler-
+         * generated), so semantic analysis's own method_sym resolution
+         * can land on an unrelated same-named method from a completely
+         * different class. Confirmed against gumdrop's own
+         * DnssecTrustAnchorUpdater.loadState(), where "KeyState.
+         * valueOf(...)" (KeyState a nested enum) got a 2-parameter
+         * method_sym instead of the real 1-parameter synthetic
+         * valueOf(String) - undercounting arg_slots by one and popping
+         * one slot too many below, wrapping mg->stack_depth to a huge
+         * unsigned value and, from that point on, corrupting every
+         * later max_stack comparison for the rest of the method
+         * (VerifyError: "Operand stack overflow", confirmed reduced to
+         * a minimal repro and traced by hand against the real bytecode
+         * before finding this). Parse arg_slots directly from
+         * custom_descriptor's own parameter list instead of trusting
+         * method_sym whenever both are present. */
+        method_descriptor_t *md = descriptor_parse_method(custom_descriptor);
+        if (md) {
+            arg_slots = 0;
+            for (int i = 0; i < md->param_count; i++) {
+                arg_slots += (md->params[i].type == DESC_LONG ||
+                              md->params[i].type == DESC_DOUBLE) ? 2 : 1;
+            }
+            method_descriptor_free(md);
+        } else {
+            arg_slots = calculate_arg_slot_count(mg, args);
+        }
+    } else if (is_varargs_method && varargs_param) {
         /* For varargs, we pushed: fixed args + 1 array (regardless of varargs count) */
         /* Count fixed parameter slots based on PARAMETER types */
         arg_slots = 0;
@@ -6453,7 +6870,7 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
     
     /* Check if constructor is varargs */
     symbol_t *ctor_sym_for_varargs = expr->sem_symbol;
-    bool is_varargs_ctor = (ctor_sym_for_varargs && 
+    bool is_varargs_ctor = (ctor_sym_for_varargs &&
                            ctor_sym_for_varargs->kind == SYM_CONSTRUCTOR &&
                            (ctor_sym_for_varargs->modifiers & MOD_VARARGS));
     
@@ -6478,6 +6895,7 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
     /* Generate constructor arguments */
     /* Skip AST_BLOCK if this is an anonymous class (the block is the class body, not an argument) */
     int arg_index = 0;
+    bool varargs_array_pushed = false;
     for (slist_t *node = children->next; node; node = node->next, arg_index++) {
         ast_node_t *arg = (ast_node_t *)node->data;
         
@@ -6488,6 +6906,7 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         
         /* Check if we've hit the varargs position */
         if (is_varargs_ctor && arg_index == fixed_param_count && varargs_param) {
+            varargs_array_pushed = true;
             /* Count remaining arguments */
             int varargs_count = 0;
             for (slist_t *n = node; n; n = n->next) {
@@ -6631,7 +7050,54 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             ctor_param_node = ctor_param_node->next;
         }
     }
-    
+
+    /* Handle case where a varargs constructor is called with no varargs
+     * arguments at all - the loop above never took its "hit the varargs
+     * position" branch (varargs_array_pushed stays false), since there
+     * was nothing left to iterate once the fixed parameters were
+     * consumed. The descriptor built below always declares the trailing
+     * array parameter, so an empty array must still be pushed for it
+     * here, or the actual argument count on the stack falls one short of
+     * what invokespecial's descriptor requires. Mirrors the identical
+     * "no varargs arguments" case already handled for a plain (non-
+     * constructor) varargs method call a bit earlier in this file.
+     *
+     * Checking arg_index == fixed_param_count here instead, rather than
+     * this dedicated flag, looked equivalent but wasn't: the loop above
+     * also leaves arg_index sitting at exactly fixed_param_count when it
+     * DID take the varargs branch and then broke out of the loop (break
+     * happens before the for-loop's own arg_index++), so that condition
+     * can't tell "no varargs args were passed" apart from "the varargs
+     * array was already pushed, for a call with EXACTLY one varargs
+     * argument" - wrongly pushing a second, spurious empty array in the
+     * latter case. */
+    if (is_varargs_ctor && varargs_param && !varargs_array_pushed) {
+        type_t *elem_type = varargs_element_type(varargs_param->type);
+        bc_emit(mg->code, OP_ICONST_0);
+        mg_push_int(mg);
+        if (elem_type && elem_type->kind == TYPE_CLASS) {
+            char *internal = class_to_internal_name(elem_type->data.class_type.name);
+            uint16_t class_ref = cp_add_class(cp, internal);
+            bc_emit(mg->code, OP_ANEWARRAY);
+            bc_emit_u2(mg->code, class_ref);
+            free(internal);
+        } else if (elem_type && elem_type->kind == TYPE_ARRAY) {
+            char *elem_desc = type_to_descriptor(elem_type);
+            uint16_t class_ref = cp_add_class(cp, elem_desc);
+            bc_emit(mg->code, OP_ANEWARRAY);
+            bc_emit_u2(mg->code, class_ref);
+            free(elem_desc);
+        } else if (elem_type && type_kind_to_atype(elem_type->kind) >= 0) {
+            bc_emit(mg->code, OP_NEWARRAY);
+            bc_emit_u1(mg->code, (uint8_t)type_kind_to_atype(elem_type->kind));
+        } else {
+            uint16_t obj_ref = cp_add_class(cp, "java/lang/Object");
+            bc_emit(mg->code, OP_ANEWARRAY);
+            bc_emit_u2(mg->code, obj_ref);
+        }
+        /* Array replaces size on stack - no net change. */
+    }
+
     /* Build constructor descriptor */
     string_t *desc = string_new("(");
     
@@ -6724,23 +7190,48 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         }
     }
     /* Arguments were coerced to the declared parameter types, so those decide
-     * the slot count (a boxed long is one slot, an int widened to long two). */
-    slist_t *slot_param = NULL;
-    if (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR) {
-        slot_param = expr->sem_symbol->data.method_data.parameters;
-    }
-    for (slist_t *node = children->next; node; node = node->next) {
-        ast_node_t *arg = (ast_node_t *)node->data;
-        if (is_anonymous_class && arg->type == AST_BLOCK && !node->next) break;
-        type_kind_t kind = get_expr_type_kind(mg, arg);
-        if (slot_param) {
-            symbol_t *param = (symbol_t *)slot_param->data;
-            if (param && param->type) {
-                kind = param->type->kind;
-            }
-            slot_param = slot_param->next;
+     * the slot count (a boxed long is one slot, an int widened to long two).
+     *
+     * For a varargs constructor, every raw argument from fixed_param_count
+     * onward was packed into a SINGLE array by the argument-generation
+     * loop above (one array reference pushed, regardless of how many
+     * source arguments fed it, including zero) - counting each of those
+     * raw arguments as its own slot here, as a plain 1:1 zip against
+     * children would, overcounts and pops one slot too many per extra
+     * vararg, corrupting mg->stack_depth for the rest of the method (the
+     * same "popped more than was actually pushed" underflow already seen
+     * elsewhere this session for other call shapes). Only the fixed
+     * parameters get zipped 1:1 against their own arguments; the varargs
+     * parameter itself always contributes exactly one slot. */
+    if (is_varargs_ctor && varargs_param) {
+        slist_t *slot_param = ctor_sym_for_varargs->data.method_data.parameters;
+        slist_t *node = children->next;
+        for (int i = 0; i < fixed_param_count && node; i++, node = node->next) {
+            symbol_t *param = slot_param ? (symbol_t *)slot_param->data : NULL;
+            type_kind_t kind = param && param->type ? param->type->kind
+                                                      : get_expr_type_kind(mg, (ast_node_t *)node->data);
+            arg_slots += (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
+            if (slot_param) slot_param = slot_param->next;
         }
-        arg_slots += (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
+        arg_slots += 1;  /* The varargs array itself - always 1 slot. */
+    } else {
+        slist_t *slot_param = NULL;
+        if (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR) {
+            slot_param = expr->sem_symbol->data.method_data.parameters;
+        }
+        for (slist_t *node = children->next; node; node = node->next) {
+            ast_node_t *arg = (ast_node_t *)node->data;
+            if (is_anonymous_class && arg->type == AST_BLOCK && !node->next) break;
+            type_kind_t kind = get_expr_type_kind(mg, arg);
+            if (slot_param) {
+                symbol_t *param = (symbol_t *)slot_param->data;
+                if (param && param->type) {
+                    kind = param->type->kind;
+                }
+                slot_param = slot_param->next;
+            }
+            arg_slots += (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
+        }
     }
     mg_pop_typed(mg, arg_slots + 1);  /* +1 for object reference */
     
@@ -7937,18 +8428,17 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                             free(outer_internal);
                             free(field_desc);
                             return true;
-                        } else if (mg->class_gen->is_inner_class || 
+                        } else if (mg->class_gen->is_inner_class ||
                                    mg->class_gen->is_local_class ||
                                    mg->class_gen->is_anonymous_class) {
-                            /* Instance field in enclosing class - access via this$0 */
-                            /* Load this$0 */
-                            bc_emit(mg->code, OP_ALOAD_0);
-                            mg_push_object(mg, mg->class_gen->internal_name);
-                            bc_emit(mg->code, OP_GETFIELD);
-                            bc_emit_u2(mg->code, mg->class_gen->this_dollar_zero_ref);
+                            /* Instance field in enclosing class - access via this$0,
+                             * walking the full this$0 chain (not just one hop) since
+                             * 'enclosing' may be two or more levels of anonymous/
+                             * inner/local class away from the current class. */
+                            codegen_load_enclosing_this(mg, cp, enclosing);
                             mg_pop_typed(mg, 1);
                             mg_push_object(mg, outer_internal);
-                            
+
                             if (compound) {
                                 /* Duplicate outer instance for getfield */
                                 bc_emit(mg->code, OP_DUP);
@@ -8043,20 +8533,81 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         if (receiver->type == AST_IDENTIFIER) {
             const char *recv_name = receiver->data.leaf.name;
             const char *class_name = resolve_class_name(mg, recv_name);
-            
+
+            /* resolve_class_name() only knows a handful of well-known JDK
+             * classes, the current class, and a nested class of the
+             * current class - it never looks at imports (its own comment
+             * says so: "TODO: Check imports"). Fall back to semantic
+             * analysis's own resolution, the same way the READ side of a
+             * static field access (the AST_IDENTIFIER branch of
+             * codegen_field_access, a few hundred lines above) already
+             * does: receiver->sem_symbol is set to the imported class's
+             * real symbol regardless of which package it's in. Without
+             * this, assigning to a static field of an imported class not
+             * in resolve_class_name()'s whitelist (e.g. "StorageExecutor.
+             * workThreadObserver = ...", StorageExecutor imported from a
+             * different package) fell through to the "instance field
+             * assignment" path below with a bare class-name AST_IDENTIFIER
+             * as the "receiver" - codegen_expr() on that identifier is not
+             * a real expression and pushes nothing, so the value alone
+             * ended up on the stack where [receiver, value] was expected,
+             * and the DUP_X1/PUTFIELD sequence that follows saw an empty
+             * or short stack (VerifyError: "Operand stack underflow" /
+             * "Attempt to pop empty stack") - confirmed against gumdrop's
+             * own ZoneFilePersistenceTest, which does exactly this. */
+            if (!class_name && receiver->sem_symbol &&
+                (receiver->sem_symbol->kind == SYM_CLASS ||
+                 receiver->sem_symbol->kind == SYM_INTERFACE ||
+                 receiver->sem_symbol->kind == SYM_ENUM)) {
+                static __thread char external_class_name[256];
+                if (receiver->sem_symbol->qualified_name) {
+                    char *internal = class_to_internal_name(receiver->sem_symbol->qualified_name);
+                    strncpy(external_class_name, internal, sizeof(external_class_name) - 1);
+                    external_class_name[sizeof(external_class_name) - 1] = '\0';
+                    free(internal);
+                    class_name = external_class_name;
+                }
+            }
+
             if (class_name) {
                 /* Static field assignment */
                 const char *field_desc = get_known_static_field_descriptor(class_name, field_name);
-                
+
                 if (!field_desc && mg->class_gen && strcmp(class_name, mg->class_gen->internal_name) == 0) {
                     field_gen_t *field = hashtable_lookup(mg->class_gen->field_map, field_name);
                     if (field) {
                         field_desc = field->descriptor;
                     }
                 }
-                
+
+                /* Same external-class fallback as the read path: an
+                 * imported class's field isn't in either lookup above
+                 * (it's neither "well-known" nor the current class), but
+                 * its symbol - and members - are available via
+                 * receiver->sem_symbol once semantic analysis has run. */
+                if (!field_desc && receiver->sem_symbol &&
+                    (receiver->sem_symbol->kind == SYM_CLASS ||
+                     receiver->sem_symbol->kind == SYM_INTERFACE ||
+                     receiver->sem_symbol->kind == SYM_ENUM)) {
+                    symbol_t *ext_class = receiver->sem_symbol;
+                    if (ext_class->data.class_data.members) {
+                        symbol_t *field_sym = scope_lookup_local(
+                            ext_class->data.class_data.members, field_name);
+                        if (field_sym && field_sym->kind == SYM_FIELD && field_sym->type) {
+                            static __thread char ext_field_desc_buf[256];
+                            char *desc = type_to_descriptor(field_sym->type);
+                            if (desc) {
+                                strncpy(ext_field_desc_buf, desc, sizeof(ext_field_desc_buf) - 1);
+                                ext_field_desc_buf[sizeof(ext_field_desc_buf) - 1] = '\0';
+                                free(desc);
+                                field_desc = ext_field_desc_buf;
+                            }
+                        }
+                    }
+                }
+
                 if (!field_desc) {
-                    fprintf(stderr, "codegen: cannot resolve static field for assignment: %s.%s\n", 
+                    fprintf(stderr, "codegen: cannot resolve static field for assignment: %s.%s\n",
                             recv_name, field_name);
                     return false;
                 }
@@ -8123,10 +8674,12 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                 recv_class = class_to_internal_name(receiver->sem_type->data.class_type.name);
             }
 
-            /* Look up field descriptor from receiver's class symbol */
+            /* Look up field descriptor from receiver's class symbol -
+             * walking the superclass chain too, since the field may be
+             * inherited (see lookup_field_with_superclass()). */
             symbol_t *class_sym = receiver->sem_type->data.class_type.symbol;
-            if (class_sym && class_sym->data.class_data.members) {
-                symbol_t *field_sym = scope_lookup_local(class_sym->data.class_data.members, field_name);
+            if (class_sym) {
+                symbol_t *field_sym = lookup_field_with_superclass(class_sym, field_name);
                 if (field_sym && field_sym->type) {
                     char *desc = type_to_descriptor(field_sym->type);
                     if (desc) {
@@ -8144,6 +8697,33 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             if (field) {
                 field_desc = field->descriptor;
                 field_desc_owned = false;
+            } else if (!field_desc_owned && mg->class_gen->class_sym) {
+                /* mg->class_gen->field_map only ever holds fields declared
+                 * directly on THIS class - a field inherited from a
+                 * superclass (e.g. "this.deliveryCount" where
+                 * deliveryCount is declared on a superclass, not the
+                 * current class) is never in it, so this lookup alone
+                 * silently fell through with field_desc still at its
+                 * hardcoded "I" (int) default from above - the earlier,
+                 * correctly superclass-aware lookup via
+                 * lookup_field_with_superclass() (right above this
+                 * block) never even ran for a bare "this" receiver,
+                 * since AST_THIS_EXPR nodes carry no sem_type for that
+                 * check to key off. Faking an int descriptor for what's
+                 * actually e.g. a long field picked the narrow DUP_X1
+                 * instead of DUP2_X1 below (VerifyError: "Bad type on
+                 * operand stack", a stray long's second half where a
+                 * category-1 value was expected) - walk the superclass
+                 * chain here too, the same way the sem_type-based branch
+                 * above already does. */
+                symbol_t *field_sym = lookup_field_with_superclass(mg->class_gen->class_sym, field_name);
+                if (field_sym && field_sym->type) {
+                    char *desc = type_to_descriptor(field_sym->type);
+                    if (desc) {
+                        field_desc = desc;
+                        field_desc_owned = true;
+                    }
+                }
             }
         }
 
@@ -9023,7 +9603,12 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         if (!codegen_expr(mg, operand, cp)) {
                             return false;
                         }
-                        bc_emit(mg->code, OP_INEG);
+                        switch (get_expr_type_kind(mg, operand)) {
+                            case TYPE_LONG:   bc_emit(mg->code, OP_LNEG); break;
+                            case TYPE_FLOAT:  bc_emit(mg->code, OP_FNEG); break;
+                            case TYPE_DOUBLE: bc_emit(mg->code, OP_DNEG); break;
+                            default:          bc_emit(mg->code, OP_INEG); break;
+                        }
                         return true;
                     
                     case TOK_PLUS:
@@ -9098,7 +9683,80 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 
                                 if (inc_info) {
                                     uint16_t slot = inc_info->slot;
-                                    
+                                    type_kind_t inc_kind = inc_info->kind;
+
+                                    if (inc_kind == TYPE_LONG || inc_kind == TYPE_DOUBLE ||
+                                        inc_kind == TYPE_FLOAT) {
+                                        /* JVM's iinc only ever operates on a single 32-bit
+                                         * int-categorized local slot - there's no wide
+                                         * equivalent, so a long/double/float local variable
+                                         * can't use the iload/iinc shortcut below at all (doing
+                                         * so silently truncated/corrupted the value and left
+                                         * the slot's own stackmap-tracked type - long/double/
+                                         * float - out of sync with the int-only iload/iinc
+                                         * that was actually emitted, producing "VerifyError:
+                                         * Bad local variable type"). Load, add/subtract 1, and
+                                         * store back explicitly instead, duplicating whichever
+                                         * value (old for post, new for pre) this expression
+                                         * itself evaluates to - the same "dup before/after the
+                                         * arithmetic" shape already used for a plain local
+                                         * assignment's own chaining support just above. */
+                                        bool wide = (inc_kind == TYPE_LONG || inc_kind == TYPE_DOUBLE);
+                                        mg_emit_load_local(mg, slot, inc_kind);
+
+                                        if (is_post) {
+                                            bc_emit(mg->code, wide ? OP_DUP2 : OP_DUP);
+                                            mg_push(mg, wide ? 2 : 1);
+                                        }
+
+                                        switch (inc_kind) {
+                                            case TYPE_LONG:
+                                                bc_emit(mg->code, OP_LCONST_1);
+                                                mg_push_long(mg);
+                                                bc_emit(mg->code, is_inc ? OP_LADD : OP_LSUB);
+                                                mg_pop_typed(mg, 2);
+                                                break;
+                                            case TYPE_DOUBLE:
+                                                bc_emit(mg->code, OP_DCONST_1);
+                                                mg_push_double(mg);
+                                                bc_emit(mg->code, is_inc ? OP_DADD : OP_DSUB);
+                                                mg_pop_typed(mg, 2);
+                                                break;
+                                            default: /* TYPE_FLOAT */
+                                                bc_emit(mg->code, OP_FCONST_1);
+                                                mg_push_float(mg);
+                                                bc_emit(mg->code, is_inc ? OP_FADD : OP_FSUB);
+                                                mg_pop_typed(mg, 1);
+                                                break;
+                                        }
+
+                                        if (!is_post) {
+                                            bc_emit(mg->code, wide ? OP_DUP2 : OP_DUP);
+                                            mg_push(mg, wide ? 2 : 1);
+                                        }
+
+                                        mg_emit_store_local(mg, slot, inc_kind);
+
+                                        /* mg_emit_store_local only adjusts the operand-stack
+                                         * depth - refresh the slot's own stackmap-tracked
+                                         * local type too, mirroring the identical update
+                                         * after a plain local assignment. */
+                                        if (mg->stackmap) {
+                                            switch (inc_kind) {
+                                                case TYPE_LONG:
+                                                    stackmap_set_local_long(mg->stackmap, slot);
+                                                    break;
+                                                case TYPE_DOUBLE:
+                                                    stackmap_set_local_double(mg->stackmap, slot);
+                                                    break;
+                                                default:
+                                                    stackmap_set_local_float(mg->stackmap, slot);
+                                                    break;
+                                            }
+                                        }
+                                        return true;
+                                    }
+
                                     if (is_post) {
                                         /* Post: load old value, then increment */
                                         /* iload slot; iinc slot, delta */
@@ -9229,12 +9887,12 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                                 char *outer_internal = class_to_internal_name(enclosing->qualified_name);
                                                 char *field_desc = type_to_descriptor(outer_field->type);
                                                 
-                                                /* Access via this$0 */
-                                                /* Stack: [] -> [this] -> [outer] */
-                                                bc_emit(mg->code, OP_ALOAD_0);
-                                                mg_push_object(mg, mg->class_gen->internal_name);
-                                                bc_emit(mg->code, OP_GETFIELD);
-                                                bc_emit_u2(mg->code, mg->class_gen->this_dollar_zero_ref);
+                                                /* Access via this$0, walking the full this$0
+                                                 * chain (not just one hop) since 'enclosing' may
+                                                 * be two or more levels of anonymous/inner/local
+                                                 * class away from the current class. */
+                                                /* Stack: [] -> [this] -> ... -> [outer] */
+                                                codegen_load_enclosing_this(mg, cp, enclosing);
                                                 mg_pop_typed(mg, 1);
                                                 mg_push_object(mg, outer_internal);
                                                 
@@ -9303,34 +9961,74 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 }
                                 
                                 ast_node_t *receiver = (ast_node_t *)op_children->data;
-                                
+
                                 /* Get field descriptor and class info from semantic analysis */
                                 const char *obj_class = "java/lang/Object";
                                 const char *field_desc = "I";  /* Default to int */
-                                
+                                type_kind_t field_kind = TYPE_INT;
+
                                 if (receiver->sem_type && receiver->sem_type->kind == TYPE_CLASS) {
                                     if (receiver->sem_type->data.class_type.name) {
                                         char *internal = class_to_internal_name(receiver->sem_type->data.class_type.name);
                                         obj_class = internal;
                                     }
-                                    
-                                    /* Look up the field in the class to get its type */
+
+                                    /* Look up the field in the class to get its type -
+                                     * walking the superclass chain too, since the field
+                                     * may be inherited (see lookup_field_with_superclass()). */
                                     symbol_t *class_sym = receiver->sem_type->data.class_type.symbol;
-                                    if (class_sym && class_sym->data.class_data.members) {
-                                        symbol_t *field_sym = scope_lookup_local(class_sym->data.class_data.members, field_name);
-                                        if (field_sym && field_sym->kind == SYM_FIELD && field_sym->type) {
+                                    if (class_sym) {
+                                        symbol_t *field_sym = lookup_field_with_superclass(class_sym, field_name);
+                                        if (field_sym && field_sym->type) {
                                             field_desc = type_to_descriptor(field_sym->type);
+                                            field_kind = field_sym->type->kind;
                                         }
                                     }
                                 }
-                                
+
                                 /* Evaluate receiver to put object reference on stack */
                                 if (!codegen_expr(mg, receiver, cp)) {
                                     return false;
                                 }
-                                
+
                                 uint16_t fieldref = cp_add_fieldref(cp, obj_class, field_name, field_desc);
-                                
+
+                                /* Choose the const/add/sub ops for the field's
+                                 * actual type - defaulting to the int-family
+                                 * ones covers byte/char/short/boolean/int
+                                 * alike (all use iconst/iadd/isub), same as
+                                 * the array-access version of this code just
+                                 * below. A long/double field is also WIDE
+                                 * (2 stack slots): unconditionally using
+                                 * DUP_X1/ICONST_1/IADD here (as this code
+                                 * used to) silently corrupted a long/double
+                                 * field's value, and DUP_X1 on a wide value
+                                 * is rejected outright by the verifier
+                                 * ("Type long_2nd ... not assignable to
+                                 * category1 type") - confirmed against
+                                 * gumdrop's own SecondaryZoneRefresher.check(),
+                                 * whose "state.generation++" on a long field
+                                 * hits exactly this path. */
+                                uint8_t const1_op = OP_ICONST_1;
+                                uint8_t add_op = OP_IADD;
+                                uint8_t sub_op = OP_ISUB;
+                                bool is_wide = false;
+                                switch (field_kind) {
+                                    case TYPE_LONG:
+                                        const1_op = OP_LCONST_1; add_op = OP_LADD; sub_op = OP_LSUB;
+                                        is_wide = true;
+                                        break;
+                                    case TYPE_DOUBLE:
+                                        const1_op = OP_DCONST_1; add_op = OP_DADD; sub_op = OP_DSUB;
+                                        is_wide = true;
+                                        break;
+                                    case TYPE_FLOAT:
+                                        const1_op = OP_FCONST_1; add_op = OP_FADD; sub_op = OP_FSUB;
+                                        break;
+                                    default:
+                                        break;
+                                }
+
                                 if (is_post) {
                                     /* Post-increment: result is OLD value
                                      * Stack: [] -> [obj] -> [obj,obj] -> [obj,old] -> [old,obj,old] -> [old,obj,old,1] -> [old,obj,new] -> [old] */
@@ -9338,32 +10036,58 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                     mg_push_object(mg, obj_class);  /* [obj,obj] */
                                     bc_emit(mg->code, OP_GETFIELD);
                                     bc_emit_u2(mg->code, fieldref);
-                                    /* getfield: pop ref, push value: [obj,old] */
-                                    bc_emit(mg->code, OP_DUP_X1);
-                                    mg_push_int(mg);  /* [old,obj,old] - dup old value UNDER obj ref */
-                                    bc_emit(mg->code, OP_ICONST_1);
-                                    mg_push_int(mg);  /* [old,obj,old,1] */
-                                    bc_emit(mg->code, is_inc ? OP_IADD : OP_ISUB);
-                                    mg_pop_typed(mg, 1);   /* [old,obj,new] */
+                                    /* getfield: pop ref, push value (1 or 2
+                                     * slots): [obj,old] */
+                                    mg_pop_typed(mg, 1);
+                                    switch (field_kind) {
+                                        case TYPE_LONG:   mg_push_long(mg); break;
+                                        case TYPE_DOUBLE: mg_push_double(mg); break;
+                                        case TYPE_FLOAT:  mg_push_float(mg); break;
+                                        default:          mg_push_int(mg); break;
+                                    }
+                                    if (is_wide) {
+                                        bc_emit(mg->code, OP_DUP2_X1);
+                                        mg_dup2_x1(mg);  /* [old,obj,old] */
+                                    } else {
+                                        bc_emit(mg->code, OP_DUP_X1);
+                                        mg_dup_x1(mg);   /* [old,obj,old] */
+                                    }
+                                    bc_emit(mg->code, const1_op);
+                                    mg_push(mg, is_wide ? 2 : 1);  /* [old,obj,old,1] */
+                                    bc_emit(mg->code, is_inc ? add_op : sub_op);
+                                    mg_pop_typed(mg, is_wide ? 2 : 1);   /* [old,obj,new] */
                                     bc_emit(mg->code, OP_PUTFIELD);
                                     bc_emit_u2(mg->code, fieldref);
-                                    mg_pop_typed(mg, 2);   /* [old] - putfield consumes ref and value, leaving old */
+                                    mg_pop_typed(mg, is_wide ? 3 : 2);   /* [old] - putfield consumes ref and value, leaving old */
                                 } else {
                                     /* Pre: obj -> [obj,obj] -> [obj,old] -> [obj,old,1] -> [obj,new] -> [new,obj,new] -> [new] */
                                     bc_emit(mg->code, OP_DUP);
                                     mg_push_object(mg, obj_class);  /* [obj,obj] */
                                     bc_emit(mg->code, OP_GETFIELD);
                                     bc_emit_u2(mg->code, fieldref);
-                                    /* getfield: pop ref, push value: [obj,old] */
-                                    bc_emit(mg->code, OP_ICONST_1);
-                                    mg_push_int(mg);  /* [obj,old,1] */
-                                    bc_emit(mg->code, is_inc ? OP_IADD : OP_ISUB);
-                                    mg_pop_typed(mg, 1);   /* [obj,new] */
-                                    bc_emit(mg->code, OP_DUP_X1);
-                                    mg_push_int(mg);  /* [new,obj,new] */
+                                    /* getfield: pop ref, push value (1 or 2
+                                     * slots): [obj,old] */
+                                    mg_pop_typed(mg, 1);
+                                    switch (field_kind) {
+                                        case TYPE_LONG:   mg_push_long(mg); break;
+                                        case TYPE_DOUBLE: mg_push_double(mg); break;
+                                        case TYPE_FLOAT:  mg_push_float(mg); break;
+                                        default:          mg_push_int(mg); break;
+                                    }
+                                    bc_emit(mg->code, const1_op);
+                                    mg_push(mg, is_wide ? 2 : 1);  /* [obj,old,1] */
+                                    bc_emit(mg->code, is_inc ? add_op : sub_op);
+                                    mg_pop_typed(mg, is_wide ? 2 : 1);   /* [obj,new] */
+                                    if (is_wide) {
+                                        bc_emit(mg->code, OP_DUP2_X1);
+                                        mg_dup2_x1(mg);  /* [new,obj,new] */
+                                    } else {
+                                        bc_emit(mg->code, OP_DUP_X1);
+                                        mg_dup_x1(mg);   /* [new,obj,new] */
+                                    }
                                     bc_emit(mg->code, OP_PUTFIELD);
                                     bc_emit_u2(mg->code, fieldref);
-                                    mg_pop_typed(mg, 2);   /* [new] - putfield consumes ref and value */
+                                    mg_pop_typed(mg, is_wide ? 3 : 2);   /* [new] - putfield consumes ref and value */
                                 }
                                 return true;
                             }
@@ -9467,7 +10191,23 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                     bc_emit(mg->code, OP_DUP2);
                                     mg_push(mg, 2);  /* [arr, i, arr, i] */
                                     bc_emit(mg->code, load_op);
-                                    mg_pop_typed(mg, 1);  /* [arr, i, old] - load consumes arr,i pushes value */
+                                    /* load_op consumes arr+i (2 words) and pushes
+                                     * the element value - for a WIDE element
+                                     * (long/double, 2 words) that's a net
+                                     * ZERO change in tracked stack depth, not
+                                     * -1: unconditionally popping 1 here
+                                     * (correct only for a narrow, 1-word
+                                     * element) undercounted the wide case by
+                                     * one word, propagating through every
+                                     * later push/pop in this same sequence
+                                     * and ultimately computing max_stack one
+                                     * word too small for the whole method
+                                     * (VerifyError: "Operand stack overflow",
+                                     * confirmed against gumdrop's own
+                                     * DoubleHistogram.HistogramBuckets.record(),
+                                     * whose "counts[bucket]++" on a long[]
+                                     * hits exactly this path). */
+                                    mg_pop_typed(mg, is_wide ? 0 : 1);  /* [arr, i, old] - load consumes arr,i pushes value */
                                     if (is_wide) {
                                         bc_emit(mg->code, OP_DUP2_X2);
                                         mg_push(mg, 2);  /* [old, arr, i, old] for long/double */
@@ -9489,7 +10229,10 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                     bc_emit(mg->code, OP_DUP2);
                                     mg_push(mg, 2);  /* [arr, i, arr, i] */
                                     bc_emit(mg->code, load_op);
-                                    mg_pop_typed(mg, 1);  /* [arr, i, old] */
+                                    /* See the identical wide/narrow net-change
+                                     * distinction (and its full reasoning) in
+                                     * the post-increment branch above. */
+                                    mg_pop_typed(mg, is_wide ? 0 : 1);  /* [arr, i, old] */
                                     bc_emit(mg->code, const1_op);
                                     mg_push(mg, is_wide ? 2 : 1);  /* [arr, i, old, 1] */
                                     bc_emit(mg->code, is_inc ? add_op : sub_op);
@@ -9843,6 +10586,35 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         } else {
                             target_class = type_node->data.node.name;
                         }
+                    } else if (type_node->sem_type && type_node->sem_type->kind == TYPE_TYPEVAR) {
+                        /* Casting to a TYPE VARIABLE (e.g. "(A) expr" inside
+                         * "<A extends BasicFileAttributes> A m(...)") must
+                         * erase to the type variable's bound (or
+                         * java.lang.Object if unbounded), exactly like every
+                         * other type-variable erasure site in this codebase
+                         * (type_to_descriptor()'s own TYPE_TYPEVAR case,
+                         * used for method/field descriptors) - not fall
+                         * through to the AST-name fallback below, which
+                         * literally uses the type PARAMETER's own name
+                         * ("A") as if it were a real class. That produced
+                         * "checkcast A", a class that doesn't exist, and
+                         * the JVM's own class-loading for it failed with
+                         * NoClassDefFoundError/ClassNotFoundException the
+                         * moment the method actually ran - confirmed
+                         * against gumdrop's own MemoryFileSystemProvider.
+                         * readAttributes() ("<A extends BasicFileAttributes>
+                         * A readAttributes(...) { ...; return (A) new
+                         * MemoryFileAttributes(...); }"). */
+                        type_t *bound = type_node->sem_type->data.type_var.bound;
+                        if (bound && bound->kind == TYPE_CLASS) {
+                            target_class = bound->data.class_type.symbol &&
+                                bound->data.class_type.symbol->qualified_name ?
+                                bound->data.class_type.symbol->qualified_name :
+                                bound->data.class_type.name;
+                        }
+                        if (!target_class) {
+                            target_class = "java.lang.Object";
+                        }
                     } else {
                         target_class = type_node->data.node.name;
                     }
@@ -10118,9 +10890,25 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                  * own overall type as the correct join of both branches
                  * (expr->sem_type); use that directly for the frame instead,
                  * mirroring the same correction codegen_identifier() makes
-                 * for a reference-typed local's tracked type. */
+                 * for a reference-typed local's tracked type.
+                 *
+                 * A ternary whose own type is a bare type variable (e.g. a
+                 * generic method's "return local != null ? local : fallback;"
+                 * where both operands have type T) previously fell through
+                 * this gate entirely (TYPE_TYPEVAR was never included),
+                 * leaving the else branch's own possibly-wrong tracked type
+                 * in place uncorrected - confirmed against gumdrop's own
+                 * TlsConfig.coalesce(T, T), where the merge frame ended up
+                 * recorded as the null type instead of java/lang/Object
+                 * (VerifyError: "Inconsistent stackmap frames"/"Type
+                 * java/lang/Object ... is not assignable to null").
+                 * type_to_descriptor() already erases TYPE_TYPEVAR to its
+                 * bound (or Object if unbounded), same as every other
+                 * TYPE_TYPEVAR erasure site in this codebase, so including
+                 * it here needs no special-casing beyond the type check. */
                 if (mg->stackmap && expr->sem_type &&
-                    (expr->sem_type->kind == TYPE_CLASS || expr->sem_type->kind == TYPE_ARRAY)) {
+                    (expr->sem_type->kind == TYPE_CLASS || expr->sem_type->kind == TYPE_ARRAY ||
+                     expr->sem_type->kind == TYPE_TYPEVAR)) {
                     char *merged_desc = type_to_descriptor(expr->sem_type);
                     if (merged_desc) {
                         stackmap_pop(mg->stackmap, 1);

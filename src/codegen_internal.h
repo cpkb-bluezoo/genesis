@@ -85,6 +85,32 @@ loop_context_t *mg_find_loop_by_label(method_gen_t *mg, const char *label);
  */
 void mg_add_break_to_context(loop_context_t *ctx, size_t break_pos);
 
+/**
+ * Add a continue position to a specific loop context. Every `continue`
+ * (labeled or not) is compiled as a placeholder `goto` (offset 0) whose
+ * real offset is only filled in once that loop's real continue target -
+ * the update/condition-recheck point coming after the loop body, not
+ * known until the body has been fully generated - is finalized via
+ * mg_patch_continue_offsets(). This mirrors mg_add_break_to_context()'s
+ * identical deferred-patch pattern for forward break jumps.
+ *
+ * @param ctx           Target loop context
+ * @param continue_pos  Bytecode offset of the continue instruction
+ */
+void mg_add_continue_to_context(loop_context_t *ctx, size_t continue_pos);
+
+/**
+ * Finalize a loop context's real continue target and patch every
+ * `continue` instruction recorded against it (via
+ * mg_add_continue_to_context()) to jump there.
+ *
+ * @param mg              Method generator
+ * @param ctx             Loop context to finalize
+ * @param continue_target Bytecode offset continue should jump to
+ */
+void mg_patch_continue_offsets(method_gen_t *mg, loop_context_t *ctx,
+                                size_t continue_target);
+
 /* ========================================================================
  * Local Variable Helpers
  * ======================================================================== */

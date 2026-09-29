@@ -445,6 +445,19 @@ struct ast_node
                 double float_val;
                 char *str_val;
             } value;
+            /* Number of bytes actually stored at value.str_val, for a
+             * TOK_STRING_LITERAL/TOK_TEXT_BLOCK/TOK_CHAR_LITERAL leaf -
+             * meaningless (left 0) for every other leaf kind. Needed
+             * because str_val itself, although NUL-terminated for
+             * convenience, may contain embedded NUL byte(s) of its own
+             * (JLS 3.10.6 octal escapes like "\0") that plain strlen()
+             * would stop at short - every consumer that needs the value's
+             * true byte length (constant-pool emission in particular)
+             * must use this field instead of strlen(str_val). Ordinary
+             * strings/chars with no embedded NUL always have
+             * str_len == strlen(str_val), so nothing else needs to
+             * change. */
+            size_t str_len;
         } leaf;
         
         /* For nodes with children */

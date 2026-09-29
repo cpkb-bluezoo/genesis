@@ -334,7 +334,27 @@ typedef struct loop_context
     size_t continue_target;         /* Where continue jumps to (loop condition) */
     size_t break_patches;           /* List of break locations to patch */
     slist_t *break_offsets;         /* List of break instruction offsets to patch */
+    slist_t *continue_offsets;      /* List of continue instruction offsets to patch,
+                                      * once this loop's real continue_target (the
+                                      * update/condition-recheck point, which for a
+                                      * for-loop/do-while/array-based enhanced-for is
+                                      * only known after the body has been fully
+                                      * generated) is finalized - see
+                                      * mg_add_continue_to_context()/
+                                      * mg_patch_continue_offsets(). */
     const char *label;              /* Optional label name */
+    size_t finally_depth;           /* Length of mg->finally_stack at the
+                                      * point this loop was entered - a
+                                      * break/continue targeting this loop
+                                      * must only run the finally blocks
+                                      * pushed AFTER that (try statements
+                                      * nested inside the loop body, between
+                                      * its start and the break/continue),
+                                      * never a finally block belonging to a
+                                      * try statement that wraps the loop
+                                      * itself, since neither break nor
+                                      * continue ever leaves that try's own
+                                      * scope. See emit_pending_finally_blocks(). */
 } loop_context_t;
 
 /*

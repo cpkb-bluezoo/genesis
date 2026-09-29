@@ -90,26 +90,85 @@ static uint16_t cp_add_entry(const_pool_t *cp)
     return cp->count++;
 }
 
+uint16_t cp_add_utf8_len(const_pool_t *cp, const char *str, size_t len)
+{
+    if (!cp || !str) {
+        return 0;
+    }
+
+    /* The dedup cache (cp->utf8_cache) is a plain hashtable_t keyed by
+     * 'const char *' - it hashes/compares that key as an ordinary
+     * NUL-terminated C string, so it can only safely represent a value
+     * with no embedded NUL byte of its own. When len != strlen(str),
+     * the value has an embedded NUL (a JLS 3.10.6 octal escape, e.g.
+     * "\0alice\0s3cret") - skip the cache entirely for it rather than
+     * risk an incorrect collision (e.g. matching a previously-added
+     * empty string, since both hash/compare as "" up to the first NUL).
+     * This is a rare edge case; the only cost of skipping dedup for it
+     * is a possible duplicate (but individually correct) UTF8 entry,
+     * which the classfile format explicitly permits. */
+    bool has_embedded_nul = (len != strlen(str));
+
+    if (!has_embedded_nul) {
+        /* Check cache first for deduplication */
+        void *cached = hashtable_lookup(cp->utf8_cache, str);
+        if (cached) {
+            return (uint16_t)(uintptr_t)cached;
+        }
+    }
+
+    char *copy = malloc(len + 1);
+    if (!copy) {
+        return 0;
+    }
+    memcpy(copy, str, len);
+    copy[len] = '\0';
+
+    uint16_t index = cp_add_entry(cp);
+    cp->entries[index].type = CONST_UTF8;
+    cp->entries[index].data.utf8 = copy;
+    cp->entries[index].utf8_len = (uint16_t)len;
+
+    if (!has_embedded_nul) {
+        /* Cache it for future lookups */
+        hashtable_insert(cp->utf8_cache, str, (void *)(uintptr_t)index);
+    }
+
+    return index;
+}
+
 uint16_t cp_add_utf8(const_pool_t *cp, const char *str)
 {
     if (!cp || !str) {
         return 0;
     }
-    
-    /* Check cache first for deduplication */
-    void *cached = hashtable_lookup(cp->utf8_cache, str);
-    if (cached) {
-        return (uint16_t)(uintptr_t)cached;
+    return cp_add_utf8_len(cp, str, strlen(str));
+}
+
+size_t cp_utf8_modified_length(const char *bytes, size_t len)
+{
+    size_t extra = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (bytes[i] == '\0') {
+            extra++;  /* 0x00 -> 0xC0 0x80: one extra byte */
+        }
     }
-    
-    uint16_t index = cp_add_entry(cp);
-    cp->entries[index].type = CONST_UTF8;
-    cp->entries[index].data.utf8 = strdup(str);
-    
-    /* Cache it for future lookups */
-    hashtable_insert(cp->utf8_cache, str, (void *)(uintptr_t)index);
-    
-    return index;
+    return len + extra;
+}
+
+void cp_utf8_modified_write(uint8_t **p, const char *bytes, size_t len)
+{
+    uint8_t *out = *p;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)bytes[i];
+        if (c == 0) {
+            *out++ = 0xC0;
+            *out++ = 0x80;
+        } else {
+            *out++ = c;
+        }
+    }
+    *p = out;
 }
 
 uint16_t cp_add_integer(const_pool_t *cp, int32_t value)
@@ -229,18 +288,26 @@ uint16_t cp_add_class(const_pool_t *cp, const char *name)
     return index;
 }
 
+uint16_t cp_add_string_len(const_pool_t *cp, const char *str, size_t len)
+{
+    if (!cp || !str) {
+        return 0;
+    }
+
+    uint16_t utf8_index = cp_add_utf8_len(cp, str, len);
+
+    uint16_t index = cp_add_entry(cp);
+    cp->entries[index].type = CONST_STRING;
+    cp->entries[index].data.string_index = utf8_index;
+    return index;
+}
+
 uint16_t cp_add_string(const_pool_t *cp, const char *str)
 {
     if (!cp || !str) {
         return 0;
     }
-    
-    uint16_t utf8_index = cp_add_utf8(cp, str);
-    
-    uint16_t index = cp_add_entry(cp);
-    cp->entries[index].type = CONST_STRING;
-    cp->entries[index].data.string_index = utf8_index;
-    return index;
+    return cp_add_string_len(cp, str, strlen(str));
 }
 
 uint16_t cp_add_name_and_type(const_pool_t *cp, const char *name, const char *descriptor)

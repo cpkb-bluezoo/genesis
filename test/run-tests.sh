@@ -523,6 +523,21 @@ else
 fi
 
 echo
+echo "--- Cast-narrowed qualified constant as a switch case label ---"
+printf "%-30s ... " "CastQualifiedConstantCaseLabel"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/castqualifiedconst/Descriptors.java" \
+       "$TEST_SRC/src/java8/castqualifiedconst/CastQualifiedConstantCaseLabelVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" castqualifiedconst.CastQualifiedConstantCaseLabelVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "--- Class literal as synchronized lock keeps its package prefix ---"
 printf "%-30s ... " "PackagedClassLiteralSync"
 if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
@@ -530,6 +545,141 @@ if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
        "$TEST_SRC/src/java8/pkgclasslit/PackagedClassLiteralSyncVerifyTest.java" \
        >/dev/null 2>&1 && \
    "$JAVA" -cp "$TEST_BUILD" PackagedClassLiteralSyncVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Cross-file generic method call chained directly (Class<T> param) ---"
+printf "%-30s ... " "CrossFileGenericMethodChain"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/crossfilegenericmethodchain/Registry.java" \
+       "$TEST_SRC/src/java8/crossfilegenericmethodchain/CrossFileGenericMethodChainVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" crossfilegenericmethodchain.CrossFileGenericMethodChainVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Inherited field accessed via a doubly-cross-file receiver ---"
+printf "%-30s ... " "InheritedCrossFileField"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/inheritedcrossfilefield/Base.java" \
+       "$TEST_SRC/src/java8/inheritedcrossfilefield/Session.java" \
+       "$TEST_SRC/src/java8/inheritedcrossfilefield/Mid.java" \
+       "$TEST_SRC/src/java8/inheritedcrossfilefield/InheritedCrossFileFieldVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" inheritedcrossfilefield.InheritedCrossFileFieldVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Chained .name() on a cross-file enum returned by a cross-file method ---"
+printf "%-30s ... " "CrossFileEnumMethodChainName"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/crossfileenummethodname/Kind.java" \
+       "$TEST_SRC/src/java8/crossfileenummethodname/Question.java" \
+       "$TEST_SRC/src/java8/crossfileenummethodname/Metrics.java" \
+       "$TEST_SRC/src/java8/crossfileenummethodname/CrossFileEnumMethodChainNameVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" crossfileenummethodname.CrossFileEnumMethodChainNameVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Inherited member type named in a cross-file signature ---"
+# Compiled into its own freshly emptied directory, from inside it, and
+# never into the shared $TEST_BUILD: genesis puts both its -d directory
+# and "." on the classpath, and class files left behind by an earlier
+# compile let the early name-qualification pass resolve these names from
+# the OLD class files, masking the bug this test covers.
+printf "%-30s ... " "InheritedMemberType"
+imt_out="$TEST_BUILD/inheritedmembertype-out"
+rm -rf "$imt_out"
+mkdir -p "$imt_out"
+if (cd "$imt_out" && "$GENESIS" -source 8 -d "$imt_out" \
+       "$TEST_SRC/src/java8/inheritedmembertype/base/Base.java" \
+       "$TEST_SRC/src/java8/inheritedmembertype/base/Kind.java" \
+       "$TEST_SRC/src/java8/inheritedmembertype/base/Tagged.java" \
+       "$TEST_SRC/src/java8/inheritedmembertype/base/Mid.java" \
+       "$TEST_SRC/src/java8/inheritedmembertype/lexer/Lexer.java" \
+       "$TEST_SRC/src/java8/inheritedmembertype/lexer/Deep.java" \
+       "$TEST_SRC/src/java8/inheritedmembertype/lexer/InheritedMemberTypeVerifyTest.java" \
+       >/dev/null 2>&1) && \
+   "$JAVA" -cp "$imt_out" inheritedmembertype.lexer.InheritedMemberTypeVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Cross-file call to a class-level BOUNDED type variable param ---"
+# Own freshly emptied -d directory, same reason as InheritedMemberType above.
+printf "%-30s ... " "GenericBoundedTypeVarErasure"
+gbtv_out="$TEST_BUILD/genericboundedtypevar-out"
+rm -rf "$gbtv_out"
+mkdir -p "$gbtv_out"
+if (cd "$gbtv_out" && "$GENESIS" -source 8 -d "$gbtv_out" \
+       "$TEST_SRC/src/java8/genericboundedtypevar/Sink.java" \
+       "$TEST_SRC/src/java8/genericboundedtypevar/Tok.java" \
+       "$TEST_SRC/src/java8/genericboundedtypevar/User.java" \
+       "$TEST_SRC/src/java8/genericboundedtypevar/GenericBoundedTypeVarErasureVerifyTest.java" \
+       >/dev/null 2>&1) && \
+   "$JAVA" -cp "$gbtv_out" genericboundedtypevar.GenericBoundedTypeVarErasureVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Cross-file static field assignment (Holder.field = value) ---"
+printf "%-30s ... " "CrossFileStaticFieldAssign"
+cfsfa_out="$TEST_BUILD/crossfilestaticfieldassign-out"
+rm -rf "$cfsfa_out"
+mkdir -p "$cfsfa_out"
+if (cd "$cfsfa_out" && "$GENESIS" -source 8 -d "$cfsfa_out" \
+       "$TEST_SRC/src/java8/crossfilestaticfieldassign/Holder.java" \
+       "$TEST_SRC/src/java8/crossfilestaticfieldassign/User.java" \
+       "$TEST_SRC/src/java8/crossfilestaticfieldassign/CrossFileStaticFieldAssignVerifyTest.java" \
+       >/dev/null 2>&1) && \
+   "$JAVA" -cp "$cfsfa_out" crossfilestaticfieldassign.CrossFileStaticFieldAssignVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Interface member class is implicitly public and static ---"
+printf "%-30s ... " "InterfaceMemberClassImplicit"
+imci_out="$TEST_BUILD/interfacemembertype-out"
+rm -rf "$imci_out"
+mkdir -p "$imci_out"
+if (cd "$imci_out" && "$GENESIS" -source 8 -d "$imci_out" \
+       "$TEST_SRC/src/java8/interfacemembertype/iface/Container.java" \
+       "$TEST_SRC/src/java8/interfacemembertype/caller/InterfaceMemberClassImplicitPublicStaticVerifyTest.java" \
+       >/dev/null 2>&1) && \
+   "$JAVA" -cp "$imci_out" interfacemembertype.caller.InterfaceMemberClassImplicitPublicStaticVerifyTest >/dev/null 2>&1; then
     echo PASS
     passed=$((passed + 1))
 else

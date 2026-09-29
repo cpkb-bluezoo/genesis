@@ -156,7 +156,28 @@ ast_node_t *ast_new_literal_from_lexer(lexer_t *lexer)
         case TOK_STRING_LITERAL:
         case TOK_TEXT_BLOCK:
         case TOK_CHAR_LITERAL:
-            node->data.leaf.value.str_val = text ? strdup(text) : NULL;  /* String values are freed */
+            /* Use the lexer's own tracked length, not strdup()+strlen(),
+             * to build str_val - a string/text-block literal may contain
+             * an embedded NUL byte of its own (JLS 3.10.6 octal escape,
+             * e.g. "\0alice\0s3cret"), which strdup() would silently
+             * truncate at (copying only up to, and not including, the
+             * first NUL). lexer_text_len() reports the real scanned
+             * length regardless of embedded NULs, so copy exactly that
+             * many bytes and record it in str_len for every downstream
+             * consumer (constant-pool emission in particular) that needs
+             * the value's true byte length instead of strlen(str_val).
+             * String values are freed. */
+            if (text) {
+                size_t len = lexer_text_len(lexer);
+                char *buf = malloc(len + 1);
+                memcpy(buf, text, len);
+                buf[len] = '\0';
+                node->data.leaf.value.str_val = buf;
+                node->data.leaf.str_len = len;
+            } else {
+                node->data.leaf.value.str_val = NULL;
+                node->data.leaf.str_len = 0;
+            }
             node->data.leaf.name = text ? (char *)intern(text) : NULL;
             break;
         case TOK_TRUE:

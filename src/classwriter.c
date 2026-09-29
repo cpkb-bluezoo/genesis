@@ -1407,10 +1407,20 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         switch (entry->type) {
             case CONST_UTF8:
                 {
-                    uint16_t len = strlen(entry->data.utf8);
-                    write_be_u2(&p, len);
-                    memcpy(p, entry->data.utf8, len);
-                    p += len;
+                    /* entry->utf8_len (not strlen(entry->data.utf8)) is the
+                     * entry's true raw byte length - data.utf8 may contain
+                     * an embedded NUL byte of its own (JLS 3.10.6 octal
+                     * escape, e.g. a string literal "\0alice\0s3cret") that
+                     * strlen() would stop at short. Per JVMS 4.4.7, a
+                     * classfile Utf8 entry also can't contain a raw 0x00
+                     * byte at all - it must be "modified UTF-8" encoded as
+                     * the two-byte sequence 0xC0 0x80 instead - so both the
+                     * written length and bytes go through the
+                     * modified-UTF8 helpers rather than a plain memcpy. */
+                    size_t raw_len = entry->utf8_len;
+                    uint16_t enc_len = (uint16_t)cp_utf8_modified_length(entry->data.utf8, raw_len);
+                    write_be_u2(&p, enc_len);
+                    cp_utf8_modified_write(&p, entry->data.utf8, raw_len);
                 }
                 break;
             
