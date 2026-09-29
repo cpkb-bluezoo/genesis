@@ -313,6 +313,35 @@ void stackmap_pop(stack_map_table_t *smt, uint16_t count)
     }
 }
 
+void stackmap_dup_x1(stack_map_table_t *smt)
+{
+    if (!smt || smt->current_stack_size < 2) return;
+
+    verification_type_t a = smt->current_stack[smt->current_stack_size - 2];
+    verification_type_t b = smt->current_stack[smt->current_stack_size - 1];
+
+    ensure_stack_capacity(smt, smt->current_stack_size);
+    smt->current_stack[smt->current_stack_size - 2] = b;
+    smt->current_stack[smt->current_stack_size - 1] = a;
+    smt->current_stack[smt->current_stack_size++] = b;
+}
+
+void stackmap_dup2_x1(stack_map_table_t *smt)
+{
+    if (!smt || smt->current_stack_size < 3) return;
+
+    verification_type_t a    = smt->current_stack[smt->current_stack_size - 3];
+    verification_type_t b_lo = smt->current_stack[smt->current_stack_size - 2];
+    verification_type_t b_hi = smt->current_stack[smt->current_stack_size - 1];
+
+    ensure_stack_capacity(smt, smt->current_stack_size + 1);
+    smt->current_stack[smt->current_stack_size - 3] = b_lo;
+    smt->current_stack[smt->current_stack_size - 2] = b_hi;
+    smt->current_stack[smt->current_stack_size - 1] = a;
+    smt->current_stack[smt->current_stack_size++] = b_lo;
+    smt->current_stack[smt->current_stack_size++] = b_hi;
+}
+
 void stackmap_clear_stack(stack_map_table_t *smt)
 {
     if (!smt) return;
@@ -446,6 +475,38 @@ void stackmap_record_frame(stack_map_table_t *smt, uint16_t offset)
     }
     
     smt->num_entries++;
+}
+
+void stackmap_prune_out_of_bounds_frame(stack_map_table_t *smt, uint16_t code_length)
+{
+    if (!smt) return;
+
+    /* Frames are recorded in non-decreasing offset order as codegen
+     * proceeds (stackmap_record_frame() inserts in sorted order), so only
+     * the tail of the list can ever be out of bounds - nothing generates a
+     * frame beyond the code length at the time it's recorded, and the
+     * code length only grows afterward. Loop in case more than one
+     * trailing frame ended up exactly at (or past) the final length. */
+    while (smt->last_frame && smt->last_frame->offset >= code_length) {
+        stack_map_frame_t *bad = smt->last_frame;
+
+        if (smt->frames == bad) {
+            smt->frames = NULL;
+            smt->last_frame = NULL;
+        } else {
+            stack_map_frame_t *prev = smt->frames;
+            while (prev->next != bad) {
+                prev = prev->next;
+            }
+            prev->next = NULL;
+            smt->last_frame = prev;
+        }
+
+        free(bad->locals);
+        free(bad->stack);
+        free(bad);
+        smt->num_entries--;
+    }
 }
 
 stack_map_frame_t *stackmap_get_frame(stack_map_table_t *smt, uint16_t offset)

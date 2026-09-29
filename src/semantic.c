@@ -634,7 +634,8 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
             const_sym->modifiers = MOD_PUBLIC | MOD_STATIC | MOD_FINAL;
             const_sym->type = sym->type;  /* Type is the enum itself */
             const_sym->data.var_data.is_enum_constant = true;
-            
+
+
             scope_define(sym->data.class_data.members, const_sym);
         }
     }
@@ -2140,8 +2141,21 @@ static bool check_access(uint32_t member_mods, symbol_t *member_class, symbol_t 
         return true;
     }
     
-    /* If accessing from same class, always allowed */
-    if (member_class == accessing_class) {
+    /* If accessing from same class, always allowed. Compare by qualified
+     * name too, not just pointer identity: two DIFFERENT symbol_t
+     * instances can both legitimately represent the same class - a
+     * forward-reference "registry stub" (created the moment any file in
+     * the same compilation batch needs to resolve this class before its
+     * own file has been processed) versus the "real" symbol pass1 later
+     * creates for the class's own declaration (see current_task.md's
+     * enum-ordinal-cross-file bug for the same root architectural gap,
+     * where a nested/inner class does get its stub reconciled but a
+     * top-level one currently doesn't). Comparing by name alone is safe
+     * here since a qualified name is unique within a compilation. */
+    if (member_class == accessing_class ||
+        (member_class && accessing_class &&
+         member_class->qualified_name && accessing_class->qualified_name &&
+         strcmp(member_class->qualified_name, accessing_class->qualified_name) == 0)) {
         return true;
     }
     
@@ -2165,11 +2179,16 @@ static bool check_access(uint32_t member_mods, symbol_t *member_class, symbol_t 
             access_top = access_top->data.class_data.enclosing_class;
         }
         
-        /* If they share the same top-level class, private access is allowed */
-        if (member_top == access_top && member_top != NULL) {
+        /* If they share the same top-level class, private access is
+         * allowed - again comparing by qualified name too, not just
+         * pointer identity (see the same-class check above for why). */
+        if (member_top && access_top &&
+            (member_top == access_top ||
+             (member_top->qualified_name && access_top->qualified_name &&
+              strcmp(member_top->qualified_name, access_top->qualified_name) == 0))) {
             return true;
         }
-        
+
         return false;
     }
     
@@ -4418,6 +4437,40 @@ static void ensure_method_return_from_descriptor(symbol_t *method)
 }
 
 /**
+ * A bare type-variable reference parsed from a method's own generic
+ * signature (e.g. the "T" in a constructor parameter "T crlfTokenType")
+ * carries only the variable's name - unlike a type parameter's own
+ * declaration (parsed separately, from the class's or method's own
+ * <T:Bound> signature section), a mere *reference* to it has no bound
+ * information of its own; generic_type_to_type() correctly leaves such a
+ * reference's bound unset. For a class-level type variable (as opposed to
+ * one declared on the method/constructor itself), that bound was already
+ * parsed once, when the *class's* type parameters were loaded (see
+ * sym->data.class_data.type_params, set up earlier in this same
+ * function) - patch it back in here by name, so a parameter or return
+ * type that's just a reference to the class's own bounded type variable
+ * (e.g. "T extends Enum<T>") doesn't silently erase to Object instead of
+ * its real bound the next time something (e.g. a cross-file caller
+ * building an invokespecial/invokevirtual descriptor for this method)
+ * reads type_to_descriptor() on it.
+ */
+static void patch_typevar_bound_from_class(type_t *t, symbol_t *class_sym)
+{
+    if (!t || t->kind != TYPE_TYPEVAR || t->data.type_var.bound ||
+        !t->data.type_var.name || !class_sym) {
+        return;
+    }
+    for (slist_t *tp = class_sym->data.class_data.type_params; tp; tp = tp->next) {
+        symbol_t *tp_sym = (symbol_t *)tp->data;
+        if (tp_sym && tp_sym->name && strcmp(tp_sym->name, t->data.type_var.name) == 0 &&
+            tp_sym->type && tp_sym->type->kind == TYPE_TYPEVAR) {
+            t->data.type_var.bound = tp_sym->type->data.type_var.bound;
+            return;
+        }
+    }
+}
+
+/**
  * Create a symbol from a loaded class file.
  * This is used by codegen to load classes for method resolution.
  */
@@ -4465,6 +4518,34 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
     if (cf->access_flags & ACC_STATIC) mods |= MOD_STATIC;
     if (cf->access_flags & ACC_FINAL) mods |= MOD_FINAL;
     if (cf->access_flags & ACC_ABSTRACT) mods |= MOD_ABSTRACT;
+
+    /* A nested class's own "static" modifier is NEVER encoded in its own
+     * class_file's top-level access_flags (per JVMS 4.1's Table 4.1-A,
+     * ACC_STATIC isn't even a valid class-level flag there) - only in a
+     * self-referential entry of its own InnerClasses attribute (every
+     * nested class's classfile lists itself there, alongside any nested
+     * classes it itself declares). Without checking this, a classfile-
+     * loaded static nested class (e.g. java.util.concurrent.
+     * ThreadPoolExecutor$AbortPolicy, loaded independently when resolving
+     * "new ThreadPoolExecutor.AbortPolicy()" from a different file) was
+     * always treated as non-static, wrongly making codegen's "new X()"
+     * inner-class handling inject an enclosing-instance argument (and
+     * build the constructor call/descriptor accordingly) that the real
+     * (static) class's real (no-arg) constructor never expects -
+     * VerifyError: "Bad type on operand stack" at the resulting
+     * invokespecial, since "this" of the unrelated enclosing method got
+     * pushed where no such parameter exists at all. */
+    inner_class_info_t *self_inner_classes = classfile_get_inner_classes(cf);
+    for (inner_class_info_t *ic = self_inner_classes; ic; ic = ic->next) {
+        if (ic->inner_class_name && strcmp(ic->inner_class_name, binary_name) == 0) {
+            if (ic->access_flags & ACC_STATIC) {
+                mods |= MOD_STATIC;
+            }
+            break;
+        }
+    }
+    inner_class_info_free(self_inner_classes);
+
     sym->modifiers = mods;
     
     /* Create class member scope */
@@ -4487,7 +4568,26 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
                     if (type_var) {
                         type_var->kind = TYPE_TYPEVAR;
                         type_var->data.type_var.name = strdup(tp->name);
-                        type_var->data.type_var.bound = NULL;
+                        /* Convert the parsed class bound (e.g. "T extends
+                         * Enum<T>"'s Enum<T>) to a real type_t, the same
+                         * way csig->superclass gets converted a few lines
+                         * below - not just NULL unconditionally. Every
+                         * consumer of a type variable's bound (e.g.
+                         * type_to_descriptor()'s TYPE_TYPEVAR case, used to
+                         * erase a generic parameter type for a method or
+                         * constructor descriptor) falls back to Object
+                         * when bound is NULL - correct for a genuinely
+                         * unbounded "<T>", but wrong for a bounded one
+                         * loaded from a classfile, which used to always
+                         * erase to Object instead of its real bound. A
+                         * cross-file caller's descriptor for a bounded
+                         * generic constructor/method parameter then didn't
+                         * match the one actually compiled for it
+                         * (NoSuchMethodError at the first call, since the
+                         * verifier doesn't check that a referenced method
+                         * exists). */
+                        type_var->data.type_var.bound = tp->class_bound ?
+                            generic_type_to_type(tp->class_bound) : NULL;
                     }
                     tp_sym->type = type_var;
                     
@@ -4682,20 +4782,22 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
                 /* Use generic signature for return type and parameters */
                 if (msig->return_type) {
                     method_sym->type = generic_type_to_type(msig->return_type);
+                    patch_typevar_bound_from_class(method_sym->type, sym);
                 }
-                
+
                 /* Create parameter symbols from signature */
                 generic_type_t *sig_param = msig->params;
                 int param_idx = 0;
                 while (sig_param) {
                     char param_name[16];
                     snprintf(param_name, sizeof(param_name), "arg%d", param_idx);
-                    
+
                     symbol_t *param_sym = symbol_new(SYM_PARAMETER, param_name);
                     param_sym->type = generic_type_to_type(sig_param);
-                    
+                    patch_typevar_bound_from_class(param_sym->type, sym);
+
                     slist_push(&method_sym->data.method_data.parameters, param_sym);
-                    
+
                     sig_param = sig_param->next;
                     param_idx++;
                 }
@@ -6986,7 +7088,7 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         /* Recursively resolve the outer name */
         char *qualified_outer = resolve_import(sem, outer_name);
         free(outer_name);
-        
+
         if (qualified_outer) {
             /* Build qualified name using $ for inner class: "java.util.Map$Entry" */
             size_t qo_len = strlen(qualified_outer);
@@ -7244,6 +7346,38 @@ retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const 
     return result;
 }
 
+/**
+ * Look up the declared return type descriptor of an annotation element
+ * (e.g. "timeout" on org.junit.Test -> "()J") by resolving the
+ * annotation's simple name through this file's imports and reading the
+ * element method's descriptor from its classfile on the classpath.
+ * Returns a malloc'd descriptor, or NULL if the annotation or element
+ * can't be resolved - callers must fall back to inferring the value's
+ * type from the literal itself in that case.
+ */
+char *semantic_resolve_annotation_element_descriptor(semantic_t *sem,
+                                                       const char *annotation_name,
+                                                       const char *element_name)
+{
+    if (!sem || !annotation_name || !element_name || !sem->classpath) {
+        return NULL;
+    }
+
+    char *qualified = strchr(annotation_name, '.') ?
+        strdup(annotation_name) : resolve_import(sem, annotation_name);
+    if (!qualified) {
+        return NULL;
+    }
+
+    classfile_t *cf = classpath_load_class(sem->classpath, qualified);
+    free(qualified);
+    if (!cf) {
+        return NULL;
+    }
+
+    return classfile_get_method_descriptor(cf, element_name);
+}
+
 /* ========================================================================
  * Early Type Resolution (Post-Parse Pass)
  * ========================================================================
@@ -7334,12 +7468,32 @@ static char *resolve_type_name_with_imports(const char *simple_name,
         free(first_part);
         
         if (resolved_first) {
-            /* Combine resolved first part with the rest */
-            const char *rest = dot;  /* includes the leading dot */
-            size_t total_len = strlen(resolved_first) + strlen(rest) + 1;
+            /* Combine resolved first part with the rest - joined by '$',
+             * not '.': "rest" is always a further NESTED-CLASS path from
+             * here (the first, possibly multi-segment, package-qualified
+             * component was already resolved above), so every remaining
+             * dot marks a nested-class boundary in the JVM's binary name,
+             * never a package separator. Using '.' here (the bug this
+             * comment replaces) produced a name indistinguishable from a
+             * package-qualified one, which class_to_internal_name()'s
+             * blind dot-to-slash conversion later mangled into
+             * ".../Outer/Inner" instead of ".../Outer$Inner" - the same
+             * defect already fixed for resolve_import()'s own equivalent
+             * "Outer.Inner" splitting (which correctly joins with '$'),
+             * just missed here since this is a separate function used
+             * only by the early type-name pre-resolution pass. */
+            const char *rest = dot + 1;  /* skip the leading dot itself */
+            size_t total_len = strlen(resolved_first) + 1 + strlen(rest) + 1;
             char *result = malloc(total_len);
-            snprintf(result, total_len, "%s%s", resolved_first, rest);
+            snprintf(result, total_len, "%s$%s", resolved_first, rest);
             free(resolved_first);
+            /* Any further dots in the appended portion (e.g.
+             * "Outer.Middle.Inner", where only the first dot was split
+             * off above) are also nested-class boundaries, not package
+             * separators - convert them too. */
+            for (char *c = result + strlen(result) - strlen(rest); *c; c++) {
+                if (*c == '.') *c = '$';
+            }
             return result;
         }
         
@@ -9063,9 +9217,22 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                             sem->target_type->kind == TYPE_CLASS &&
                             sem->target_type->data.class_type.type_args) {
                             /* Diamond inference: use target type's arguments */
-                            type_t *param_type = type_new_class(qualified);
+                            /* Build the parameterized type from the resolved
+                             * type's own name, not the raw import-resolved
+                             * "qualified" spelling: for a type nested inside
+                             * another class (e.g. "Outer.Inner"), "qualified"
+                             * is still dot-separated, and class_to_internal_name()
+                             * has no way to tell a nested-class dot from a
+                             * package dot - it would turn "Outer.Inner" into
+                             * "Outer/Inner" instead of "Outer$Inner". cached's
+                             * own name is already correctly "Outer$Inner" (it
+                             * was resolved once, correctly, whichever way it
+                             * first got cached), so prefer that. */
+                            const char *cname = cached->data.class_type.name ?
+                                cached->data.class_type.name : qualified;
+                            type_t *param_type = type_new_class(cname);
                             param_type->data.class_type.symbol = cached->data.class_type.symbol;
-                            
+
                             /* Copy type arguments from target type */
                             for (slist_t *c = sem->target_type->data.class_type.type_args; c; c = c->next) {
                                 type_t *arg_type = (type_t *)c->data;
@@ -9075,17 +9242,22 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                     slist_append(param_type->data.class_type.type_args, arg_type);
                                 }
                             }
-                            
+
                             type_node->sem_type = param_type;
                             free(qualified);
                             return param_type;
                         }
-                        
+
                         /* Even if cached, check for type arguments */
                         slist_t *children = type_node->data.node.children;
                         if (children) {
-                            /* Has type arguments - create parameterized type */
-                            type_t *param_type = type_new_class(qualified);
+                            /* Has type arguments - create parameterized type.
+                             * See the diamond-inference branch above for why
+                             * this must use cached's own name rather than the
+                             * raw "qualified" spelling. */
+                            const char *cname = cached->data.class_type.name ?
+                                cached->data.class_type.name : qualified;
+                            type_t *param_type = type_new_class(cname);
                             param_type->data.class_type.symbol = cached->data.class_type.symbol;
                             
                             /* Resolve each type argument */
@@ -9117,10 +9289,23 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                             if (has_diamond && sem->target_type && 
                                 sem->target_type->kind == TYPE_CLASS &&
                                 sem->target_type->data.class_type.type_args) {
-                                /* Diamond inference: use target type's arguments */
-                                type_t *param_type = type_new_class(qualified);
+                                /* Diamond inference: use target type's arguments.
+                                 * Prefer sym->type's own name over "qualified"
+                                 * for the same reason as the same-file/cached
+                                 * branches above: a nested type's raw import-
+                                 * resolved spelling is still dot-separated
+                                 * ("Outer.Inner"), and class_to_internal_name()
+                                 * can't tell that dot apart from a package
+                                 * separator, producing "Outer/Inner" instead
+                                 * of "Outer$Inner". sym->type->data.class_type.name
+                                 * was already resolved correctly when the
+                                 * class was loaded. */
+                                const char *cname = (sym->type->kind == TYPE_CLASS &&
+                                    sym->type->data.class_type.name) ?
+                                    sym->type->data.class_type.name : qualified;
+                                type_t *param_type = type_new_class(cname);
                                 param_type->data.class_type.symbol = sym;
-                                
+
                                 /* Copy type arguments from target type */
                                 for (slist_t *c = sem->target_type->data.class_type.type_args; c; c = c->next) {
                                     type_t *arg_type = (type_t *)c->data;
@@ -9130,17 +9315,23 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                         slist_append(param_type->data.class_type.type_args, arg_type);
                                     }
                                 }
-                                
+
                                 type_node->sem_type = param_type;
                                 free(qualified);
                                 return param_type;
                             }
-                            
+
                             /* Check for type arguments (generics) */
                             slist_t *children = type_node->data.node.children;
                             if (children) {
-                                /* Has type arguments - create parameterized type */
-                                type_t *param_type = type_new_class(qualified);
+                                /* Has type arguments - create parameterized
+                                 * type. See the diamond-inference branch
+                                 * above for why this must prefer sym->type's
+                                 * own name over the raw "qualified" spelling. */
+                                const char *cname = (sym->type->kind == TYPE_CLASS &&
+                                    sym->type->data.class_type.name) ?
+                                    sym->type->data.class_type.name : qualified;
+                                type_t *param_type = type_new_class(cname);
                                 param_type->data.class_type.symbol = sym;
                                 
                                 /* Resolve each type argument */
@@ -9377,7 +9568,24 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     }
                     free(qualified);
                 }
-                
+
+                /* Per-compilation-unit type scope (like javac's toplevelScope):
+                 * types defined in the current file, keyed by simple name. This
+                 * is the same registry AST_CLASS_TYPE's own resolution above
+                 * already consults - needed here too so a bare identifier used
+                 * as a type reference (e.g. a field-access receiver later found
+                 * to actually be a qualified constant, "Constants.START") can
+                 * also resolve a same-file sibling type in the default
+                 * (unnamed) package, where resolve_import()'s own same-package
+                 * lookup can't help (it requires a non-empty package name). */
+                {
+                    type_t *unit_type = hashtable_lookup(sem->unit_types, name);
+                    if (unit_type) {
+                        type_node->sem_type = unit_type;
+                        return unit_type;
+                    }
+                }
+
                 semantic_error(sem, type_node->line, type_node->column,
                               "Cannot resolve type: %s", name);
                 return type_new_primitive(TYPE_UNKNOWN);
@@ -9788,7 +9996,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             /* Check if this class was pre-registered (for forward reference support) */
                             symbol_t *sym = node->sem_symbol;
                             bool was_preregistered = (sym != NULL);
-                            
+
                             if (!sym) {
                                 sym = symbol_new(kind, name);
                             }
@@ -10565,9 +10773,8 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             
                             /* Check if already pre-registered (from preregister_nested_types) */
                             symbol_t *existing = scope_lookup_local(sem->current_scope, name);
-                            if (existing && existing->kind == SYM_FIELD && 
+                            if (existing && existing->kind == SYM_FIELD &&
                                 existing->data.var_data.is_enum_constant) {
-                                /* Already registered - just store symbol on AST for codegen */
                                 node->sem_symbol = existing;
                                 break;
                             }
@@ -11111,11 +11318,26 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                         param->type = semantic_resolve_type(sem, 
                                             child->data.node.children->data);
                                         
-                                        /* Varargs: convert type to array type (String... -> String[]) */
-                                        if (is_varargs && param->type && 
-                                            param->type->kind != TYPE_ARRAY) {
-                                            type_t *array_type = type_new_array(param->type, 1);
-                                            param->type = array_type;
+                                        /* Varargs: convert type to array type (String... ->
+                                         * String[], or byte[]... -> byte[][] when the
+                                         * WRITTEN type is itself already an array) - always
+                                         * wrap exactly once here, regardless of whether
+                                         * param->type already happens to be TYPE_ARRAY:
+                                         * it's freshly re-derived from
+                                         * semantic_resolve_type()'s own cache on the type
+                                         * NODE each time this runs (not from param->type's
+                                         * own previous value), so this can't double-wrap on
+                                         * a second pass - and skipping the wrap whenever the
+                                         * WRITTEN type already happens to be an array (the
+                                         * previous behavior, guarded on
+                                         * "param->type->kind != TYPE_ARRAY") left a varargs
+                                         * parameter like "byte[]... parts" typed as plain
+                                         * "byte[]" instead of the real "byte[][]",
+                                         * corrupting every varargs call site's own
+                                         * array-of-arrays construction (wrong store opcode,
+                                         * wrong ANEWARRAY element type). */
+                                        if (is_varargs && param->type) {
+                                            param->type = type_new_array(param->type, 1);
                                         }
                                     }
                                     
@@ -11731,6 +11953,93 @@ static void propagate_capture_to_enclosing_classes(semantic_t *sem, symbol_t *sy
         }
         anc = anc->data.class_data.enclosing_class;
     }
+}
+
+/**
+ * Collect `sym` and every ancestor it transitively extends/implements
+ * (superclass chain, plus every interface reachable from any of those,
+ * including interfaces of interfaces) into `*out`. Used to find a
+ * ternary expression's common ancestor type when neither branch is a
+ * subtype of the other - see get_expression_type()'s AST_CONDITIONAL_EXPR
+ * case. Guards against re-visiting an already-collected symbol (Java
+ * disallows real inheritance cycles, but a partially-resolved symbol
+ * could still loop).
+ */
+static void collect_ancestor_symbols(symbol_t *sym, slist_t **out)
+{
+    if (!sym) {
+        return;
+    }
+    for (slist_t *n = *out; n; n = n->next) {
+        if (n->data == sym) {
+            return;
+        }
+    }
+    if (!*out) {
+        *out = slist_new(sym);
+    } else {
+        slist_append(*out, sym);
+    }
+    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE) {
+        /* Directly-implemented/extended interfaces first, THEN the
+         * superclass chain - so a close, specific shared interface
+         * (e.g. two sibling classes both implementing the same
+         * interface) is collected, and found by find_common_ancestor_symbol()'s
+         * closest-first search, before the walk reaches all the way up
+         * to the ultimate common ancestor every class shares
+         * (java.lang.Object). */
+        for (slist_t *n = sym->data.class_data.interfaces; n; n = n->next) {
+            collect_ancestor_symbols((symbol_t *)n->data, out);
+        }
+        collect_ancestor_symbols(sym->data.class_data.superclass, out);
+    }
+}
+
+/**
+ * Find a common ancestor (class or interface) of two class symbols - a
+ * simplified least-upper-bound: not necessarily the single most-specific
+ * common ancestor in a diamond scenario, but always a valid one (safe
+ * for both compile-time assignment-compatibility checks and bytecode
+ * verification), found by walking `a`'s own ancestors closest-first and
+ * returning the first one also reachable from `b`. Returns NULL if
+ * either symbol is missing, or no common ancestor was found (every real
+ * class pair always shares at least Object, so NULL here means the
+ * caller should treat it the same as an explicit Object result).
+ */
+static symbol_t *find_common_ancestor_symbol(symbol_t *a, symbol_t *b)
+{
+    if (!a || !b) {
+        return NULL;
+    }
+
+    slist_t *a_ancestors = NULL;
+    slist_t *b_ancestors = NULL;
+    collect_ancestor_symbols(a, &a_ancestors);
+    collect_ancestor_symbols(b, &b_ancestors);
+
+    symbol_t *result = NULL;
+    for (slist_t *an = a_ancestors; an && !result; an = an->next) {
+        symbol_t *candidate = (symbol_t *)an->data;
+        for (slist_t *bn = b_ancestors; bn; bn = bn->next) {
+            if (bn->data == candidate) {
+                result = candidate;
+                break;
+            }
+        }
+    }
+
+    for (slist_t *n = a_ancestors; n; ) {
+        slist_t *next = n->next;
+        free(n);
+        n = next;
+    }
+    for (slist_t *n = b_ancestors; n; ) {
+        slist_t *next = n->next;
+        free(n);
+        n = next;
+    }
+
+    return result;
 }
 
 /**
@@ -14227,9 +14536,23 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                         current_type = field_sym->type;
                                         current_class = NULL;  /* Can't traverse further */
                                         remaining_parts = remaining_parts->next;
-                                        
+
                                         /* If this is the last part, we found it */
                                         if (!remaining_parts && current_type) {
+                                            /* Expose the resolved field symbol on the
+                                             * overall expression node - without this,
+                                             * a caller needing the field's OWN symbol
+                                             * (not just its type), e.g. to check
+                                             * MOD_FINAL or read a constant's literal
+                                             * initializer value - such as a switch
+                                             * statement's own case-label resolution
+                                             * for a qualified constant reference like
+                                             * "case Type.CONSTANT:" - had no way to
+                                             * reach it at all; this function only
+                                             * ever returned the field's type,
+                                             * discarding the symbol reference
+                                             * entirely. */
+                                            expr->sem_symbol = field_sym;
                                             /* Ensure the returned type has its symbol set for chained access */
                                             if (current_type->kind == TYPE_CLASS &&
                                                 !current_type->data.class_type.symbol &&
@@ -15188,6 +15511,52 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         }
                     }
 
+                    /* Neither is a subtype of the other (e.g. two
+                     * unrelated final classes both implementing a common
+                     * interface, like HandshakeSecurityInfo and
+                     * Tls12SecurityInfo both implementing SecurityInfo,
+                     * neither a subclass of the other) - find a real
+                     * (if not necessarily tightest) common ancestor via
+                     * find_common_ancestor_symbol() instead of blindly
+                     * falling back to then_type (as this function used
+                     * to, unconditionally), which used a type the OTHER
+                     * branch's real value often isn't actually assignable
+                     * to - corrupting the ternary's own join-point
+                     * stack-map frame (codegen_expr.c's
+                     * AST_CONDITIONAL_EXPR handling uses this exact type
+                     * for that correction) whenever the runtime path
+                     * actually takes the else branch. A blind
+                     * java.lang.Object fallback would also work for
+                     * bytecode verification alone, but is too wide for
+                     * this function's OTHER callers - e.g. checking that
+                     * `Info info = flag ? new A() : new B();` is a valid
+                     * assignment - which need the tightest common type
+                     * available, not just any safe one. */
+                    if (then_type && else_type && then_type != else_type &&
+                        then_type->kind == TYPE_CLASS && else_type->kind == TYPE_CLASS) {
+                        /* Not the same type_t instance, but still the
+                         * identical named class - common for a classfile-
+                         * loaded type (e.g. java.nio.channels.FileChannel)
+                         * whose type_t may carry no ->symbol at all, two
+                         * separate resolutions of which produce two
+                         * distinct type_t objects with the same name.
+                         * find_common_ancestor_symbol() below has nothing
+                         * to walk without a symbol on at least one side,
+                         * and would wrongly fall back to Object for what
+                         * is actually an exact match - check by name
+                         * first, before ever needing a symbol at all. */
+                        if (then_type->data.class_type.name && else_type->data.class_type.name &&
+                            strcmp(then_type->data.class_type.name, else_type->data.class_type.name) == 0) {
+                            return then_type;
+                        }
+                        symbol_t *common = find_common_ancestor_symbol(
+                            then_type->data.class_type.symbol, else_type->data.class_type.symbol);
+                        if (common && common->qualified_name) {
+                            return type_new_class(common->qualified_name);
+                        }
+                        return type_object();
+                    }
+
                     /* Otherwise use the then branch type (could be improved to find LUB) */
                     return then_type;
                 }
@@ -15327,10 +15696,22 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         
                         if (dims > 1) {
                             /* Multi-dimensional: return array with one fewer dimension */
-                            return type_new_array(elem_type, dims - 1);
+                            type_t *sub_array_type = type_new_array(elem_type, dims - 1);
+                            expr->sem_type = sub_array_type;
+                            return sub_array_type;
                         } else {
                             /* Single dimension: return the element type */
                             if (elem_type) {
+                                /* Self-annotate, like every sibling case in
+                                 * this function does - without it, any
+                                 * codegen that reads a receiver's own
+                                 * sem_type (e.g. codegen_field_access()'s
+                                 * general case, for `arr[i].field`) sees
+                                 * NULL and silently falls back to treating
+                                 * the field as Ljava/lang/Object;, pushing
+                                 * the wrong stackmap type for whatever the
+                                 * field's real type actually is. */
+                                expr->sem_type = elem_type;
                                 return elem_type;
                             }
                         }
@@ -15466,6 +15847,18 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     type_t *arg_type = semantic_resolve_type(sem, type_node);
                     if (arg_type && arg_type->kind != TYPE_UNKNOWN) {
                         class_type->data.class_type.type_args = slist_new(arg_type);
+                        /* Self-annotate the type node with its resolved type,
+                         * like every other "resolve then use the result
+                         * locally" case in this file must - codegen's
+                         * ast_type_to_descriptor() (for the ldc/CONSTANT_Class
+                         * this literal compiles to) reads type_node->sem_type
+                         * to get the correctly qualified name; without this,
+                         * it fell back to the bare, unqualified source name
+                         * (e.g. "Foo" instead of "pkg/Foo") for any class
+                         * literal referencing a type outside java.lang's own
+                         * small hardcoded list - NoClassDefFoundError at the
+                         * first use (e.g. "synchronized (Foo.class) {...}"). */
+                        type_node->sem_type = arg_type;
                     }
                 }
                 /* Set sem_type for codegen to detect it's a reference type */
@@ -15525,6 +15918,30 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         }
                     }
                     
+                    /* When more than one constructor shares this argument
+                     * count (e.g. "Foo(int x)" and "Foo(String s)", both
+                     * one-parameter), matching by count alone can pick the
+                     * wrong one - codegen builds the invokespecial
+                     * descriptor straight from whichever constructor gets
+                     * resolved here, so a wrong pick isn't just a missed
+                     * lambda-target-typing nicety, it produces a descriptor
+                     * that doesn't match the actual argument being passed
+                     * (VerifyError: "Type X is not assignable to Y" at the
+                     * call). Resolve each argument's own type once, up
+                     * front, so a candidate can be checked for genuine
+                     * parameter-type compatibility, not just arity. */
+                    type_t **arg_types = arg_count > 0 ? calloc(arg_count, sizeof(type_t *)) : NULL;
+                    {
+                        int ai = 0;
+                        for (slist_t *a = expr->data.node.children; a; a = a->next, ai++) {
+                            ast_node_t *arg = (ast_node_t *)a->data;
+                            if (arg && arg->type != AST_LAMBDA_EXPR && arg->type != AST_METHOD_REF) {
+                                arg_types[ai] = get_expression_type(sem, arg);
+                            }
+                        }
+                    }
+                    symbol_t *type_matched_ctor = NULL;
+
                     for (slist_t *c = ctors; c; c = c->next) {
                         symbol_t *ctor = (symbol_t *)c->data;
                         if (ctor && ctor->kind == SYM_CONSTRUCTOR) {
@@ -15546,14 +15963,51 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 } else if (!fallback_ctor) {
                                     fallback_ctor = ctor;
                                 }
+
+                                if (!type_matched_ctor && arg_types) {
+                                    bool all_compatible = true;
+                                    int pi = 0;
+                                    for (slist_t *p = ctor->data.method_data.parameters; p && all_compatible;
+                                         p = p->next, pi++) {
+                                        symbol_t *pp = (symbol_t *)p->data;
+                                        if (pp && pp->type && arg_types[pi]) {
+                                            if (!type_assignable(pp->type, arg_types[pi])) {
+                                                all_compatible = false;
+                                            }
+                                        }
+                                    }
+                                    if (all_compatible) {
+                                        type_matched_ctor = ctor;
+                                    }
+                                }
                             }
                         }
                     }
-                    
-                    if (!best_ctor) {
+                    free(arg_types);
+
+                    if (type_matched_ctor) {
+                        best_ctor = type_matched_ctor;
+                    } else if (!best_ctor) {
                         best_ctor = fallback_ctor;
                     }
-                    
+
+                    /* Store the resolved constructor symbol so codegen can
+                     * build the invokespecial descriptor from its own
+                     * declared (and, for a generic superclass, already-
+                     * erased) parameter types - not from the actual
+                     * argument expressions' own types, which is all
+                     * codegen has to fall back on otherwise. Without this,
+                     * "super(n, someEnumValue, ...)" calling a superclass
+                     * constructor declared as "(int, T, ...)" produced an
+                     * invokespecial descriptor naming the *argument's*
+                     * concrete type (e.g. the enum) instead of T's erasure
+                     * (Object) - a descriptor that doesn't match the
+                     * constructor actually compiled for the superclass,
+                     * throwing NoSuchMethodError the first time it's ever
+                     * called (not caught by bytecode verification, which
+                     * doesn't check that a referenced method exists). */
+                    expr->sem_symbol = best_ctor;
+
                     /* Bind lambda arguments to constructor parameter types */
                     if (best_ctor) {
                         slist_t *param_node = best_ctor->data.method_data.parameters;
@@ -19762,7 +20216,33 @@ define_local_var:
                             }
                         }
                         break;
-                    
+
+                    case AST_SYNCHRONIZED_STMT:
+                        {
+                            /* Resolve the lock expression's type - not for
+                             * any validation (any reference type is a
+                             * legal monitor), but because nothing else in
+                             * this whole pass visits a synchronized
+                             * statement's lock expression at all (unlike
+                             * an if/while/for's own condition, handled by
+                             * the sibling cases here). Without this, a
+                             * class literal used as the lock (e.g.
+                             * "synchronized (Foo.class) {...}") never got
+                             * its type_node->sem_type annotated by
+                             * AST_CLASS_LITERAL's own get_expression_type
+                             * case, so codegen's ast_type_to_descriptor()
+                             * fell back to the bare, unqualified source
+                             * name for the class literal's own internal
+                             * name - dropping the package entirely
+                             * (NoClassDefFoundError at the first use). */
+                            slist_t *children = node->data.node.children;
+                            if (children) {
+                                ast_node_t *lock_expr = (ast_node_t *)children->data;
+                                get_expression_type(sem, lock_expr);
+                            }
+                        }
+                        break;
+
                     case AST_WHILE_STMT:
                         {
                             /* Check that while condition is boolean */
@@ -19897,7 +20377,7 @@ define_local_var:
                                                             found = true;
                                                         }
                                                     }
-                                                    
+
                                                     /* Fallback: try looking through AST if symbol table didn't work */
                                                     if (!found) {
                                                     ast_node_t *enum_decl = enum_sym->ast;
@@ -19987,11 +20467,194 @@ define_local_var:
                                                     /* Check if it's final (constant expression).
                                                      * Interface fields are implicitly final but may not have MOD_FINAL
                                                      * if declared in a source file that's not fully processed. */
-                                                    bool is_interface_field = (sem->current_class && 
+                                                    bool is_interface_field = (sem->current_class &&
                                                                               sem->current_class->kind == SYM_INTERFACE);
                                                     if (!is_interface_field && !(sym->modifiers & MOD_FINAL)) {
                                                         semantic_error(sem, case_expr->line, case_expr->column,
                                                             "constant expression required");
+                                                    }
+
+                                                    /* Resolve and store this constant's own value on
+                                                     * the case label, exactly like the enum-switch
+                                                     * branch above already does for an enum constant's
+                                                     * ordinal - codegen's lookupswitch needs an actual
+                                                     * match value per case, and for a plain (non-enum)
+                                                     * switch over int/char/byte/short, nothing else
+                                                     * ever resolves a named "static final int FOO = n;"
+                                                     * case label back to its value n. Handles the common
+                                                     * case of a simple literal initializer directly;
+                                                     * a more complex constant expression (e.g. "= 2 + 2")
+                                                     * isn't evaluated here, matching this file's existing
+                                                     * scope elsewhere of handling the concrete case that's
+                                                     * actually needed rather than a general constant-
+                                                     * folding evaluator. */
+                                                    if (sym->ast && sym->ast->type == AST_VAR_DECLARATOR &&
+                                                        sym->ast->data.node.children) {
+                                                        ast_node_t *init_expr =
+                                                            (ast_node_t *)sym->ast->data.node.children->data;
+                                                        /* A plain integer literal initializer is handled
+                                                         * directly here, as is a char literal one (e.g.
+                                                         * "private static final byte TAG_A = 'a';",
+                                                         * matching gumdrop's own AMQP FieldTable tag
+                                                         * constants) - a switch selector can only be
+                                                         * char/byte/short/int (or their boxed forms) to
+                                                         * begin with, so those are the only literal kinds
+                                                         * actually reachable for a valid case label's
+                                                         * constant. A char literal's own value isn't
+                                                         * stored in this leaf's int_val - it's the
+                                                         * character stored as a string in str_val -
+                                                         * so it needs its own decoding, matching the
+                                                         * existing TOK_CHAR_LITERAL handling already used
+                                                         * elsewhere in this file for the same reason
+                                                         * (narrowing-constant-allowed's own literal
+                                                         * decoding, ~line 2098). */
+                                                        if (init_expr && init_expr->type == AST_LITERAL &&
+                                                            init_expr->data.leaf.token_type == TOK_INTEGER_LITERAL) {
+                                                            case_expr->data.leaf.value.int_val =
+                                                                init_expr->data.leaf.value.int_val;
+                                                        } else if (init_expr && init_expr->type == AST_LITERAL &&
+                                                                   init_expr->data.leaf.token_type == TOK_CHAR_LITERAL) {
+                                                            const char *str = init_expr->data.leaf.value.str_val;
+                                                            case_expr->data.leaf.value.int_val =
+                                                                (str && str[0]) ? (unsigned char)str[0] : 0;
+                                                        }
+                                                    }
+                                                }
+                                            } else if (case_expr && case_expr->type == AST_FIELD_ACCESS) {
+                                                /* Qualified constant reference, e.g.
+                                                 * "case AmqpMethod.CONNECTION_START:" - the
+                                                 * exact same "named static final int
+                                                 * constant" need as the bare-identifier
+                                                 * case just above, just referenced through
+                                                 * an explicit Type.CONSTANT qualifier
+                                                 * instead of a plain name (e.g. via static
+                                                 * import or same-class access).
+                                                 *
+                                                 * Resolved DIRECTLY here (receiver ->
+                                                 * semantic_resolve_type() -> member lookup)
+                                                 * rather than via get_expression_type()'s own
+                                                 * AST_FIELD_ACCESS handling: that function's
+                                                 * FQN-chain detection only reaches its own
+                                                 * field lookup for already-loaded/well-known
+                                                 * classes (e.g. java.lang.System), and never
+                                                 * fires at all for a same-compilation-batch,
+                                                 * user-defined type (confirmed by direct
+                                                 * testing) - the same "shared type registry
+                                                 * / same-batch timing" gap seen elsewhere in
+                                                 * this compiler. semantic_resolve_type()'s own
+                                                 * AST_IDENTIFIER case resolves a bare type
+                                                 * name via a plain scope_lookup(), which does
+                                                 * see same-batch types, so it's used instead.
+                                                 *
+                                                 * Once resolved, TRANSFORM this case_expr
+                                                 * node in place into a plain AST_LITERAL
+                                                 * carrying the resolved value, rather than
+                                                 * adding a parallel AST_FIELD_ACCESS branch
+                                                 * to codegen_stmt.c's own case-value
+                                                 * extraction (which only recognizes
+                                                 * AST_LITERAL/AST_IDENTIFIER there) - safe
+                                                 * because a case label's own constant
+                                                 * expression is never consulted again for
+                                                 * anything but its value once semantic
+                                                 * analysis is done with it, and because
+                                                 * ast_node_t's "leaf" and "node" data
+                                                 * variants are a union: writing straight
+                                                 * into case_expr's own .leaf.value.int_val
+                                                 * without first changing case_expr->type
+                                                 * away from AST_FIELD_ACCESS would silently
+                                                 * alias/corrupt its existing .node.children/
+                                                 * .node.name (the receiver and field name
+                                                 * this resolution needs to read FIRST, before
+                                                 * any such transformation happens). */
+                                                slist_t *fa_children = case_expr->data.node.children;
+                                                ast_node_t *receiver = fa_children ?
+                                                    (ast_node_t *)fa_children->data : NULL;
+                                                const char *field_name = case_expr->data.node.name;
+                                                symbol_t *sym = NULL;
+
+                                                if (receiver && field_name) {
+                                                    type_t *recv_type = semantic_resolve_type(sem, receiver);
+                                                    if (recv_type && recv_type->kind == TYPE_CLASS) {
+                                                        symbol_t *type_sym = recv_type->data.class_type.symbol;
+                                                        if (!type_sym && recv_type->data.class_type.name) {
+                                                            type_sym = load_external_class(sem, recv_type->data.class_type.name);
+                                                            if (type_sym) {
+                                                                recv_type->data.class_type.symbol = type_sym;
+                                                            }
+                                                        }
+
+                                                        if (type_sym && type_sym->data.class_data.members) {
+                                                            sym = scope_lookup_local(type_sym->data.class_data.members, field_name);
+                                                        }
+
+                                                        /* Also check the type's own implemented interfaces
+                                                         * for the constant (a class may reference a constant
+                                                         * inherited from an interface it implements). */
+                                                        if (!sym && type_sym) {
+                                                            slist_t *ifaces = type_sym->data.class_data.interfaces;
+                                                            for (slist_t *i = ifaces; i && !sym; i = i->next) {
+                                                                symbol_t *iface = (symbol_t *)i->data;
+                                                                if (iface && iface->data.class_data.members) {
+                                                                    sym = scope_lookup_local(iface->data.class_data.members, field_name);
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                if (sym && sym->kind == SYM_FIELD && sym->ast) {
+                                                    /* A field symbol's ->ast points at its own
+                                                     * AST_VAR_DECLARATOR when registered by the
+                                                     * main same-batch member-registration pass,
+                                                     * but at the whole AST_FIELD_DECL (whose
+                                                     * children are [type_node, declarator, ...],
+                                                     * one declarator per comma-separated name)
+                                                     * when registered via the interface/classpath
+                                                     * completion path - both shapes are handled
+                                                     * here since a qualified case-label constant
+                                                     * commonly resolves through the latter (e.g.
+                                                     * a same-batch but differently-registered
+                                                     * sibling interface). */
+                                                    ast_node_t *declarator = NULL;
+                                                    if (sym->ast->type == AST_VAR_DECLARATOR) {
+                                                        declarator = sym->ast;
+                                                    } else if (sym->ast->type == AST_FIELD_DECL) {
+                                                        for (slist_t *dc = sym->ast->data.node.children; dc; dc = dc->next) {
+                                                            ast_node_t *cand = (ast_node_t *)dc->data;
+                                                            if (cand && cand->type == AST_VAR_DECLARATOR &&
+                                                                cand->data.node.name &&
+                                                                strcmp(cand->data.node.name, field_name) == 0) {
+                                                                declarator = cand;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+
+                                                    if (declarator && declarator->data.node.children) {
+                                                        ast_node_t *init_expr =
+                                                            (ast_node_t *)declarator->data.node.children->data;
+                                                        long long resolved_value = 0;
+                                                        bool have_value = false;
+                                                        if (init_expr && init_expr->type == AST_LITERAL &&
+                                                            init_expr->data.leaf.token_type == TOK_INTEGER_LITERAL) {
+                                                            resolved_value = init_expr->data.leaf.value.int_val;
+                                                            have_value = true;
+                                                        } else if (init_expr && init_expr->type == AST_LITERAL &&
+                                                                   init_expr->data.leaf.token_type == TOK_CHAR_LITERAL) {
+                                                            /* See the matching TOK_CHAR_LITERAL handling
+                                                             * just above for the bare-identifier case -
+                                                             * a char literal's value is the character
+                                                             * stored as a string in str_val, not int_val. */
+                                                            const char *str = init_expr->data.leaf.value.str_val;
+                                                            resolved_value = (str && str[0]) ? (unsigned char)str[0] : 0;
+                                                            have_value = true;
+                                                        }
+                                                        if (have_value) {
+                                                            case_expr->type = AST_LITERAL;
+                                                            case_expr->data.leaf.name = NULL;
+                                                            case_expr->data.leaf.token_type = TOK_INTEGER_LITERAL;
+                                                            case_expr->data.leaf.value.int_val = resolved_value;
+                                                        }
                                                     }
                                                 }
                                             }

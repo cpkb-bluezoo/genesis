@@ -950,6 +950,22 @@ void mg_pop_typed(method_gen_t *mg, int slots)
     if (mg->stackmap) stackmap_pop(mg->stackmap, slots);
 }
 
+/* Type-aware counterparts of an emitted OP_DUP_X1/OP_DUP2_X1 - update
+ * mg->stack_depth (via mg_push) and reorder mg->stackmap's own tracked
+ * types to match, rather than leaving the stackmap's type array stale
+ * (see stackmap_dup_x1()/stackmap_dup2_x1() for why this matters). */
+void mg_dup_x1(method_gen_t *mg)
+{
+    mg_push(mg, 1);
+    if (mg->stackmap) stackmap_dup_x1(mg->stackmap);
+}
+
+void mg_dup2_x1(method_gen_t *mg)
+{
+    mg_push(mg, 2);
+    if (mg->stackmap) stackmap_dup2_x1(mg->stackmap);
+}
+
 /* ========================================================================
  * Type Descriptor Generation
  * ======================================================================== */
@@ -1640,12 +1656,30 @@ char *ast_type_to_descriptor(ast_node_t *type_node)
         
         case AST_IDENTIFIER:
             {
-                /* Identifier used as type name (e.g., in String.class or String[].class) */
+                /* Identifier used as type name (e.g., in String.class or String[].class).
+                 * Prefer the resolved type from semantic analysis (which
+                 * correctly carries the full package-qualified name) over
+                 * the bare source identifier - mirrors AST_CLASS_TYPE's own
+                 * sem_type check just above. Without this, any class
+                 * literal referencing a type outside the small hardcoded
+                 * java.lang list below (e.g. "Foo.class" for a type in a
+                 * real package) used the bare "Foo" as its internal name,
+                 * dropping the package entirely (NoClassDefFoundError). */
+                if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS &&
+                    type_node->sem_type->data.class_type.name) {
+                    char *internal = class_to_internal_name(type_node->sem_type->data.class_type.name);
+                    size_t len = strlen(internal) + 3;
+                    char *desc = malloc(len);
+                    snprintf(desc, len, "L%s;", internal);
+                    free(internal);
+                    return desc;
+                }
+
                 const char *name = type_node->data.leaf.name;
                 if (!name) {
                     return strdup("Ljava/lang/Object;");
                 }
-                
+
                 /* Check for common java.lang types */
                 if (strcmp(name, "String") == 0) {
                     return strdup("Ljava/lang/String;");
@@ -2302,16 +2336,34 @@ static bool codegen_interface_method(class_gen_t *cg, ast_node_t *method_decl)
     mi->code = NULL;  /* Abstract methods have no Code attribute */
     mi->ast = method_decl;  /* Store AST for annotations and defaults */
     mi->throws = extract_throws_types(method_decl, cg->sem);  /* Extract throws clause */
-    
+
+    /* Generic signature (e.g. "(TT;)V" for an interface method like
+     * "void completed(T result)"). Without this, a LATER, separate
+     * compilation that loads this interface back from its compiled
+     * .class file (via -cp, as happens whenever a multi-module build
+     * forks the compiler once per module/batch rather than compiling
+     * everything in one invocation) has no way to tell this parameter
+     * was ever a type variable - only the erased descriptor
+     * "(Ljava/lang/Object;)V" survives. generate_interface_bridges() in
+     * this file relies on exactly that information (a parameter or
+     * return type resolved to TYPE_TYPEVAR) to decide whether an
+     * implementing class needs a synthetic bridge method; without the
+     * Signature attribute, that check silently comes back false for an
+     * interface loaded from a classfile, so no bridge gets generated -
+     * and the concrete override alone doesn't satisfy the interface's
+     * own (erased) abstract method, producing an AbstractMethodError
+     * the first time it's actually invoked. */
+    mi->signature = generate_method_signature(method_decl, method_decl->sem_symbol);
+
     string_free(desc, true);
-    
+
     /* Add to methods list */
     if (!cg->methods) {
         cg->methods = slist_new(mi);
     } else {
         slist_append(cg->methods, mi);
     }
-    
+
     return true;
 }
 
@@ -2380,7 +2432,12 @@ static bool codegen_abstract_method(class_gen_t *cg, ast_node_t *method_decl)
     mi->code = NULL;  /* Abstract/native methods have no Code attribute */
     mi->ast = method_decl;  /* Store AST for annotations */
     mi->throws = extract_throws_types(method_decl, cg->sem);  /* Extract throws clause */
-    
+
+    /* Generic signature - see codegen_interface_method()'s identical call
+     * for why this matters for a method whose parameter or return type is
+     * a type variable, even though it has no body of its own here. */
+    mi->signature = generate_method_signature(method_decl, method_decl->sem_symbol);
+
     string_free(desc, true);
     
     /* Add to methods list */
@@ -2602,8 +2659,21 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
             if (param_type_node) {
                 char *param_desc = ast_type_to_descriptor(param_type_node);
                 
-                /* For varargs, convert element type descriptor to array descriptor */
-                if (is_varargs && param_desc[0] != '[') {
+                /* For varargs, prepend '[' to reflect the extra array
+                 * dimension varargs always adds - unconditionally,
+                 * regardless of whether the WRITTEN element type
+                 * descriptor already starts with '[' itself (e.g.
+                 * "byte[]... parts": the written type "byte[]" already
+                 * descriptors to "[B", but the parameter's REAL type is
+                 * "byte[][]", i.e. "[[B" - one MORE dimension on top,
+                 * same as for a non-array element type). The previous
+                 * "only if not already an array descriptor" guard here
+                 * silently left an array-typed varargs parameter one
+                 * dimension short, corrupting its own LocalVariableTable/
+                 * StackMapTable entry - rejected the moment the method's
+                 * own body used the parameter as what it's really
+                 * declared as. */
+                if (is_varargs) {
                     /* Prepend '[' to make it an array descriptor */
                     size_t len = strlen(param_desc);
                     char *array_desc = malloc(len + 2);
@@ -2837,20 +2907,32 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                     /* Look up field descriptor */
                     field_gen_t *field = hashtable_lookup(cg->field_map, field_name);
                     if (field) {
-                        /* aload_0 (this) */
+                        /* aload_0 (this) - mg_push_object() (not a raw
+                         * mg_push()) so mg->stackmap actually tracks this
+                         * reference, matching the real bytecode; the
+                         * mg_pop_typed() below then correctly removes it
+                         * (plus the pushed initializer value) again -
+                         * otherwise the stackmap never got these entries
+                         * added OR removed at all, and any value the
+                         * initializer expression itself pushed (e.g. a
+                         * long/double result) permanently leaked into
+                         * mg->stackmap's tracked state, corrupting every
+                         * stack-map frame recorded later in this
+                         * constructor (VerifyError: "Inconsistent
+                         * stackmap frames"). */
                         bc_emit(mg->code, OP_ALOAD_0);
-                        mg_push(mg, 1);
-                        
+                        mg_push_object(mg, cg->internal_name);
+
                         /* Generate initializer expression */
                         codegen_expr(mg, init_expr, cg->cp);
                         coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
-                        
+
                         /* putfield */
                         uint16_t field_ref = cp_add_fieldref(cg->cp,
                             cg->internal_name, field_name, field->descriptor);
                         bc_emit(mg->code, OP_PUTFIELD);
                         bc_emit_u2(mg->code, field_ref);
-                        mg_pop(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 3 : 2);
+                        mg_pop_typed(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 3 : 2);
                     }
                 }
             }
@@ -2919,7 +3001,20 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
         mg->last_opcode != OP_ATHROW) {
         bc_emit(mg->code, OP_RETURN);
     }
-    
+
+    /* A loop construct (for/do-while) conservatively records a stack-map
+     * frame at its own exit point regardless of whether a `break` actually
+     * targets it, since it can't know in advance whether an implicit
+     * return (just above) or more enclosing statements will end up
+     * following that position. When neither happens (e.g. a non-void
+     * method whose last statement is a "for(;;)" loop that always
+     * returns internally, with no break) that frame dangles past the
+     * method's real final instruction - drop it here, now that the final
+     * code length is known. */
+    if (mg->stackmap) {
+        stackmap_prune_out_of_bounds_frame(mg->stackmap, (uint16_t)mg->code->length);
+    }
+
     /* Update max_stack and max_locals */
     mg->code->max_stack = mg->max_stack;
     mg->code->max_locals = mg->max_locals;
@@ -3255,7 +3350,21 @@ static void generate_superclass_bridges(class_gen_t *cg)
                     entry = entry->next;
                     continue;
                 }
-                
+
+                /* A final superclass method can never be legally
+                 * overridden - and since this branch only fires when the
+                 * subclass has no override of its own, the "bridge" it
+                 * would generate always has exactly the superclass
+                 * method's own erased descriptor (same symbol, same
+                 * erasure), so the JVM would reject it as illegally
+                 * overriding a final method (e.g. java.lang.Enum's own
+                 * final compareTo(T), erased to compareTo(Enum) since T is
+                 * bound by "T extends Enum<T>"). Skip it. */
+                if (method->modifiers & MOD_FINAL) {
+                    entry = entry->next;
+                    continue;
+                }
+
                 /* Check if current class already has this method */
                 bool has_override = false;
                 if (class_sym->data.class_data.members && 
@@ -3310,13 +3419,15 @@ static void generate_superclass_bridges(class_gen_t *cg)
                 for (slist_t *p = params; p; p = p->next) {
                     symbol_t *param = (symbol_t *)p->data;
                     if (param && param->type) {
-                        if (param->type->kind == TYPE_TYPEVAR) {
-                            string_append(desc, "Ljava/lang/Object;");
-                        } else {
-                            char *param_desc = type_to_descriptor(param->type);
-                            string_append(desc, param_desc);
-                            free(param_desc);
-                        }
+                        /* type_to_descriptor() already erases TYPE_TYPEVAR to
+                         * its bound (or Object if unbounded) - do not
+                         * hardcode Object here, or a bounded type variable
+                         * (e.g. "T extends Enum<T>") gets the wrong erased
+                         * descriptor and the bridge won't match the
+                         * interface/superclass method's own erasure. */
+                        char *param_desc = type_to_descriptor(param->type);
+                        string_append(desc, param_desc);
+                        free(param_desc);
                         /* Count slots for parameter loading */
                         if (param->type->kind == TYPE_LONG || param->type->kind == TYPE_DOUBLE) {
                             slot += 2;
@@ -3326,16 +3437,12 @@ static void generate_superclass_bridges(class_gen_t *cg)
                     }
                 }
                 string_append(desc, ")");
-                
+
                 /* Return type */
                 if (method->type) {
-                    if (method->type->kind == TYPE_TYPEVAR) {
-                        string_append(desc, "Ljava/lang/Object;");
-                    } else {
-                        char *ret_desc = type_to_descriptor(method->type);
-                        string_append(desc, ret_desc);
-                        free(ret_desc);
-                    }
+                    char *ret_desc = type_to_descriptor(method->type);
+                    string_append(desc, ret_desc);
+                    free(ret_desc);
                 } else {
                     string_append(desc, "V");
                 }
@@ -3585,29 +3692,26 @@ static void generate_interface_bridges(class_gen_t *cg)
                     continue;
                 }
                 
-                /* Check if we already have a bridge with the erased signature */
+                /* Check if we already have a bridge with the erased signature.
+                 * type_to_descriptor() already erases TYPE_TYPEVAR to its
+                 * bound (or Object if unbounded) - do not hardcode Object
+                 * here, or a bounded type variable (e.g. "T extends
+                 * Enum<T>") gets the wrong erased descriptor and this
+                 * bridge won't match the interface method's own erasure. */
                 string_t *erased_desc = string_new("(");
                 for (slist_t *p = params; p; p = p->next) {
                     symbol_t *param = (symbol_t *)p->data;
                     if (param && param->type) {
-                        if (param->type->kind == TYPE_TYPEVAR) {
-                            string_append(erased_desc, "Ljava/lang/Object;");
-                        } else {
-                            char *pdesc = type_to_descriptor(param->type);
-                            string_append(erased_desc, pdesc);
-                            free(pdesc);
-                        }
+                        char *pdesc = type_to_descriptor(param->type);
+                        string_append(erased_desc, pdesc);
+                        free(pdesc);
                     }
                 }
                 string_append(erased_desc, ")");
                 if (iface_method->type) {
-                    if (iface_method->type->kind == TYPE_TYPEVAR) {
-                        string_append(erased_desc, "Ljava/lang/Object;");
-                    } else {
-                        char *rdesc = type_to_descriptor(iface_method->type);
-                        string_append(erased_desc, rdesc);
-                        free(rdesc);
-                    }
+                    char *rdesc = type_to_descriptor(iface_method->type);
+                    string_append(erased_desc, rdesc);
+                    free(rdesc);
                 } else {
                     string_append(erased_desc, "V");
                 }
@@ -3773,6 +3877,384 @@ static void generate_interface_bridges(class_gen_t *cg)
                 
                 entry = entry->next;
             }
+        }
+    }
+}
+
+/**
+ * Generate bridge methods for a covariant override of an inherited generic
+ * superclass method.
+ *
+ * generate_superclass_bridges() above only handles the case where the
+ * current class does NOT override an inherited generic method at all -
+ * forwarding the erased entry point straight to super via invokespecial
+ * (skipping entirely, via its own "has_override" check, whenever the
+ * current class already declares a method with the same name/arity). That
+ * is backwards for a different, previously entirely unhandled scenario:
+ * the current class DOES override the method, but with a signature that is
+ * more specific than the superclass's own erased one - e.g. a covariant
+ * return type, such as java.lang.ThreadLocal<T>'s "protected T
+ * initialValue()" (erasing to "protected Object initialValue()")
+ * overridden by an anonymous subclass as "protected int[] initialValue()".
+ *
+ * Without a synthetic bridge at the superclass's own erased descriptor, a
+ * virtual call compiled against that erased signature - such as
+ * ThreadLocal.get()'s own internal "this.initialValue()" call, compiled
+ * against "()Ljava/lang/Object;" since that's the only signature
+ * ThreadLocal's own classfile declares - finds no method with that exact
+ * descriptor anywhere in the subclass, and falls back through the class
+ * hierarchy to the superclass's own body. Since ThreadLocal.initialValue()
+ * is concrete ("return null;"), this fails silently (wrong runtime value),
+ * not with an AbstractMethodError.
+ *
+ * This is the mirror image of generate_interface_bridges()'s own handling
+ * of the analogous "class overrides a generic interface method with a
+ * covariant/concrete signature" case - same idea, but for a class hierarchy
+ * (invokevirtual on the current class's own override) instead of an
+ * interface (which also needs parameter checkcasts, reused here for
+ * symmetry even though the primary, confirmed bug is return-type-only).
+ */
+static void generate_covariant_override_bridges(class_gen_t *cg)
+{
+    if (!cg || !cg->class_sym) {
+        return;
+    }
+
+    symbol_t *class_sym = cg->class_sym;
+    symbol_t *super_sym = class_sym->data.class_data.superclass;
+
+    if (!super_sym || !super_sym->data.class_data.members) {
+        return;
+    }
+
+    scope_t *super_members = super_sym->data.class_data.members;
+    if (!super_members || !super_members->symbols) {
+        return;
+    }
+
+    if (!class_sym->data.class_data.members ||
+        !class_sym->data.class_data.members->symbols) {
+        return;
+    }
+    hashtable_t *class_methods = class_sym->data.class_data.members->symbols;
+
+    hashtable_t *ht = super_members->symbols;
+    for (size_t i = 0; i < ht->size; i++) {
+        hashtable_entry_t *entry = ht->buckets[i];
+        while (entry) {
+            symbol_t *method = (symbol_t *)entry->value;
+            if (!method || method->kind != SYM_METHOD ||
+                (method->modifiers & MOD_STATIC) ||
+                (method->modifiers & MOD_PRIVATE) ||
+                (method->modifiers & MOD_FINAL)) {
+                entry = entry->next;
+                continue;
+            }
+
+            /* Only relevant when the superclass method's own signature
+             * involves a type variable somewhere (parameter or return) -
+             * otherwise there's no erasure gap that could ever need a
+             * bridge to begin with. */
+            bool has_type_var = false;
+            slist_t *super_params = method->data.method_data.parameters;
+            for (slist_t *p = super_params; p; p = p->next) {
+                symbol_t *param = (symbol_t *)p->data;
+                if (param && param->type && param->type->kind == TYPE_TYPEVAR) {
+                    has_type_var = true;
+                    break;
+                }
+            }
+            if (method->type && method->type->kind == TYPE_TYPEVAR) {
+                has_type_var = true;
+            }
+            if (!has_type_var) {
+                entry = entry->next;
+                continue;
+            }
+
+            /* Find the current class's own override, if any. Matching by
+             * name + parameter COUNT alone (the convention
+             * generate_superclass_bridges()'s/generate_interface_bridges()'s
+             * own "find the override/implementation" lookups already use
+             * elsewhere in this file) is not sufficient here: a class can
+             * declare multiple overloads sharing both the name and arity
+             * with the superclass method being considered (e.g.
+             * java.nio.file.spi.FileSystemProvider declares BOTH
+             * "<A> A readAttributes(Path, Class<A>, LinkOption...)" and
+             * "Map<String,Object> readAttributes(Path, String,
+             * LinkOption...)" - both 3 parameters, both named
+             * readAttributes). Per JLS, overriding (unlike overloading)
+             * requires each PARAMETER's type to match the superclass
+             * method's own erased parameter type EXACTLY - only the
+             * RETURN type may be covariant - so compare erased parameter
+             * descriptors, not just count, or this could pick the WRONG
+             * overload as the bridge's own call target and generate a
+             * bridge invoking it with completely incompatible argument
+             * types (confirmed: this exact collision produced a real
+             * VerifyError - "Type java/lang/Class ... not assignable to
+             * java/lang/String" - against gumdrop's own
+             * MemoryFileSystemProvider). */
+            symbol_t *impl_method = NULL;
+            string_t *super_param_desc = string_new("");
+            for (slist_t *sp = super_params; sp; sp = sp->next) {
+                symbol_t *sparam = (symbol_t *)sp->data;
+                if (sparam && sparam->type) {
+                    char *pdesc = type_to_descriptor(sparam->type);
+                    string_append(super_param_desc, pdesc);
+                    free(pdesc);
+                }
+            }
+
+            for (size_t j = 0; j < class_methods->size && !impl_method; j++) {
+                hashtable_entry_t *class_entry = class_methods->buckets[j];
+                while (class_entry && !impl_method) {
+                    symbol_t *class_method = (symbol_t *)class_entry->value;
+                    if (class_method && class_method->kind == SYM_METHOD &&
+                        class_method->name && method->name &&
+                        strcmp(class_method->name, method->name) == 0 &&
+                        !(class_method->modifiers & MOD_STATIC)) {
+                        string_t *cand_param_desc = string_new("");
+                        for (slist_t *cp = class_method->data.method_data.parameters; cp; cp = cp->next) {
+                            symbol_t *cparam = (symbol_t *)cp->data;
+                            if (cparam && cparam->type) {
+                                char *pdesc = type_to_descriptor(cparam->type);
+                                string_append(cand_param_desc, pdesc);
+                                free(pdesc);
+                            }
+                        }
+                        if (strcmp(cand_param_desc->str, super_param_desc->str) == 0) {
+                            impl_method = class_method;
+                        }
+                        string_free(cand_param_desc, true);
+                    }
+                    class_entry = class_entry->next;
+                }
+            }
+            string_free(super_param_desc, true);
+
+            /* Not overridden at all - that's generate_superclass_bridges()'s
+             * own job (invokespecial forwarding to super), not ours. */
+            if (!impl_method) {
+                entry = entry->next;
+                continue;
+            }
+
+            /* Build the superclass method's own erased descriptor - the
+             * entry point a virtual call compiled against the superclass
+             * needs to find. */
+            string_t *erased_desc = string_new("(");
+            for (slist_t *p = super_params; p; p = p->next) {
+                symbol_t *param = (symbol_t *)p->data;
+                if (param && param->type) {
+                    char *pdesc = type_to_descriptor(param->type);
+                    string_append(erased_desc, pdesc);
+                    free(pdesc);
+                }
+            }
+            string_append(erased_desc, ")");
+            if (method->type) {
+                char *rdesc = type_to_descriptor(method->type);
+                string_append(erased_desc, rdesc);
+                free(rdesc);
+            } else {
+                string_append(erased_desc, "V");
+            }
+
+            /* Build the override's own real (possibly covariant)
+             * descriptor. */
+            string_t *concrete_desc = string_new("(");
+            for (slist_t *p = impl_method->data.method_data.parameters; p; p = p->next) {
+                symbol_t *param = (symbol_t *)p->data;
+                if (param && param->type) {
+                    char *pdesc = type_to_descriptor(param->type);
+                    string_append(concrete_desc, pdesc);
+                    free(pdesc);
+                }
+            }
+            string_append(concrete_desc, ")");
+            if (impl_method->type) {
+                char *rdesc = type_to_descriptor(impl_method->type);
+                string_append(concrete_desc, rdesc);
+                free(rdesc);
+            } else {
+                string_append(concrete_desc, "V");
+            }
+
+            /* The override's own erased descriptor already matches the
+             * superclass's (e.g. an unbounded T overridden with "Object"
+             * again) - no separate bridge needed, the override itself IS
+             * already the erased entry point. */
+            if (strcmp(erased_desc->str, concrete_desc->str) == 0) {
+                string_free(erased_desc, true);
+                string_free(concrete_desc, true);
+                entry = entry->next;
+                continue;
+            }
+
+            /* Don't emit a duplicate/conflicting method if something else
+             * (e.g. generate_interface_bridges(), run alongside this) has
+             * already generated a method with this exact name+descriptor. */
+            bool already_exists = false;
+            for (slist_t *m = cg->methods; m && !already_exists; m = m->next) {
+                method_info_gen_t *existing = (method_info_gen_t *)m->data;
+                if (!existing) continue;
+                const char *existing_name = NULL;
+                const char *existing_desc = NULL;
+                for (uint16_t idx = 1; idx < cg->cp->count; idx++) {
+                    if (cg->cp->entries[idx].type == CONST_UTF8) {
+                        if (idx == existing->name_index) {
+                            existing_name = cg->cp->entries[idx].data.utf8;
+                        }
+                        if (idx == existing->descriptor_index) {
+                            existing_desc = cg->cp->entries[idx].data.utf8;
+                        }
+                    }
+                }
+                if (existing_name && existing_desc &&
+                    strcmp(existing_name, method->name) == 0 &&
+                    strcmp(existing_desc, erased_desc->str) == 0) {
+                    already_exists = true;
+                }
+            }
+            if (already_exists) {
+                string_free(erased_desc, true);
+                string_free(concrete_desc, true);
+                entry = entry->next;
+                continue;
+            }
+
+            /* Generate bridge method:
+             * public synthetic bridge <erased> name(<erased params>) {
+             *     return this.name(<params>);  // invokevirtual, the REAL
+             *                                   // override - not
+             *                                   // invokespecial/super,
+             *                                   // since we must reach the
+             *                                   // subclass's own concrete
+             *                                   // implementation.
+             * }
+             */
+            method_info_gen_t *mi = calloc(1, sizeof(method_info_gen_t));
+            if (!mi) {
+                string_free(erased_desc, true);
+                string_free(concrete_desc, true);
+                entry = entry->next;
+                continue;
+            }
+
+            mi->access_flags = ACC_PUBLIC | ACC_SYNTHETIC | ACC_BRIDGE;
+            mi->name_index = cp_add_utf8(cg->cp, method->name);
+            mi->descriptor_index = cp_add_utf8(cg->cp, erased_desc->str);
+
+            bytecode_t *code = bytecode_new();
+            int max_stack = 1;  /* 'this' */
+            int slot = 1;
+
+            bc_emit(code, OP_ALOAD_0);
+
+            slist_t *sparam_it = super_params;
+            slist_t *cparam_it = impl_method->data.method_data.parameters;
+            while (sparam_it && cparam_it) {
+                symbol_t *sp_sym = (symbol_t *)sparam_it->data;
+                symbol_t *cp_sym = (symbol_t *)cparam_it->data;
+                type_kind_t erased_kind = TYPE_CLASS;  /* default for type vars */
+                if (sp_sym && sp_sym->type && sp_sym->type->kind != TYPE_TYPEVAR) {
+                    erased_kind = sp_sym->type->kind;
+                }
+
+                switch (erased_kind) {
+                    case TYPE_LONG:
+                        bc_emit(code, slot <= 3 ? OP_LLOAD_0 + slot : OP_LLOAD);
+                        if (slot > 3) bc_emit_u1(code, slot);
+                        max_stack += 2;
+                        slot += 2;
+                        break;
+                    case TYPE_DOUBLE:
+                        bc_emit(code, slot <= 3 ? OP_DLOAD_0 + slot : OP_DLOAD);
+                        if (slot > 3) bc_emit_u1(code, slot);
+                        max_stack += 2;
+                        slot += 2;
+                        break;
+                    case TYPE_FLOAT:
+                        bc_emit(code, slot <= 3 ? OP_FLOAD_0 + slot : OP_FLOAD);
+                        if (slot > 3) bc_emit_u1(code, slot);
+                        max_stack++;
+                        slot++;
+                        break;
+                    case TYPE_BOOLEAN:
+                    case TYPE_BYTE:
+                    case TYPE_CHAR:
+                    case TYPE_SHORT:
+                    case TYPE_INT:
+                        bc_emit(code, slot <= 3 ? OP_ILOAD_0 + slot : OP_ILOAD);
+                        if (slot > 3) bc_emit_u1(code, slot);
+                        max_stack++;
+                        slot++;
+                        break;
+                    default:  /* CLASS, ARRAY, TYPEVAR -> aload */
+                        bc_emit(code, slot <= 3 ? OP_ALOAD_0 + slot : OP_ALOAD);
+                        if (slot > 3) bc_emit_u1(code, slot);
+                        max_stack++;
+                        slot++;
+                        /* Superclass parameter erases to a type variable but
+                         * the override's own declared parameter is a
+                         * genuinely narrower concrete class - needs a
+                         * checkcast, mirroring generate_interface_bridges()'s
+                         * own equivalent cast for the same reason (covariant
+                         * PARAMETER, as opposed to this bug's primary,
+                         * confirmed target of covariant RETURN). */
+                        if (sp_sym && sp_sym->type && sp_sym->type->kind == TYPE_TYPEVAR &&
+                            cp_sym && cp_sym->type && cp_sym->type->kind == TYPE_CLASS) {
+                            const char *cast_name = cp_sym->type->data.class_type.name;
+                            if (cast_name) {
+                                char *internal = class_to_internal_name(cast_name);
+                                uint16_t cast_class = cp_add_class(cg->cp, internal);
+                                bc_emit(code, OP_CHECKCAST);
+                                bc_emit_u2(code, cast_class);
+                                free(internal);
+                            }
+                        }
+                        break;
+                }
+
+                sparam_it = sparam_it->next;
+                cparam_it = cparam_it->next;
+            }
+
+            /* invokevirtual this.<real override>(concrete_desc) */
+            uint16_t methodref = cp_add_methodref(cg->cp, cg->internal_name,
+                                                   impl_method->name, concrete_desc->str);
+            bc_emit(code, OP_INVOKEVIRTUAL);
+            bc_emit_u2(code, methodref);
+
+            type_kind_t ret_kind = impl_method->type ? impl_method->type->kind : TYPE_VOID;
+            switch (ret_kind) {
+                case TYPE_VOID:   bc_emit(code, OP_RETURN); break;
+                case TYPE_LONG:   bc_emit(code, OP_LRETURN); break;
+                case TYPE_DOUBLE: bc_emit(code, OP_DRETURN); break;
+                case TYPE_FLOAT:  bc_emit(code, OP_FRETURN); break;
+                case TYPE_BOOLEAN:
+                case TYPE_BYTE:
+                case TYPE_CHAR:
+                case TYPE_SHORT:
+                case TYPE_INT:    bc_emit(code, OP_IRETURN); break;
+                default:          bc_emit(code, OP_ARETURN); break;
+            }
+
+            code->max_stack = max_stack;
+            code->max_locals = slot;
+
+            mi->code = code;
+
+            string_free(erased_desc, true);
+            string_free(concrete_desc, true);
+
+            if (!cg->methods) {
+                cg->methods = slist_new(mi);
+            } else {
+                slist_append(cg->methods, mi);
+            }
+
+            entry = entry->next;
         }
     }
 }
@@ -4239,7 +4721,17 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
     if (!is_interface && !is_annotation) {
         generate_superclass_bridges(cg);
     }
-    
+
+    /* Generate bridge methods for a covariant override of an inherited
+     * generic superclass method (e.g. a ThreadLocal<int[]> subclass's
+     * "int[] initialValue()" overriding ThreadLocal's own erased "Object
+     * initialValue()") - the mutually-exclusive complement to
+     * generate_superclass_bridges() above, which only handles the "not
+     * overridden at all" case. */
+    if (!is_interface && !is_annotation) {
+        generate_covariant_override_bridges(cg);
+    }
+
     /* Generate bridge methods for generic interface implementations.
      * When C implements Comparator<X>, it needs compare(Object, Object) -> compare(X, X). */
     if (!is_interface && !is_annotation) {
@@ -4715,19 +5207,24 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 
                 field_gen_t *field = hashtable_lookup(cg->field_map, field_name);
                 if (field) {
+                    /* mg_push_object()/mg_pop_typed() (not raw mg_push()/
+                     * mg_pop()) so mg->stackmap actually tracks and then
+                     * removes this reference and the initializer's pushed
+                     * value - see the matching comment at the sibling
+                     * instance-field-init site above. */
                     bc_emit(mg->code, OP_ALOAD_0);
-                    mg_push(mg, 1);
+                    mg_push_object(mg, cg->internal_name);
                     codegen_expr(mg, init_expr, cg->cp);
                     coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
                     uint16_t field_ref = cp_add_fieldref(cg->cp,
                         cg->internal_name, field_name, field->descriptor);
                     bc_emit(mg->code, OP_PUTFIELD);
                     bc_emit_u2(mg->code, field_ref);
-                    mg_pop(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 3 : 2);
+                    mg_pop_typed(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 3 : 2);
                 }
             }
         }
-        
+
         /* Inject instance initializer blocks */
         for (slist_t *node = cg->instance_initializers; node; node = node->next) {
             ast_node_t *init_block = (ast_node_t *)node->data;
@@ -4736,10 +5233,10 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 codegen_statement(mg, block);
             }
         }
-        
+
         /* return */
         bc_emit(mg->code, OP_RETURN);
-        
+
         /* Set max_stack and max_locals */
         mg->code->max_stack = mg->max_stack;
         mg->code->max_locals = mg->max_locals;
@@ -4888,28 +5385,23 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     codegen_expr(mg, arg, cg->cp);
                     arg_count++;
                     
-                    /* Get the type descriptor for this argument from sem_type if available */
-                    if (arg->sem_type) {
-                        char *arg_desc = type_to_descriptor(arg->sem_type);
+                    /* Get the type descriptor for this argument: prefer
+                     * sem_type if some earlier pass already self-annotated
+                     * it, otherwise ask the semantic analyzer directly
+                     * (e.g. a bare literal argument's own codegen has no
+                     * need to call get_expression_type itself, so its
+                     * sem_type is never set here). This replaces a former
+                     * fallback that guessed a literal's type from its
+                     * source text - "contains '.', 'e', or 'E'" - which
+                     * misdetected any hex literal with 'e'/'E' as one of
+                     * its hex digits (e.g. 0x11ec) and the boolean literal
+                     * "true" (itself containing 'e') as double/float,
+                     * corrupting the invokespecial's own descriptor. */
+                    type_t *arg_type = arg->sem_type ? arg->sem_type : get_expression_type(cg->sem, arg);
+                    if (arg_type) {
+                        char *arg_desc = type_to_descriptor(arg_type);
                         string_append(ctor_desc, arg_desc);
                         free(arg_desc);
-                    } else if (arg->type == AST_LITERAL) {
-                        /* Fallback for literals based on value */
-                        const char *val = arg->data.leaf.name;
-                        if (val) {
-                            /* Check for double/float literals */
-                            if (strchr(val, '.') != NULL || strchr(val, 'e') != NULL || strchr(val, 'E') != NULL) {
-                                if (val[strlen(val) - 1] == 'f' || val[strlen(val) - 1] == 'F') {
-                                    string_append(ctor_desc, "F");
-                                } else {
-                                    string_append(ctor_desc, "D");
-                                }
-                            } else if (val[strlen(val) - 1] == 'L' || val[strlen(val) - 1] == 'l') {
-                                string_append(ctor_desc, "J");
-                            } else {
-                                string_append(ctor_desc, "I");
-                            }
-                        }
                     }
                     args = args->next;
                 }
@@ -4957,7 +5449,11 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         cg->internal_name, field_name, field->descriptor);
                     bc_emit(mg->code, OP_PUTSTATIC);
                     bc_emit_u2(mg->code, field_ref);
-                    mg_pop(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 2 : 1);
+                    /* mg_pop_typed() (not raw mg_pop()) so mg->stackmap
+                     * actually removes the initializer's pushed value -
+                     * see the matching comment at the instance-field-init
+                     * sites above. */
+                    mg_pop_typed(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 2 : 1);
                 }
             }
         }
@@ -6157,6 +6653,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
     /* Bridge methods, as for a named class: new Function<Integer, Integer>() {
      * public Integer apply(Integer x) ... } also needs apply(Object). */
     generate_superclass_bridges(cg);
+    generate_covariant_override_bridges(cg);
     generate_interface_bridges(cg);
     
     /* Generate default constructor - anonymous classes always need one
@@ -6513,19 +7010,24 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 
                 field_gen_t *field = hashtable_lookup(cg->field_map, field_name);
                 if (field) {
+                    /* mg_push_object()/mg_pop_typed() (not raw mg_push()/
+                     * mg_pop()) so mg->stackmap actually tracks and then
+                     * removes this reference and the initializer's pushed
+                     * value - see the matching comment at the sibling
+                     * instance-field-init site above. */
                     bc_emit(mg->code, OP_ALOAD_0);
-                    mg_push(mg, 1);
+                    mg_push_object(mg, cg->internal_name);
                     codegen_expr(mg, init_expr, cg->cp);
                     coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
                     uint16_t field_ref = cp_add_fieldref(cg->cp,
                         cg->internal_name, field_name, field->descriptor);
                     bc_emit(mg->code, OP_PUTFIELD);
                     bc_emit_u2(mg->code, field_ref);
-                    mg_pop(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 3 : 2);
+                    mg_pop_typed(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 3 : 2);
                 }
             }
         }
-        
+
         /* Inject instance initializer blocks */
         for (slist_t *node = cg->instance_initializers; node; node = node->next) {
             ast_node_t *init_block = (ast_node_t *)node->data;
@@ -6534,10 +7036,10 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 codegen_statement(mg, block);
             }
         }
-        
+
         /* return */
         bc_emit(mg->code, OP_RETURN);
-        
+
         /* Set max_stack and max_locals */
         mg->code->max_stack = mg->max_stack;
         mg->code->max_locals = mg->max_locals;
@@ -6610,11 +7112,15 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                         cg->internal_name, field_name, field->descriptor);
                     bc_emit(mg->code, OP_PUTSTATIC);
                     bc_emit_u2(mg->code, field_ref);
-                    mg_pop(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 2 : 1);
+                    /* mg_pop_typed() (not raw mg_pop()) so mg->stackmap
+                     * actually removes the initializer's pushed value -
+                     * see the matching comment at the instance-field-init
+                     * sites above. */
+                    mg_pop_typed(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 2 : 1);
                 }
             }
         }
-        
+
         /* Generate static initializer blocks */
         for (slist_t *node = static_initializers; node; node = node->next) {
             ast_node_t *init_block = (ast_node_t *)node->data;

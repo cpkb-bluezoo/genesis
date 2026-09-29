@@ -819,6 +819,16 @@ char *semantic_resolve_annotation_type_name(semantic_t *sem, const char *simple_
  * unannotated. Defined in semantic.c; used by classwriter.c. */
 retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const char *annotation_name);
 
+/* Look up the declared return type descriptor of an annotation element
+ * (e.g. "timeout" on org.junit.Test -> "()J") by resolving the
+ * annotation's simple name through this file's imports and reading the
+ * element method's descriptor from its classfile on the classpath.
+ * Returns a malloc'd descriptor, or NULL if unresolvable. Defined in
+ * semantic.c; used by classwriter.c. */
+char *semantic_resolve_annotation_element_descriptor(semantic_t *sem,
+                                                       const char *annotation_name,
+                                                       const char *element_name);
+
 /*
  * Shared Type Registry for Parallel Compilation
  * 

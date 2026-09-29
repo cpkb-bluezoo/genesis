@@ -95,6 +95,55 @@ static void mg_push_object_from_descriptor(method_gen_t *mg, const char *descrip
 }
 
 /**
+ * Build a JVM array-type descriptor ("[[I", "[Ljava/lang/String;", ...) from
+ * a base (element) type kind/class and a dimension count. Used to give
+ * array-element-load codegen a correctly-typed stackmap replacement when the
+ * load result is itself a sub-array (jagged/multi-dimensional access).
+ */
+static char *build_array_descriptor(type_kind_t base_kind, const char *base_class, int dims)
+{
+    char *heap_base = NULL;
+    const char *base_desc;
+
+    switch (base_kind) {
+        case TYPE_BOOLEAN: base_desc = "Z"; break;
+        case TYPE_BYTE:    base_desc = "B"; break;
+        case TYPE_CHAR:    base_desc = "C"; break;
+        case TYPE_SHORT:   base_desc = "S"; break;
+        case TYPE_INT:     base_desc = "I"; break;
+        case TYPE_LONG:    base_desc = "J"; break;
+        case TYPE_FLOAT:   base_desc = "F"; break;
+        case TYPE_DOUBLE:  base_desc = "D"; break;
+        case TYPE_CLASS:
+            {
+                char *internal = class_to_internal_name(base_class ? base_class : "java.lang.Object");
+                size_t len = strlen(internal) + 3;
+                heap_base = malloc(len);
+                snprintf(heap_base, len, "L%s;", internal);
+                free(internal);
+                base_desc = heap_base;
+            }
+            break;
+        default:
+            base_desc = "Ljava/lang/Object;";
+            break;
+    }
+
+    if (dims < 1) {
+        dims = 1;
+    }
+    size_t len = strlen(base_desc) + (size_t)dims + 1;
+    char *desc = malloc(len);
+    char *p = desc;
+    for (int i = 0; i < dims; i++) {
+        *p++ = '[';
+    }
+    strcpy(p, base_desc);
+    free(heap_base);
+    return desc;
+}
+
+/**
  * Emit ++/-- on an instance field of the current object (this.field).
  * field_owner_internal is the class that declares the field (may be a superclass).
  */
@@ -446,8 +495,7 @@ bool emit_unboxing(method_gen_t *mg, const_pool_t *cp, type_kind_t target_prim, 
 {
     const char *method;
     const char *descriptor;
-    int stack_adjust = 0;  /* Amount to push after unboxing */
-    
+
     switch (target_prim) {
         case TYPE_INT:
             method = "intValue";
@@ -456,12 +504,10 @@ bool emit_unboxing(method_gen_t *mg, const_pool_t *cp, type_kind_t target_prim, 
         case TYPE_LONG:
             method = "longValue";
             descriptor = "()J";
-            stack_adjust = 1;  /* 1 slot -> 2 slots */
             break;
         case TYPE_DOUBLE:
             method = "doubleValue";
             descriptor = "()D";
-            stack_adjust = 1;  /* 1 slot -> 2 slots */
             break;
         case TYPE_FLOAT:
             method = "floatValue";
@@ -488,15 +534,33 @@ bool emit_unboxing(method_gen_t *mg, const_pool_t *cp, type_kind_t target_prim, 
             fprintf(stderr, "codegen: cannot unbox to type %d\n", target_prim);
             return false;
     }
-    
+
     uint16_t methodref = cp_add_methodref(cp, wrapper_class, method, descriptor);
     bc_emit(mg->code, OP_INVOKEVIRTUAL);
     bc_emit_u2(mg->code, methodref);
-    
-    if (stack_adjust > 0) {
-        mg_push(mg, stack_adjust);
+
+    /* invokevirtual here always consumes exactly the wrapper reference on
+     * top of the stack (1 word, 1 stackmap entry) and pushes the unboxed
+     * primitive result - pop that one entry and push a properly-typed
+     * replacement via the type-aware mg_push_*() helpers (which update
+     * both mg->stack_depth and mg->stackmap together), rather than
+     * blindly bumping the raw stack_depth counter alone. Without this,
+     * the wrapper's own stackmap entry was left in place uncorrected -
+     * for a category-1 result (int/float/etc) its wrong TYPE (still the
+     * wrapper class) lingered; for a category-2 result (long/double) one
+     * of its two required tracking slots was never even added, since the
+     * old code's raw mg_push() call touched only the word counter, never
+     * mg->stackmap - corrupting every stack-map frame subsequently
+     * recorded in the same method (VerifyError: "Inconsistent stackmap
+     * frames"/"StackMapTable error"). */
+    mg_pop_typed(mg, 1);
+    switch (target_prim) {
+        case TYPE_LONG:   mg_push_long(mg); break;
+        case TYPE_DOUBLE: mg_push_double(mg); break;
+        case TYPE_FLOAT:  mg_push_float(mg); break;
+        default:          mg_push_int(mg); break;  /* int/byte/short/char/boolean */
     }
-    
+
     return true;
 }
 
@@ -2651,6 +2715,104 @@ static bool codegen_string_concat(method_gen_t *mg, ast_node_t *expr, const_pool
     return true;
 }
 
+/**
+ * Generate code for a boolean condition that branches to a not-yet-known
+ * target when `expr` evaluates false, WITHOUT ever materializing an
+ * intermediate 0/1 value on the stack for a top-level chain of `&&`
+ * operators - each pending branch instruction's offset (still needing a
+ * backpatch once the caller knows the real target) is prepended onto
+ * *false_positions, mirroring the existing break_offsets pattern
+ * (mg_add_break_to_context/mg_pop_loop in codegen.c).
+ *
+ * This exists because the generic codegen_binary_expr()'s TOK_AND/TOK_OR
+ * handling materializes a single 0/1 value at a merge point shared by
+ * BOTH the "short-circuited false" and "both true" edges - correct when
+ * the expression's own VALUE is genuinely needed afterward (its two
+ * edges are indistinguishable from that point on), but wrong for a
+ * condition used directly by a control-flow statement (if/while/for),
+ * where the "both true" edge (entering the loop body/then-branch) must
+ * stay entirely separate from the "false" edge: once a local's tracked
+ * type is (correctly) degraded at that shared merge point - e.g. for
+ * `while (guard && (x = next()) != null) { use(x); }`, `x`'s tracked
+ * type must become the safe common type across both edges - the
+ * verifier treats that recorded frame as authoritative for ALL code
+ * reached from it afterward, including the loop body, even along the
+ * edge where `x` really was just assigned a real, narrower type. Direct
+ * per-operand branching (this function) sidesteps the shared merge
+ * entirely, so the loop body is reached only via the "both true" edge,
+ * with every operand's own side effects (like `x`'s assignment) intact.
+ *
+ * Only a top-level `&&` chain is special-cased (recursively, through any
+ * number of nested TOK_AND and AST_PARENTHESIZED wrappers); anything
+ * else (`||`, `!`, a plain comparison, a method call, ...) falls back to
+ * the ordinary value-based codegen_expr() plus a single ifeq, exactly
+ * matching the behavior callers had before this function existed. This
+ * covers the common "guard && (assignment) != null" loop idiom without
+ * the larger, riskier change of a fully general jump-code condition
+ * compiler for `||`/`!` as well.
+ */
+bool codegen_condition_and_chain_false_branch(method_gen_t *mg, const_pool_t *cp,
+                                               ast_node_t *expr, slist_t **false_positions)
+{
+    while (expr->type == AST_PARENTHESIZED) {
+        slist_t *inner = expr->data.node.children;
+        if (!inner) {
+            return false;
+        }
+        expr = (ast_node_t *)inner->data;
+    }
+
+    if (expr->type == AST_BINARY_EXPR && expr->data.node.op_token == TOK_AND) {
+        slist_t *children = expr->data.node.children;
+        if (!children || !children->next) {
+            return false;
+        }
+        ast_node_t *left = (ast_node_t *)children->data;
+        ast_node_t *right = (ast_node_t *)children->next->data;
+        if (!codegen_condition_and_chain_false_branch(mg, cp, left, false_positions)) {
+            return false;
+        }
+        return codegen_condition_and_chain_false_branch(mg, cp, right, false_positions);
+    }
+
+    /* Base case: an arbitrary boolean-valued expression - evaluate it and
+     * branch on its own value, exactly as the pre-existing generic path
+     * already did for a while/if/for condition. */
+    if (!codegen_expr(mg, expr, cp)) {
+        return false;
+    }
+
+    if (expr->sem_type && expr->sem_type->kind == TYPE_CLASS &&
+        expr->sem_type->data.class_type.name) {
+        type_kind_t prim = get_primitive_for_wrapper(expr->sem_type->data.class_type.name);
+        if (prim == TYPE_BOOLEAN) {
+            char *internal = class_to_internal_name(expr->sem_type->data.class_type.name);
+            emit_unboxing(mg, cp, prim, internal);
+            free(internal);
+        }
+    }
+
+    size_t branch_pos = mg->code->length;
+    bc_emit(mg->code, OP_IFEQ);
+    bc_emit_u2(mg->code, 0);  /* placeholder offset, patched by the caller */
+    mg_pop_typed(mg, 1);
+
+    pending_condition_branch_t *pending = malloc(sizeof(*pending));
+    pending->branch_pos = branch_pos;
+    pending->state = mg->stackmap ? stackmap_save_state(mg->stackmap) : NULL;
+
+    /* slist_append() returns the newly-appended TAIL node, not the list's
+     * head - only adopt it as *false_positions when the list was
+     * previously empty (that first node IS the head); on every later
+     * call the existing head must be kept as-is, or earlier entries
+     * become unreachable from the caller's own list pointer. */
+    slist_t *new_node = slist_append(*false_positions, pending);
+    if (!*false_positions) {
+        *false_positions = new_node;
+    }
+    return true;
+}
+
 /* ========================================================================
  * Binary Expression Code Generation
  * ======================================================================== */
@@ -2724,9 +2886,19 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
         }
         bc_emit_u2(mg->code, 0);  /* placeholder offset */
         mg_pop_typed(mg, 1);  /* left operand consumed by branch */
-        
+
+        /* Snapshot local-variable tracking as it stood before the right
+         * operand runs - branch1 (left-operand-false) reaches the
+         * short-circuit target WITHOUT ever running the right operand, so
+         * any local the right operand assigns (e.g. `x` in
+         * `cond && (x = expr()) != null`) is genuinely still whatever it
+         * was here on that edge - not the real type the assignment gives
+         * it on the other (branch2) edge. */
+        stackmap_state_t *pre_right_state = mg->stackmap ? stackmap_save_state(mg->stackmap) : NULL;
+
         /* Evaluate right operand */
         if (!codegen_expr(mg, right, cp)) {
+            stackmap_state_free(pre_right_state);
             return false;
         }
         
@@ -2769,9 +2941,22 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
         
         /* Pop the result from the non-short-circuit path for correct frame recording */
         mg_pop_typed(mg, 1);
-        
+
+        /* branch1 also targets this same position, arriving with the
+         * right operand never run - restore locals to that pre-right-
+         * operand state (any local the right operand assigned reverts to
+         * its prior, possibly-unassigned tracked type) before recording
+         * the frame both branches share. Only locals are restored - the
+         * stack was already corrected to empty by the pop above, which
+         * matches both edges (branch1's own ifeq also consumed its
+         * operand off the stack). */
+        if (pre_right_state && mg->stackmap) {
+            stackmap_restore_locals_only(mg->stackmap, pre_right_state);
+        }
+
         /* Record frame at short-circuit target (target of branch1 and branch2) */
         mg_record_frame(mg);
+        stackmap_state_free(pre_right_state);
         
         if (op == TOK_AND) {
             bc_emit(mg->code, OP_ICONST_0);  /* && short-circuit: left was false */
@@ -3266,27 +3451,27 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
                  */
                 bc_emit(mg->code, branch_op);
                 bc_emit_u2(mg->code, 7);
-                
+
                 /* Pop operands before branch - they're consumed by the comparison */
                 mg_pop_typed(mg, 2);
-                
+
                 /* Emit: iconst_1 (condition was true) */
                 bc_emit(mg->code, OP_ICONST_1);
                 mg_push_int(mg);
-                
+
                 /* Emit: goto +4 (skip iconst_0) */
                 bc_emit(mg->code, OP_GOTO);
                 bc_emit_u2(mg->code, 4);  /* offset to end */
-                
+
                 /* Record frame at iconst_0 (branch target from if_icmpXX) */
                 /* Pop the iconst_1 that the other path pushed, for frame recording */
                 mg_pop_typed(mg, 1);
                 mg_record_frame(mg);
-                
+
                 /* iconst_0 (condition was false) */
                 bc_emit(mg->code, OP_ICONST_0);
                 mg_push_int(mg);
-                
+
                 /* Record frame at end (goto target from iconst_1 path) */
                 mg_record_frame(mg);
                 
@@ -4120,6 +4305,99 @@ static void coerce_arg_to_param(method_gen_t *mg, const_pool_t *cp, ast_node_t *
         }
 }
 
+/**
+ * Emit bytecode to load the nearest enclosing instance of type
+ * target_owner, walking the this$0 chain from mg's current class as many
+ * levels as needed. Shared by "outer.new Inner()"'s implicit (non-
+ * explicit) outer-instance case and by an unqualified instance method
+ * call that resolves to an enclosing class rather than the current class
+ * or one of its superclasses (e.g. calling an outer class's method with
+ * no explicit qualifier from inside a non-static inner class).
+ */
+static void codegen_load_enclosing_this(method_gen_t *mg, const_pool_t *cp, symbol_t *target_owner)
+{
+    if (!mg->class_gen || !mg->class_gen->class_sym) return;
+
+    /* Start with 'this' */
+    bc_emit(mg->code, OP_ALOAD_0);
+    if (mg->class_gen->internal_name) {
+        mg_push_object(mg, mg->class_gen->internal_name);
+    } else {
+        mg_push_null(mg);
+    }
+
+    /* Traverse the enclosing class chain to find how many levels deep */
+    symbol_t *current = mg->class_gen->class_sym;
+    bool first_iteration = true;
+
+    while (current && current != target_owner) {
+        symbol_t *cur_enclosing = current->data.class_data.enclosing_class;
+        if (!cur_enclosing) break;
+
+        /* Get this$0 from current class to get to cur_enclosing */
+        char *cur_internal = class_to_internal_name(current->qualified_name);
+        char *enc_internal = class_to_internal_name(cur_enclosing->qualified_name);
+        size_t desc_len = strlen(enc_internal) + 3;
+        char *desc = malloc(desc_len);
+        snprintf(desc, desc_len, "L%s;", enc_internal);
+
+        /* Use the already-computed this$0 ref for the first iteration if available */
+        uint16_t this0_ref;
+        if (first_iteration && mg->class_gen->this_dollar_zero_ref) {
+            this0_ref = mg->class_gen->this_dollar_zero_ref;
+        } else {
+            this0_ref = cp_add_fieldref(cp, cur_internal, "this$0", desc);
+        }
+
+        bc_emit(mg->code, OP_GETFIELD);
+        bc_emit_u2(mg->code, this0_ref);
+        /* Stack unchanged: popped old, pushed enclosing */
+
+        free(cur_internal);
+        free(enc_internal);
+        free(desc);
+
+        /* If we found the target enclosing class, we're done */
+        if (cur_enclosing == target_owner) {
+            break;
+        }
+
+        current = cur_enclosing;
+        first_iteration = false;
+    }
+}
+
+/**
+ * Compute the type each individual argument at a varargs position must
+ * have, given the varargs parameter's own full declared type (e.g. for
+ * `void m(byte[]... parts)`, the parameter's own declared type is
+ * "byte[][]" - dimensions=2, base element_type=byte - but each actual
+ * argument passed for it is a single "byte[]" - dimensions=1). genesis
+ * represents an array type as a dimension count plus a single base
+ * element type (not a chain of nested TYPE_ARRAY types), so simply
+ * reading ->data.array_type.element_type directly (as every call site
+ * needing this used to do) strips ALL the way down to the base scalar
+ * type regardless of how many dimensions the varargs parameter itself
+ * has - correct only for the common "T... parts" case (dimensions=1,
+ * base=T), but wrong whenever T is itself an array (dimensions>=2):
+ * the varargs array's own synthetic-array-store codegen then picked a
+ * primitive store opcode (e.g. BASTORE, matching the base scalar type)
+ * for what are actually array-reference elements, rejected by the
+ * verifier the moment a real array reference reached that store.
+ */
+static type_t *varargs_element_type(type_t *varargs_param_type)
+{
+    if (!varargs_param_type || varargs_param_type->kind != TYPE_ARRAY) {
+        return NULL;
+    }
+    int dims = varargs_param_type->data.array_type.dimensions;
+    type_t *base = varargs_param_type->data.array_type.element_type;
+    if (dims <= 1) {
+        return base;
+    }
+    return type_new_array(base, dims - 1);
+}
+
 static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 {
     if (!expr || expr->type != AST_METHOD_CALL) {
@@ -4143,7 +4421,11 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
     bool is_void_return = false;
     char *custom_descriptor = NULL;
     symbol_t *method_sym = NULL;  /* Resolved method symbol */
-    
+    /* Set when an unqualified instance-method call resolves to an
+     * ENCLOSING class's method (not our own, not an inherited one) - see
+     * the matching comment where this is set, further down. */
+    symbol_t *implicit_call_enclosing_owner = NULL;
+
     /* Check if this is an explicit receiver call (obj.method()) vs implicit (method(args)) */
     bool has_explicit_receiver = (expr->data.node.flags & AST_METHOD_CALL_EXPLICIT_RECEIVER) != 0;
     
@@ -4961,13 +5243,42 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         /* If method_sym is set (from semantic analysis), use it but set context */
         if (method_sym && !target_class) {
             is_static = (method_sym->modifiers & MOD_STATIC) != 0;
-            
+
             /* Check if this is a static import (method from different class) */
             symbol_t *owner_class = method_sym->scope ? method_sym->scope->owner : NULL;
             if (owner_class && owner_class->qualified_name) {
                 /* Method belongs to a different class (e.g., static import) */
                 target_class = class_to_internal_name(owner_class->qualified_name);
                 is_interface_call = (owner_class->kind == SYM_INTERFACE);
+
+                /* An unqualified instance-method call resolved to a class
+                 * other than our own is either an INHERITED method
+                 * (reachable by walking our own superclass chain - still
+                 * invoked on plain "this") or an enclosing instance's
+                 * method (an inner class calling an outer method with no
+                 * explicit qualifier, e.g. "shutdown();" from inside a
+                 * non-static inner class, resolved by semantic analysis
+                 * via the enclosing-class chain, not inheritance) - which
+                 * needs the SAME instance actually walked at runtime, not
+                 * "this". Distinguish the two so the receiver-loading
+                 * code below knows to walk this$0 instead of emitting a
+                 * bare aload_0, which would push the wrong (inner) object
+                 * as the receiver (VerifyError: "Bad type on operand
+                 * stack", the invoked method's owner type not assignable
+                 * from the inner class pushed). */
+                if (!is_static && owner_class != class_sym) {
+                    bool is_inherited = false;
+                    for (symbol_t *s = class_sym->data.class_data.superclass; s;
+                         s = s->data.class_data.superclass) {
+                        if (s == owner_class) {
+                            is_inherited = true;
+                            break;
+                        }
+                    }
+                    if (!is_inherited) {
+                        implicit_call_enclosing_owner = owner_class;
+                    }
+                }
             } else {
                 /* Method belongs to current class */
                 target_class = mg->class_gen->internal_name;
@@ -5024,6 +5335,13 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 if (static_import_class) free(static_import_class);
                 return false;
             }
+        } else if (implicit_call_enclosing_owner) {
+            /* Unqualified call to an enclosing class's instance method
+             * (e.g. "shutdown();" from inside a non-static inner class,
+             * meaning the outer class's method, not our own) - walk the
+             * this$0 chain to load the actual enclosing instance the
+             * method must be invoked on, not our own "this". */
+            codegen_load_enclosing_this(mg, cp, implicit_call_enclosing_owner);
         } else if (!mg->is_static || use_invokespecial) {
             /* Implicit 'this' (including K.super.m() in instance methods) */
             bc_emit(mg->code, OP_ALOAD_0);
@@ -5073,13 +5391,10 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
             /* Count remaining arguments */
             int varargs_count = 0;
             for (slist_t *n = node; n; n = n->next) varargs_count++;
-            
+
             /* Get element type from varargs array type */
-            type_t *elem_type = NULL;
-            if (varargs_param->type && varargs_param->type->kind == TYPE_ARRAY) {
-                elem_type = varargs_param->type->data.array_type.element_type;
-            }
-            
+            type_t *elem_type = varargs_element_type(varargs_param->type);
+
             /* Check for array-to-varargs conversion:
              * If there's exactly one argument at the varargs position and it's
              * already an array of the compatible type, pass it directly */
@@ -5219,10 +5534,22 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 array_type_str = malloc(len);
                 snprintf(array_type_str, len, "[L%s;", internal);
                 free(internal);
+            } else if (elem_type && elem_type->kind == TYPE_ARRAY) {
+                /* e.g. "byte[]... parts" - each element is itself an
+                 * array ("byte[]"), so the synthetic array being built
+                 * here is "byte[][]" ("[[B"), not the generic
+                 * "[Ljava/lang/Object;" fallback below (which isn't
+                 * assignable to the method's real, exact parameter
+                 * type). */
+                char *elem_desc = type_to_descriptor(elem_type);
+                size_t len = strlen(elem_desc) + 2;  /* "[" + desc + null */
+                array_type_str = malloc(len);
+                snprintf(array_type_str, len, "[%s", elem_desc);
+                free(elem_desc);
             } else {
                 array_type_str = strdup("[Ljava/lang/Object;");
             }
-            
+
             /* Create the array */
             if (elem_type && elem_type->kind == TYPE_CLASS) {
                 char *internal = class_to_internal_name(elem_type->data.class_type.name);
@@ -5230,6 +5557,15 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 bc_emit(mg->code, OP_ANEWARRAY);
                 bc_emit_u2(mg->code, class_ref);
                 free(internal);
+            } else if (elem_type && elem_type->kind == TYPE_ARRAY) {
+                /* ANEWARRAY's class constant for an array element type is
+                 * the element's own full descriptor ("[B"), not an
+                 * unwrapped internal name (JVMS 4.4.1). */
+                char *elem_desc = type_to_descriptor(elem_type);
+                uint16_t class_ref = cp_add_class(cp, elem_desc);
+                bc_emit(mg->code, OP_ANEWARRAY);
+                bc_emit_u2(mg->code, class_ref);
+                free(elem_desc);
             } else if (elem_type && type_kind_to_atype(elem_type->kind) >= 0) {
                 /* Primitive array - use NEWARRAY */
                 bc_emit(mg->code, OP_NEWARRAY);
@@ -5276,12 +5612,28 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 /* Box primitive if needed for Object[] */
                 type_kind_t va_kind = get_expr_type_kind(mg, va_arg);
                 if (va_arg->sem_type) va_kind = va_arg->sem_type->kind;
-                
-                if (elem_type && elem_type->kind == TYPE_CLASS &&
+
+                /* elem_type->kind == TYPE_CLASS alone missed a generic
+                 * varargs parameter (e.g. "<T> List<T> asList(T... a)",
+                 * matching java.util.Arrays.asList - gumdrop calls it with
+                 * mixed int/String arguments) whose own element type is a
+                 * bare type variable (TYPE_TYPEVAR), which - after erasure -
+                 * is exactly as much a reference array as TYPE_CLASS is; the
+                 * "Create the array" logic just above already treats it
+                 * that way (falling through to its own "Default to
+                 * Object[]" ANEWARRAY branch), but this boxing check never
+                 * matched it, so an int literal argument got AASTORE'd
+                 * unboxed (VerifyError: "Bad type on operand stack",
+                 * "Type integer ... is not assignable to 'java/lang/Object'").
+                 * The correct test mirrors the array-creation logic itself:
+                 * box exactly when the array being built is NOT one of the
+                 * primitive-element arrays created via NEWARRAY above. */
+                bool va_array_is_primitive = elem_type && type_kind_to_atype(elem_type->kind) >= 0;
+                if (!va_array_is_primitive &&
                     va_kind >= TYPE_BOOLEAN && va_kind <= TYPE_DOUBLE) {
                     emit_boxing(mg, cp, va_kind);
                 }
-                
+
                 /* Store into array */
                 if (elem_type && elem_type->kind >= TYPE_BOOLEAN && 
                     elem_type->kind <= TYPE_DOUBLE) {
@@ -5334,10 +5686,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         /* If we have exactly the fixed params (no varargs provided), create empty array */
         if (arg_count == fixed_param_count) {
             /* Get element type from varargs array type */
-            type_t *elem_type = NULL;
-            if (varargs_param->type && varargs_param->type->kind == TYPE_ARRAY) {
-                elem_type = varargs_param->type->data.array_type.element_type;
-            }
+            type_t *elem_type = varargs_element_type(varargs_param->type);
             
             /* Push 0 (empty array size) */
             bc_emit(mg->code, OP_ICONST_0);
@@ -5350,6 +5699,17 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 bc_emit(mg->code, OP_ANEWARRAY);
                 bc_emit_u2(mg->code, class_ref);
                 free(internal);
+            } else if (elem_type && elem_type->kind == TYPE_ARRAY) {
+                /* e.g. an empty "byte[]... parts" call site needs a
+                 * "byte[][]" (0-length) array - ANEWARRAY's class
+                 * constant for an array element type is the element's
+                 * own full descriptor ("[B"), not an unwrapped internal
+                 * name (JVMS 4.4.1). */
+                char *elem_desc = type_to_descriptor(elem_type);
+                uint16_t class_ref = cp_add_class(cp, elem_desc);
+                bc_emit(mg->code, OP_ANEWARRAY);
+                bc_emit_u2(mg->code, class_ref);
+                free(elem_desc);
             } else if (elem_type && type_kind_to_atype(elem_type->kind) >= 0) {
                 bc_emit(mg->code, OP_NEWARRAY);
                 bc_emit_u1(mg->code, (uint8_t)type_kind_to_atype(elem_type->kind));
@@ -5492,21 +5852,30 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
             bc_emit_u2(mg->code, class_idx);
         }
     } else if (!is_void_return && expr->sem_type && expr->sem_type->kind == TYPE_ARRAY &&
-               method_sym && method_sym->type && method_sym->type->kind == TYPE_ARRAY &&
-               method_sym->type->data.array_type.element_type &&
-               method_sym->type->data.array_type.element_type->kind == TYPE_TYPEVAR) {
+               method_sym && method_sym->type &&
+               ((method_sym->type->kind == TYPE_ARRAY &&
+                 method_sym->type->data.array_type.element_type &&
+                 method_sym->type->data.array_type.element_type->kind == TYPE_TYPEVAR) ||
+                method_sym->type->kind == TYPE_TYPEVAR)) {
         /* Same idea, for a method that returns T[] (e.g.
          * Collection<T>.toArray(T[] a)) - this erases to Object[] (or the
          * type variable's bound array) at the JVM level, same as a bare
-         * type-variable return above. If semantic analysis determined a
-         * more specific array type at this call site (e.g. String[] for
-         * list.toArray(new String[0])), narrow it with a checkcast -
-         * without this, the erased Object[] was left on the stack
-         * wherever the result was used, and the verifier rejected it
-         * ("Bad type on operand stack ... not assignable to
-         * '[Ljava/lang/String;'"). Unlike a plain class checkcast, an
-         * array checkcast's constant-pool entry is the full descriptor
-         * (e.g. "[Ljava/lang/String;"), not an unwrapped internal name. */
+         * type-variable return above - OR for a method that returns a
+         * bare T (e.g. List<T>.get(int)) whose type ARGUMENT at this
+         * call site happens to itself be an array type (e.g. byte[] for
+         * a List<byte[]>) - erasing to plain Object either way. If
+         * semantic analysis determined a more specific array type at
+         * this call site (e.g. String[] for list.toArray(new String[0]),
+         * or byte[] for a List<byte[]>.get(i)), narrow it with a
+         * checkcast - without this, the erased Object/Object[] was left
+         * on the stack wherever the result was used, and the verifier
+         * rejected it ("Bad type on operand stack ... not assignable to
+         * '[Ljava/lang/String;'", or "Invalid type: 'java/lang/Object'"
+         * at whatever instruction - e.g. a baload for a byte[] element
+         * access - first required the real array type). Unlike a plain
+         * class checkcast, an array checkcast's constant-pool entry is
+         * the full descriptor (e.g. "[Ljava/lang/String;"), not an
+         * unwrapped internal name. */
         char *actual_desc = type_to_descriptor(expr->sem_type);
         char *erased_desc = type_to_descriptor(method_sym->type);
         if (actual_desc && erased_desc && strcmp(actual_desc, erased_desc) != 0) {
@@ -5551,6 +5920,42 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         }
                     } else {
                         mg_push_object(mg, "[Ljava/lang/Object;");
+                    }
+                    break;
+                case TYPE_TYPEVAR:
+                    /* A bare type-variable return (e.g. T in
+                     * List<T>.get(int)) - method_sym->type never reflects
+                     * the call site's own substituted type argument, so
+                     * falling to the plain-int default below would track
+                     * this as an int even when the checkcast just above
+                     * (for a TYPE_CLASS or TYPE_ARRAY substitution)
+                     * narrowed the real value to a reference type -
+                     * fine as long as the value is consumed before any
+                     * frame gets recorded, but wrong (a stale int where a
+                     * real reference belongs) the moment it crosses a
+                     * loop/if/try boundary first. Prefer expr->sem_type
+                     * (the call site's own resolved type) when it's more
+                     * specific than a bare type variable; otherwise erase
+                     * to Object, matching what the actual bytecode
+                     * produces with no narrowing checkcast at all. */
+                    if (expr->sem_type && expr->sem_type->kind == TYPE_CLASS) {
+                        if (expr->sem_type->data.class_type.name) {
+                            char *internal = class_to_internal_name(expr->sem_type->data.class_type.name);
+                            mg_push_object(mg, internal);
+                            free(internal);
+                        } else {
+                            mg_push_object(mg, "java/lang/Object");
+                        }
+                    } else if (expr->sem_type && expr->sem_type->kind == TYPE_ARRAY) {
+                        char *desc = type_to_descriptor(expr->sem_type);
+                        if (desc) {
+                            mg_push_object(mg, desc);
+                            free(desc);
+                        } else {
+                            mg_push_object(mg, "[Ljava/lang/Object;");
+                        }
+                    } else {
+                        mg_push_object(mg, "java/lang/Object");
                     }
                     break;
                 default:          mg_push_int(mg); break;  /* boolean, byte, char, short, int */
@@ -5601,9 +6006,28 @@ static bool codegen_explicit_ctor_call(method_gen_t *mg, ast_node_t *expr, const
     } else {
         mg_push_null(mg);
     }
-    
+
+    /* An enum's own constructors are compiler-extended with a leading
+     * (String name, int ordinal) pair (JVMS 4.1) - already occupying
+     * local slots 1 and 2 of every constructor by the time any of its
+     * bodies run - which a user-written this(...) call between two of
+     * the enum's own constructors never spells out explicitly (Java
+     * doesn't let source code reference them at all). Without
+     * explicitly forwarding them here, the target constructor - whose
+     * own descriptor genesis's enum-constant-instantiation codegen
+     * already correctly prefixes with (Ljava/lang/String;I) - would be
+     * called with those two arguments simply missing. */
+    bool is_enum_this_call = is_this_call && mg->class_gen &&
+        mg->class_gen->class_sym && mg->class_gen->class_sym->kind == SYM_ENUM;
+    if (is_enum_this_call) {
+        bc_emit(mg->code, OP_ALOAD_1);
+        mg_push_object(mg, "java/lang/String");
+        bc_emit(mg->code, OP_ILOAD_2);
+        mg_push_int(mg);
+    }
+
     /* Generate constructor arguments */
-    int arg_count = 0;
+    int arg_count = is_enum_this_call ? 2 : 0;
     for (slist_t *node = expr->data.node.children; node; node = node->next) {
         if (!codegen_expr(mg, (ast_node_t *)node->data, cp)) {
             return false;
@@ -5611,12 +6035,66 @@ static bool codegen_explicit_ctor_call(method_gen_t *mg, ast_node_t *expr, const
         arg_count++;
     }
     
-    /* Build constructor descriptor */
-    char *descriptor = build_method_descriptor(expr->data.node.children, NULL);
-    /* Ensure descriptor has void return */
-    size_t len = strlen(descriptor);
-    if (len > 0 && descriptor[len - 1] != 'V') {
-        descriptor[len - 1] = 'V';
+    /* Build constructor descriptor - prefer the resolved target
+     * constructor's own declared parameter types (semantic.c's
+     * AST_EXPLICIT_CTOR_CALL case stores this on expr->sem_symbol) over
+     * inferring one from the argument expressions' own types. A
+     * superclass constructor parameter typed as a class-level type
+     * variable (e.g. "T" in "GenericBase<T>(int, T, T)") is erased to
+     * Object in its real, compiled descriptor - but an argument's own
+     * concrete type (e.g. an enum constant passed for that parameter)
+     * is not, so building the descriptor from arguments alone produced
+     * one that named the argument's concrete type instead, which didn't
+     * match the constructor actually compiled for the superclass
+     * (NoSuchMethodError at the first call, since the verifier doesn't
+     * check that a referenced method exists). Falls back to the old,
+     * argument-inferred descriptor only if semantic analysis didn't
+     * resolve a target constructor (should not normally happen). */
+    char *descriptor = NULL;
+    if (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR) {
+        /* Build "(<param descriptors>)V" directly from the resolved
+         * constructor's own parameters - not via method_to_descriptor(),
+         * which also appends method->type's own descriptor as the return
+         * type. A constructor symbol's ->type isn't reliably void (some
+         * other code sets it to the enclosing class's own type for
+         * unrelated purposes, e.g. resolving a "new Foo(...)" expression's
+         * overall type), so that would append a multi-character class
+         * descriptor - and the single-byte "overwrite the last char with
+         * V" patch below only works for a single-character return type,
+         * silently corrupting the descriptor otherwise (e.g.
+         * "(I)LParamParent;" -> the broken "(I)LParamParentV"). */
+        string_t *desc = string_new("(");
+        if (is_enum_this_call) {
+            /* The resolved constructor's own declared parameter list
+             * (below) only ever holds the user-written parameters - the
+             * compiler-added (String, int) prefix (see the comment at
+             * this function's own aload_1/iload_2 forwarding above) is
+             * never part of it and must be added here too, to match the
+             * real compiled descriptor genesis's enum-constant-
+             * instantiation codegen already builds for this exact
+             * target constructor. */
+            string_append(desc, "Ljava/lang/String;I");
+        }
+        for (slist_t *p = expr->sem_symbol->data.method_data.parameters; p; p = p->next) {
+            symbol_t *param = (symbol_t *)p->data;
+            if (param && param->type) {
+                char *param_desc = type_to_descriptor(param->type);
+                string_append(desc, param_desc);
+                free(param_desc);
+            }
+        }
+        string_append(desc, ")V");
+        descriptor = string_free(desc, false);
+    } else {
+        descriptor = build_method_descriptor(expr->data.node.children, NULL);
+        /* Ensure descriptor has void return (only safe here since this
+         * path's descriptor is inferred purely from argument expressions,
+         * whose own inferred "return type" placeholder is always a single
+         * character). */
+        size_t len = strlen(descriptor);
+        if (len > 0 && descriptor[len - 1] != 'V') {
+            descriptor[len - 1] = 'V';
+        }
     }
     
     /* Emit: invokespecial <init> */
@@ -5781,11 +6259,23 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                 /* Defined in static method */
                 enclosing_is_static = true;
             }
-            /* For anonymous/local classes in static initializers (no enclosing method) */
-            if (!target_sym->data.class_data.enclosing_method) {
-                /* Static initializer context */
-                enclosing_is_static = true;
-            }
+            /* NOTE: deliberately no "no enclosing_method -> static" fallback
+             * here. An anonymous/local class created directly inside a
+             * field initializer or instance initializer block also has no
+             * enclosing_method (it's not inside any method at all), but
+             * that's NOT necessarily a static context - an *instance*
+             * field initializer's anonymous class still needs to capture
+             * the enclosing instance (e.g. "private final X x = new
+             * Y(){...};" on a non-static field runs during <init>, not
+             * <clinit>). target_sym->modifiers already correctly reflects
+             * this either way (computed once in semantic.c from
+             * sem->in_static_field_init, which IS static-field/static-
+             * init-block-aware), so trust that instead of re-deriving a
+             * wrong answer from "no enclosing method" alone. Without this
+             * fix, such an anonymous class's own constructor was correctly
+             * generated to accept the enclosing instance (this$0), but the
+             * call site here skipped pushing it and used the wrong (no-
+             * arg) invokespecial descriptor - NoSuchMethodError at runtime. */
             /* Also check if we're currently in a static method (e.g., lambda method) */
             if (mg->is_static) {
                 enclosing_is_static = true;
@@ -5930,7 +6420,19 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                 field_gen_t *cap_field = hashtable_lookup(mg->class_gen->field_map, field_name);
                 if (cap_field) {
                     bc_emit(mg->code, OP_ALOAD_0);
-                    mg_push_null(mg);
+                    /* Track the real pushed type (the current class), not
+                     * null - mg_push_null() records a VT_NULL stackmap
+                     * entry for what is actually a known, non-null `this`
+                     * reference, mistyping this stack slot for the rest
+                     * of this expression's codegen (see the identical fix
+                     * a few hundred lines down, at the instance-field-
+                     * assignment site, for the full explanation and the
+                     * bug this caused). */
+                    if (mg->class_gen && mg->class_gen->internal_name) {
+                        mg_push_object(mg, mg->class_gen->internal_name);
+                    } else {
+                        mg_push_null(mg);
+                    }
                     uint16_t fieldref = cp_add_fieldref(mg->cp, mg->class_gen->internal_name,
                                                          cap_field->name, cap_field->descriptor);
                     bc_emit(mg->code, OP_GETFIELD);
@@ -5995,10 +6497,7 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             }
             
             /* Get element type from varargs array type */
-            type_t *elem_type = NULL;
-            if (varargs_param->type && varargs_param->type->kind == TYPE_ARRAY) {
-                elem_type = varargs_param->type->data.array_type.element_type;
-            }
+            type_t *elem_type = varargs_element_type(varargs_param->type);
             
             /* Check for array-to-varargs conversion (single array argument) */
             bool passed_directly = false;
@@ -6433,7 +6932,24 @@ static bool codegen_array_init(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         array_type_desc[1] = prim_char;
         array_type_desc[2] = '\0';
     }
-    
+
+    /* newarray/anewarray/multianewarray replace the size int(s) with the new
+     * array reference - a real TYPE change even though the word count is
+     * unchanged for the single-dimension case (the "no net change" comment
+     * above refers only to word count). mg_push_int(mg) above tracked the
+     * size as an int on mg->stackmap; correct that to the actual array
+     * reference type now, or the array's own creation leaves a stale
+     * "Integer" entry buried under every subsequent per-element dup/index/
+     * value push for the rest of this array literal. That stale entry is
+     * invisible for a straight-line element store (no stackmap frame is
+     * recorded mid-store to observe it), but corrupts any StackMapTable
+     * frame recorded while it's still buried on the stack - e.g. a later
+     * element whose own value is a conditional/ternary expression, which
+     * requires recording a frame at its branch target and bakes the wrong
+     * type in (VerifyError: "Inconsistent stackmap frames"). */
+    mg_pop_typed(mg, 1);
+    mg_push_object(mg, array_type_desc);
+
     /* Populate the array with initializer values */
     int index = 0;
     for (slist_t *node = expr->data.node.children; node; node = node->next) {
@@ -6442,7 +6958,7 @@ static bool codegen_array_init(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         /* Duplicate array reference */
         bc_emit(mg->code, OP_DUP);
         mg_push_object(mg, array_type_desc);  /* Duplicated array reference */
-        
+
         /* Push index */
         if (index <= 5) {
             bc_emit(mg->code, OP_ICONST_0 + index);
@@ -6558,207 +7074,37 @@ static bool codegen_new_array(method_gen_t *mg, ast_node_t *expr, const_pool_t *
     
     /* Handle array initializer: new int[]{1, 2, 3} */
     if (array_init && dim_count == 0) {
-        /* Count elements in initializer */
-        int elem_count = 0;
-        for (slist_t *node = array_init->data.node.children; node; node = node->next) {
-            elem_count++;
+        /* codegen_array_init() requires array_init->sem_type to already
+         * be set (semantic.c's own AST_NEW_ARRAY handling in
+         * get_expression_type() sets it as a side effect) - reliably
+         * true when this whole "new Type[]{...}" expression was itself
+         * visited by that function, but NOT when it's nested as one
+         * element of an OUTER array initializer (e.g. `Object[] ids =
+         * {a, b, new byte[]{9, 9}};` - the outer initializer's own
+         * element-binding pass doesn't recurse through the exact same
+         * AST_NEW_ARRAY-visiting path for each element). Force it here
+         * if missing, rather than depending on whichever caller already
+         * happened to trigger it. */
+        if ((!array_init->sem_type || array_init->sem_type->kind != TYPE_ARRAY) &&
+            mg->class_gen && mg->class_gen->sem) {
+            get_expression_type(mg->class_gen->sem, expr);
         }
-        
-        /* Determine element type kind for store opcode */
-        type_kind_t elem_kind = TYPE_INT;
-        bool is_primitive = (type_node->type == AST_PRIMITIVE_TYPE);
-        if (is_primitive) {
-            const char *prim_name = type_node->data.leaf.name;
-            if (strcmp(prim_name, "boolean") == 0) {
-                elem_kind = TYPE_BOOLEAN;
-            } else if (strcmp(prim_name, "byte") == 0) {
-                elem_kind = TYPE_BYTE;
-            } else if (strcmp(prim_name, "char") == 0) {
-                elem_kind = TYPE_CHAR;
-            } else if (strcmp(prim_name, "short") == 0) {
-                elem_kind = TYPE_SHORT;
-            } else if (strcmp(prim_name, "int") == 0) {
-                elem_kind = TYPE_INT;
-            } else if (strcmp(prim_name, "long") == 0) {
-                elem_kind = TYPE_LONG;
-            } else if (strcmp(prim_name, "float") == 0) {
-                elem_kind = TYPE_FLOAT;
-            } else if (strcmp(prim_name, "double") == 0) {
-                elem_kind = TYPE_DOUBLE;
-            }
-        } else {
-            elem_kind = TYPE_CLASS;
-        }
-        
-        /* Push array size */
-        if (elem_count <= 5) {
-            bc_emit(mg->code, OP_ICONST_0 + elem_count);
-        } else if (elem_count <= 127) {
-            bc_emit(mg->code, OP_BIPUSH);
-            bc_emit_u1(mg->code, (uint8_t)elem_count);
-        } else {
-            bc_emit(mg->code, OP_SIPUSH);
-            bc_emit_u2(mg->code, (uint16_t)elem_count);
-        }
-        mg_push_int(mg);  /* Array size is an integer */
-        
-        /* Build array type descriptor for stackmap tracking */
-        char *new_arr_type_desc = NULL;
-        if (is_primitive) {
-            char prim_char = 'I';
-            switch (elem_kind) {
-                case TYPE_BOOLEAN: prim_char = 'Z'; break;
-                case TYPE_BYTE:    prim_char = 'B'; break;
-                case TYPE_CHAR:    prim_char = 'C'; break;
-                case TYPE_SHORT:   prim_char = 'S'; break;
-                case TYPE_INT:     prim_char = 'I'; break;
-                case TYPE_LONG:    prim_char = 'J'; break;
-                case TYPE_FLOAT:   prim_char = 'F'; break;
-                case TYPE_DOUBLE:  prim_char = 'D'; break;
-                default: prim_char = 'I';
-            }
-            new_arr_type_desc = malloc(3);
-            new_arr_type_desc[0] = '[';
-            new_arr_type_desc[1] = prim_char;
-            new_arr_type_desc[2] = '\0';
-        } else {
-            const char *class_name = type_node->data.node.name;
-            if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS) {
-                class_name = type_node->sem_type->data.class_type.name;
-            }
-            char *internal_name = class_to_internal_name(class_name);
-            size_t len = strlen(internal_name) + 4;
-            new_arr_type_desc = malloc(len);
-            snprintf(new_arr_type_desc, len, "[L%s;", internal_name);
-            free(internal_name);
-        }
-        
-        /* Create the array */
-        if (is_primitive) {
-            const char *prim_name = type_node->data.leaf.name;
-            int atype = type_name_to_atype(prim_name);
-            if (atype < 0) {
-                fprintf(stderr, "codegen: unknown primitive type for array: %s\n", prim_name);
-                free(new_arr_type_desc);
-                return false;
-            }
-            bc_emit(mg->code, OP_NEWARRAY);
-            bc_emit_u1(mg->code, (uint8_t)atype);
-        } else {
-            const char *class_name = type_node->data.node.name;
-            if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS) {
-                class_name = type_node->sem_type->data.class_type.name;
-            }
-            char *internal_name = class_to_internal_name(class_name);
-            uint16_t class_ref = cp_add_class(cp, internal_name);
-            free(internal_name);
-            bc_emit(mg->code, OP_ANEWARRAY);
-            bc_emit_u2(mg->code, class_ref);
-        }
-        /* Stack: size -> arrayref. Update stackmap: pop int, push array type */
-        mg_pop_typed(mg, 1);
-        mg_push_object(mg, new_arr_type_desc);
-        
-        /* Now populate the array with initializer values */
-        /* For each element: dup arrayref, push index, push value, store */
-        int index = 0;
-        for (slist_t *node = array_init->data.node.children; node; node = node->next) {
-            ast_node_t *elem_expr = (ast_node_t *)node->data;
-            
-            /* Duplicate array reference */
-            bc_emit(mg->code, OP_DUP);
-            mg_push_object(mg, new_arr_type_desc);  /* Duplicated array reference */
-            
-            /* Push index */
-            if (index <= 5) {
-                bc_emit(mg->code, OP_ICONST_0 + index);
-            } else if (index <= 127) {
-                bc_emit(mg->code, OP_BIPUSH);
-                bc_emit_u1(mg->code, (uint8_t)index);
-            } else {
-                bc_emit(mg->code, OP_SIPUSH);
-                bc_emit_u2(mg->code, (uint16_t)index);
-            }
-            mg_push_int(mg);  /* Array index is an integer */
-            
-            /* Generate element value */
-            if (!codegen_expr(mg, elem_expr, cp)) {
-                return false;
-            }
-            
-            /* Widen int literals to long/float/double if needed.
-             * Integer literals are compiled as int, but array may need wider type. */
-            type_kind_t expr_kind = get_expr_type_kind(mg, elem_expr);
-            if (expr_kind == TYPE_INT || expr_kind == TYPE_BYTE || 
-                expr_kind == TYPE_SHORT || expr_kind == TYPE_CHAR) {
-                if (elem_kind == TYPE_LONG) {
-                    bc_emit(mg->code, OP_I2L);
-                    mg_pop_typed(mg, 1);  /* Pop int */
-                    mg_push_long(mg);     /* Push long */
-                } else if (elem_kind == TYPE_FLOAT) {
-                    bc_emit(mg->code, OP_I2F);
-                    /* Stack size unchanged: int -> float, both 1 slot */
-                } else if (elem_kind == TYPE_DOUBLE) {
-                    bc_emit(mg->code, OP_I2D);
-                    mg_pop_typed(mg, 1);  /* Pop int */
-                    mg_push_double(mg);   /* Push double (2 slots) */
-                }
-            } else if (expr_kind == TYPE_LONG && elem_kind == TYPE_DOUBLE) {
-                bc_emit(mg->code, OP_L2D);
-                /* Stack size unchanged: long -> double, both 2 slots */
-            } else if (expr_kind == TYPE_LONG && elem_kind == TYPE_FLOAT) {
-                bc_emit(mg->code, OP_L2F);
-                mg_pop_typed(mg, 1);  /* Pop long's second slot */
-            } else if (expr_kind == TYPE_FLOAT && elem_kind == TYPE_DOUBLE) {
-                bc_emit(mg->code, OP_F2D);
-                mg_push(mg, 1);  /* float -> double gains a slot */
-            }
-            
-            /* Store to array */
-            switch (elem_kind) {
-                case TYPE_BOOLEAN:
-                case TYPE_BYTE:
-                    bc_emit(mg->code, OP_BASTORE);
-                    break;
-                case TYPE_CHAR:
-                    bc_emit(mg->code, OP_CASTORE);
-                    break;
-                case TYPE_SHORT:
-                    bc_emit(mg->code, OP_SASTORE);
-                    break;
-                case TYPE_INT:
-                    bc_emit(mg->code, OP_IASTORE);
-                    break;
-                case TYPE_LONG:
-                    bc_emit(mg->code, OP_LASTORE);
-                    break;
-                case TYPE_FLOAT:
-                    bc_emit(mg->code, OP_FASTORE);
-                    break;
-                case TYPE_DOUBLE:
-                    bc_emit(mg->code, OP_DASTORE);
-                    break;
-                case TYPE_CLASS:
-                case TYPE_ARRAY:
-                    bc_emit(mg->code, OP_AASTORE);
-                    break;
-                default:
-                    bc_emit(mg->code, OP_IASTORE);
-                    break;
-            }
-            /* Store consumes arrayref, index, value */
-            mg_pop_typed(mg, 3);
-            if (elem_kind == TYPE_LONG || elem_kind == TYPE_DOUBLE) {
-                mg_pop_typed(mg, 1);  /* Wide types take 2 slots */
-            }
-            
-            index++;
-        }
-        
-        free(new_arr_type_desc);
-        
-        /* Array reference is left on stack */
-        return true;
+        /* Delegate to codegen_array_init(), which already handles this
+         * correctly and generally: it reads array_init->sem_type (a
+         * proper type_t with the real dimensions/element_type, reliably
+         * populated by semantic.c's AST_NEW_ARRAY handling - including
+         * for a multi-dimensional literal like `new int[][] { {2, 1} }`,
+         * whose element-type AST node the parser leaves as a nested
+         * AST_ARRAY_TYPE rather than the primitive it actually is) and
+         * recurses correctly for each nested dimension. The hand-rolled
+         * version this replaced derived everything from that same
+         * (dimension-losing) type_node instead, so a multi-dimensional
+         * literal fell into its reference-type/ANEWARRAY branch with no
+         * real class name available, silently defaulting to
+         * "java/lang/Object" (i.e. producing an Object[] instead of,
+         * say, int[][]) - rejected by the verifier the moment that value
+         * was used somewhere requiring the real array type. */
+        return codegen_array_init(mg, array_init, cp);
     }
     
     if (dim_count == 0) {
@@ -7310,11 +7656,29 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     return true;
                 } else if (!mg->is_static) {
                     /* Instance field assignment: this.field = value */
-                    
+
                     /* Load 'this' */
                     bc_emit(mg->code, OP_ALOAD_0);
-                    mg_push_null(mg);  /* Object reference */
-                    
+                    /* Track the real pushed type (the current class), not
+                     * null - mg_push_null() records a VT_NULL stackmap
+                     * entry for what is actually a known, non-null `this`
+                     * reference. Harmless as long as `this` is immediately
+                     * consumed, but if any OTHER value gets pushed and a
+                     * stack-map frame recorded before that happens (e.g. a
+                     * null-comparison inside the RHS's own ternary
+                     * condition, recording its own internal branch-target
+                     * frame with `this` still buried underneath), the
+                     * recorded frame wrongly types that slot as `null`
+                     * instead of the current class - rejected the moment
+                     * the real, non-null value reaches it
+                     * (`VerifyError: Inconsistent stackmap frames ...
+                     * Type 'X' ... not assignable to null`). */
+                    if (mg->class_gen && mg->class_gen->internal_name) {
+                        mg_push_object(mg, mg->class_gen->internal_name);
+                    } else {
+                        mg_push_null(mg);
+                    }
+
                     if (compound) {
                         /* Duplicate 'this' for getfield, then load current value */
                         bc_emit(mg->code, OP_DUP);
@@ -7372,13 +7736,20 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     /* DUP_X1 to keep a copy of value for chained assignments
                      * Stack before: [this, value]
                      * Stack after:  [value, this, value]
-                     * Then PUTFIELD consumes [this, value], leaving [value] */
+                     * Then PUTFIELD consumes [this, value], leaving [value]
+                     *
+                     * mg_dup_x1()/mg_dup2_x1() (not a raw mg_push()) also
+                     * reorder mg->stackmap's own tracked types to match -
+                     * without that, the stackmap's type array never
+                     * reflected this real reordering, corrupting every
+                     * stack-map frame recorded later in the same method
+                     * (VerifyError: "Inconsistent stackmap frames"). */
                     if (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') {
                         bc_emit(mg->code, OP_DUP2_X1);
-                        mg_push(mg, 2);  /* DUP2_X1 adds 2 slots */
+                        mg_dup2_x1(mg);
                     } else {
                         bc_emit(mg->code, OP_DUP_X1);
-                        mg_push(mg, 1);  /* DUP_X1 adds 1 slot */
+                        mg_dup_x1(mg);
                     }
 
                     /* Store to field: putfield pops object ref and value */
@@ -7424,8 +7795,16 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     
                     /* Load 'this' for putfield */
                     bc_emit(mg->code, OP_ALOAD_0);
-                    mg_push_null(mg);
-                    
+                    /* Track the real pushed type, not null - see the
+                     * identical fix (and full explanation) at the
+                     * sibling own-class instance-field-assignment site
+                     * above. */
+                    if (mg->class_gen && mg->class_gen->internal_name) {
+                        mg_push_object(mg, mg->class_gen->internal_name);
+                    } else {
+                        mg_push_null(mg);
+                    }
+
                     if (compound) {
                         /* Duplicate 'this' for getfield, then load current value */
                         bc_emit(mg->code, OP_DUP);
@@ -7910,14 +8289,12 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     break;
                 case TYPE_LONG:
                     bc_emit(mg->code, OP_LALOAD);
-                    mg_push(mg, 1);
                     break;
                 case TYPE_FLOAT:
                     bc_emit(mg->code, OP_FALOAD);
                     break;
                 case TYPE_DOUBLE:
                     bc_emit(mg->code, OP_DALOAD);
-                    mg_push(mg, 1);
                     break;
                 case TYPE_CLASS:
                 case TYPE_ARRAY:
@@ -7927,7 +8304,30 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     bc_emit(mg->code, OP_IALOAD);
                     break;
             }
-            mg_pop_typed(mg, 1);  /* Load consumed arrayref, index; pushed value */
+            /* Load consumed the duplicated arrayref+index (2 tracked
+             * slots) and pushed the loaded value - pop both placeholder
+             * entries and push the value's real type, or the array's own
+             * (stale) type is left on the tracked stack in its place (see
+             * the identical fix in AST_ARRAY_ACCESS's own load codegen). */
+            mg_pop_typed(mg, 2);
+            switch (elem_kind) {
+                case TYPE_LONG:   mg_push_long(mg); break;
+                case TYPE_FLOAT:  mg_push_float(mg); break;
+                case TYPE_DOUBLE: mg_push_double(mg); break;
+                case TYPE_CLASS:
+                    {
+                        char *internal = class_to_internal_name(elem_class ? elem_class : "java.lang.Object");
+                        mg_push_object(mg, internal);
+                        free(internal);
+                    }
+                    break;
+                case TYPE_ARRAY:
+                    mg_push_object(mg, "java/lang/Object");
+                    break;
+                default:
+                    mg_push_int(mg);
+                    break;
+            }
         }
         
         /* Generate value expression */
@@ -9186,15 +9586,21 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                  */
                 type_kind_t elem_kind = TYPE_INT;  /* Default to int */
                 bool is_multi_dim_intermediate = false;
-                
+                const char *elem_class = NULL;      /* class name, when elem_kind == TYPE_CLASS */
+                int remaining_dims = 0;             /* dims left, when is_multi_dim_intermediate */
+
                 if (array_expr->sem_type && array_expr->sem_type->kind == TYPE_ARRAY) {
                     type_t *elem_type = array_expr->sem_type->data.array_type.element_type;
                     if (elem_type) {
                         elem_kind = elem_type->kind;
+                        if (elem_kind == TYPE_CLASS) {
+                            elem_class = elem_type->data.class_type.name;
+                        }
                     }
                     /* Check if this is a multi-dim array with more dimensions */
                     if (array_expr->sem_type->data.array_type.dimensions > 1) {
                         is_multi_dim_intermediate = true;
+                        remaining_dims = array_expr->sem_type->data.array_type.dimensions - 1;
                     }
                 } else if (array_expr->type == AST_IDENTIFIER) {
                     /* Look up local variable's array info */
@@ -9204,8 +9610,12 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         if (dims > 1) {
                             /* This access yields another array */
                             is_multi_dim_intermediate = true;
+                            remaining_dims = dims - 1;
                         } else {
                             elem_kind = mg_local_array_elem_kind(mg, arr_name);
+                        }
+                        if (elem_kind == TYPE_CLASS || is_multi_dim_intermediate) {
+                            elem_class = mg_local_array_elem_class(mg, arr_name);
                         }
                     }
                 } else if (array_expr->type == AST_ARRAY_ACCESS) {
@@ -9223,8 +9633,12 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             if (depth < dims) {
                                 /* Still have more dimensions, result is an array */
                                 is_multi_dim_intermediate = true;
+                                remaining_dims = dims - depth;
                             } else {
                                 elem_kind = mg_local_array_elem_kind(mg, arr_name);
+                            }
+                            if (elem_kind == TYPE_CLASS || is_multi_dim_intermediate) {
+                                elem_class = mg_local_array_elem_class(mg, arr_name);
                             }
                         }
                     }
@@ -9251,14 +9665,12 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             break;
                         case TYPE_LONG:
                             bc_emit(mg->code, OP_LALOAD);
-                            mg_push(mg, 1);  /* Long takes 2 slots */
                             break;
                         case TYPE_FLOAT:
                             bc_emit(mg->code, OP_FALOAD);
                             break;
                         case TYPE_DOUBLE:
                             bc_emit(mg->code, OP_DALOAD);
-                            mg_push(mg, 1);  /* Double takes 2 slots */
                             break;
                         case TYPE_CLASS:
                         case TYPE_ARRAY:
@@ -9269,9 +9681,45 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             break;
                     }
                 }
-                
-                /* Stack: arrayref, index -> value (net effect: -1) */
-                mg_pop_typed(mg, 1);
+
+                /* Stack: arrayref, index -> value. Both operands (a single
+                 * category-1 slot each) must be popped from the tracked
+                 * stackmap, then the actual LOADED value's type pushed in
+                 * their place - not just the raw slot count adjusted, or
+                 * the array's own (now-stale) reference type is left
+                 * masquerading as the loaded element's type, which the
+                 * verifier rejects the moment anything but a reference
+                 * type (where the mismatch usually happens to still be
+                 * assignable) is actually loaded. */
+                mg_pop_typed(mg, 2);
+                if (is_multi_dim_intermediate) {
+                    char *sub_array_desc = build_array_descriptor(elem_kind, elem_class, remaining_dims);
+                    mg_push_object_from_descriptor(mg, sub_array_desc);
+                    free(sub_array_desc);
+                } else {
+                    switch (elem_kind) {
+                        case TYPE_LONG:   mg_push_long(mg); break;
+                        case TYPE_FLOAT:  mg_push_float(mg); break;
+                        case TYPE_DOUBLE: mg_push_double(mg); break;
+                        case TYPE_CLASS:
+                            {
+                                char *internal = class_to_internal_name(elem_class ? elem_class : "java.lang.Object");
+                                mg_push_object(mg, internal);
+                                free(internal);
+                            }
+                            break;
+                        case TYPE_ARRAY:
+                            /* Nested array element type without a tracked
+                             * dimension count (rare) - fall back to a bare
+                             * Object reference, matching the existing
+                             * "shouldn't happen" fallback elsewhere. */
+                            mg_push_object(mg, "java/lang/Object");
+                            break;
+                        default:
+                            mg_push_int(mg);
+                            break;
+                    }
+                }
                 return true;
             }
         
@@ -9370,6 +9818,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 /* Determine source and target types */
                 type_kind_t target_kind = TYPE_UNKNOWN;
                 const char *target_class = NULL;
+                char *target_class_owned = NULL;  /* non-NULL only for the AST_ARRAY_TYPE branch's heap-allocated descriptor - freed after use */
                 
                 if (type_node->type == AST_PRIMITIVE_TYPE) {
                     const char *prim_name = type_node->data.leaf.name;
@@ -9399,7 +9848,32 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     }
                 } else if (type_node->type == AST_ARRAY_TYPE) {
                     target_kind = TYPE_ARRAY;
-                    /* TODO: Handle array type descriptor */
+                    /* Resolve (forcing it if some earlier pass hasn't
+                     * already) to a proper type_t with real dimensions/
+                     * element type, then build the full array descriptor
+                     * ("[B", "[[I", "[Ljava/lang/String;", ...) from it -
+                     * target_class doubles as "the checkcast constant's
+                     * name" below, and for an array type that name IS
+                     * the full descriptor (JVMS 4.4.1: a CONSTANT_Class
+                     * name can be either a binary class name or an array
+                     * descriptor) - not an unwrapped internal name like a
+                     * plain class target uses. Without this, a cast to
+                     * an array type (e.g. `(byte[]) obj`) emitted NO
+                     * checkcast at all (target_class stayed NULL, so the
+                     * "if (target_class)" guard below skipped emitting
+                     * anything) - silently leaving the operand's
+                     * pre-cast type on the stack, rejected the moment
+                     * the result was used somewhere requiring the real,
+                     * narrower array type. */
+                    type_t *array_type = type_node->sem_type;
+                    if ((!array_type || array_type->kind != TYPE_ARRAY) &&
+                        mg->class_gen && mg->class_gen->sem) {
+                        array_type = semantic_resolve_type(mg->class_gen->sem, type_node);
+                    }
+                    if (array_type && array_type->kind == TYPE_ARRAY) {
+                        target_class_owned = type_to_descriptor(array_type);
+                        target_class = target_class_owned;
+                    }
                 }
                 
                 /* Generate the operand expression */
@@ -9425,6 +9899,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         bc_emit_u2(mg->code, class_index);
                         /* Stack: objectref -> objectref (no change) */
                     }
+                    free(target_class_owned);
                     return true;
                 }
                 
@@ -9542,7 +10017,22 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 if (!codegen_expr(mg, condition, cp)) {
                     return false;
                 }
-                
+
+                /* Auto-unbox Boolean to boolean for ternary condition,
+                 * mirroring AST_IF_STMT's own identical fix - a boxed
+                 * Boolean condition (e.g. "(Boolean) value ? 1 : 0") left
+                 * a java/lang/Boolean reference on the stack right where
+                 * the ifeq below requires an int, failing verification. */
+                if (condition->sem_type && condition->sem_type->kind == TYPE_CLASS &&
+                    condition->sem_type->data.class_type.name &&
+                    strcmp(condition->sem_type->data.class_type.name, "java.lang.Boolean") == 0) {
+                    uint16_t unbox_ref = cp_add_methodref(cp,
+                        "java/lang/Boolean", "booleanValue", "()Z");
+                    bc_emit(mg->code, OP_INVOKEVIRTUAL);
+                    bc_emit_u2(mg->code, unbox_ref);
+                    /* Stack stays same size (Boolean -> int) */
+                }
+
                 /* ifeq else_branch (jump if condition is false/0) */
                 size_t ifeq_pos = mg->code->length;
                 bc_emit(mg->code, OP_IFEQ);
@@ -9556,7 +10046,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     saved_state = stackmap_save_state(mg->stackmap);
                 }
                 int saved_stack_depth = mg->stack_depth;
-                
+
                 /* Generate then branch */
                 if (!codegen_expr(mg, then_expr, cp)) {
                     stackmap_state_free(saved_state);
@@ -10657,7 +11147,15 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 /* Push captured values onto stack */
                 if (captures_this) {
                     bc_emit_u1(mg->code, OP_ALOAD_0);
-                    mg_push_null(mg);  /* Object reference */
+                    /* Track the real pushed type, not null - see the
+                     * identical fix (and full explanation) at the
+                     * instance-field-assignment site earlier in this
+                     * file. */
+                    if (cg && cg->internal_name) {
+                        mg_push_object(mg, cg->internal_name);
+                    } else {
+                        mg_push_null(mg);
+                    }
                 }
                 for (slist_t *cap = captures; cap; cap = cap->next) {
                     symbol_t *var_sym = (symbol_t *)cap->data;

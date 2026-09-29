@@ -35,6 +35,13 @@
 static void preadd_annotations_list_cp(const_pool_t *cp, slist_t *annotations,
                                         retention_policy_t retention);
 
+/* Defined in codegen_expr.c (declared there in codegen_internal.h) - builds
+ * a JVM type descriptor from a type AST node (AST_PRIMITIVE_TYPE,
+ * AST_CLASS_TYPE, AST_ARRAY_TYPE, ...). Reused here for a class-literal
+ * annotation element value's own 'c'-tagged descriptor (see
+ * write_annotation_value()'s AST_CLASS_LITERAL case). */
+char *ast_type_to_descriptor(ast_node_t *type_node);
+
 /*
  * The semantic_t for the file currently being written to a classfile, so
  * that get_annotation_retention() and write_annotation() can resolve a
@@ -158,28 +165,85 @@ retention_policy_t get_annotation_retention(const char *annotation_name)
 /**
  * Write annotation element_value to buffer.
  * Returns the number of bytes written.
+ *
+ * qualified_annotation_name/element_name (either may be NULL) let a
+ * numeric literal be widened to the element's *declared* return type
+ * (e.g. "@Test(timeout = 10000)", an int literal, where
+ * org.junit.Test.timeout() returns long) - without resolving this, the
+ * literal was always written as a plain int constant, which the JVM
+ * accepts at class-load time but rejects at reflection time with
+ * AnnotationTypeMismatchException, since the element_value's own tag
+ * must match the annotation interface method's real return type.
  */
-static int write_annotation_value(uint8_t **p, const_pool_t *cp, ast_node_t *value)
+static int write_annotation_value(uint8_t **p, const_pool_t *cp, ast_node_t *value,
+                                   const char *qualified_annotation_name,
+                                   const char *element_name)
 {
     if (!value) return 0;
-    
+
     uint8_t *start = *p;
-    
+
     /* Handle different value types */
     if (value->type == AST_LITERAL) {
         token_type_t tok = value->data.leaf.token_type;
-        
+
         if (tok == TOK_STRING_LITERAL) {
             /* String value */
             *(*p)++ = 's';  /* tag for String */
-            uint16_t idx = cp_add_utf8(cp, value->data.leaf.value.str_val ? 
+            uint16_t idx = cp_add_utf8(cp, value->data.leaf.value.str_val ?
                                        value->data.leaf.value.str_val : "");
             write_be_u2(p, idx);
         } else if (tok == TOK_INTEGER_LITERAL) {
-            /* Integer value */
-            *(*p)++ = 'I';  /* tag for int */
-            uint16_t idx = cp_add_integer(cp, (int32_t)value->data.leaf.value.int_val);
-            write_be_u2(p, idx);
+            /* Integer value - but the element's declared return type may
+             * be wider than int (long/float/double) or narrower (byte/
+             * short/char), which a constant-expression int literal is
+             * allowed to target; the element_value's tag must reflect
+             * that declared type, not just the literal's own int shape. */
+            char ret_tag = 'I';
+            if (g_classwriter_sem && qualified_annotation_name && element_name) {
+                char *desc = semantic_resolve_annotation_element_descriptor(
+                    g_classwriter_sem, qualified_annotation_name, element_name);
+                if (desc) {
+                    const char *rparen = strchr(desc, ')');
+                    if (rparen && rparen[1]) {
+                        ret_tag = rparen[1];
+                    }
+                    free(desc);
+                }
+            }
+            long long ival = value->data.leaf.value.int_val;
+            switch (ret_tag) {
+                case 'J': {
+                    *(*p)++ = 'J';
+                    uint16_t idx = cp_add_long(cp, (int64_t)ival);
+                    write_be_u2(p, idx);
+                    break;
+                }
+                case 'F': {
+                    *(*p)++ = 'F';
+                    uint16_t idx = cp_add_float(cp, (float)ival);
+                    write_be_u2(p, idx);
+                    break;
+                }
+                case 'D': {
+                    *(*p)++ = 'D';
+                    uint16_t idx = cp_add_double(cp, (double)ival);
+                    write_be_u2(p, idx);
+                    break;
+                }
+                case 'B': case 'C': case 'S': case 'Z': {
+                    *(*p)++ = (uint8_t)ret_tag;
+                    uint16_t idx = cp_add_integer(cp, (int32_t)ival);
+                    write_be_u2(p, idx);
+                    break;
+                }
+                default: {
+                    *(*p)++ = 'I';
+                    uint16_t idx = cp_add_integer(cp, (int32_t)ival);
+                    write_be_u2(p, idx);
+                    break;
+                }
+            }
         } else if (tok == TOK_TRUE || tok == TOK_FALSE) {
             /* Boolean value */
             *(*p)++ = 'Z';  /* tag for boolean */
@@ -219,6 +283,49 @@ static int write_annotation_value(uint8_t **p, const_pool_t *cp, ast_node_t *val
         write_be_u2(p, type_idx);
         uint16_t const_idx = cp_add_utf8(cp, value->data.node.name);
         write_be_u2(p, const_idx);
+    } else if (value->type == AST_CLASS_LITERAL) {
+        /* Class-valued element, e.g. @Test(expected = IllegalStateException.class) -
+         * exactly like the enum-constant case above, this had NO case at
+         * all here: the "Unknown value type - skip" fallback silently
+         * wrote 0 bytes for the value while the element_name_index and
+         * the annotation's own num_element_value_pairs count were already
+         * committed assuming a value WOULD follow, desyncing the rest of
+         * the annotation's binary layout - every later reflective access
+         * to ANY annotation on the same construct then failed with
+         * java.lang.annotation.AnnotationFormatError: "Unexpected end of
+         * annotations" (the parser reading past the real end of the
+         * attribute once one element's encoding came up short). Per JVMS
+         * 4.7.16.1, a 'c'-tagged element_value's class_info_index points
+         * to a CONSTANT_Utf8 holding the literal's own type descriptor
+         * (e.g. "Ljava/lang/IllegalStateException;", or a primitive/array
+         * descriptor for a class literal on those) - NOT a CONSTANT_Class
+         * entry (unlike an ordinary ".class" literal used in code, which
+         * does use CONSTANT_Class via ldc). */
+        slist_t *lit_children = value->data.node.children;
+        ast_node_t *type_node = lit_children ? (ast_node_t *)lit_children->data : NULL;
+        if (!type_node) {
+            return 0;
+        }
+        *(*p)++ = 'c';  /* tag for class */
+        /* Force resolution if some earlier pass hasn't already: unlike a
+         * ".class" literal used in ordinary code, nothing visits an
+         * annotation's own class-literal value to resolve its type node
+         * (annotation values are validated by dedicated, separate logic
+         * in semantic.c, not the general expression-visiting passes), so
+         * type_node->sem_type is reliably still NULL here - without
+         * forcing it, ast_type_to_descriptor() fell back to the type
+         * node's bare, unqualified AST source name (e.g.
+         * "IllegalStateException" instead of
+         * "Ljava/lang/IllegalStateException;"), which the JVM's own
+         * reflection later failed to resolve as a real class at all
+         * (java.lang.TypeNotPresentException). */
+        if ((!type_node->sem_type) && g_classwriter_sem) {
+            semantic_resolve_type(g_classwriter_sem, type_node);
+        }
+        char *desc = ast_type_to_descriptor(type_node);
+        uint16_t desc_idx = cp_add_utf8(cp, desc ? desc : "Ljava/lang/Object;");
+        free(desc);
+        write_be_u2(p, desc_idx);
     } else {
         /* Unknown value type - skip */
         return 0;
@@ -271,7 +378,7 @@ static int write_annotation(uint8_t **p, const_pool_t *cp, ast_node_t *annot)
             /* value */
             if (pair->data.node.children) {
                 ast_node_t *value = (ast_node_t *)pair->data.node.children->data;
-                write_annotation_value(p, cp, value);
+                write_annotation_value(p, cp, value, qualified_name, pair->data.node.name);
             }
         }
     }
@@ -885,9 +992,10 @@ static void preadd_annotation_cp_entries(const_pool_t *cp, ast_node_t *annot)
     /* Annotation type descriptor. Must match write_annotation()'s resolved
      * name exactly - the constant pool is serialized before write_annotation()
      * runs, so any string it needs (like the fully-qualified descriptor) has
-     * to already exist by the time this pre-add pass is done. */
+     * to already exist by the time this pre-add pass is done. Also used
+     * below to resolve each element's own declared return type. */
+    const char *qualified_name = resolve_annotation_qualified_name(annot->data.node.name);
     if (annot->data.node.name) {
-        const char *qualified_name = resolve_annotation_qualified_name(annot->data.node.name);
         char *type_desc = calloc(strlen(qualified_name) + 4, 1);
         sprintf(type_desc, "L%s;", qualified_name);
         for (char *c = type_desc; *c; c++) {
@@ -912,7 +1020,37 @@ static void preadd_annotation_cp_entries(const_pool_t *cp, ast_node_t *annot)
                     if (tok == TOK_STRING_LITERAL && value->data.leaf.value.str_val) {
                         cp_add_utf8(cp, value->data.leaf.value.str_val);
                     } else if (tok == TOK_INTEGER_LITERAL) {
-                        cp_add_integer(cp, (int32_t)value->data.leaf.value.int_val);
+                        /* Must add the SAME constant pool entry (by type)
+                         * that write_annotation_value() will look up when
+                         * it actually writes this element's value - the
+                         * constant pool is serialized once, before that
+                         * happens, so an entry only cp_add_long()'d for
+                         * the first time during the real write (e.g. for
+                         * a long-returning element like
+                         * "@Test(timeout = 10000)") would be added too
+                         * late to appear in the serialized class file at
+                         * all, corrupting the index the attribute
+                         * references ("Constant pool index out of
+                         * bounds" at reflection time). */
+                        char ret_tag = 'I';
+                        if (g_classwriter_sem && qualified_name && pair->data.node.name) {
+                            char *desc = semantic_resolve_annotation_element_descriptor(
+                                g_classwriter_sem, qualified_name, pair->data.node.name);
+                            if (desc) {
+                                const char *rparen = strchr(desc, ')');
+                                if (rparen && rparen[1]) {
+                                    ret_tag = rparen[1];
+                                }
+                                free(desc);
+                            }
+                        }
+                        long long ival = value->data.leaf.value.int_val;
+                        switch (ret_tag) {
+                            case 'J': cp_add_long(cp, (int64_t)ival); break;
+                            case 'F': cp_add_float(cp, (float)ival); break;
+                            case 'D': cp_add_double(cp, (double)ival); break;
+                            default:  cp_add_integer(cp, (int32_t)ival); break;
+                        }
                     } else if (tok == TOK_TRUE || tok == TOK_FALSE) {
                         cp_add_integer(cp, tok == TOK_TRUE ? 1 : 0);
                     }
@@ -935,6 +1073,28 @@ static void preadd_annotation_cp_entries(const_pool_t *cp, ast_node_t *annot)
                         cp_add_utf8(cp, type_desc);
                         free(type_desc);
                         cp_add_utf8(cp, value->data.node.name);
+                    }
+                } else if (value && value->type == AST_CLASS_LITERAL) {
+                    /* Class-valued element - see write_annotation_value()'s
+                     * matching 'c' tag case for the full explanation. Must
+                     * pre-add the SAME Utf8 descriptor entry the real write
+                     * pass will look up, for the same reason as the
+                     * long/float/double case above: the constant pool is
+                     * serialized before the real write pass runs, so an
+                     * entry first added there could end up referencing an
+                     * index that was never actually written to the class
+                     * file at all. */
+                    slist_t *lit_children = value->data.node.children;
+                    ast_node_t *type_node = lit_children ? (ast_node_t *)lit_children->data : NULL;
+                    if (type_node) {
+                        /* Force resolution if needed - see the matching
+                         * comment in write_annotation_value() for why. */
+                        if ((!type_node->sem_type) && g_classwriter_sem) {
+                            semantic_resolve_type(g_classwriter_sem, type_node);
+                        }
+                        char *desc = ast_type_to_descriptor(type_node);
+                        cp_add_utf8(cp, desc ? desc : "Ljava/lang/Object;");
+                        free(desc);
                     }
                 }
             }
@@ -1010,8 +1170,12 @@ static int write_annotation_default_attribute(uint8_t **p, const_pool_t *cp,
     uint8_t *len_pos = *p;
     *p += 4;
     
-    /* Write the default element_value */
-    write_annotation_value(p, cp, default_value);
+    /* Write the default element_value. No annotation/element name to
+     * resolve a declared return type against here (this writes the
+     * *declaration* of the element's own default within the annotation
+     * interface itself, not a usage site) - out of scope for the
+     * int-literal-widening fix above. */
+    write_annotation_value(p, cp, default_value, NULL, NULL);
     
     /* Fill in attribute_length */
     uint32_t attr_len = (*p - len_pos) - 4;

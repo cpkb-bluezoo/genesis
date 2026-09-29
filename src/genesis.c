@@ -1236,6 +1236,7 @@ static symbol_t *create_type_stub(const char *qname, ast_node_t *decl,
     if (sym->kind == SYM_ENUM && decl->data.node.children) {
         sym->data.class_data.members = scope_new(SCOPE_CLASS, NULL);
         if (sym->data.class_data.members) {
+            int enum_ordinal = 0;
             for (slist_t *child = decl->data.node.children; child; child = child->next) {
                 ast_node_t *member = (ast_node_t *)child->data;
                 if (member && member->type == AST_ENUM_CONSTANT && member->data.node.name) {
@@ -1246,6 +1247,7 @@ static symbol_t *create_type_stub(const char *qname, ast_node_t *decl,
                         const_sym->modifiers = MOD_PUBLIC | MOD_STATIC | MOD_FINAL;
                         const_sym->type = type;  /* Type is the enum itself */
                         const_sym->data.var_data.is_enum_constant = true;
+                        const_sym->data.var_data.enum_ordinal = enum_ordinal++;
                         scope_define(sym->data.class_data.members, const_sym);
                     }
                 }

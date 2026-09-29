@@ -381,6 +381,14 @@ typedef struct method_gen
      * being generated (innermost last), so a `return` lexically inside one
      * or more of them can release each held monitor before returning. */
     slist_t *sync_lock_stack;
+
+    /* Stack of enclosing try statements' finally-block AST nodes, for the
+     * try BODY currently being generated (innermost last), so a `return`
+     * lexically inside one or more of them can run each pending finally
+     * block before returning - mirrors sync_lock_stack's role for
+     * synchronized statements. Does not (yet) cover a return from inside
+     * a catch clause belonging to the same try/finally. */
+    slist_t *finally_stack;
     
     /* Exception handlers */
     slist_t *exception_handlers;
@@ -604,6 +612,8 @@ void mg_push_null(method_gen_t *mg);     /* Push null reference */
 void mg_push_object(method_gen_t *mg, const char *class_name);  /* Push object reference */
 void mg_push_uninitialized(method_gen_t *mg, uint16_t new_offset);  /* Push uninitialized reference (from 'new' instruction) */
 void mg_pop_typed(method_gen_t *mg, int slots);  /* Pop from both runtime and stackmap */
+void mg_dup_x1(method_gen_t *mg);   /* Type-aware OP_DUP_X1 (see stackmap_dup_x1) */
+void mg_dup2_x1(method_gen_t *mg);  /* Type-aware OP_DUP2_X1 form 2 (see stackmap_dup2_x1) */
 
 /* Line number and local variable recording */
 void mg_record_line(method_gen_t *mg, int line);

@@ -195,6 +195,40 @@ void mg_add_exception_handler(method_gen_t *mg, uint16_t start_pc,
  */
 bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp);
 
+/**
+ * One pending false-branch collected by
+ * codegen_condition_and_chain_false_branch: a bytecode position still
+ * needing an offset patch to the caller's eventual false-target, paired
+ * with a snapshot of the stackmap's local-variable tracking as it stood
+ * right after this branch's own operand was evaluated - i.e. before any
+ * LATER operand in the same `&&` chain could run and reassign a local.
+ * The list is built in evaluation order (append, not prepend), so its
+ * HEAD is always the chronologically first (leftmost) operand's own
+ * snapshot - the caller uses that one alone (see
+ * codegen_condition_and_chain_false_branch's own comment for why it's
+ * always a safe, conservative choice for the whole group) to record the
+ * merged frame at the shared false-target, and frees every entry.
+ */
+typedef struct {
+    size_t branch_pos;
+    stackmap_state_t *state;   /* NULL when mg->stackmap is NULL */
+} pending_condition_branch_t;
+
+/**
+ * Generate direct-branch (jump-code) bytecode for a boolean condition
+ * used by a control-flow statement (if/while/for), special-casing a
+ * top-level `&&` chain so the "both true" edge never merges with the
+ * "false" edge through an intermediate materialized 0/1 value. See the
+ * full comment at its definition in codegen_expr.c for why this exists.
+ * Each pending branch is appended onto *false_positions as a heap-
+ * allocated pending_condition_branch_t* - the caller patches every
+ * entry's branch_pos to the real target, uses the head entry's state to
+ * record a correct merged frame there, and frees each entry (and its
+ * state, if non-NULL) via stackmap_state_free.
+ */
+bool codegen_condition_and_chain_false_branch(method_gen_t *mg, const_pool_t *cp,
+                                               ast_node_t *expr, slist_t **false_positions);
+
 /* Autoboxing/unboxing code generation */
 bool emit_boxing(method_gen_t *mg, const_pool_t *cp, type_kind_t prim_kind);
 bool emit_unboxing(method_gen_t *mg, const_pool_t *cp, type_kind_t target_prim, const char *wrapper_class);

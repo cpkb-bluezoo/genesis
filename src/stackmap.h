@@ -144,6 +144,23 @@ void stackmap_push_uninitialized(stack_map_table_t *smt, uint16_t new_offset);
 void stackmap_pop(stack_map_table_t *smt, uint16_t count);
 void stackmap_clear_stack(stack_map_table_t *smt);
 
+/* Reorder the tracked stack to match OP_DUP_X1: duplicate the top
+ * (category-1) entry and insert the copy below the next (category-1)
+ * entry - [..., A, B] becomes [..., B, A, B]. Needed anywhere codegen
+ * emits a real DUP_X1 (e.g. "keep a copy of an assigned value for a
+ * chained/reused assignment expression") - without a matching stackmap
+ * update, the reordering it performs on the *real* JVM stack silently
+ * desyncs from what mg->stackmap tracks, corrupting later frames. */
+void stackmap_dup_x1(stack_map_table_t *smt);
+
+/* Reorder the tracked stack to match OP_DUP2_X1's form 2: duplicate the
+ * top category-2 entry (occupying two tracking slots: the real type
+ * plus its "top" placeholder) and insert the copy below the single
+ * category-1 entry beneath it - [..., A, B_lo, B_hi] becomes
+ * [..., B_lo, B_hi, A, B_lo, B_hi]. See stackmap_dup_x1() for why this
+ * matters. */
+void stackmap_dup2_x1(stack_map_table_t *smt);
+
 /* Get/set locals count for save/restore around scoped regions (e.g., catch blocks) */
 uint16_t stackmap_get_locals_count(stack_map_table_t *smt);
 void stackmap_set_locals_count(stack_map_table_t *smt, uint16_t count);
@@ -154,6 +171,17 @@ void stackmap_init_object(stack_map_table_t *smt, uint16_t new_offset,
 
 /* Record a frame at a branch target */
 void stackmap_record_frame(stack_map_table_t *smt, uint16_t offset);
+
+/* Drop any recorded frame(s) whose offset is >= a method's own final,
+ * fully-generated code length - such a frame doesn't correspond to any
+ * real instruction (e.g. a loop construct conservatively records a
+ * frame "just in case" at its own exit point, which turns out to be
+ * genuinely unreachable and past-the-end when the loop has no break and
+ * is the last thing generated for the method) and the JVM verifier
+ * rejects it ("StackMapTable error: bad offset"). Call once, at method
+ * finalization, after the final code length is known (including any
+ * implicit trailing return). */
+void stackmap_prune_out_of_bounds_frame(stack_map_table_t *smt, uint16_t code_length);
 
 /* Get frame at specific offset (for merging at join points) */
 stack_map_frame_t *stackmap_get_frame(stack_map_table_t *smt, uint16_t offset);

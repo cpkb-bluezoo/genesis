@@ -137,7 +137,20 @@ uint16_t cp_add_float(const_pool_t *cp, float value)
     if (!cp) {
         return 0;
     }
-    
+
+    /* Deduplicate (mirrors cp_add_integer) - callers that need the same
+     * constant twice across separate passes (e.g. an annotation element's
+     * value pre-added before the constant pool is serialized, then
+     * looked up again while writing the actual attribute) must get back
+     * the same index each time, not a second entry added too late to be
+     * serialized. */
+    for (uint16_t i = 1; i < cp->count; i++) {
+        if (cp->entries[i].type == CONST_FLOAT &&
+            cp->entries[i].data.float_val == value) {
+            return i;
+        }
+    }
+
     uint16_t index = cp_add_entry(cp);
     cp->entries[index].type = CONST_FLOAT;
     cp->entries[index].data.float_val = value;
@@ -149,14 +162,23 @@ uint16_t cp_add_long(const_pool_t *cp, int64_t value)
     if (!cp) {
         return 0;
     }
-    
+
+    /* Deduplicate - see cp_add_float() for why this matters, not just for
+     * space. */
+    for (uint16_t i = 1; i < cp->count; i++) {
+        if (cp->entries[i].type == CONST_LONG &&
+            cp->entries[i].data.long_val == value) {
+            return i;
+        }
+    }
+
     uint16_t index = cp_add_entry(cp);
     cp->entries[index].type = CONST_LONG;
     cp->entries[index].data.long_val = value;
-    
+
     /* Long and Double take two constant pool slots */
     cp_add_entry(cp);
-    
+
     return index;
 }
 
@@ -165,14 +187,23 @@ uint16_t cp_add_double(const_pool_t *cp, double value)
     if (!cp) {
         return 0;
     }
-    
+
+    /* Deduplicate - see cp_add_float() for why this matters, not just for
+     * space. */
+    for (uint16_t i = 1; i < cp->count; i++) {
+        if (cp->entries[i].type == CONST_DOUBLE &&
+            cp->entries[i].data.double_val == value) {
+            return i;
+        }
+    }
+
     uint16_t index = cp_add_entry(cp);
     cp->entries[index].type = CONST_DOUBLE;
     cp->entries[index].data.double_val = value;
-    
+
     /* Long and Double take two constant pool slots */
     cp_add_entry(cp);
-    
+
     return index;
 }
 

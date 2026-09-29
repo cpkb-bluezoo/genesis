@@ -156,6 +156,72 @@ else
     failed=$((failed + 1))
 fi
 
+printf "%-30s ... " "NestedGenericInterfaceBridge"
+if "$GENESIS" -cp "$ext_lib" -d "$ext_out" \
+       "$TEST_SRC/external/NestedGenericInterfaceBridgeTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ext_out:$ext_lib" NestedGenericInterfaceBridgeTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "GenericSuperCtorErasure"
+if "$GENESIS" -cp "$ext_lib" -d "$ext_out" \
+       "$TEST_SRC/external/GenericSuperCtorErasureTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ext_out:$ext_lib" GenericSuperCtorErasureTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "BoundedTypeVarErasure"
+if "$GENESIS" -cp "$ext_lib" -d "$ext_out" \
+       "$TEST_SRC/external/BoundedTypeVarErasureTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ext_out:$ext_lib" BoundedTypeVarErasureTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "BoundedInterfaceBridge"
+if "$GENESIS" -cp "$ext_lib" -d "$ext_out" \
+       "$TEST_SRC/external/BoundedInterfaceBridgeTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ext_out:$ext_lib" BoundedInterfaceBridgeTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "AnnotationLongElement"
+if "$GENESIS" -cp "$ext_lib" -d "$ext_out" \
+       "$TEST_SRC/external/AnnotationLongElementTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ext_out:$ext_lib" AnnotationLongElementTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "AnnotationClassElement"
+if "$GENESIS" -cp "$ext_lib" -d "$ext_out" \
+       "$TEST_SRC/external/AnnotationClassElementTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ext_out:$ext_lib" AnnotationClassElementTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "--- RUNTIME-retention annotation defined outside the JDK builtins ---"
 # The annotation type is compiled first, then the client is compiled
@@ -404,6 +470,66 @@ if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
        "$TEST_SRC/src/java8/instanceoftest/InstanceofSelfQualifyVerifyTest.java" \
        >/dev/null 2>&1 && \
    "$JAVA" -cp "$TEST_BUILD" instanceoftest.InstanceofSelfQualifyVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Cross-file nested generic type keeps its \$-separated name ---"
+printf "%-30s ... " "CrossFileNestedGenericType"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/crossfilenested/CrossFileNestedGenericHelper.java" \
+       "$TEST_SRC/src/java8/crossfilenested/CrossFileNestedGenericTypeTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" CrossFileNestedGenericTypeTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Cross-file enum switch keeps its constants' real ordinals ---"
+printf "%-30s ... " "EnumOrdinalCrossFileSwitch"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/enumswitchcrossfile/TransportKind.java" \
+       "$TEST_SRC/src/java8/enumswitchcrossfile/EnumOrdinalCrossFileSwitchVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" enumswitchcrossfile.EnumOrdinalCrossFileSwitchVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Qualified constant (Type.CONSTANT) as a switch case label ---"
+printf "%-30s ... " "SwitchQualifiedConstantCaseLabel"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/switchqualifiedconst/SwitchConstants.java" \
+       "$TEST_SRC/src/java8/switchqualifiedconst/SwitchQualifiedConstantCaseLabelVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" switchqualifiedconst.SwitchQualifiedConstantCaseLabelVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Class literal as synchronized lock keeps its package prefix ---"
+printf "%-30s ... " "PackagedClassLiteralSync"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/pkgclasslit/Foo.java" \
+       "$TEST_SRC/src/java8/pkgclasslit/PackagedClassLiteralSyncVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" PackagedClassLiteralSyncVerifyTest >/dev/null 2>&1; then
     echo PASS
     passed=$((passed + 1))
 else

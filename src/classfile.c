@@ -1104,6 +1104,18 @@ char *classfile_get_retention_policy_name(classfile_t *cf)
     return NULL;
 }
 
+char *classfile_get_method_descriptor(classfile_t *cf, const char *method_name)
+{
+    if (!cf || !method_name) return NULL;
+    for (uint16_t i = 0; i < cf->methods_count; i++) {
+        method_info_t *m = &cf->methods[i];
+        if (m->name && strcmp(m->name, method_name) == 0) {
+            return m->descriptor ? strdup(m->descriptor) : NULL;
+        }
+    }
+    return NULL;
+}
+
 /* ========================================================================
  * Generic Signature Parsing
  * JVMS 4.7.9.1

@@ -925,7 +925,20 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
             bc_emit_u1(mg->code, (uint8_t)exc_slot);
         }
         mg_pop_typed(mg, 1);
-        
+
+        uint16_t catch_start = (uint16_t)mg->code->length;
+
+        /* Reset last_opcode before generating the catch body - otherwise it
+         * carries over stale state from the try block (e.g. OP_ATHROW, if
+         * the try body's own last statement was a throw), which has
+         * nothing to do with whether THIS catch body itself terminates,
+         * and would wrongly mark it as terminal below if the catch body's
+         * own last statement doesn't itself set/reset last_opcode (as most
+         * plain statements don't). Mirrors the same reset already used
+         * elsewhere (if/else, synchronized, for-loop bodies) to prevent
+         * exactly this kind of stale carryover. */
+        mg->last_opcode = 0;
+
         /* Generate catch block */
         if (!codegen_statement(mg, catch_block)) {
             free(resource_slots);
@@ -936,13 +949,25 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
             stackmap_state_free(try_entry_state);
             return false;
         }
-        
-        /* Generate goto to skip other catch handlers (if not ending with return/throw) */
+
+        /* Generate goto to skip other catch handlers (if not ending with
+         * return/throw/goto). OP_GOTO is included since a catch block
+         * ending in break/continue (see the matching fix a few hundred
+         * lines below, in the main AST_TRY_STMT catch-clause loop) jumps
+         * unconditionally elsewhere just like return/throw - without this,
+         * the epilogue goto emitted below would be unreachable dead code
+         * with no stack frame recorded for it. Guarded by catch_emitted_code
+         * (see the matching, more detailed comment below) since an EMPTY
+         * catch block never terminates, regardless of whatever unrelated
+         * value mg->last_opcode was carrying over from before this catch
+         * clause began. */
         uint8_t last_op = mg->last_opcode;
+        bool catch_emitted_code = mg->code->length > catch_start;
         bool catch_ends_with_return = (last_op == OP_RETURN || last_op == OP_ARETURN ||
                                        last_op == OP_IRETURN || last_op == OP_LRETURN ||
                                        last_op == OP_FRETURN || last_op == OP_DRETURN ||
-                                       last_op == OP_ATHROW);
+                                       last_op == OP_ATHROW ||
+                                       (last_op == OP_GOTO && catch_emitted_code));
         
         if (!catch_ends_with_return) {
             size_t *goto_pos = malloc(sizeof(size_t));
@@ -1030,6 +1055,42 @@ static void emit_pending_monitorexits(method_gen_t *mg)
         mg_push_object(mg, NULL);
         bc_emit(mg->code, OP_MONITOREXIT);
         mg_pop_typed(mg, 1);
+    }
+}
+
+/**
+ * Run every enclosing try statement's finally block, in innermost-first
+ * order, right before a `return` leaves the method from inside one or
+ * more of their try bodies - mirrors emit_pending_monitorexits() above
+ * for synchronized statements. Without this, a `return` lexically inside
+ * a try-with-finally (e.g. "try { return x; } finally { cleanup(); }")
+ * skipped the finally block entirely: codegen_statement for
+ * AST_RETURN_STMT emits the return instruction directly at that point in
+ * the bytecode stream, never reaching the try statement's own inlined
+ * "normal completion" copy of the finally block (which sits, unreached,
+ * right after the return - and since it directly follows an
+ * unconditional return, the verifier also rejects it for lacking a stack
+ * frame there: "Expecting a stack map frame").
+ *
+ * Each finally block is re-generated (via codegen_statement) here, just
+ * as the try statement's own codegen already does once per other exit
+ * edge (normal completion, each catch clause, the exception handler) -
+ * next_slot is saved/restored around each copy so a temp local the
+ * finally block allocates itself (e.g. a nested synchronized statement's
+ * lock slot) gets the same slot number as every other copy, matching the
+ * established convention for those other copies (see AST_TRY_STMT).
+ *
+ * Does not (yet) run a finally block for a return from inside a catch
+ * clause belonging to the same try/finally - only the try body itself is
+ * covered, which is what an early return here can currently reach.
+ */
+static void emit_pending_finally_blocks(method_gen_t *mg)
+{
+    for (slist_t *node = mg->finally_stack; node; node = node->next) {
+        ast_node_t *finally_block = (ast_node_t *)node->data;
+        uint16_t saved_slot = mg->next_slot;
+        codegen_statement(mg, finally_block);
+        mg->next_slot = saved_slot;
     }
 }
 
@@ -1318,6 +1379,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         }
                     }
                     
+                    emit_pending_finally_blocks(mg);
                     emit_pending_monitorexits(mg);
                     bc_emit(mg->code, return_op);
                     mg->last_opcode = return_op;
@@ -1327,6 +1389,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * "if (x) return someLong;" before more statements). */
                     mg_pop_typed(mg, (return_op == OP_LRETURN || return_op == OP_DRETURN) ? 2 : 1);
                 } else {
+                    emit_pending_finally_blocks(mg);
                     emit_pending_monitorexits(mg);
                     bc_emit(mg->code, OP_RETURN);
                     mg->last_opcode = OP_RETURN;
@@ -1993,17 +2056,20 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* Push loop context for break/continue */
                 mg_push_loop(mg, loop_start, mg->pending_label);
                 
-                /* Generate condition */
-                if (!codegen_expr(mg, condition, mg->cp)) {
+                /* Generate condition as a direct branch to loop_end on
+                 * false, rather than materializing a 0/1 value and doing
+                 * a single ifeq on it - a top-level `&&` chain (e.g.
+                 * `guard && (x = next()) != null`) is special-cased so
+                 * the loop body is only ever reached via the "every
+                 * operand true" edge, keeping any local an operand
+                 * assigns (like `x`) at its real, narrowed type within
+                 * the body - see codegen_condition_and_chain_false_branch's
+                 * own comment for the full reasoning. */
+                slist_t *false_positions = NULL;
+                if (!codegen_condition_and_chain_false_branch(mg, mg->cp, condition, &false_positions)) {
                     return false;
                 }
-                
-                /* ifeq loop_end (exit if condition false) */
-                size_t branch_pos = mg->code->length;
-                bc_emit(mg->code, OP_IFEQ);
-                bc_emit_u2(mg->code, 0);  /* Placeholder */
-                mg_pop_typed(mg, 1);  /* Consume condition */
-                
+
                 /* Generate body */
                 if (body && !codegen_statement(mg, body)) {
                     return false;
@@ -2031,21 +2097,52 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     bc_emit_u2(mg->code, back_offset);
                 }
                 
-                /* Patch forward branch to here (loop_end) */
+                /* Patch every pending false-branch (one per operand of a
+                 * top-level `&&` chain) to here (loop_end). They arrive
+                 * with genuinely different local-variable state whenever
+                 * a later operand assigned a local the earlier operand(s)
+                 * never touched (e.g. `x` in
+                 * `guard && (x = next()) != null`) - the head entry
+                 * (chronologically first/leftmost operand) is always a
+                 * safe, conservative frame for the WHOLE group, since
+                 * every later operand's own local writes can only refine
+                 * (assign a value whose static type is compatible with)
+                 * whatever the head's snapshot already recorded - so
+                 * restore from just that one rather than trusting
+                 * mg->stackmap's ambient state (which by now reflects
+                 * the LOOP BODY's own last statement, an edge that
+                 * doesn't even reach loop_end when the body has no
+                 * break). */
                 size_t loop_end = mg->code->length;
-                int16_t end_offset = (int16_t)(loop_end - branch_pos);
-                mg->code->code[branch_pos + 1] = (end_offset >> 8) & 0xFF;
-                mg->code->code[branch_pos + 2] = end_offset & 0xFF;
-                
+                stackmap_state_t *loop_exit_state = NULL;
+                for (slist_t *node = false_positions; node; ) {
+                    slist_t *next = node->next;
+                    pending_condition_branch_t *pending = (pending_condition_branch_t *)node->data;
+                    bc_patch_u2(mg->code, pending->branch_pos + 1,
+                                (uint16_t)(int16_t)(loop_end - pending->branch_pos));
+                    if (!loop_exit_state) {
+                        loop_exit_state = pending->state;
+                    } else {
+                        stackmap_state_free(pending->state);
+                    }
+                    free(pending);
+                    free(node);
+                    node = next;
+                }
+                if (loop_exit_state && mg->stackmap) {
+                    stackmap_restore_locals_only(mg->stackmap, loop_exit_state);
+                }
+
                 /* Record frame at loop end (break target) */
                 mg_record_frame(mg);
-                
+                stackmap_state_free(loop_exit_state);
+
                 /* Pop loop context and patch breaks */
                 mg_pop_loop(mg, loop_end);
-                
+
                 /* Reset last_opcode - loop bodies don't guarantee method termination */
                 mg->last_opcode = 0;
-                
+
                 return true;
             }
         
@@ -2119,18 +2216,23 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     }
                 }
                 
-                /* Record frame at loop end (break target) */
+                /* Record frame at loop end (break target). See the matching
+                 * comment on AST_FOR_STMT loop-end frame recording: any
+                 * dangling frame this produces (loop has no break, is the
+                 * methods last statement) is pruned centrally at method
+                 * finalization (stackmap_prune_out_of_bounds_frame in
+                 * codegen.c), not predicted here. */
                 mg_record_frame(mg);
-                
+
                 /* Pop loop context and patch breaks */
                 mg_pop_loop(mg, mg->code->length);
-                
+
                 /* Reset last_opcode - loop bodies don't guarantee method termination */
                 mg->last_opcode = 0;
-                
+
                 return true;
             }
-        
+
         case AST_FOR_STMT:
             {
                 /* Children: init, condition, update, body */
@@ -2259,12 +2361,31 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 
                 /* loop_end: */
                 size_t loop_end = mg->code->length;
-                
-                /* Record frame at loop end (break target) */
+
+                /* Record frame at loop end (break target). Note: if this
+                 * loop has no break at all AND is the very last thing
+                 * generated for the enclosing method (nothing follows this
+                 * position, ever), this frame would dangle past the
+                 * methods actual final instruction - handled centrally by
+                 * stackmap_prune_out_of_bounds_frame() at method
+                 * finalization (see codegen.c), rather than predicted here
+                 * (this code cannot know in advance whether an implicit
+                 * trailing return, or more enclosing statements, will end
+                 * up following this exact position). */
                 mg_record_frame(mg);
-                
-                /* Patch forward branch if we have a condition */
-                if (condition) {
+
+                /* Patch forward branch if we have a condition.
+                 * "condition" is non-NULL even for "for (;;)" - the parser
+                 * always fills an omitted condition with an AST_EMPTY_STMT
+                 * placeholder, never NULL - so this guard must match the
+                 * one above (line ~2187) that decides whether the ifeq
+                 * placeholder was actually emitted at all (branch_pos left
+                 * at its initial 0 otherwise). Without this check, a
+                 * "for (;;)" loop patches a branch-target value into
+                 * mg->code->code[1]/[2] - i.e. bytes 1-2 of the METHOD
+                 * ITSELF - clobbering whatever real instruction happens to
+                 * start there. */
+                if (condition && condition->type != AST_EMPTY_STMT) {
                     int16_t end_offset = (int16_t)(loop_end - branch_pos);
                     mg->code->code[branch_pos + 1] = (end_offset >> 8) & 0xFF;
                     mg->code->code[branch_pos + 2] = end_offset & 0xFF;
@@ -2303,18 +2424,29 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     target_ctx = (loop_context_t *)mg->loop_stack->data;
                 }
                 
+                /* Run any enclosing try statement's finally block(s) before
+                 * actually jumping - see emit_pending_finally_blocks()'s
+                 * own comment. A `break` lexically inside a try-with-
+                 * finally (e.g. gumdrop's own ScheduledTimer.run(), whose
+                 * main loop's try body both breaks and continues out past
+                 * a "finally { lock.unlock(); }") previously skipped the
+                 * finally block entirely on this path - the same class of
+                 * bug already fixed for `return`, just for a different
+                 * exit statement. */
+                emit_pending_finally_blocks(mg);
+
                 /* Emit goto with placeholder offset */
                 size_t break_pos = mg->code->length;
                 bc_emit(mg->code, OP_GOTO);
                 bc_emit_u2(mg->code, 0);  /* Will be patched by mg_pop_loop */
                 mg->last_opcode = OP_GOTO;  /* Track for dead code detection */
-                
+
                 /* Register this break for patching */
                 mg_add_break_to_context(target_ctx, break_pos);
-                
+
                 return true;
             }
-        
+
         case AST_ENHANCED_FOR_STMT:
             {
                 /* Children: type, variable, iterable, body */
@@ -2830,14 +2962,22 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     target_ctx = (loop_context_t *)mg->loop_stack->data;
                 }
                 
+                /* Run any enclosing try statement's finally block(s)
+                 * before actually jumping - see AST_BREAK_STMT's matching
+                 * comment and emit_pending_finally_blocks() itself. Must
+                 * happen before computing the branch offset below, since
+                 * inlining the finally block's own bytecode here shifts
+                 * mg->code->length. */
+                emit_pending_finally_blocks(mg);
+
                 int16_t offset = (int16_t)(target_ctx->continue_target - mg->code->length);
                 bc_emit(mg->code, OP_GOTO);
                 bc_emit_u2(mg->code, offset);
                 mg->last_opcode = OP_GOTO;  /* Track for dead code detection */
-                
+
                 return true;
             }
-        
+
         case AST_SWITCH_STMT:
             {
                 /* Children: selector_expr, case_label1, case_label2, ... */
@@ -2962,8 +3102,16 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                 ast_node_t *case_expr = (ast_node_t *)case_children->data;
                                 if (case_expr->type == AST_LITERAL) {
                                     case_values[case_idx] = (int32_t)case_expr->data.leaf.value.int_val;
-                                } else if (case_expr->type == AST_IDENTIFIER && is_enum_switch) {
-                                    /* For enum switch, semantic analysis stored the ordinal */
+                                } else if (case_expr->type == AST_IDENTIFIER) {
+                                    /* semantic.c already resolved this case label's
+                                     * own constant value onto its leaf, whether it's
+                                     * an enum switch (an enum constant's ordinal) or
+                                     * a plain int/char/byte/short switch (a named
+                                     * "static final int FOO = n;" constant's own
+                                     * literal value) - not gating on is_enum_switch
+                                     * here anymore, since both are populated the
+                                     * same way and this needs no different handling
+                                     * for either. */
                                     case_values[case_idx] = (int32_t)case_expr->data.leaf.value.int_val;
                                 }
                             }
@@ -3102,13 +3250,26 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 mg->code->code[default_offset_pos + 2] = (default_offset >> 8) & 0xFF;
                 mg->code->code[default_offset_pos + 3] = default_offset & 0xFF;
                 
-                /* Record stackmap frame at switch end if there are break statements to patch.
-                 * Breaks jump to switch_end, so we need a frame there. */
-                if (mg->loop_stack) {
-                    loop_context_t *ctx = (loop_context_t *)mg->loop_stack->data;
-                    if (ctx->break_offsets) {
-                        mg_record_frame(mg);
-                    }
+                /* Record stackmap frame at switch end if it's actually a
+                 * reachable jump target: either some break statement
+                 * targets it, OR there's no explicit "default:" label, in
+                 * which case the lookupswitch/tableswitch's own default
+                 * offset (patched above) points HERE too - the "no case
+                 * matched" path falls through to exactly this position
+                 * (see "default_offset = switch_end - switch_pos" just
+                 * above). A plain switch statement (unlike a switch
+                 * expression) doesn't require exhaustiveness, so this is
+                 * a perfectly ordinary, reachable path whenever the
+                 * selector's actual value doesn't match any case label -
+                 * missing this frame produced "VerifyError: Expecting a
+                 * stackmap frame" the moment such a switch was the last
+                 * statement inside an enclosing try block (or otherwise
+                 * followed by more code), even though every explicit case
+                 * ended in return/break. */
+                if ((mg->loop_stack &&
+                     ((loop_context_t *)mg->loop_stack->data)->break_offsets) ||
+                    default_code_pos == 0) {
+                    mg_record_frame(mg);
                 }
                 
                 /* Pop switch context and patch breaks */
@@ -3631,13 +3792,66 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     try_entry_state = stackmap_save_state(mg->stackmap);
                 }
                 
-                /* Generate try block */
-                if (!codegen_statement(mg, try_block)) {
+                /* Generate try block - with the finally block (if any)
+                 * pushed onto mg->finally_stack first, so a `return`
+                 * lexically inside the try body runs it before actually
+                 * returning (see emit_pending_finally_blocks()). Popped
+                 * again right after, since only the try body itself (not
+                 * the catch clauses generated below) can currently reach
+                 * that pending-finally mechanism. */
+                ast_node_t *finally_block_for_return = NULL;
+                if (finally_clause && finally_clause->data.node.children) {
+                    finally_block_for_return = (ast_node_t *)finally_clause->data.node.children->data;
+                    mg->finally_stack = slist_prepend(mg->finally_stack, finally_block_for_return);
+                }
+
+                bool try_body_ok = codegen_statement(mg, try_block);
+
+                if (finally_block_for_return) {
+                    slist_t *old_finally = mg->finally_stack;
+                    mg->finally_stack = mg->finally_stack->next;
+                    free(old_finally);
+                }
+
+                if (!try_body_ok) {
                     slist_free(catch_clauses);
                     stackmap_state_free(try_entry_state);
                     return false;
                 }
-                
+
+                /* If the try body already ends with return/throw/break/
+                 * continue on every path, it never falls through to here
+                 * at all - by now, any `return`/`break`/`continue`
+                 * reachable from inside it has already run this same
+                 * finally block itself via emit_pending_finally_blocks()
+                 * (see the finally_stack push/pop above and
+                 * AST_BREAK_STMT/AST_CONTINUE_STMT's own calls to it),
+                 * inlined right before that exit. The "normal completion"
+                 * copy below would therefore be genuinely unreachable dead
+                 * code - and, being the instruction immediately following
+                 * an unconditional jump, is also invalid without a stack
+                 * frame nothing records for it ("Expecting a stack map
+                 * frame" / "Inconsistent stackmap frames"). Skip it
+                 * entirely in that case, mirroring the same reachability
+                 * reasoning already used elsewhere in this file (e.g.
+                 * AST_SYNCHRONIZED_STMT's own body_ends_with_return
+                 * check). OP_GOTO here can only mean break/continue (a
+                 * loop reaching its own natural back-edge/exit is a
+                 * different AST node, not part of this try body's own
+                 * last_opcode), both of which now run this finally block
+                 * inline via emit_pending_finally_blocks() same as
+                 * return. */
+                bool try_body_ends_with_return = false;
+                {
+                    uint8_t body_last_op = mg->last_opcode;
+                    if (body_last_op == OP_RETURN || body_last_op == OP_IRETURN ||
+                        body_last_op == OP_LRETURN || body_last_op == OP_FRETURN ||
+                        body_last_op == OP_DRETURN || body_last_op == OP_ARETURN ||
+                        body_last_op == OP_ATHROW || body_last_op == OP_GOTO) {
+                        try_body_ends_with_return = true;
+                    }
+                }
+
                 /* If finally exists, inline finally code at end of try block.
                  *
                  * The finally block's own AST is re-walked once per exit
@@ -3658,8 +3872,16 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * stack map frames. Saving/restoring next_slot around each
                  * copy keeps every copy's slot numbering identical. */
                 uint16_t finally_saved_slot = mg->next_slot;
-                if (finally_clause && finally_clause->data.node.children) {
+                if (!try_body_ends_with_return &&
+                    finally_clause && finally_clause->data.node.children) {
                     ast_node_t *finally_block = (ast_node_t *)finally_clause->data.node.children->data;
+                    /* Reset before regenerating - see the matching reset
+                     * and comment at the escape-handler's own copy further
+                     * down for why this must not inherit last_opcode
+                     * carried over from the try body (or, via
+                     * emit_pending_finally_blocks(), from an earlier
+                     * inlined copy of this very same finally block). */
+                    mg->last_opcode = 0;
                     if (!codegen_statement(mg, finally_block)) {
                         slist_free(catch_clauses);
                         return false;
@@ -3721,6 +3943,23 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* Track catch handler info: [goto_pos, catch_start, catch_end] triplets */
                 slist_t *catch_gotos = NULL;   /* List of goto positions to patch */
                 slist_t *catch_ranges = NULL;  /* List of catch ranges for finally handlers */
+
+                /* Snapshot of the smallest (safest) locals state among any
+                 * catch clause that falls through normally (mirrors
+                 * try_exit_state above, for the same reason: by the time
+                 * the join-point frame is computed after all handlers,
+                 * mg->stackmap's "current" state has been overwritten by
+                 * the finally clause's own escape-handler bookkeeping
+                 * below, which is not a real predecessor of the join
+                 * point at all - so neither it, nor any single catch
+                 * clause's own leftover state, can be trusted there.
+                 * Keeping the SMALLEST snapshot across multiple falling-
+                 * through catch clauses is safe: they all share the same
+                 * try_catch_saved_locals prefix, and the smallest is the
+                 * common subset guaranteed initialized on every such
+                 * edge. */
+                stackmap_state_t *catch_exit_state = NULL;
+                uint16_t catch_exit_locals_count = 0;
                 
                 /* Track if all catch blocks end with return/throw */
                 bool all_catches_return = true;
@@ -3841,9 +4080,23 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         bc_emit_u1(mg->code, (uint8_t)catch_exc_slot);
                     }
                     mg_pop_typed(mg, 1);
-                    
+
                     uint16_t catch_start = (uint16_t)mg->code->length;
-                    
+
+                    /* Reset last_opcode before generating the catch body -
+                     * see the matching comment at the analogous spot in the
+                     * try-with-resources catch-clause codegen above. Without
+                     * this, a catch body ending in an ordinary statement
+                     * (which doesn't itself touch last_opcode) inherits
+                     * whatever last_opcode the TRY block's own last
+                     * statement left behind (e.g. OP_ATHROW from a `throw`),
+                     * wrongly marking this catch as terminal below even
+                     * though it plainly falls through - which can in turn
+                     * make the *enclosing* method wrongly skip its own
+                     * implicit trailing return (VerifyError: "Control flow
+                     * falls through code end"). */
+                    mg->last_opcode = 0;
+
                     /* Generate catch block */
                     if (!codegen_statement(mg, catch_block)) {
                         slist_free(catch_clauses);
@@ -3871,8 +4124,20 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         mg->next_slot = catch_finally_saved_slot;
                     }
 
-                    /* Save catch range for finally exception handler (before inlined finally) */
-                    if (finally_clause) {
+                    /* Save catch range for finally exception handler (before
+                     * inlined finally) - but only when the catch body
+                     * actually emitted bytecode. An empty catch clause
+                     * (e.g. one containing only a comment) emits nothing
+                     * at all, so catch_start == catch_end - registering
+                     * that zero-length range as an exception handler
+                     * protected range is invalid per JVMS 4.7.3
+                     * (start_pc must be strictly less than end_pc), and
+                     * every real JVM classloader rejects it outright at
+                     * class-load time ("Illegal exception table range"),
+                     * before verification even runs. There's also nothing
+                     * to protect: no instructions in an empty range can
+                     * ever throw. */
+                    if (finally_clause && catch_end > catch_start) {
                         uint32_t *range = malloc(sizeof(uint32_t) * 2);
                         range[0] = catch_start;
                         range[1] = catch_end;
@@ -3884,14 +4149,49 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         }
                     }
                     
-                    /* Check if catch block ended with a terminating instruction */
+                    /* Check if catch block ended with a terminating instruction.
+                     * Use mg->last_opcode (the reliable, already-established way
+                     * to answer "did the last thing terminate unconditionally" -
+                     * see the matching checks for try/if/synchronized bodies
+                     * elsewhere in this file) instead of re-reading the last
+                     * byte physically written to the bytecode buffer, which is
+                     * only ever correct for single-byte opcodes (the RETURN
+                     * variants, ATHROW) and silently wrong for any multi-byte
+                     * terminal instruction - in particular OP_GOTO (3 bytes),
+                     * emitted for a `break`/`continue` ending the catch block
+                     * (e.g. "catch (InterruptedException e) { ...; break; }"),
+                     * where the buffer's last byte is just part of the jump
+                     * offset, never OP_GOTO itself.
+                     *
+                     * Also include OP_GOTO outright, but ONLY when the catch
+                     * block actually emitted bytecode of its own (mg->code
+                     * grew past catch_start): mg->last_opcode is not reset
+                     * generically by bc_emit for every instruction, only at a
+                     * handful of specific call sites (return/throw/break/
+                     * continue, plus a few explicit resets) - so an EMPTY
+                     * catch block (e.g. one containing only a comment,
+                     * which emits nothing itself) leaves mg->last_opcode
+                     * exactly as whatever it was carried over from BEFORE this
+                     * catch clause even began (e.g. the try block's own
+                     * unrelated OP_GOTO/OP_ATHROW), which has nothing to do
+                     * with whether this empty catch body terminates - and it
+                     * never does; catch bodies must always fall through when
+                     * empty. Without the catch_start guard, that stale,
+                     * unrelated OP_GOTO look like a genuine break/continue and
+                     * wrongly skip the epilogue goto other statements need to
+                     * fall through the try/catch, producing "Control flow
+                     * falls through code end". A catch block ending in a
+                     * genuine break/continue always emits at least the 3-byte
+                     * goto itself, so this guard never excludes the real case. */
                     bool catch_ends_with_return = false;
-                    if (mg->code->length > 0) {
-                        uint8_t last_op = mg->code->code[mg->code->length - 1];
+                    {
+                        uint8_t last_op = mg->last_opcode;
+                        bool catch_emitted_code = mg->code->length > catch_start;
                         if (last_op == OP_RETURN || last_op == OP_IRETURN ||
                             last_op == OP_LRETURN || last_op == OP_FRETURN ||
                             last_op == OP_DRETURN || last_op == OP_ARETURN ||
-                            last_op == OP_ATHROW) {
+                            last_op == OP_ATHROW ||
+                            (last_op == OP_GOTO && catch_emitted_code)) {
                             catch_ends_with_return = true;
                         }
                     }
@@ -3907,13 +4207,27 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * in BOTH try and catch (like `value` in SafeMap.put) will be
                      * re-added to the stackmap when the catch block assigns them. */
                     mg_restore_locals_count(mg, try_catch_saved_locals);
-                    
+
                     /* Jump to end (only if catch didn't end with return/throw) */
                     if (!catch_ends_with_return) {
+                        /* Snapshot THIS catch clause's own real fallthrough-
+                         * exit state, keeping only the smallest seen so
+                         * far - see catch_exit_state's own comment above. */
+                        if (mg->stackmap) {
+                            uint16_t this_catch_locals = mg->stackmap->current_locals_count;
+                            if (!catch_exit_state || this_catch_locals < catch_exit_locals_count) {
+                                if (catch_exit_state) {
+                                    stackmap_state_free(catch_exit_state);
+                                }
+                                catch_exit_state = stackmap_save_state(mg->stackmap);
+                                catch_exit_locals_count = this_catch_locals;
+                            }
+                        }
+
                         size_t catch_exit_goto = mg->code->length;
                         bc_emit(mg->code, OP_GOTO);
                         bc_emit_u2(mg->code, 0);  /* Placeholder - will be patched */
-                        
+
                         /* Store goto position for patching later (using slist_append for order) */
                         if (!catch_gotos) {
                             catch_gotos = slist_new((void *)(uintptr_t)catch_exit_goto);
@@ -3923,7 +4237,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         }
                     }
                 }
-                
+
                 /* Generate finally exception handler (if finally exists) */
                 uint16_t finally_handler_pc = 0;
                 if (finally_clause) {
@@ -3972,7 +4286,6 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     if (mg->stackmap) {
                         stackmap_set_local_object(mg->stackmap, exc_slot, mg->cp, "java/lang/Throwable");
                     }
-
                     /* Generate finally block.
                      * See finally_saved_slot's comment above: each inlined
                      * copy of the finally block must start temp-local
@@ -3981,6 +4294,21 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     if (finally_clause->data.node.children) {
                         ast_node_t *finally_block = (ast_node_t *)finally_clause->data.node.children->data;
                         uint16_t escape_finally_saved_slot = mg->next_slot;
+                        /* Reset before regenerating - without this,
+                         * mg->last_opcode carried over from BEFORE this
+                         * copy (e.g. OP_IRETURN left by the try body's own
+                         * early return, when the "normal completion" copy
+                         * above was correctly skipped as unreachable) made
+                         * the "did the finally block itself return/throw"
+                         * check just below see a stale return opcode that
+                         * has nothing to do with THIS copy's own actual
+                         * termination - wrongly skipping the re-throw and
+                         * silently swallowing whatever exception the try
+                         * block threw (VerifyError: "Control flow falls
+                         * through code end", since the method could then
+                         * end without ever re-throwing or returning on
+                         * this path). */
+                        mg->last_opcode = 0;
                         if (!codegen_statement(mg, finally_block)) {
                             slist_free(catch_clauses);
                             slist_free(catch_gotos);
@@ -4061,30 +4389,55 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * removed by restore. So current_locals_count reflects what's valid on ALL
                  * catch paths that flow to this point. */
                 if (has_try_exit_goto || catch_gotos) {
-                    if (has_try_exit_goto && !catch_gotos && try_exit_state && mg->stackmap) {
-                        /* Every catch clause terminates (return/throw), so the try
-                         * block's own exit goto is the only live edge reaching this
-                         * join point. mg->stackmap currently reflects the last catch
-                         * handler's entry state (restored to try_entry_state while
-                         * framing that handler), not the try block's actual exit
-                         * state - restore the snapshot taken right after the try
-                         * block instead of just trimming the locals count. */
-                        stackmap_restore_state(mg->stackmap, try_exit_state);
-                    } else if (mg->stackmap && has_try_exit_goto && try_exit_locals_count > 0) {
-                        /* If try block didn't exit (no try_exit_goto), only catch paths
-                         * reach here, so use current stackmap state as-is.
-                         * If try block exited and at least one catch path is also live,
-                         * we need to merge with try path's locals. */
-                        /* Take minimum of try and catch locals counts */
-                        if (try_exit_locals_count < mg->stackmap->current_locals_count) {
-                            /* Try path had fewer locals (e.g., catch block added vars) */
-                            mg_restore_locals_count(mg, try_exit_locals_count);
+                    /* By this point, if a finally clause exists, its escape-
+                     * handler segment above has already overwritten
+                     * mg->stackmap's "current" state with its own internal
+                     * bookkeeping (restoring to try_entry_state, then adding
+                     * exc_slot as a live Throwable local) - that segment is
+                     * NOT a real predecessor of this join point at all (it
+                     * always ends in athrow or an early return, never falls
+                     * through here), so "current" state can never be trusted
+                     * for this frame. Always restore explicitly from a real
+                     * saved snapshot of whichever edge(s) actually reach
+                     * here, instead of reading/trimming ambient state. */
+                    if (mg->stackmap) {
+                        if (has_try_exit_goto && !catch_gotos && try_exit_state) {
+                            /* Every catch clause terminates (return/throw), so the
+                             * try block's own exit goto is the only live edge. */
+                            stackmap_restore_state(mg->stackmap, try_exit_state);
+                        } else if (catch_gotos && !has_try_exit_goto && catch_exit_state) {
+                            /* The try block always terminates, so the smallest
+                             * falling-through catch clause's own exit is the only
+                             * live edge. */
+                            stackmap_restore_state(mg->stackmap, catch_exit_state);
+                        } else if (has_try_exit_goto && catch_gotos &&
+                                   try_exit_state && catch_exit_state) {
+                            /* Both the try block and at least one catch clause
+                             * fall through - restore from whichever snapshot has
+                             * fewer locals (the common, guaranteed-safe subset
+                             * both real edges agree on), then trim to the true
+                             * minimum of the two counts. */
+                            if (try_exit_locals_count <= catch_exit_locals_count) {
+                                stackmap_restore_state(mg->stackmap, try_exit_state);
+                                if (catch_exit_locals_count < mg->stackmap->current_locals_count) {
+                                    mg_restore_locals_count(mg, catch_exit_locals_count);
+                                }
+                            } else {
+                                stackmap_restore_state(mg->stackmap, catch_exit_state);
+                                if (try_exit_locals_count < mg->stackmap->current_locals_count) {
+                                    mg_restore_locals_count(mg, try_exit_locals_count);
+                                }
+                            }
+                        } else if (has_try_exit_goto && try_exit_state) {
+                            stackmap_restore_state(mg->stackmap, try_exit_state);
+                        } else if (catch_exit_state) {
+                            stackmap_restore_state(mg->stackmap, catch_exit_state);
                         }
-                        /* If catch path has fewer locals, current state is already correct */
                     }
                     mg_record_frame(mg);
                 }
                 stackmap_state_free(try_exit_state);
+                stackmap_state_free(catch_exit_state);
                 
                 /* Patch try exit goto (only if we emitted one) */
                 if (has_try_exit_goto) {
