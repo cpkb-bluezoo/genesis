@@ -5088,7 +5088,19 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
                 field_sym->data.var_data.is_enum_constant = true;
                 field_sym->data.var_data.enum_ordinal = enum_ordinal++;
             }
-            
+
+            /* A "static final" field's own ConstantValue attribute
+             * (JVMS 4.7.2) - needed so a switch case label referencing
+             * this classfile-loaded constant (e.g. an inherited
+             * "case PAGE_SCOPE:" from javax.servlet.jsp.PageContext) can
+             * resolve its actual value the same way an AST-based
+             * constant's own literal initializer already does. */
+            long long const_value = 0;
+            if (classfile_get_attribute_constant_value(cf, fi->attributes, fi->attributes_count, &const_value)) {
+                field_sym->data.var_data.has_const_value = true;
+                field_sym->data.var_data.const_value = const_value;
+            }
+
             /* Try to get generic signature first - this has the real generic types
              * (e.g., List<String> instead of just List) */
             char *field_sig = classfile_get_attribute_signature(cf, fi->attributes, fi->attributes_count);
@@ -19255,7 +19267,35 @@ static bool resolve_qualified_constant_case_value(semantic_t *sem, ast_node_t *f
         }
     }
 
-    if (!sym || sym->kind != SYM_FIELD || !sym->ast) {
+    if (!sym || sym->kind != SYM_FIELD) {
+        return false;
+    }
+
+    /* A classfile-loaded field (e.g. a cross-module "int
+     * SETTINGS_HEADER_TABLE_SIZE = 0x1;" declared on an interface compiled
+     * separately and referenced only via -cp) has no AST declarator at
+     * all to read an initializer expression from - its value instead
+     * comes from its own ConstantValue attribute, already resolved onto
+     * the symbol when the classfile's fields were loaded (see
+     * resolve_named_int_constant()'s own identical fallback just above,
+     * which this function lacked even though both resolve the same kind
+     * of case-label constant - just qualified vs bare). Without this, a
+     * qualified reference to such a field silently resolved to nothing,
+     * defaulting its case label to 0 and colliding with every OTHER case
+     * referencing a sibling constant from the same classfile-loaded type
+     * (all of which hit this same gap): ClassFormatError/VerifyError
+     * "Bad lookupswitch instruction" (JVMS 4.9.1 requires strictly
+     * increasing match values). Confirmed against gumdrop's own
+     * HttpProtocolHandler.settingsFrameReceived(), whose `case
+     * H2FrameHandler.SETTINGS_HEADER_TABLE_SIZE:` etc. (H2FrameHandler is
+     * an interface compiled as part of a different module) all
+     * collapsed to "case 0:". */
+    if (sym->data.var_data.has_const_value) {
+        *out_value = sym->data.var_data.const_value;
+        return true;
+    }
+
+    if (!sym->ast) {
         return false;
     }
 
@@ -19430,20 +19470,99 @@ static bool resolve_named_int_constant(semantic_t *sem, const char *name, int32_
     if (!sym && sem->current_class && sem->current_class->data.class_data.members) {
         sym = scope_lookup_local(sem->current_class->data.class_data.members, name);
     }
-    if (!sym && sem->current_class) {
-        slist_t *ifaces = sem->current_class->data.class_data.interfaces;
+    /* Also check implemented interfaces and, walking upward, every
+     * superclass - a bare case label can inherit its constant from
+     * EITHER, not just an interface (which the earlier version of this
+     * function alone checked). Interfaces first, closest to furthest,
+     * matching find_common_ancestor_symbol()'s own closest-first
+     * philosophy elsewhere in this file; the superclass chain is walked
+     * the same way scope_lookup() itself would for a real field-access
+     * EXPRESSION, which a case label deliberately bypasses (see
+     * resolve_qualified_constant_case_value()'s own doc comment) - so
+     * nothing else ever walks it for a case label specifically.
+     * Confirmed against gumdrop's own test-only MockPageContext, whose
+     * inherited "case PAGE_SCOPE:" (from javax.servlet.jsp.PageContext,
+     * an ABSTRACT SUPERCLASS, not an interface) needed exactly this. */
+    for (symbol_t *cls = sem->current_class; cls && !sym; cls = cls->data.class_data.superclass) {
+        symbol_complete(cls);  /* Force a lazy classfile stub's members/superclass to resolve */
+        slist_t *ifaces = cls->data.class_data.interfaces;
         for (slist_t *i = ifaces; i && !sym; i = i->next) {
             symbol_t *iface = (symbol_t *)i->data;
             if (iface && iface->data.class_data.members) {
                 sym = scope_lookup_local(iface->data.class_data.members, name);
             }
         }
+        if (!sym && cls != sem->current_class && cls->data.class_data.members) {
+            sym = scope_lookup_local(cls->data.class_data.members, name);
+        }
     }
-    if (!sym || sym->kind != SYM_FIELD || !sym->ast || sym->ast->type != AST_VAR_DECLARATOR ||
-        !sym->ast->data.node.children) {
+    /* A bare case label can also name a constant brought in via a
+     * static import ("import static pkg.Class.CONST;" or "import
+     * static pkg.Class.*;") - nothing above walks sem->static_imports
+     * at all (that's a completely separate resolution mechanism from
+     * scope/inheritance, already implemented for ordinary identifier
+     * EXPRESSIONS via resolve_static_import_field(), just never wired
+     * into this case-label-specific resolver). Without this, EVERY
+     * case label naming a statically-imported constant silently
+     * resolved to nothing, defaulting to match value 0 and colliding
+     * with every OTHER such case in the same switch: VerifyError/
+     * ClassFormatError "Bad lookupswitch instruction". Confirmed
+     * against gumdrop's own
+     * SocksProtocolHandler.handleSOCKS5Request()'s "switch (atyp)",
+     * whose three case labels (SOCKS5_ATYP_IPV4/_DOMAINNAME/_IPV6) are
+     * all brought in via "import static
+     * org.bluezoo.gumdrop.socks.SocksConstants.*;". */
+    if (!sym) {
+        symbol_t *field_sym = NULL;
+        if (resolve_static_import_field(sem, name, &field_sym) && field_sym) {
+            sym = field_sym;
+        }
+    }
+    if (!sym || sym->kind != SYM_FIELD) {
         return false;
     }
-    ast_node_t *init_expr = (ast_node_t *)sym->ast->data.node.children->data;
+    /* A classfile-loaded field (e.g. an inherited "public static final
+     * int PAGE_SCOPE = 1;" from an external/JDK superclass) has no AST
+     * declarator to read an initializer expression from at all - its
+     * value instead comes from its own ConstantValue attribute, already
+     * resolved onto the symbol when the classfile's fields were loaded
+     * (see the "Load fields" loop above). Confirmed against gumdrop's
+     * own test-only MockPageContext, whose inherited
+     * "case PAGE_SCOPE:"/"case REQUEST_SCOPE:"/etc. (from
+     * javax.servlet.jsp.PageContext) are exactly this shape. */
+    if (sym->data.var_data.has_const_value) {
+        *out_value = (int32_t)sym->data.var_data.const_value;
+        return true;
+    }
+    /* A field symbol's ->ast points at its own AST_VAR_DECLARATOR when
+     * registered by the main same-batch member-registration pass, but
+     * at the whole AST_FIELD_DECL (whose children are [type_node,
+     * declarator, ...], one declarator per comma-separated name) when
+     * registered via the interface/classpath completion path -
+     * resolve_static_import_field()'s own member lookup (used just
+     * above for a statically-imported constant) returns exactly this
+     * latter shape even for a same-batch class, so both must be
+     * handled here too, mirroring
+     * resolve_qualified_constant_case_value()'s own identical
+     * unwrapping. Confirmed against gumdrop's own
+     * SocksProtocolHandler.handleSOCKS5Request()'s "switch (atyp)". */
+    ast_node_t *declarator = NULL;
+    if (sym->ast && sym->ast->type == AST_VAR_DECLARATOR) {
+        declarator = sym->ast;
+    } else if (sym->ast && sym->ast->type == AST_FIELD_DECL) {
+        for (slist_t *dc = sym->ast->data.node.children; dc; dc = dc->next) {
+            ast_node_t *cand = (ast_node_t *)dc->data;
+            if (cand && cand->type == AST_VAR_DECLARATOR &&
+                cand->data.node.name && strcmp(cand->data.node.name, name) == 0) {
+                declarator = cand;
+                break;
+            }
+        }
+    }
+    if (!declarator || !declarator->data.node.children) {
+        return false;
+    }
+    ast_node_t *init_expr = (ast_node_t *)declarator->data.node.children->data;
     return eval_case_constant_operand(sem, init_expr, out_value);
 }
 
@@ -21293,23 +21412,59 @@ define_local_var:
                                                 /* Must be a constant (final static field or enum constant) */
                                                 const char *name = case_expr->data.leaf.name;
                                                 symbol_t *sym = scope_lookup(sem->current_scope, name);
-                                                
+
                                                 /* If not found in scope, try current class members (for interface constants) */
                                                 if (!sym && sem->current_class && sem->current_class->data.class_data.members) {
                                                     sym = scope_lookup_local(sem->current_class->data.class_data.members, name);
                                                 }
-                                                
-                                                /* Also check implemented interfaces for constants */
-                                                if (!sym && sem->current_class) {
-                                                    slist_t *ifaces = sem->current_class->data.class_data.interfaces;
+
+                                                /* Also check implemented interfaces and, walking
+                                                 * upward, every superclass - a bare case label can
+                                                 * inherit its constant from EITHER, not just an
+                                                 * interface. See resolve_named_int_constant()'s
+                                                 * identical walk (used for the same constant
+                                                 * appearing as an OPERAND rather than the whole
+                                                 * case label) for the full explanation; confirmed
+                                                 * against gumdrop's own test-only MockPageContext,
+                                                 * whose inherited "case PAGE_SCOPE:" (from
+                                                 * javax.servlet.jsp.PageContext, an ABSTRACT
+                                                 * SUPERCLASS, not an interface) needed exactly
+                                                 * this. */
+                                                for (symbol_t *cls = sem->current_class; cls && !sym; cls = cls->data.class_data.superclass) {
+                                                    symbol_complete(cls);
+                                                    slist_t *ifaces = cls->data.class_data.interfaces;
                                                     for (slist_t *i = ifaces; i && !sym; i = i->next) {
                                                         symbol_t *iface = (symbol_t *)i->data;
                                                         if (iface && iface->data.class_data.members) {
                                                             sym = scope_lookup_local(iface->data.class_data.members, name);
                                                         }
                                                     }
+                                                    if (!sym && cls != sem->current_class && cls->data.class_data.members) {
+                                                        sym = scope_lookup_local(cls->data.class_data.members, name);
+                                                    }
                                                 }
-                                                
+
+                                                /* A bare case label can also name a
+                                                 * constant brought in via a static
+                                                 * import - see
+                                                 * resolve_named_int_constant()'s
+                                                 * identical fallback (used for the
+                                                 * same constant as an OPERAND rather
+                                                 * than the whole case label) for the
+                                                 * full explanation. Confirmed against
+                                                 * gumdrop's own
+                                                 * SocksProtocolHandler.handleSOCKS5Request()'s
+                                                 * "switch (atyp)", whose three case
+                                                 * labels are all brought in via
+                                                 * "import static
+                                                 * org.bluezoo.gumdrop.socks.SocksConstants.*;". */
+                                                if (!sym) {
+                                                    symbol_t *field_sym = NULL;
+                                                    if (resolve_static_import_field(sem, name, &field_sym) && field_sym) {
+                                                        sym = field_sym;
+                                                    }
+                                                }
+
                                                 if (sym && sym->kind == SYM_FIELD) {
                                                     /* Check if it's final (constant expression).
                                                      * Interface fields are implicitly final but may not have MOD_FINAL
@@ -21338,13 +21493,56 @@ define_local_var:
                                                      * EXT_ENCRYPTED_CLIENT_HELLO) - a bare literal
                                                      * initializer used to be handled inline right here
                                                      * instead, missing both of those. */
-                                                    if (sym->ast && sym->ast->type == AST_VAR_DECLARATOR &&
-                                                        sym->ast->data.node.children) {
-                                                        ast_node_t *init_expr =
-                                                            (ast_node_t *)sym->ast->data.node.children->data;
-                                                        int32_t resolved_value;
-                                                        if (eval_case_constant_operand(sem, init_expr, &resolved_value)) {
-                                                            case_expr->data.leaf.value.int_val = resolved_value;
+                                                    if (sym->data.var_data.has_const_value) {
+                                                        /* Classfile-loaded field (e.g. an
+                                                         * inherited "case PAGE_SCOPE:" from
+                                                         * javax.servlet.jsp.PageContext) - no
+                                                         * AST declarator to read an initializer
+                                                         * from; its value already came from its
+                                                         * own ConstantValue attribute when the
+                                                         * classfile's fields were loaded. See
+                                                         * resolve_named_int_constant()'s
+                                                         * identical fallback for the same
+                                                         * constant used as an OPERAND rather
+                                                         * than the whole case label. */
+                                                        case_expr->data.leaf.value.int_val =
+                                                            (int32_t)sym->data.var_data.const_value;
+                                                    } else {
+                                                        /* sym->ast is the field's own
+                                                         * AST_VAR_DECLARATOR when registered
+                                                         * by the main same-batch member-
+                                                         * registration pass, but the whole
+                                                         * AST_FIELD_DECL (one declarator per
+                                                         * comma-separated name) when
+                                                         * registered via the interface/
+                                                         * classpath completion path -
+                                                         * resolve_static_import_field()'s own
+                                                         * member lookup (used just above for a
+                                                         * statically-imported constant) returns
+                                                         * exactly this latter shape even for a
+                                                         * same-batch class. See
+                                                         * resolve_named_int_constant()'s
+                                                         * identical unwrapping. */
+                                                        ast_node_t *declarator = NULL;
+                                                        if (sym->ast && sym->ast->type == AST_VAR_DECLARATOR) {
+                                                            declarator = sym->ast;
+                                                        } else if (sym->ast && sym->ast->type == AST_FIELD_DECL) {
+                                                            for (slist_t *dc = sym->ast->data.node.children; dc; dc = dc->next) {
+                                                                ast_node_t *cand = (ast_node_t *)dc->data;
+                                                                if (cand && cand->type == AST_VAR_DECLARATOR &&
+                                                                    cand->data.node.name && strcmp(cand->data.node.name, name) == 0) {
+                                                                    declarator = cand;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                        if (declarator && declarator->data.node.children) {
+                                                            ast_node_t *init_expr =
+                                                                (ast_node_t *)declarator->data.node.children->data;
+                                                            int32_t resolved_value;
+                                                            if (eval_case_constant_operand(sem, init_expr, &resolved_value)) {
+                                                                case_expr->data.leaf.value.int_val = resolved_value;
+                                                            }
                                                         }
                                                     }
                                                 }

@@ -375,8 +375,20 @@ typedef struct class_signature
  */
 
 /* Find an attribute by name in the attribute list */
-char *classfile_get_attribute_signature(classfile_t *cf, attribute_info_t *attrs, 
+char *classfile_get_attribute_signature(classfile_t *cf, attribute_info_t *attrs,
                                         uint16_t attr_count);
+
+/* A field's ConstantValue attribute (JVMS 4.7.2) - present for a
+ * "static final" field whose value is a compile-time constant, e.g. an
+ * external/JDK class's "public static final int PAGE_SCOPE = 1;". Reads
+ * the u2 constant pool index the attribute stores and resolves it to the
+ * actual int/long value. Returns true and sets *out_value only for a
+ * CONSTANT_Integer or CONSTANT_Long pool entry (the only kinds a switch
+ * case label's own constant can ever need); false if no ConstantValue
+ * attribute is present or it names some other constant kind (String,
+ * Float, Double - never valid as a case label's type to begin with). */
+bool classfile_get_attribute_constant_value(classfile_t *cf, attribute_info_t *attrs,
+                                            uint16_t attr_count, long long *out_value);
 
 /* Parse a generic type from a signature string */
 generic_type_t *signature_parse_type(const char **sig);

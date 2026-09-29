@@ -228,6 +228,7 @@ verification_type_t vtype_float(void);
 verification_type_t vtype_double(void);
 verification_type_t vtype_null(void);
 verification_type_t vtype_top(void);
+verification_type_t vtype_uninitialized_this(void);
 
 #endif /* STACKMAP_H */
 

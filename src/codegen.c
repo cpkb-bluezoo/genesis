@@ -1005,6 +1005,12 @@ void mg_push_uninitialized(method_gen_t *mg, uint16_t new_offset)
     if (mg->stackmap) stackmap_push_uninitialized(mg->stackmap, new_offset);
 }
 
+void mg_push_uninitialized_this(method_gen_t *mg)
+{
+    mg_push(mg, 1);
+    if (mg->stackmap) stackmap_push(mg->stackmap, vtype_uninitialized_this());
+}
+
 void mg_pop_typed(method_gen_t *mg, int slots)
 {
     mg_pop(mg, slots);

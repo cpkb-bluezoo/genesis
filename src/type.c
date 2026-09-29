@@ -866,7 +866,32 @@ bool type_needs_unboxing(type_t *target, type_t *source)
         return true;
     }
     
-    /* Allow widening after unboxing (e.g., Integer -> long) */
+    /* Allow widening after unboxing (e.g., Integer -> long) - but ONLY
+     * when the unboxed primitive is itself numeric. boolean is neither
+     * numeric nor widening-compatible with anything: there is no boolean
+     * -> int/long/float/double conversion in Java, boxed or not. Without
+     * this guard, the switch below had no case for TYPE_BOOLEAN, leaving
+     * prim_rank at its default 0 - lower than every real numeric rank
+     * (even byte's 1), so "target_rank >= prim_rank" was true for EVERY
+     * numeric target: type_needs_unboxing(long, Boolean) and
+     * type_needs_unboxing(double, Boolean) both wrongly returned true,
+     * exactly like the real conversion (Integer -> long) this comment
+     * describes. That, in turn, made overload resolution score a
+     * Boolean-typed argument as EQUALLY valid unboxing-compatible with
+     * boolean/long/double overloads alike (all three score the same 40
+     * "needs boxing/unboxing" - see this function's caller in
+     * find_best_method_by_types()), so genesis could pick a numeric
+     * overload for a boolean argument: an invokevirtual expecting
+     * long/double where a Boolean reference is actually on the stack,
+     * VerifyError "Bad type on operand stack ... not assignable to
+     * long_2nd/double_2nd". Confirmed against gumdrop's own
+     * MqttProtocolHandler.addSessionAttribute(), whose "sessionSpan.
+     * addAttribute(key, (Boolean) value)" - resolving among
+     * addAttribute(String,boolean)/(String,long)/(String,double) - hits
+     * exactly this. */
+    if (prim == TYPE_BOOLEAN) {
+        return false;
+    }
     if (type_is_numeric(target)) {
         int target_rank = 0, prim_rank = 0;
         switch (target->kind) {

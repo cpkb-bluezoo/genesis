@@ -21,6 +21,13 @@ TEST_SRC=${TEST_SRC:-$here}
 TEST_BUILD=${TEST_BUILD:-$here/build}
 JAVA=${JAVA:-${JAVA_HOME:+$JAVA_HOME/bin/java}}
 JAVA=${JAVA:-java}
+# Only used by the ExternalJavacConstant test below, which specifically
+# needs a REAL javac-compiled library (genesis's own classwriter uses
+# <clinit> for constant initialization, never a ConstantValue attribute -
+# see the README - so a genesis-compiled library can never exercise
+# genesis's ConstantValue-reading support at all).
+JAVAC=${JAVAC:-${JAVA_HOME:+$JAVA_HOME/bin/javac}}
+JAVAC=${JAVAC:-javac}
 
 # Source-version directories, oldest first. Each holds tests requiring at
 # least that language level.
@@ -166,6 +173,69 @@ if "$GENESIS" -d "$mc_lib" "$TEST_SRC"/external/lib/*.java >/dev/null 2>&1 &&
        "$TEST_SRC/external/MultiCatchExternalLibExceptionTest.java" \
        "$TEST_SRC/external/MultiCatchLocalException.java" >/dev/null 2>&1 &&
    "$JAVA" -cp "$mc_out:$mc_lib" MultiCatchExternalLibExceptionTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "ExternalJavacConstantSwitch"
+ejc_lib="$TEST_BUILD/external-javac-lib"
+ejc_out="$TEST_BUILD/external-javac-out"
+rm -rf "$ejc_lib" "$ejc_out"
+mkdir -p "$ejc_lib" "$ejc_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$ejc_lib" "$TEST_SRC"/external/javaclib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ejc_lib" -d "$ejc_out" \
+       "$TEST_SRC/external/ExternalJavacConstantSwitchTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ejc_out:$ejc_lib" ExternalJavacConstantSwitchTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "CrossModuleConstantSwitch"
+cmc_lib="$TEST_BUILD/cross-module-const-lib"
+cmc_out="$TEST_BUILD/cross-module-const-out"
+rm -rf "$cmc_lib" "$cmc_out"
+mkdir -p "$cmc_lib" "$cmc_out"
+if "$GENESIS" -d "$cmc_lib" "$TEST_SRC"/external/genesislib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$cmc_lib" -d "$cmc_out" \
+       "$TEST_SRC/external/CrossModuleConstantSwitchTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$cmc_out:$cmc_lib" CrossModuleConstantSwitchTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "StaticImportSwitchCaseLabel"
+sisc_out="$TEST_BUILD/static-import-switch-out"
+rm -rf "$sisc_out"
+mkdir -p "$sisc_out"
+if "$GENESIS" -d "$sisc_out" "$TEST_SRC/external/genesislib/SocksAtypConsts.java" \
+       "$TEST_SRC/external/StaticImportSwitchCaseLabelTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$sisc_out" StaticImportSwitchCaseLabelTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "CrossModuleQualifiedIfaceConst"
+cmqi_lib="$TEST_BUILD/cross-module-qualified-iface-const-lib"
+cmqi_out="$TEST_BUILD/cross-module-qualified-iface-const-out"
+rm -rf "$cmqi_lib" "$cmqi_out"
+mkdir -p "$cmqi_lib" "$cmqi_out"
+if "$GENESIS" -d "$cmqi_lib" "$TEST_SRC/external/genesislib/FrameSettings.java" >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$cmqi_lib" -d "$cmqi_out" \
+       "$TEST_SRC/external/CrossModuleQualifiedInterfaceConstantSwitchTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$cmqi_out:$cmqi_lib" CrossModuleQualifiedInterfaceConstantSwitchTest >/dev/null 2>&1; then
     echo PASS
     passed=$((passed + 1))
 else

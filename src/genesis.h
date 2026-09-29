@@ -686,6 +686,16 @@ struct symbol
             bool is_enum_constant;      /* True if this is an enum constant */
             int enum_ordinal;           /* Ordinal value (for enum constants) */
             void *unresolved_type;      /* unresolved_type_t* for field type */
+            bool has_const_value;       /* True if const_value below is populated -
+                                          * a classfile-loaded "static final" field's
+                                          * own ConstantValue attribute (JVMS 4.7.2),
+                                          * e.g. an external/JDK class's "public
+                                          * static final int PAGE_SCOPE = 1;". An
+                                          * AST-based field's constant value is read
+                                          * from its own initializer expression
+                                          * instead (sym->ast), which a classfile-
+                                          * loaded field has none of. */
+            long long const_value;      /* The resolved constant, when has_const_value */
         } var_data;
     } data;
     

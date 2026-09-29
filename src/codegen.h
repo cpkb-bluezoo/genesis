@@ -450,6 +450,19 @@ typedef struct field_gen
     uint16_t descriptor_index;
     slist_t *attributes;
     ast_node_t *ast;             /* Original AST (for annotations) */
+    uint16_t const_value_cp_index;  /* ConstantValue attribute's constant
+                                      * pool index (0 if none) - computed
+                                      * ONCE in classwriter.c's pre-add
+                                      * pass and cached here, since unlike
+                                      * cp_add_integer() (which dedupes),
+                                      * cp_add_string() does NOT: calling
+                                      * the computation a second time in
+                                      * the later field-writing pass would
+                                      * add a SECOND string constant pool
+                                      * entry after the pool has already
+                                      * been serialized, referencing an
+                                      * index that was never written out
+                                      * at all. */
 } field_gen_t;
 
 /*
@@ -631,6 +644,7 @@ void mg_push_double(method_gen_t *mg);   /* Push double type (2 slots) */
 void mg_push_null(method_gen_t *mg);     /* Push null reference */
 void mg_push_object(method_gen_t *mg, const char *class_name);  /* Push object reference */
 void mg_push_uninitialized(method_gen_t *mg, uint16_t new_offset);  /* Push uninitialized reference (from 'new' instruction) */
+void mg_push_uninitialized_this(method_gen_t *mg);  /* Push uninitializedThis (receiver of an explicit this()/super() call, before it completes) */
 void mg_pop_typed(method_gen_t *mg, int slots);  /* Pop from both runtime and stackmap */
 void mg_dup_x1(method_gen_t *mg);   /* Type-aware OP_DUP_X1 (see stackmap_dup_x1) */
 void mg_dup2_x1(method_gen_t *mg);  /* Type-aware OP_DUP2_X1 form 2 (see stackmap_dup2_x1) */

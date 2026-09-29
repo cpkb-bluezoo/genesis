@@ -35,6 +35,127 @@
 static void preadd_annotations_list_cp(const_pool_t *cp, slist_t *annotations,
                                         retention_policy_t retention);
 
+/**
+ * A "static final" field's own ConstantValue attribute (JVMS 4.7.2) -
+ * javac always emits one for a "constant variable" (JLS 4.12.4: static
+ * final, of primitive or String type, initialized with a constant
+ * expression); genesis instead always initializes such fields via
+ * <clinit> (see the README's own documented note on this difference),
+ * which works for ordinary runtime use but leaves nothing for another
+ * compile unit's own compile-time constant folding to read - e.g. a
+ * switch case label in a DIFFERENT file/module referencing this field by
+ * name needs its value baked into the classfile at COMPILE time, not
+ * read at class-INIT time. Handles a plain literal initializer (the
+ * common case for a real constant declaration) and a unary +/- wrapping
+ * one; a field whose initializer is itself a more complex expression
+ * (referencing OTHER constants, arithmetic, ...) is intentionally left
+ * without a ConstantValue attribute here, matching this file's existing
+ * philosophy elsewhere of handling the concrete shape actually needed
+ * rather than a fully general constant-expression evaluator - genesis's
+ * own <clinit> initialization still runs regardless, so such a field
+ * still works correctly for every use except cross-module case-label
+ * folding of that specific shape. Confirmed against gumdrop's own
+ * PageContext (jakarta.servlet.jsp) - "public static final int
+ * PAGE_SCOPE = 1;" and its three siblings, referenced as bare case
+ * labels by a DIFFERENT module's ELEvaluatorTest - exactly this shape.
+ * Returns a constant pool index (a CONSTANT_Integer/Long/Float/Double/
+ * String entry matching the field's own descriptor) for the
+ * ConstantValue attribute to reference, or 0 if this field isn't
+ * eligible (not static final, not a primitive/String type, or its
+ * initializer isn't one of the two shapes handled above).
+ */
+static uint16_t field_gen_constant_value_index(const_pool_t *cp, field_gen_t *fg)
+{
+    if (!fg || !fg->descriptor || !fg->ast) {
+        return 0;
+    }
+    if ((fg->access_flags & (ACC_STATIC | ACC_FINAL)) != (ACC_STATIC | ACC_FINAL)) {
+        return 0;
+    }
+    char desc0 = fg->descriptor[0];
+    bool is_string = strcmp(fg->descriptor, "Ljava/lang/String;") == 0;
+    if (!is_string && strchr("ZBCSIJFD", desc0) == NULL) {
+        return 0;  /* Not a primitive or String field */
+    }
+
+    /* Find the AST_VAR_DECLARATOR among fg->ast's children matching this
+     * field's own name - fg->ast is the whole AST_FIELD_DECL, which may
+     * declare several fields at once (e.g. "static final int A = 1, B = 2;"),
+     * each with its own field_gen_t sharing the same ->ast. */
+    ast_node_t *declarator = NULL;
+    for (slist_t *c = fg->ast->data.node.children; c; c = c->next) {
+        ast_node_t *child = (ast_node_t *)c->data;
+        if (child->type == AST_VAR_DECLARATOR && child->data.node.name &&
+            strcmp(child->data.node.name, fg->name) == 0) {
+            declarator = child;
+            break;
+        }
+    }
+    if (!declarator || !declarator->data.node.children) {
+        return 0;
+    }
+    ast_node_t *init_expr = (ast_node_t *)declarator->data.node.children->data;
+
+    /* Unwrap a single unary +/- (e.g. "= -1;"), the only compound shape
+     * handled here. */
+    bool negate = false;
+    if (init_expr->type == AST_UNARY_EXPR &&
+        (init_expr->data.node.op_token == TOK_MINUS || init_expr->data.node.op_token == TOK_PLUS) &&
+        init_expr->data.node.children) {
+        negate = (init_expr->data.node.op_token == TOK_MINUS);
+        init_expr = (ast_node_t *)init_expr->data.node.children->data;
+    }
+
+    if (init_expr->type == AST_LITERAL) {
+        token_type_t tt = init_expr->data.leaf.token_type;
+        if (is_string) {
+            if (tt == TOK_STRING_LITERAL && init_expr->data.leaf.value.str_val) {
+                return cp_add_string(cp, init_expr->data.leaf.value.str_val);
+            }
+            return 0;
+        }
+        switch (desc0) {
+            case 'J':
+                if (tt == TOK_INTEGER_LITERAL || tt == TOK_LONG_LITERAL) {
+                    int64_t v = init_expr->data.leaf.value.int_val;
+                    return cp_add_long(cp, negate ? -v : v);
+                }
+                return 0;
+            case 'F':
+                if (tt == TOK_FLOAT_LITERAL || tt == TOK_INTEGER_LITERAL) {
+                    double v = (tt == TOK_FLOAT_LITERAL) ? init_expr->data.leaf.value.float_val
+                                                          : (double)init_expr->data.leaf.value.int_val;
+                    return cp_add_float(cp, (float)(negate ? -v : v));
+                }
+                return 0;
+            case 'D':
+                if (tt == TOK_DOUBLE_LITERAL || tt == TOK_FLOAT_LITERAL || tt == TOK_INTEGER_LITERAL) {
+                    double v = (tt == TOK_INTEGER_LITERAL) ? (double)init_expr->data.leaf.value.int_val
+                                                            : init_expr->data.leaf.value.float_val;
+                    return cp_add_double(cp, negate ? -v : v);
+                }
+                return 0;
+            case 'Z':
+                if (tt == TOK_TRUE) return cp_add_integer(cp, 1);
+                if (tt == TOK_FALSE) return cp_add_integer(cp, 0);
+                return 0;
+            case 'C':
+                if (tt == TOK_CHAR_LITERAL && init_expr->data.leaf.value.str_val) {
+                    int32_t v = (unsigned char)init_expr->data.leaf.value.str_val[0];
+                    return cp_add_integer(cp, negate ? -v : v);
+                }
+                return 0;
+            default:  /* B, S, I */
+                if (tt == TOK_INTEGER_LITERAL) {
+                    int32_t v = (int32_t)init_expr->data.leaf.value.int_val;
+                    return cp_add_integer(cp, negate ? -v : v);
+                }
+                return 0;
+        }
+    }
+    return 0;
+}
+
 /* Defined in codegen_expr.c (declared there in codegen_internal.h) - builds
  * a JVM type descriptor from a type AST node (AST_PRIMITIVE_TYPE,
  * AST_CLASS_TYPE, AST_ARRAY_TYPE, ...). Reused here for a class-literal
@@ -1351,7 +1472,26 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
             cp_add_utf8(cg->cp, fg->signature);
         }
     }
-    
+
+    /* Pre-add ConstantValue attribute constant pool entries for eligible
+     * fields, caching each field's own resolved index on fg itself - the
+     * constant pool is serialized (written to the output buffer) BEFORE
+     * the fields section below, so any entry a field's ConstantValue
+     * needs must already exist by then, AND (unlike most of this file's
+     * other pre-added attributes) can't just be recomputed again in the
+     * field-writing loop: cp_add_string() does not deduplicate the way
+     * cp_add_integer()/cp_add_long()/etc. do, so a second call for the
+     * same String constant would add a NEW entry after the pool was
+     * already serialized, and the field would reference an index that
+     * was never actually written out. */
+    for (slist_t *node = cg->fields; node; node = node->next) {
+        field_gen_t *fg = (field_gen_t *)node->data;
+        fg->const_value_cp_index = field_gen_constant_value_index(cg->cp, fg);
+        if (fg->const_value_cp_index != 0) {
+            cp_add_utf8(cg->cp, "ConstantValue");
+        }
+    }
+
     /* Pre-add exception class names to constant pool for Exceptions attribute */
     for (slist_t *node = cg->methods; node; node = node->next) {
         method_info_gen_t *mi = (method_info_gen_t *)node->data;
@@ -1539,9 +1679,16 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         
         /* Count Signature attribute */
         if (fg->signature) field_attr_count++;
-        
+
+        /* Count ConstantValue attribute - use the index already resolved
+         * and cached in the pre-add pass above, NOT a fresh call to
+         * field_gen_constant_value_index() (see that pre-add pass's own
+         * comment for why: cp_add_string() doesn't dedupe). */
+        uint16_t const_value_index = fg->const_value_cp_index;
+        if (const_value_index != 0) field_attr_count++;
+
         write_be_u2(&p, field_attr_count);
-        
+
         /* Signature attribute (for field) */
         if (fg->signature) {
             uint16_t sig_attr_name = cp_add_utf8(cg->cp, "Signature");
@@ -1550,7 +1697,15 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
             write_be_u4(&p, 2);  /* attribute_length is always 2 */
             write_be_u2(&p, sig_index);
         }
-        
+
+        /* ConstantValue attribute (for field) */
+        if (const_value_index != 0) {
+            uint16_t cv_attr_name = cp_add_utf8(cg->cp, "ConstantValue");
+            write_be_u2(&p, cv_attr_name);
+            write_be_u4(&p, 2);  /* attribute_length is always 2 */
+            write_be_u2(&p, const_value_index);
+        }
+
         /* RuntimeVisibleAnnotations attribute (for field) */
         if (field_rt_annots > 0) {
             write_annotations_attribute(&p, cg->cp, fg->ast->annotations, true);

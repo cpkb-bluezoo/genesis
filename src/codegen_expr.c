@@ -487,12 +487,27 @@ bool emit_boxing(method_gen_t *mg, const_pool_t *cp, type_kind_t prim_kind)
     uint16_t methodref = cp_add_methodref(cp, wrapper_class, "valueOf", descriptor);
     bc_emit(mg->code, OP_INVOKESTATIC);
     bc_emit_u2(mg->code, methodref);
-    
-    /* Stack: primitive -> reference (adjusting for wide types) */
-    if (prim_kind == TYPE_LONG || prim_kind == TYPE_DOUBLE) {
-        mg_pop_typed(mg, 1);  /* Was 2 slots, now 1 */
-    }
-    
+
+    /* invokestatic here always consumes exactly the primitive value on top
+     * of the stack (1 or 2 words depending on category) and pushes the
+     * boxed wrapper reference (1 word) - pop the primitive's stackmap
+     * entry/entries and push a properly-typed wrapper-class replacement
+     * via mg_push_object(), rather than leaving the primitive's type
+     * lingering in mg->stackmap (or, for long/double, only correcting the
+     * word count via mg_pop_typed() without ever replacing the TYPE).
+     * Mirrors the equivalent fix already applied to emit_unboxing() above.
+     * Without this, a later branch (e.g. a ternary building a further
+     * call argument) while the boxed value still sits deeper on the
+     * stack computes its StackMapTable frame from the stale primitive
+     * type: VerifyError "Inconsistent stackmap frames ... Type
+     * 'java/lang/Integer' ... is not assignable to integer". Confirmed
+     * against gumdrop's own
+     * ContentTypeParser.processRawParamsFromSlices()'s
+     * "ranges.put(index, new int[] {..., quoted ? 1 : 0})" on a
+     * TreeMap<Integer, int[]>. */
+    mg_pop_typed(mg, (prim_kind == TYPE_LONG || prim_kind == TYPE_DOUBLE) ? 2 : 1);
+    mg_push_object(mg, wrapper_class);
+
     return true;
 }
 
@@ -6442,14 +6457,34 @@ static bool codegen_explicit_ctor_call(method_gen_t *mg, ast_node_t *expr, const
         }
     }
     
-    /* Push 'this' reference */
+    /* Push 'this' reference. Track it on mg->stackmap as
+     * uninitializedThis (matching what local[0] already holds at this
+     * point in a constructor, per JVMS 4.10.1.4/4.10.1.6), NOT the
+     * class's own real type - "this" genuinely isn't a fully
+     * constructed instance yet until the invokespecial below actually
+     * runs. Pushing the real type here "happens to work" for the
+     * common case, where nothing branches between this aload_0 and the
+     * invokespecial (so no explicit frame is ever recorded while this
+     * value is still on the stack) - but a constructor ARGUMENT that
+     * itself branches (e.g. a ternary, "this(..., masked ?
+     * generateMaskingKey() : null, ...)") forces an explicit frame to
+     * be recorded at its merge point, mid-argument-list, while "this"
+     * is still sitting deeper on the stack: the wrong (already-
+     * initialized) tracked type there produced a RECORDED frame that
+     * disagreed with the real verifier's own forward dataflow (which
+     * correctly still sees uninitializedThis) - VerifyError
+     * "Inconsistent stackmap frames ... Type uninitializedThis
+     * (current frame, stack[N]) is not assignable to
+     * '<TheClass>'". Confirmed against gumdrop's own
+     * WebSocketFrame(int,byte[],boolean,boolean)'s delegating
+     * this(...) call, whose masking-key argument is exactly such a
+     * ternary. stackmap_init_object() (called right after the
+     * invokespecial below) still correctly promotes local[0] from
+     * uninitializedThis to the real type once construction actually
+     * completes - this stack-side push was the only place still using
+     * the wrong type. */
     bc_emit(mg->code, OP_ALOAD_0);
-    /* Push with actual class type for stackmap */
-    if (mg->class_gen && mg->class_gen->internal_name) {
-        mg_push_object(mg, mg->class_gen->internal_name);
-    } else {
-        mg_push_null(mg);
-    }
+    mg_push_uninitialized_this(mg);
 
     /* An enum's own constructors are compiler-extended with a leading
      * (String name, int ordinal) pair (JVMS 4.1) - already occupying
@@ -9750,14 +9785,37 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         return true;
                     
                     case TOK_TILDE:
-                        /* Bitwise not: xor with -1 */
+                        /* Bitwise not: xor with -1. A `long` operand needs
+                         * a `long` -1 and LXOR, not an `int` -1 and IXOR -
+                         * int semantics on a long value corrupts the
+                         * operand's own type on the verifier's operand
+                         * stack: "Bad type on operand stack ... long_2nd
+                         * ... is not assignable to integer". Confirmed
+                         * against gumdrop's own
+                         * PacketNumberCodec.decode()'s "~pnMask", where
+                         * pnMask is declared long. Mirrors the
+                         * op_type==TYPE_LONG check every OTHER bitwise
+                         * operator (TOK_BITAND/TOK_BITOR/TOK_CARET/etc.)
+                         * already has, just missing here since this is a
+                         * unary (not binary) operator with its own
+                         * separate codegen path. */
                         if (!codegen_expr(mg, operand, cp)) {
                             return false;
                         }
-                        bc_emit(mg->code, OP_ICONST_M1);
-                        bc_emit(mg->code, OP_IXOR);
-                        mg_push(mg, 1);
-                        mg_pop_typed(mg, 1);
+                        if (get_expr_type_kind(mg, operand) == TYPE_LONG) {
+                            bc_emit(mg->code, OP_ICONST_M1);
+                            bc_emit(mg->code, OP_I2L);
+                            mg_push_long(mg);
+                            bc_emit(mg->code, OP_LXOR);
+                            mg_pop_typed(mg, 4);  /* both long operands (2 words each) */
+                            mg_push_long(mg);
+                        } else {
+                            bc_emit(mg->code, OP_ICONST_M1);
+                            mg_push_int(mg);
+                            bc_emit(mg->code, OP_IXOR);
+                            mg_pop_typed(mg, 2);  /* both int operands */
+                            mg_push_int(mg);
+                        }
                         return true;
                     
                     case TOK_INC:

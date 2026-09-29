@@ -2495,9 +2495,44 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * operand true" edge, keeping any local an operand
                  * assigns (like `x`) at its real, narrowed type within
                  * the body - see codegen_condition_and_chain_false_branch's
-                 * own comment for the full reasoning. */
+                 * own comment for the full reasoning.
+                 *
+                 * A condition that's the compile-time-constant literal
+                 * `true` (e.g. "while (true) { ... }") needs no runtime
+                 * test emitted at all - matching AST_FOR_STMT's own
+                 * already-correct handling of an EMPTY condition
+                 * ("for (;;)"), which likewise skips the test entirely.
+                 * Emitting the generic "push condition; ifeq loop_end"
+                 * pattern here instead creates a REAL, always-untaken
+                 * branch instruction that still unconditionally targets
+                 * loop_end - and when this loop is the method's own last
+                 * statement, with no `break` and every exit an internal
+                 * `return` (so nothing else follows in the bytecode
+                 * either), that ifeq's target coincides EXACTLY with the
+                 * method's final code length: a branch to an instruction
+                 * that doesn't exist, which is malformed regardless of
+                 * whether a stack map frame is recorded there (dropping
+                 * the "dangling" frame via
+                 * stackmap_prune_out_of_bounds_frame() doesn't fix
+                 * this - the live branch targeting nothing was always
+                 * the real problem). VerifyError "Expecting a stack map
+                 * frame at branch target N", N being exactly one byte
+                 * past the method's own final instruction. Confirmed
+                 * against gumdrop's own SocksServer.acquireRelay()'s
+                 * "while (true) { ... }" (every exit an internal
+                 * `return`, no `break`). */
+                ast_node_t *cond_unwrapped = condition;
+                while (cond_unwrapped && cond_unwrapped->type == AST_PARENTHESIZED &&
+                       cond_unwrapped->data.node.children) {
+                    cond_unwrapped = (ast_node_t *)cond_unwrapped->data.node.children->data;
+                }
+                bool condition_always_true = cond_unwrapped &&
+                    cond_unwrapped->type == AST_LITERAL &&
+                    cond_unwrapped->data.leaf.token_type == TOK_TRUE;
+
                 slist_t *false_positions = NULL;
-                if (!codegen_condition_and_chain_false_branch(mg, mg->cp, condition, &false_positions)) {
+                if (!condition_always_true &&
+                    !codegen_condition_and_chain_false_branch(mg, mg->cp, condition, &false_positions)) {
                     return false;
                 }
 
@@ -3961,6 +3996,47 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * whichever case preceded it in AST order. */
                     if (prev_case_terminates && switch_entry_state && mg->stackmap) {
                         stackmap_restore_state(mg->stackmap, switch_entry_state);
+                    } else if (switch_entry_state && mg->stackmap) {
+                        /* prev_case_terminates is false: this label is
+                         * reached via TWO edges at once - the lookupswitch's
+                         * own direct dispatch entry (which always arrives
+                         * with exactly switch_entry_state, since every case
+                         * label, default included, has its own table
+                         * entry) AND by falling through from the previous
+                         * case's body, which may have just assigned a local
+                         * declared inside it (in scope here per JLS 6.3,
+                         * but only actually DEFINITELY ASSIGNED along the
+                         * fallthrough edge). The ONE frame recorded below
+                         * at this single bytecode offset must be valid for
+                         * both incoming edges - leaving mg->stackmap
+                         * holding only the fallthrough edge's state (the
+                         * previous, unfixed behavior) wrongly recorded that
+                         * fallthrough-only local as definitely assigned
+                         * even along the direct-dispatch edge, where it
+                         * never was. Merge them with the same
+                         * merge_stackmap_states_into() used below for the
+                         * switch's own shared exit frame, instead of a
+                         * plain restore/overwrite. Confirmed via a minimal
+                         * repro (a case declaring a local and falling
+                         * through, sibling cases with plain breaks, no
+                         * default): VerifyError "Inconsistent stackmap
+                         * frames ... Type top ... is not assignable to
+                         * '<the fallthrough-only local's type>'" the
+                         * moment the lookupswitch dispatched directly into
+                         * that case label without going through the
+                         * fallthrough. Also confirmed against gumdrop's own
+                         * DeploymentDescriptorParser.endElement(), whose
+                         * `case HANDLER:` declares `HandlerDef handlerDef`
+                         * and falls through (no break) into `case
+                         * MAPPED_NAME:`. */
+                        stackmap_state_t *fallthrough_snap = stackmap_save_state(mg->stackmap);
+                        if (fallthrough_snap) {
+                            slist_t *merge_inputs = slist_new(switch_entry_state);
+                            slist_append(merge_inputs, fallthrough_snap);
+                            merge_stackmap_states_into(mg->stackmap, merge_inputs);
+                            slist_free(merge_inputs);
+                            stackmap_state_free(fallthrough_snap);
+                        }
                     }
 
                     /* Record frame at case label (branch target) */
@@ -3979,6 +4055,30 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         mg->code->code[case_offset_positions[sorted_idx] + 3] = offset & 0xFF;
                     }
                     
+                    /* Reset last_opcode before generating this case's own
+                     * statements - otherwise it's whatever an EARLIER,
+                     * unrelated case left behind (e.g. an earlier case
+                     * ending in `return;`), and if THIS case's own body
+                     * doesn't itself touch last_opcode (a plain assignment
+                     * or call statement doesn't), the stale terminal value
+                     * survives unnoticed. For the PHYSICALLY LAST case that
+                     * corrupts switch_terminates below into wrongly
+                     * reporting "the switch always terminates" even though
+                     * this, its real last case, falls straight off the end
+                     * - mg->last_opcode then reaches the enclosing method's
+                     * own implicit-return check (see codegen.c) still
+                     * showing that borrowed RETURN, so no synthetic return
+                     * gets appended: VerifyError "Control flow falls
+                     * through code end". Confirmed against gumdrop's own
+                     * HttpProtocolHandler.processRequestLine(), whose
+                     * first case ends in `return;` while its last (the
+                     * `default:` reached via HTTP_1_0's intentional
+                     * fall-through) ends in a plain field assignment.
+                     * Mirrors the same reset already done before every
+                     * other construct's own nested body (if/while/for/
+                     * synchronized) elsewhere in this file. */
+                    mg->last_opcode = 0;
+
                     /* Generate statements (skip case expression for non-default) */
                     slist_t *stmts = case_label->data.node.children;
                     if (!is_default && stmts) {
@@ -4897,6 +4997,14 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* Track if all catch blocks end with return/throw */
                 bool all_catches_return = true;
                 bool has_catch_clauses = (catch_clauses != NULL);
+
+                /* Whether the finally block itself (if any) unconditionally
+                 * returns/throws on its own - set inside the finally-handler
+                 * segment below (where it's first computed to decide
+                 * whether to re-throw), and read again afterward by the
+                 * "does this whole try statement terminate" check near the
+                 * end of this case, which needs it too. */
+                bool finally_ends_with_return = false;
                 
                 /* For catch path locals tracking, we use try_catch_saved_locals which is
                  * the state BEFORE the try block. This ensures that locals declared inside
@@ -5366,7 +5474,6 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * threw whenever the finally block's last statement
                      * was a synchronized block (or anything else with its
                      * own trailing exception-handler bytecode). */
-                    bool finally_ends_with_return = false;
                     {
                         uint8_t last_op = mg->last_opcode;
                         if (last_op == OP_RETURN || last_op == OP_IRETURN ||
@@ -5504,10 +5611,31 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     mg_restore_locals_count(mg, try_catch_saved_locals);
                 }
                 
-                /* Update last_opcode based on whether all paths terminated
-                 * If try block returns and all catch blocks return, the try-catch terminates
-                 * Otherwise, there's a path that reaches the end */
-                if (try_ends_with_return && all_catches_return && has_catch_clauses) {
+                /* Update last_opcode based on whether all paths terminated.
+                 * If try block returns and all catch blocks return, the
+                 * try-catch(-finally) terminates. Requiring has_catch_clauses
+                 * on top of that (the previous condition) wrongly excluded a
+                 * plain try-finally with NO catch clauses at all: there,
+                 * all_catches_return stays at its vacuous default (true,
+                 * never touched since the catch loop never runs), so
+                 * try_ends_with_return alone already correctly captures
+                 * whether the whole construct terminates - the exception
+                 * path (via finally_handler_pc, whenever a finally clause
+                 * exists) always itself terminates regardless of catches,
+                 * either because the finally block returns/throws on its
+                 * own or via the explicit re-throw right after it. Without
+                 * this, a try-finally (no catch) whose try body always
+                 * returns wrongly reset mg->last_opcode to 0 here, making
+                 * an ENCLOSING try-catch's own "does my try body end with
+                 * return" check (this exact same logic, one level up) think
+                 * its body could fall through - appending a dead, frame-
+                 * less "normal completion" goto right after the inner
+                 * try-finally's own final athrow: VerifyError "Expecting a
+                 * stack map frame". Confirmed against gumdrop's own
+                 * HttpProtocolHandler.encodeHeaders(): an outer try-catch
+                 * wrapping an inner try-finally whose try body ends with
+                 * `return encoded;`. */
+                if (try_ends_with_return && (!has_catch_clauses || all_catches_return)) {
                     /* All paths return - set last_opcode to indicate termination
                      * Use IRETURN as a marker (the actual return type doesn't matter
                      * for the check in codegen.c) */
