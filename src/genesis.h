@@ -836,6 +836,20 @@ typedef struct semantic
                                   * load_class_from_source; guards against a
                                   * package scan walking back into a source
                                   * file that is itself still being parsed. */
+    hashtable_t *scanned_packages;  /* Packages whose sourcepath directories
+                                  * have been scanned to the end (see
+                                  * scan_package_for_type). */
+    hashtable_t *sourcepath_misses; /* Qualified names for which no source
+                                  * file exists on the sourcepath (see
+                                  * load_class_from_source_impl). */
+    hashtable_t *loading_external_names; /* Qualified names currently mid-load
+                                  * via load_external_class. Deliberately a
+                                  * separate table from loading_names:
+                                  * load_external_class calls
+                                  * load_class_from_source for the SAME name,
+                                  * so one shared table made the inner call
+                                  * see the outer call's own marker and give
+                                  * up at once. */
 } semantic_t;
 
 /* Resolve an annotation's simple name to its fully qualified name using the

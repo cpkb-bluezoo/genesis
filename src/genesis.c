@@ -30,6 +30,7 @@
 #include "encoding.h"
 #include "jarwriter.h"
 
+#include <limits.h>    /* For PATH_MAX */
 #include <sys/stat.h>  /* For mkdir() */
 #include <pthread.h>   /* For parallel compilation */
 
@@ -338,6 +339,21 @@ static bool output_class(class_gen_t *cg, const char *qualified_name,
 }
 
 /**
+ * Canonical form of a source path, used as the key for "already compiled
+ * in this session": the same file can be named on the command line one
+ * way (relative, or through a symlink) and reached through a -sourcepath
+ * entry another way. Caller frees.
+ */
+static char *canonical_source_path(const char *source_path)
+{
+    char resolved[PATH_MAX];
+    if (realpath(source_path, resolved)) {
+        return strdup(resolved);
+    }
+    return strdup(source_path);
+}
+
+/**
  * Check if a source file has already been compiled in this session.
  */
 bool is_source_compiled(const char *source_path)
@@ -345,7 +361,28 @@ bool is_source_compiled(const char *source_path)
     if (!g_compiled_sources || !source_path) {
         return false;
     }
-    return hashtable_lookup(g_compiled_sources, source_path) != NULL;
+    char *key = canonical_source_path(source_path);
+    bool compiled = key && hashtable_lookup(g_compiled_sources, key) != NULL;
+    free(key);
+    return compiled;
+}
+
+/**
+ * Record a source file as compiled (or being compiled) in this session.
+ */
+static void mark_source_compiled(const char *source_path)
+{
+    if (!source_path) {
+        return;
+    }
+    if (!g_compiled_sources) {
+        g_compiled_sources = hashtable_new();
+    }
+    char *key = canonical_source_path(source_path);
+    if (key) {
+        hashtable_insert(g_compiled_sources, key, (void *)1);
+        free(key);
+    }
 }
 
 /**
@@ -364,10 +401,7 @@ bool compile_dependency(const char *source_path)
     }
     
     /* Mark as compiled before actually compiling to handle circular deps */
-    if (!g_compiled_sources) {
-        g_compiled_sources = hashtable_new();
-    }
-    hashtable_insert(g_compiled_sources, source_path, (void *)1);
+    mark_source_compiled(source_path);
     
     /* Create source file and compile */
     source_file_t *src = source_file_new(source_path);
@@ -1587,67 +1621,32 @@ static void *codegen_phase_worker(void *arg)
 }
 
 /**
- * Compile all source files using parallel compilation.
- * 
- * Three-phase approach:
+ * Compile one batch of source files through the full pipeline.
+ *
  *   Phase 1: Parse all files in parallel (no shared state)
- *   Phase 2: Resolve types (uses thread-safe classpath cache)
- *   Phase 3: Analyze and codegen in parallel (thread-local semantic_t)
+ *   Phase 2-4: Register types, enter members, resolve types (serial)
+ *   Phase 5a: Semantic analysis (serial)
+ *   Phase 5b: Code generation in parallel
+ *
+ * Returns the number of errors. With dependencies_out set, the batch
+ * stops after semantic analysis whenever that analysis had to load a
+ * source file through -sourcepath that is not yet part of the
+ * compilation: it then returns -1, prints nothing, and *dependencies_out
+ * holds the paths (malloc'd strings, caller frees) of those files, for
+ * the caller to add and start over.
  */
-static int compile_parallel(compiler_options_t *opts, int thread_count)
+static int compile_batch(compiler_options_t *opts, int thread_count,
+                         char **filenames, int file_count,
+                         slist_t **dependencies_out)
 {
-    if (!opts || !opts->source_files) {
-        fprintf(stderr, "error: no source files\n");
-        return 1;
-    }
-    
-    /* Count source files and build array */
-    int file_count = 0;
-    for (slist_t *list = opts->source_files; list; list = list->next) {
-        file_count++;
-    }
-    
-    char **filenames = malloc(file_count * sizeof(char *));
-    if (!filenames) {
-        fprintf(stderr, "error: out of memory\n");
-        return 1;
-    }
-    
     int i = 0;
-    for (slist_t *list = opts->source_files; list; list = list->next) {
-        filenames[i++] = (char *)list->data;
-    }
-    
-    /* Initialize classpath (thread-safe cache) */
-    if (!init_classpath(opts)) {
-        free(filenames);
-        return 1;
-    }
-    
-    /* Set up global state */
-    g_opts = opts;
-    g_compiled_sources = hashtable_new();
-    
-    /* Create JAR writer if outputting to JAR */
-    if (opts->output_jar) {
-        g_jar_writer = jar_writer_new(opts->output_jar, opts->main_class);
-        if (!g_jar_writer) {
-            fprintf(stderr, "error: cannot create JAR file: %s\n", opts->output_jar);
-            hashtable_free(g_compiled_sources);
-            g_compiled_sources = NULL;
-            g_opts = NULL;
-            free(filenames);
-            free_classpath();
-            return 1;
-        }
-        if (opts->verbose) {
-            printf("Creating JAR: %s\n", opts->output_jar);
-        }
-    }
-    
     int source_version = classfile_java_version(
         classfile_version_from_string(opts->source_version));
-    
+
+    if (dependencies_out) {
+        *dependencies_out = NULL;
+    }
+
     if (opts->verbose) {
         printf("Parallel compilation with %d threads for %d files\n", 
                thread_count, file_count);
@@ -1657,8 +1656,6 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
     parse_result_t *parse_results = calloc(file_count, sizeof(parse_result_t));
     if (!parse_results) {
         fprintf(stderr, "error: out of memory\n");
-        free(filenames);
-        free_classpath();
         return 1;
     }
     
@@ -1735,8 +1732,6 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
         fprintf(stderr, "error: failed to create type registry\n");
         free(parse_results);
         free(threads);
-        free(filenames);
-        free_classpath();
         return 1;
     }
     
@@ -1861,6 +1856,8 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
     }
     
     int sem_errors = 0;
+    bool *sem_failed = calloc(file_count > 0 ? file_count : 1, sizeof(bool));
+    slist_t *new_dependencies = NULL;
     for (i = 0; i < file_count; i++) {
         parse_result_t *pr = &parse_results[i];
         
@@ -1892,24 +1889,73 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
         
         /* Type names were already qualified in Phase 2b */
         
-        /* Semantic analysis */
+        /* Semantic analysis. Diagnostics are printed only once it is known
+         * that this batch is the final one (see below). */
         bool sem_ok = semantic_analyze(sem, pr->ast, pr->source);
-        
+        sem_failed[i] = !sem_ok;
+        pr->sem = sem;
+
+        /* Source files this analyzer loaded through -sourcepath that are
+         * not already part of the compilation */
+        if (dependencies_out) {
+            for (slist_t *dep = sem->source_dependencies; dep; dep = dep->next) {
+                const char *dep_path = (const char *)dep->data;
+                if (!dep_path || is_source_compiled(dep_path)) {
+                    continue;
+                }
+                mark_source_compiled(dep_path);
+                char *copy = strdup(dep_path);
+                if (!new_dependencies) {
+                    new_dependencies = slist_new(copy);
+                } else {
+                    slist_append(new_dependencies, copy);
+                }
+            }
+        }
+    }
+
+    /* Anything loaded through -sourcepath means this batch is incomplete:
+     * hand the newly found files back so the caller can restart with them
+     * included, and say nothing about this batch - a symbol that came in
+     * from the sourcepath loader is a second-class copy (members entered by
+     * a separate, less complete path), and diagnostics based on it are not
+     * trustworthy. The restarted batch has every such class in the shared
+     * registry instead, where each file is analysed exactly as it is when
+     * named on the command line. */
+    if (new_dependencies) {
+        for (i = 0; i < file_count; i++) {
+            if (parse_results[i].sem) {
+                semantic_free(parse_results[i].sem);
+                parse_results[i].sem = NULL;
+            }
+            free(parse_results[i].error_msg);
+        }
+        free(sem_failed);
+        free(parse_results);
+        free(threads);
+        pthread_attr_destroy(&attr);
+        type_registry_free(registry);
+        *dependencies_out = new_dependencies;
+        return -1;
+    }
+
+    for (i = 0; i < file_count; i++) {
+        parse_result_t *pr = &parse_results[i];
+        semantic_t *sem = pr->sem;
+        if (!sem) {
+            continue;
+        }
         if (sem->error_count > 0 || sem->warning_count > 0) {
             semantic_print_diagnostics(sem);
         }
-        
-        if (!sem_ok) {
+        if (sem_failed[i]) {
             fprintf(stderr, "%d error(s) in %s\n", sem->error_count, pr->filename);
             sem_errors++;
             semantic_free(sem);
             pr->sem = NULL;
-            continue;
         }
-        
-        /* Store semantic analyzer for codegen phase */
-        pr->sem = sem;
     }
+    free(sem_failed);
     
     if (opts->verbose) {
         printf("Phase 5a complete: %d semantic errors\n", sem_errors);
@@ -1956,13 +2002,138 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
     counter_destroy(&codegen_state.next_index);
     counter_destroy(&codegen_state.error_count);
     int total_errors = parse_errors + sem_errors + codegen_errors;
-    
+
     if (opts->verbose) {
         printf("Phase 5b complete: %d codegen errors\n", codegen_errors);
         printf("Total: %d parse + %d semantic + %d codegen = %d errors\n",
                parse_errors, sem_errors, codegen_errors, total_errors);
     }
     
+
+    /* Cleanup */
+    for (i = 0; i < file_count; i++) {
+        free(parse_results[i].error_msg);
+        /* Don't free source/ast - may be referenced */
+    }
+    free(parse_results);
+    
+    /* Free type registry */
+    if (registry) {
+        type_registry_free(registry);
+    }
+
+    return total_errors;
+}
+
+/**
+ * Compile all source files named on the command line, then whatever they
+ * pulled in through -sourcepath.
+ * 
+ * Three-phase approach:
+ *   Phase 1: Parse all files in parallel (no shared state)
+ *   Phase 2: Resolve types (uses thread-safe classpath cache)
+ *   Phase 3: Analyze and codegen in parallel (thread-local semantic_t)
+ */
+static int compile_parallel(compiler_options_t *opts, int thread_count)
+{
+    if (!opts || !opts->source_files) {
+        fprintf(stderr, "error: no source files\n");
+        return 1;
+    }
+    
+    /* Count source files and build array */
+    int file_count = 0;
+    for (slist_t *list = opts->source_files; list; list = list->next) {
+        file_count++;
+    }
+    
+    char **filenames = malloc(file_count * sizeof(char *));
+    if (!filenames) {
+        fprintf(stderr, "error: out of memory\n");
+        return 1;
+    }
+    
+    int i = 0;
+    for (slist_t *list = opts->source_files; list; list = list->next) {
+        filenames[i++] = (char *)list->data;
+    }
+    
+    /* Initialize classpath (thread-safe cache) */
+    if (!init_classpath(opts)) {
+        free(filenames);
+        return 1;
+    }
+    
+    /* Set up global state */
+    g_opts = opts;
+    g_compiled_sources = hashtable_new();
+    
+    /* Create JAR writer if outputting to JAR */
+    if (opts->output_jar) {
+        g_jar_writer = jar_writer_new(opts->output_jar, opts->main_class);
+        if (!g_jar_writer) {
+            fprintf(stderr, "error: cannot create JAR file: %s\n", opts->output_jar);
+            hashtable_free(g_compiled_sources);
+            g_compiled_sources = NULL;
+            g_opts = NULL;
+            free(filenames);
+            free_classpath();
+            return 1;
+        }
+        if (opts->verbose) {
+            printf("Creating JAR: %s\n", opts->output_jar);
+        }
+    }
+    
+    /* The files named on the command line, plus - when a -sourcepath is
+     * given - whatever they turn out to need from it. javac compiles such
+     * implicitly loaded sources to class files too; the classes generated
+     * here refer to them, so without that the output cannot run on its own
+     * (NoClassDefFoundError).
+     *
+     * Rather than compiling those files afterwards one at a time through
+     * compile_file() (the old single-file driver: a private analyzer per
+     * file with no shared registry, and never the recipient of the fixes
+     * made to this pipeline), the batch is restarted with them added, so
+     * that every class involved is analysed through the same path as one
+     * named on the command line. The restart repeats only when something
+     * new was found, so an ordinary build with nothing to pull in runs
+     * exactly once. */
+    for (i = 0; i < file_count; i++) {
+        mark_source_compiled(filenames[i]);
+    }
+    int total_errors;
+    for (;;) {
+        slist_t *dependencies = NULL;
+        total_errors = compile_batch(opts, thread_count, filenames, file_count,
+                                     opts->sourcepath ? &dependencies : NULL);
+        if (total_errors >= 0) {
+            break;
+        }
+        int dep_count = 0;
+        for (slist_t *dep = dependencies; dep; dep = dep->next) {
+            dep_count++;
+        }
+        char **grown = realloc(filenames, (file_count + dep_count) * sizeof(char *));
+        if (!grown) {
+            fprintf(stderr, "error: out of memory\n");
+            slist_free_full(dependencies, free);
+            total_errors = 1;
+            break;
+        }
+        filenames = grown;
+        for (slist_t *dep = dependencies; dep; dep = dep->next) {
+            /* Ownership of the string moves to filenames; it is never freed
+             * (like the command-line names, which live in opts). */
+            filenames[file_count++] = (char *)dep->data;
+        }
+        slist_free(dependencies);
+        if (opts->verbose) {
+            printf("Restarting with %d source file(s) loaded through -sourcepath (%d files)\n",
+                   dep_count, file_count);
+        }
+    }
+
     /* Finalize JAR if in JAR output mode */
     if (g_jar_writer) {
         if (total_errors > 0) {
@@ -1981,18 +2152,6 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
             }
         }
         g_jar_writer = NULL;
-    }
-    
-    /* Cleanup */
-    for (i = 0; i < file_count; i++) {
-        free(parse_results[i].error_msg);
-        /* Don't free source/ast - may be referenced */
-    }
-    free(parse_results);
-    
-    /* Free type registry */
-    if (registry) {
-        type_registry_free(registry);
     }
     
     hashtable_free(g_compiled_sources);

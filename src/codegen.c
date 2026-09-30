@@ -2396,6 +2396,10 @@ static bool codegen_interface_method(class_gen_t *cg, ast_node_t *method_decl)
     /* Return type is stored in data.node.extra */
     ast_node_t *return_type = (ast_node_t *)method_decl->data.node.extra;
     
+    /* Set when a parameter is declared "Type... name" - see the
+     * ACC_VARARGS handling after the method_info is created below. */
+    bool has_varargs = false;
+
     /* Parameters are children */
     slist_t *children = method_decl->data.node.children;
     while (children) {
@@ -2430,6 +2434,7 @@ static bool codegen_interface_method(class_gen_t *cg, ast_node_t *method_decl)
                     strcpy(array_desc + 1, param_desc);
                     free(param_desc);
                     param_desc = array_desc;
+                    has_varargs = true;
                 }
                 string_append(desc, param_desc);
                 free(param_desc);
@@ -2459,6 +2464,26 @@ static bool codegen_interface_method(class_gen_t *cg, ast_node_t *method_decl)
     /* Interface methods are implicitly public abstract 
      * Convert MOD_ flags to ACC_ flags before adding ACC_PUBLIC and ACC_ABSTRACT */
     mi->access_flags = mods_to_access_flags(method_decl->data.node.flags) | ACC_PUBLIC | ACC_ABSTRACT;
+    /* ACC_VARARGS. The varargs marker lives on the PARAMETER node, not in
+     * the method's own modifier flags, so mods_to_access_flags() above
+     * never sees it. codegen_method() adds the flag separately for a
+     * method with a body; this bodiless path never did, so an interface
+     * varargs method reached its class file as a plain array-parameter
+     * method. Harmless within one compile (callers see the source
+     * declaration), but a LATER compile that loads this interface back
+     * from its class file (-cp, as every multi-module build does) then
+     * finds no variable-arity candidate at all: a call passing the
+     * arguments individually matches nothing by arity, overload
+     * resolution returns no method, and the call site is built from a
+     * guess. With gumdrop's RedisSession.command(ArrayResultHandler,
+     * String, String...) and command(ArrayResultHandler, String,
+     * byte[]...), the guess for command(h, "CONFIG", "GET", "maxmemory")
+     * was the byte[]... overload with the Strings pushed unwrapped -
+     * "VerifyError: Bad type on operand stack" in
+     * RedisClientProtocolHandlerTest. */
+    if (has_varargs) {
+        mi->access_flags |= ACC_VARARGS;
+    }
     mi->name_index = cp_add_utf8(cg->cp, name);
     mi->descriptor_index = cp_add_utf8(cg->cp, desc->str);
     mi->code = NULL;  /* Abstract methods have no Code attribute */
@@ -2514,6 +2539,10 @@ static bool codegen_abstract_method(class_gen_t *cg, ast_node_t *method_decl)
     /* Return type is stored in data.node.extra */
     ast_node_t *return_type = (ast_node_t *)method_decl->data.node.extra;
     
+    /* Set when a parameter is declared "Type... name" - see the
+     * ACC_VARARGS handling after the method_info is created below. */
+    bool has_varargs = false;
+
     /* Parameters are children */
     slist_t *children = method_decl->data.node.children;
     while (children) {
@@ -2547,6 +2576,7 @@ static bool codegen_abstract_method(class_gen_t *cg, ast_node_t *method_decl)
                     strcpy(array_desc + 1, param_desc);
                     free(param_desc);
                     param_desc = array_desc;
+                    has_varargs = true;
                 }
                 string_append(desc, param_desc);
                 free(param_desc);
@@ -2579,6 +2609,12 @@ static bool codegen_abstract_method(class_gen_t *cg, ast_node_t *method_decl)
     mi->access_flags = mods_to_access_flags(method_decl->data.node.flags);
     if (method_decl->data.node.flags & MOD_ABSTRACT) {
         mi->access_flags |= ACC_ABSTRACT;
+    }
+    /* ACC_VARARGS - see codegen_interface_method()'s identical check for
+     * why a bodiless method needs this set here. Covers abstract class
+     * methods and native methods. */
+    if (has_varargs) {
+        mi->access_flags |= ACC_VARARGS;
     }
     mi->name_index = cp_add_utf8(cg->cp, name);
     mi->descriptor_index = cp_add_utf8(cg->cp, desc->str);
@@ -3198,6 +3234,18 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
         mi->access_flags |= ACC_VARARGS;
     }
     
+    /* An enum's constructor is implicitly private (JLS 8.9.2) whatever the
+     * source spells out - "Color(int rgb) { ... }" with no modifier is a
+     * private constructor, not a package-private one. The access flags
+     * above come straight from the declared modifiers, so such a
+     * constructor used to reach the class file package-private. (The
+     * default constructor generated for an enum that declares none is
+     * built elsewhere and was already private.) */
+    if (is_constructor && cg->class_sym && cg->class_sym->kind == SYM_ENUM) {
+        mi->access_flags &= ~(ACC_PUBLIC | ACC_PROTECTED);
+        mi->access_flags |= ACC_PRIVATE;
+    }
+
     /* Handle constructor specially - reuse is_constructor from earlier */
     if (is_constructor) {
         mi->name_index = cp_add_utf8(cg->cp, "<init>");
@@ -5861,7 +5909,16 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                  * and whose RSA_PKCS1_* constants pass literal "null" for
                  * it. Enums practically never overload their constructor,
                  * but match by parameter count regardless, for safety. */
+                /* A fixed-arity constructor of exactly this arity wins; failing
+                 * that, a VARARGS constructor whose fixed parameters this
+                 * constant's arguments cover. Varargs constructors used to be
+                 * matched by exact arity like any other and their arguments
+                 * pushed as written, so "A("a"), B" against "E(String...
+                 * labels)" passed a bare String (or nothing at all) where the
+                 * constructor takes a String[] - "VerifyError: Bad type on
+                 * operand stack" in the enum's static initializer. */
                 symbol_t *enum_ctor = NULL;
+                symbol_t *enum_varargs_ctor = NULL;
                 if (cg->class_sym && cg->class_sym->data.class_data.members &&
                     cg->class_sym->data.class_data.members->symbols) {
                     hashtable_t *mht = cg->class_sym->data.class_data.members->symbols;
@@ -5869,15 +5926,44 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         hashtable_entry_t *ment = mht->buckets[mi];
                         while (ment && !enum_ctor) {
                             symbol_t *msym = (symbol_t *)ment->value;
-                            if (msym && msym->kind == SYM_CONSTRUCTOR &&
-                                (int)slist_length(msym->data.method_data.parameters) == decl_arg_count) {
-                                enum_ctor = msym;
+                            if (msym && msym->kind == SYM_CONSTRUCTOR) {
+                                int nparams = (int)slist_length(msym->data.method_data.parameters);
+                                if (msym->modifiers & MOD_VARARGS) {
+                                    if (nparams > 0 && decl_arg_count >= nparams - 1 &&
+                                        !enum_varargs_ctor) {
+                                        enum_varargs_ctor = msym;
+                                    }
+                                } else if (nparams == decl_arg_count) {
+                                    enum_ctor = msym;
+                                }
                             }
                             ment = ment->next;
                         }
                     }
                 }
+                if (!enum_ctor) {
+                    enum_ctor = enum_varargs_ctor;
+                }
                 slist_t *ctor_param_node = enum_ctor ? enum_ctor->data.method_data.parameters : NULL;
+
+                /* For a varargs constructor: how many leading arguments map
+                 * to fixed parameters, and the varargs parameter itself. */
+                bool ctor_is_varargs = enum_ctor && (enum_ctor->modifiers & MOD_VARARGS) &&
+                                       enum_ctor->data.method_data.parameters;
+                int ctor_fixed_count = 0;
+                symbol_t *ctor_varargs_param = NULL;
+                if (ctor_is_varargs) {
+                    for (slist_t *pn = enum_ctor->data.method_data.parameters; pn; pn = pn->next) {
+                        ctor_fixed_count++;
+                        ctor_varargs_param = (symbol_t *)pn->data;
+                    }
+                    ctor_fixed_count--;
+                    if (!ctor_varargs_param || !ctor_varargs_param->type) {
+                        ctor_is_varargs = false;
+                    }
+                }
+                slist_t *varargs_nodes = NULL;
+                int user_arg_index = 0;
 
                 /* Generate constructor arguments from enum constant children.
                  * Skip method/field/initializer declarations - those are for enum
@@ -5893,6 +5979,21 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         args = args->next;
                         continue;
                     }
+                    /* Arguments at and beyond a varargs constructor's
+                     * varargs position are collected and turned into one
+                     * array after the loop. */
+                    if (ctor_is_varargs && user_arg_index >= ctor_fixed_count) {
+                        if (!varargs_nodes) {
+                            varargs_nodes = slist_new(arg);
+                        } else {
+                            slist_append(varargs_nodes, arg);
+                        }
+                        user_arg_index++;
+                        args = args->next;
+                        continue;
+                    }
+                    user_arg_index++;
+
                     /* Generate the argument expression */
                     codegen_expr(mg, arg, cg->cp);
                     arg_count++;
@@ -5916,6 +6017,17 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         free(arg_desc);
                     }
                     args = args->next;
+                }
+                if (ctor_is_varargs) {
+                    /* One array for the varargs position - built from the
+                     * collected arguments, passed straight through if the
+                     * single argument already is that array, or empty. */
+                    codegen_varargs_tail(mg, cg->cp, ctor_varargs_param, varargs_nodes, false);
+                    arg_count++;
+                    char *va_desc = type_to_descriptor(ctor_varargs_param->type);
+                    string_append(ctor_desc, va_desc);
+                    free(va_desc);
+                    slist_free(varargs_nodes);
                 }
                 string_append(ctor_desc, ")V");
                 

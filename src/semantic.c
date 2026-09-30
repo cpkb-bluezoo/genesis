@@ -348,6 +348,45 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
         }
     }
 
+    /* An interface's registry stub arrives here already holding one
+     * placeholder per method, made at type-registration time
+     * (populate_interface_stub_methods): name and modifiers only, NO
+     * parameters, filed under the key "name()". The loop below enters the
+     * real signature under its own key ("name(String)"), so the
+     * placeholder for a method that does take parameters used to stay
+     * behind as a phantom zero-parameter overload. A call from another
+     * file passing no arguments to "int pieces(byte[]... parts)" matched
+     * the phantom exactly and was compiled as "pieces:()I" -
+     * NoSuchMethodError at runtime. Drop each such placeholder before the
+     * real method goes in. */
+    if (sym->kind == SYM_INTERFACE) {
+        for (slist_t *child = decl->data.node.children; child; child = child->next) {
+            ast_node_t *member = (ast_node_t *)child->data;
+            if (!member || member->type != AST_METHOD_DECL || !member->data.node.name) {
+                continue;
+            }
+            char stub_key[512];
+            snprintf(stub_key, sizeof(stub_key), "%s()", member->data.node.name);
+            symbol_t *stub = (symbol_t *)hashtable_lookup(
+                sym->data.class_data.members->symbols, stub_key);
+            if (!stub || stub->kind != SYM_METHOD || !stub->ast ||
+                stub->data.method_data.parameters || stub->data.method_data.param_count != 0) {
+                continue;
+            }
+            bool declares_params = false;
+            for (slist_t *pc = stub->ast->data.node.children; pc; pc = pc->next) {
+                ast_node_t *ch = (ast_node_t *)pc->data;
+                if (ch && ch->type == AST_PARAMETER) {
+                    declares_params = true;
+                    break;
+                }
+            }
+            if (declares_params) {
+                hashtable_remove(sym->data.class_data.members->symbols, stub_key);
+            }
+        }
+    }
+
     /* Walk AST children */
     int child_count = 0;
     for (slist_t *c = decl->data.node.children; c; c = c->next) child_count++;
@@ -572,8 +611,18 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
                                          * element type instead of an array, breaking
                                          * array-to-array (pass-through) argument
                                          * matching against it. */
-                                        if (param_sym->type && (param_sym->modifiers & MOD_VARARGS) &&
-                                            param_sym->type->kind != TYPE_ARRAY) {
+                                        /* Always exactly one extra dimension,
+                                         * even when the written element type is
+                                         * itself an array ("byte[]... parts" is
+                                         * byte[][]): the type was resolved fresh
+                                         * just above, so this cannot double-wrap.
+                                         * Skipping the wrap for an array element
+                                         * type (as this used to) left the
+                                         * parameter typed "byte[]", and a call
+                                         * from another file then packed its
+                                         * byte[] arguments into a byte[] with
+                                         * BASTORE - a VerifyError. */
+                                        if (param_sym->type && (param_sym->modifiers & MOD_VARARGS)) {
                                             param_sym->type = type_new_array(param_sym->type, 1);
                                         }
                                     }
@@ -1766,9 +1815,11 @@ static void resolve_types_for_symbol(symbol_t *sym, type_registry_t *reg,
                 sym->data.method_data.unresolved_param_types[i]) {
                 unresolved_type_t *ut = sym->data.method_data.unresolved_param_types[i];
                 param->type = resolve_unresolved_type_full_for_method(ut, reg, cp, context, sym);
-                /* Varargs parameter type needs to be array */
-                if ((param->modifiers & MOD_VARARGS) && param->type && 
-                    param->type->kind != TYPE_ARRAY) {
+                /* Varargs parameter type needs one more array dimension,
+                 * whatever the element type (see enter_members_for_type).
+                 * This only runs when param->type was NULL, so it cannot
+                 * double-wrap. */
+                if ((param->modifiers & MOD_VARARGS) && param->type) {
                     param->type = type_new_array(param->type, 1);
                 }
             }
@@ -3399,44 +3450,39 @@ static bool method_ast_matches_signature(ast_node_t *method_ast, symbol_t *paren
                 ast_name ? ast_name : "(null)", ast_dims, sym_type->kind);
         }
         
-        /* Handle arrays (including varargs parameters stored as array types) */
+        /* Handle arrays (including varargs parameters stored as array types).
+         *
+         * A varargs parameter's AST type node is only its ELEMENT type, so
+         * "int... v" and "byte[]... parts" count one more dimension than
+         * the node itself shows. An array type_t is either flat
+         * (dimensions=N over a scalar) or nested (an array whose element
+         * is an array), so the symbol side adds up both. */
         if (sym_type->kind == TYPE_ARRAY) {
             bool sym_varargs = (sym_param->modifiers & MOD_VARARGS) != 0;
-            if (sym_varargs && ast_dims == 0) {
-                type_t *elem = sym_type;
-                while (elem && elem->kind == TYPE_ARRAY) {
-                    elem = elem->data.array_type.element_type;
-                }
-                const char *sym_name = NULL;
-                if (elem && elem->kind == TYPE_CLASS) {
-                    sym_name = elem->data.class_type.name;
-                }
-                if (!ast_name || !sym_name) {
-                    return false;
-                }
-                const char *ast_simple = strrchr(ast_name, '.');
-                ast_simple = ast_simple ? ast_simple + 1 : ast_name;
-                const char *sym_simple = strrchr(sym_name, '.');
-                sym_simple = sym_simple ? sym_simple + 1 : sym_name;
-                if (strcmp(ast_simple, sym_simple) != 0) {
-                    return false;
-                }
-                ast_p = ast_p->next;
-                sym_p = sym_p->next;
-                continue;
-            }
-            if (ast_dims == 0) return false;  /* AST not array but sym is */
-            
-            /* Get element type for comparison */
+            bool ast_varargs = (ast_param->data.node.flags & MOD_VARARGS) != 0;
+            int ast_total_dims = ast_dims + (ast_varargs ? 1 : 0);
+
             type_t *elem = sym_type;
             int sym_dims = 0;
             while (elem && elem->kind == TYPE_ARRAY) {
-                sym_dims++;
+                int d = elem->data.array_type.dimensions;
+                sym_dims += d > 0 ? d : 1;
                 elem = elem->data.array_type.element_type;
             }
-            if (ast_dims != sym_dims) return false;
-            
-            /* Compare element types - handle both primitives and classes */
+
+            /* The second alternative tolerates a varargs symbol whose type
+             * was recorded without its extra dimension. */
+            if (ast_total_dims != sym_dims &&
+                !(sym_varargs && ast_varargs && ast_dims == sym_dims)) {
+                return false;
+            }
+
+            /* Compare element types - classes and primitives. Only the
+             * class case used to be handled for a varargs parameter, so an
+             * "@Override" of a method declared in another file with a
+             * PRIMITIVE varargs parameter ("int... values") was rejected
+             * ("does not override a method from its superclass or
+             * interfaces"). */
             const char *sym_name = NULL;
             if (elem) {
                 switch (elem->kind) {
@@ -3454,15 +3500,27 @@ static bool method_ast_matches_signature(ast_node_t *method_ast, symbol_t *paren
                     default: break;
                 }
             }
+            if (elem && elem->kind == TYPE_TYPEVAR) {
+                /* Type variable element - as for a non-array type
+                 * variable below, accept any class type as matching */
+                ast_p = ast_p->next;
+                sym_p = sym_p->next;
+                continue;
+            }
             if (!ast_name || !sym_name) return false;
-            
+
             /* Handle qualified vs simple names */
             const char *ast_simple = strrchr(ast_name, '.');
             ast_simple = ast_simple ? ast_simple + 1 : ast_name;
             const char *sym_simple = strrchr(sym_name, '.');
             sym_simple = sym_simple ? sym_simple + 1 : sym_name;
-            
-            if (strcmp(ast_simple, sym_simple) != 0) return false;
+
+            if (strcmp(ast_simple, sym_simple) != 0) {
+                const char *sym_leaf = strchr(sym_simple, '$');
+                if (!sym_leaf || strcmp(ast_simple, sym_leaf + 1) != 0) {
+                    return false;
+                }
+            }
         } else if (ast_dims > 0) {
             return false;  /* AST is array but sym isn't */
         } else if (sym_type->kind == TYPE_CLASS) {
@@ -4580,6 +4638,9 @@ void semantic_free(semantic_t *sem)
     hashtable_free(sem->packages);
     hashtable_free(sem->resolved_imports);  /* Values are interned, don't free */
     hashtable_free(sem->loading_names);  /* Values are sentinels, don't free */
+    hashtable_free(sem->loading_external_names);  /* Values are sentinels, don't free */
+    hashtable_free(sem->sourcepath_misses);  /* Values are sentinels, don't free */
+    hashtable_free(sem->scanned_packages);  /* Values are sentinels, don't free */
     slist_free(sem->imports);
     slist_free_full(sem->sourcepath, free);
     slist_free_full(sem->source_dependencies, free);
@@ -5582,8 +5643,10 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
                                                                                     if (param->data.node.flags & MOD_VARARGS) {
                                                                                         param_sym->modifiers |= MOD_VARARGS;
                                                                                         method_sym->modifiers |= MOD_VARARGS;
-                                                                                        /* Varargs parameter type needs to be array */
-                                                                                        if (param_sym->type && param_sym->type->kind != TYPE_ARRAY) {
+                                                                                                                                                                                /* Varargs parameter type needs one more array dimension,
+                                                                                         * whatever the element type ("byte[]..." is byte[][]); the
+                                                                                         * type was resolved fresh just above. */
+                                                                                        if (param_sym->type) {
                                                                                             param_sym->type = type_new_array(param_sym->type, 1);
                                                                                         }
                                                                                     }
@@ -6024,8 +6087,10 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
                             if (param->data.node.flags & MOD_VARARGS) {
                                 param_sym->modifiers |= MOD_VARARGS;
                                 method_sym->modifiers |= MOD_VARARGS;
-                                /* Varargs parameter type needs to be array */
-                                if (param_sym->type && param_sym->type->kind != TYPE_ARRAY) {
+                                                                /* Varargs parameter type needs one more array dimension,
+                                 * whatever the element type ("byte[]..." is byte[][]); the
+                                 * type was resolved fresh just above. */
+                                if (param_sym->type) {
                                     param_sym->type = type_new_array(param_sym->type, 1);
                                 }
                             }
@@ -6116,6 +6181,26 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
     type_t *cached = hashtable_lookup(sem->types, name);
     if (cached && cached->kind == TYPE_CLASS && cached->data.class_type.symbol) {
         return cached->data.class_type.symbol;
+    }
+
+    /* A type that is part of this compilation already has its symbol in
+     * the shared registry; that symbol is the one every other file uses.
+     * Parsing its source file a second time here would create a private
+     * duplicate - members entered by this loader's own, less complete
+     * path - and the "CACHING type" below would then make THIS analyzer
+     * use the duplicate in place of the registry symbol for the rest of
+     * the file. Reached, for instance, through a speculative nested-type
+     * probe ("Outer$Inner") that loads "Outer" via this function rather
+     * than load_external_class(): the class then implemented the same
+     * interface symbol twice ("repeated interface"), or saw its own
+     * fields as another class's ("Cannot assign to final field ... of
+     * class ..."). */
+    if (sem->shared_registry) {
+        symbol_t *registry_sym = type_registry_lookup(sem->shared_registry, name);
+        if (registry_sym && registry_sym->type) {
+            symbol_complete(registry_sym);
+            return registry_sym;
+        }
     }
 
     /* Check if this is a nested class (contains $).
@@ -6216,6 +6301,16 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
         }
     }
     
+    /* Names already known to have no source file. The same misses recur
+     * thousands of times per file: every qualified name is probed prefix
+     * by prefix ("org", "org.bluezoo", ...) as a possible class, and each
+     * probe used to cost one fopen() per sourcepath entry. */
+    if (sem->sourcepath_misses && hashtable_contains(sem->sourcepath_misses, name)) {
+        free(file_path);
+        return NULL;
+    }
+    bool found_file = false;
+
     /* Try each sourcepath entry */
     for (slist_t *entry = sem->sourcepath; entry; entry = entry->next) {
         const char *dir = (const char *)entry->data;
@@ -6241,6 +6336,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
         
         if (f) {
             fclose(f);
+            found_file = true;
             
             /* Load and parse the source file */
             source_file_t *src = source_file_new(full_path);
@@ -6648,8 +6744,10 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                         if (param->data.node.flags & MOD_VARARGS) {
                                             param_sym->modifiers |= MOD_VARARGS;
                                             method_sym->modifiers |= MOD_VARARGS;
-                                            /* Varargs parameter type needs to be array */
-                                            if (param_sym->type && param_sym->type->kind != TYPE_ARRAY) {
+                                                                                        /* Varargs parameter type needs one more array dimension,
+                                             * whatever the element type ("byte[]..." is byte[][]); the
+                                             * type was resolved fresh just above. */
+                                            if (param_sym->type) {
                                                 param_sym->type = type_new_array(param_sym->type, 1);
                                             }
                                         }
@@ -6746,8 +6844,10 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                                         if (param->data.node.flags & MOD_VARARGS) {
                                                             param_sym->modifiers |= MOD_VARARGS;
                                                             nmethod_sym->modifiers |= MOD_VARARGS;
-                                                            /* Varargs parameter type needs to be array */
-                                                            if (param_sym->type && param_sym->type->kind != TYPE_ARRAY) {
+                                                                                                                        /* Varargs parameter type needs one more array dimension,
+                                                             * whatever the element type ("byte[]..." is byte[][]); the
+                                                             * type was resolved fresh just above. */
+                                                            if (param_sym->type) {
                                                                 param_sym->type = type_new_array(param_sym->type, 1);
                                                             }
                                                         }
@@ -6870,8 +6970,17 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                          * a fresh semantic analyzer with an empty types cache. Instead,
                          * we track the dependency and compile it after the main file's
                          * semantic analysis is complete. */
+                        /* slist_append() returns the NEW NODE, not the list
+                         * head - assigning its result straight back (as this
+                         * used to) made the list forget every earlier entry,
+                         * so of several -sourcepath dependencies only the
+                         * last one loaded was ever compiled. */
                         char *dep_path = strdup(src->filename);
-                        sem->source_dependencies = slist_append(sem->source_dependencies, dep_path);
+                        if (!sem->source_dependencies) {
+                            sem->source_dependencies = slist_new(dep_path);
+                        } else {
+                            slist_append(sem->source_dependencies, dep_path);
+                        }
                         
                         /* Restore context */
                         if (dep_pkg) {
@@ -7018,7 +7127,11 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                             
                             /* Track this source file as a dependency */
                             char *dep_path = strdup(src->filename);
-                            sem->source_dependencies = slist_append(sem->source_dependencies, dep_path);
+                            if (!sem->source_dependencies) {
+                                sem->source_dependencies = slist_new(dep_path);
+                            } else {
+                                slist_append(sem->source_dependencies, dep_path);
+                            }
                         }
                     }
                 }
@@ -7035,6 +7148,13 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
             /* Don't free ast if we registered types from it */
             source_file_free(src);
         }
+    }
+
+    if (!found_file) {
+        if (!sem->sourcepath_misses) {
+            sem->sourcepath_misses = hashtable_new();
+        }
+        hashtable_insert(sem->sourcepath_misses, name, (void *)1);
     }
     
     free(file_path);
@@ -7077,15 +7197,24 @@ symbol_t *load_external_class(semantic_t *sem, const char *name)
     if (!sem || !name) {
         return NULL;
     }
-    if (!sem->loading_names) {
-        sem->loading_names = hashtable_new();
+    /* This guard has its own table. It used to share sem->loading_names
+     * with load_class_from_source()'s guard, keyed by the same name - but
+     * load_external_class_impl() falls back to load_class_from_source()
+     * for that very name, which then found the marker just set here,
+     * took it for a reentrant load, and returned NULL without looking at
+     * the sourcepath at all. Every class reachable only through
+     * -sourcepath silently stopped resolving ("Cannot resolve type",
+     * "cannot convert ... to <unknown>", calls compiled from a guessed
+     * descriptor). */
+    if (!sem->loading_external_names) {
+        sem->loading_external_names = hashtable_new();
     }
-    if (hashtable_contains(sem->loading_names, name)) {
+    if (hashtable_contains(sem->loading_external_names, name)) {
         return NULL;
     }
-    hashtable_insert(sem->loading_names, name, (void *)1);
+    hashtable_insert(sem->loading_external_names, name, (void *)1);
     symbol_t *result = load_external_class_impl(sem, name);
-    hashtable_remove(sem->loading_names, name);
+    hashtable_remove(sem->loading_external_names, name);
     return result;
 }
 
@@ -9083,6 +9212,16 @@ static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, c
     if (!sem->sourcepath || !package_name || !type_name) {
         return NULL;
     }
+
+    /* Once every file of a package has been loaded (a scan that found
+     * nothing ran to the end), another scan of it can only repeat the
+     * "already loaded" checks below. This was the dominant cost of a
+     * -sourcepath compile: one such scan per unresolved simple name, and
+     * a file's analysis meets thousands of those (type variables, nested
+     * types, names still being resolved). */
+    if (sem->scanned_packages && hashtable_contains(sem->scanned_packages, package_name)) {
+        return NULL;
+    }
     
     /* Build package directory path: srcpath/pkg/path/ */
     char pkg_path[512];
@@ -9170,6 +9309,11 @@ static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, c
         }
         closedir(dir);
     }
+
+    if (!sem->scanned_packages) {
+        sem->scanned_packages = hashtable_new();
+    }
+    hashtable_insert(sem->scanned_packages, package_name, (void *)1);
     
     return NULL;
 }
@@ -14056,8 +14200,11 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                      * lookup of the same varargs call (e.g. as a nested
                                      * call argument, which is type-checked twice) fails to
                                      * match the varargs parameter. */
-                                    if ((param->modifiers & MOD_VARARGS) &&
-                                        pt->kind != TYPE_ARRAY) {
+                                    /* pt is resolved fresh from the WRITTEN
+                                     * (element) type each time, so wrap it
+                                     * unconditionally - also when the element
+                                     * type is itself an array. */
+                                    if (param->modifiers & MOD_VARARGS) {
                                         pt = type_new_array(pt, 1);
                                     }
                                     param->type = pt;

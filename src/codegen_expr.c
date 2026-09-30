@@ -4766,6 +4766,442 @@ static type_t *varargs_element_type(type_t *varargs_param_type)
     return type_new_array(base, dims - 1);
 }
 
+/**
+ * Number of array dimensions of "t", whichever way it is represented: a
+ * flat TYPE_ARRAY (dimensions=N over a scalar base) or nested ones (an
+ * array whose element type is itself an array). Stores the non-array
+ * base type in *base when base is not NULL.
+ */
+static int array_total_dims(type_t *t, type_t **base)
+{
+    int dims = 0;
+    while (t && t->kind == TYPE_ARRAY) {
+        int d = t->data.array_type.dimensions;
+        dims += d > 0 ? d : 1;
+        t = t->data.array_type.element_type;
+    }
+    if (base) {
+        *base = t;
+    }
+    return dims;
+}
+
+/**
+ * True if an argument of array type "arg_type" can be passed AS the
+ * whole varargs array for a parameter of type "param_type", rather than
+ * being wrapped as one element of it: same number of dimensions, and a
+ * base type that is the same primitive or an assignable reference type.
+ */
+static bool array_passes_as_varargs(type_t *param_type, type_t *arg_type)
+{
+    type_t *param_base = NULL;
+    type_t *arg_base = NULL;
+    int param_dims = array_total_dims(param_type, &param_base);
+    int arg_dims = array_total_dims(arg_type, &arg_base);
+    if (param_dims == 0 || param_dims != arg_dims || !param_base || !arg_base) {
+        return false;
+    }
+    param_base = erase_typevar_for_array(param_base);
+    if (param_base->kind >= TYPE_BOOLEAN && param_base->kind <= TYPE_DOUBLE) {
+        return arg_base->kind == param_base->kind;
+    }
+    if (arg_base->kind >= TYPE_BOOLEAN && arg_base->kind <= TYPE_DOUBLE) {
+        return false;
+    }
+    return type_assignable(param_base, arg_base);
+}
+
+/**
+ * Generate the single array argument for a call's varargs position.
+ *
+ * "node" is the list node of the first argument at the varargs position,
+ * or NULL when the call supplies none (an empty array is pushed). With
+ * skip_trailing_block set, a final AST_BLOCK is an anonymous class body
+ * ("new T(a, b) { ... }"), not an argument.
+ *
+ * Shared by method calls, constructor calls and enum constant
+ * construction (codegen.c). The constructor path
+ * used to carry its own, much weaker copy of this logic: it built an
+ * Object[] for ANY non-class element type (so "new C(1, 2, 3)" against
+ * "C(int... xs)" stored raw ints with AASTORE - VerifyError), and only
+ * passed an existing array straight through for String/Object elements.
+ *
+ * Leaves exactly one array reference on the stack.
+ */
+bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_param,
+                          slist_t *node, bool skip_trailing_block)
+{
+    /* Count the arguments at the varargs position */
+    int varargs_count = 0;
+    for (slist_t *n = node; n; n = n->next) {
+        ast_node_t *a = (ast_node_t *)n->data;
+        if (skip_trailing_block && a && a->type == AST_BLOCK && !n->next) break;
+        varargs_count++;
+    }
+    ast_node_t *arg = node ? (ast_node_t *)node->data : NULL;
+
+    /* Get element type from varargs array type */
+    type_t *elem_type = varargs_element_type(varargs_param->type);
+
+    /* Check for array-to-varargs conversion:
+     * If there's exactly one argument at the varargs position and it's
+     * already an array of the compatible type, pass it directly */
+    if (varargs_count == 1 && arg) {
+        bool is_array_arg = false;
+        const char *arg_elem_class = NULL;
+        type_kind_t arg_elem_kind = TYPE_VOID;
+        
+        /* Check if argument is an identifier referencing an array local */
+        if (arg->type == AST_IDENTIFIER && arg->data.leaf.name) {
+            const char *var_name = arg->data.leaf.name;
+            if (mg_local_is_array(mg, var_name)) {
+                is_array_arg = true;
+                arg_elem_class = mg_local_array_elem_class(mg, var_name);
+                arg_elem_kind = mg_local_array_elem_kind(mg, var_name);
+            }
+            /* Also check sem_type for identifiers - important for method return values etc. */
+            else if (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) {
+                is_array_arg = true;
+                type_t *arg_elem = arg->sem_type->data.array_type.element_type;
+                if (arg_elem) {
+                    arg_elem_kind = arg_elem->kind;
+                    if (arg_elem->kind == TYPE_CLASS) {
+                        arg_elem_class = arg_elem->data.class_type.name;
+                    }
+                }
+            }
+        }
+        /* Check for new Type[] or new Type[]{...} expression */
+        else if (arg->type == AST_NEW_ARRAY) {
+            is_array_arg = true;
+            /* Get element type from AST_NEW_ARRAY's first child (type node) */
+            slist_t *arr_children = arg->data.node.children;
+            if (arr_children) {
+                ast_node_t *elem_type_node = (ast_node_t *)arr_children->data;
+                if (elem_type_node->type == AST_PRIMITIVE_TYPE) {
+                    const char *prim_name = elem_type_node->data.leaf.name;
+                    if (strcmp(prim_name, "int") == 0) arg_elem_kind = TYPE_INT;
+                    else if (strcmp(prim_name, "long") == 0) arg_elem_kind = TYPE_LONG;
+                    else if (strcmp(prim_name, "double") == 0) arg_elem_kind = TYPE_DOUBLE;
+                    else if (strcmp(prim_name, "float") == 0) arg_elem_kind = TYPE_FLOAT;
+                    else if (strcmp(prim_name, "boolean") == 0) arg_elem_kind = TYPE_BOOLEAN;
+                    else if (strcmp(prim_name, "byte") == 0) arg_elem_kind = TYPE_BYTE;
+                    else if (strcmp(prim_name, "char") == 0) arg_elem_kind = TYPE_CHAR;
+                    else if (strcmp(prim_name, "short") == 0) arg_elem_kind = TYPE_SHORT;
+                } else if (elem_type_node->type == AST_CLASS_TYPE || 
+                           elem_type_node->type == AST_IDENTIFIER) {
+                    arg_elem_kind = TYPE_CLASS;
+                    arg_elem_class = elem_type_node->data.node.name ? 
+                        elem_type_node->data.node.name : elem_type_node->data.leaf.name;
+                }
+            }
+            /* Also check sem_type if available */
+            if (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) {
+                type_t *arg_elem = arg->sem_type->data.array_type.element_type;
+                if (arg_elem) {
+                    arg_elem_kind = arg_elem->kind;
+                    if (arg_elem->kind == TYPE_CLASS) {
+                        arg_elem_class = arg_elem->data.class_type.name;
+                    }
+                }
+            }
+        }
+        /* Also check sem_type for other array expressions (field access, etc.) */
+        else if (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) {
+            is_array_arg = true;
+            type_t *arg_elem = arg->sem_type->data.array_type.element_type;
+            if (arg_elem) {
+                arg_elem_kind = arg_elem->kind;
+                if (arg_elem->kind == TYPE_CLASS) {
+                    arg_elem_class = arg_elem->data.class_type.name;
+                }
+            }
+        }
+        
+        /* A real resolved type_t for the argument's own element
+         * type, when available (semantic analysis annotates most
+         * expressions with sem_type regardless of which branch
+         * above actually set is_array_arg/arg_elem_class) - used
+         * below for a genuine assignability check (does the
+         * argument's element type IMPLEMENT/EXTEND the varargs
+         * parameter's element type), not just an exact-name
+         * match. Without this, passing a "StandardOpenOption[]"
+         * array directly to a "OpenOption... options" varargs
+         * parameter (StandardOpenOption implements OpenOption -
+         * exactly java.nio.file.channels.FileChannel.open()'s
+         * own signature) never counted as "compatible" (the
+         * class-name strings "StandardOpenOption" and
+         * "OpenOption" are simply different), so the array got
+         * wrapped as a single vararg element instead of passed
+         * through - "ArrayStoreException:
+         * [Ljava.nio.file.StandardOpenOption;" the moment the
+         * call actually ran (storing the whole array into a
+         * slot that expects one OpenOption). Confirmed against
+         * gumdrop's own BasicFTPFileSystem.openForWriting()'s
+         * "FileChannel.open(filePath, options)". */
+        type_t *arg_elem_type_full = (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) ?
+            arg->sem_type->data.array_type.element_type : NULL;
+
+        if (is_array_arg && elem_type) {
+            bool compatible = false;
+
+            /* Handle type variable (e.g., T in Stream.of(T...)) - any reference array is compatible */
+            if (elem_type->kind == TYPE_TYPEVAR) {
+                /* Type variable accepts any reference type */
+                compatible = (arg_elem_kind == TYPE_CLASS);
+            }
+            else if (elem_type->kind == TYPE_CLASS) {
+                /* Object[] is compatible with any reference array */
+                if (strcmp(elem_type->data.class_type.name, "java.lang.Object") == 0) {
+                    compatible = (arg_elem_kind == TYPE_CLASS);
+                }
+                /* Same class type */
+                else if (arg_elem_class) {
+                    const char *expected = elem_type->data.class_type.name;
+                    /* Handle qualified vs simple names */
+                    const char *simple = strrchr(expected, '.');
+                    if (simple) simple++; else simple = expected;
+                    const char *arg_simple = strrchr(arg_elem_class, '/');
+                    if (arg_simple) arg_simple++; else {
+                        arg_simple = strrchr(arg_elem_class, '.');
+                        if (arg_simple) arg_simple++; else arg_simple = arg_elem_class;
+                    }
+                    compatible = (strcmp(simple, arg_simple) == 0 ||
+                                 strcmp(expected, arg_elem_class) == 0);
+                }
+                /* Exact name match failed - fall back to a real
+                 * assignability check (does the argument's
+                 * element type implement/extend the parameter's
+                 * element type), when a resolved type_t for it
+                 * is available. See arg_elem_type_full's own
+                 * comment above for why this is needed at all. */
+                if (!compatible && arg_elem_type_full) {
+                    compatible = type_assignable(elem_type, arg_elem_type_full);
+                }
+            } else if (elem_type->kind == TYPE_ARRAY) {
+                /* The element type is itself an array ("byte[]...
+                 * parts"): the argument passes straight through
+                 * only when it is a whole array OF those elements
+                 * (a byte[][]), i.e. one more dimension than the
+                 * element type over a compatible base type. A
+                 * single element (a byte[]) still has to be
+                 * wrapped. This case used to fall into the
+                 * primitive comparison below, which never matched,
+                 * so a byte[][] handed to "byte[]... parts" was
+                 * wrapped a second time into a one-element array
+                 * and stored where a byte[] was expected
+                 * (ArrayStoreException: [[B). */
+                compatible = arg->sem_type &&
+                    array_passes_as_varargs(varargs_param->type, arg->sem_type);
+            } else {
+                /* Primitive array - check exact type match. An
+                 * argument with more than one dimension is an
+                 * array of arrays, never an array of this
+                 * primitive. */
+                compatible = (elem_type->kind == arg_elem_kind) &&
+                    (!arg->sem_type || array_total_dims(arg->sem_type, NULL) == 1);
+            }
+            
+            if (compatible) {
+                /* Pass array directly - just generate the expression */
+                return codegen_expr(mg, arg, cp);
+            }
+        }
+    }
+    
+    /* Create array: push size */
+    if (varargs_count <= 5) {
+        bc_emit(mg->code, OP_ICONST_0 + varargs_count);
+    } else if (varargs_count <= 127) {
+        bc_emit(mg->code, OP_BIPUSH);
+        bc_emit_u1(mg->code, varargs_count);
+    } else {
+        bc_emit(mg->code, OP_SIPUSH);
+        bc_emit_u2(mg->code, varargs_count);
+    }
+    mg_push_int(mg);  /* Array size is an integer */
+    
+    /* Build array type string for stackmap tracking BEFORE array creation */
+    char *array_type_str = NULL;
+    if (elem_type && elem_type->kind == TYPE_CLASS) {
+        char *internal = class_to_internal_name(elem_type->data.class_type.name);
+        size_t len = strlen(internal) + 4;  /* "[L" + name + ";" + null */
+        array_type_str = malloc(len);
+        snprintf(array_type_str, len, "[L%s;", internal);
+        free(internal);
+    } else if (elem_type && elem_type->kind == TYPE_ARRAY) {
+        /* e.g. "byte[]... parts" - each element is itself an
+         * array ("byte[]"), so the synthetic array being built
+         * here is "byte[][]" ("[[B"), not the generic
+         * "[Ljava/lang/Object;" fallback below (which isn't
+         * assignable to the method's real, exact parameter
+         * type). */
+        char *elem_desc = type_to_descriptor(elem_type);
+        size_t len = strlen(elem_desc) + 2;  /* "[" + desc + null */
+        array_type_str = malloc(len);
+        snprintf(array_type_str, len, "[%s", elem_desc);
+        free(elem_desc);
+    } else if (elem_type && type_kind_to_atype(elem_type->kind) >= 0) {
+        /* Primitive element ("int... values" builds an "[I") */
+        char *elem_desc = type_to_descriptor(elem_type);
+        size_t len = strlen(elem_desc) + 2;
+        array_type_str = malloc(len);
+        snprintf(array_type_str, len, "[%s", elem_desc);
+        free(elem_desc);
+    } else {
+        array_type_str = strdup("[Ljava/lang/Object;");
+    }
+
+    /* Create the array */
+    if (elem_type && elem_type->kind == TYPE_CLASS) {
+        char *internal = class_to_internal_name(elem_type->data.class_type.name);
+        uint16_t class_ref = cp_add_class(cp, internal);
+        bc_emit(mg->code, OP_ANEWARRAY);
+        bc_emit_u2(mg->code, class_ref);
+        free(internal);
+    } else if (elem_type && elem_type->kind == TYPE_ARRAY) {
+        /* ANEWARRAY's class constant for an array element type is
+         * the element's own full descriptor ("[B"), not an
+         * unwrapped internal name (JVMS 4.4.1). */
+        char *elem_desc = type_to_descriptor(elem_type);
+        uint16_t class_ref = cp_add_class(cp, elem_desc);
+        bc_emit(mg->code, OP_ANEWARRAY);
+        bc_emit_u2(mg->code, class_ref);
+        free(elem_desc);
+    } else if (elem_type && type_kind_to_atype(elem_type->kind) >= 0) {
+        /* Primitive array - use NEWARRAY */
+        bc_emit(mg->code, OP_NEWARRAY);
+        bc_emit_u1(mg->code, (uint8_t)type_kind_to_atype(elem_type->kind));
+    } else {
+        /* Default to Object[] */
+        uint16_t obj_ref = cp_add_class(cp, "java/lang/Object");
+        bc_emit(mg->code, OP_ANEWARRAY);
+        bc_emit_u2(mg->code, obj_ref);
+    }
+    /* Array is now on stack (replaced size).
+     * Update stackmap: pop int (size), push array type */
+    mg_pop_typed(mg, 1);  /* Pop the int size from stackmap */
+    mg_push_object(mg, array_type_str);  /* Push array type */
+    
+    /* Store each varargs element */
+    int va_idx = 0;
+    for (slist_t *va_node = node; va_node && va_idx < varargs_count;
+         va_node = va_node->next, va_idx++) {
+        ast_node_t *va_arg = (ast_node_t *)va_node->data;
+        
+        /* Dup array ref */
+        bc_emit(mg->code, OP_DUP);
+        mg_push_object(mg, array_type_str);  /* Duplicated array reference */
+        
+        /* Push index */
+        if (va_idx <= 5) {
+            bc_emit(mg->code, OP_ICONST_0 + va_idx);
+        } else if (va_idx <= 127) {
+            bc_emit(mg->code, OP_BIPUSH);
+            bc_emit_u1(mg->code, va_idx);
+        } else {
+            bc_emit(mg->code, OP_SIPUSH);
+            bc_emit_u2(mg->code, va_idx);
+        }
+        mg_push_int(mg);  /* Array index is an integer */
+        
+        /* Generate value */
+        if (!codegen_expr(mg, va_arg, cp)) {
+            free(array_type_str);
+            return false;
+        }
+        
+        /* Box primitive if needed for Object[] */
+        type_kind_t va_kind = get_expr_type_kind(mg, va_arg);
+        if (va_arg->sem_type) va_kind = va_arg->sem_type->kind;
+
+        /* elem_type->kind == TYPE_CLASS alone missed a generic
+         * varargs parameter (e.g. "<T> List<T> asList(T... a)",
+         * matching java.util.Arrays.asList - gumdrop calls it with
+         * mixed int/String arguments) whose own element type is a
+         * bare type variable (TYPE_TYPEVAR), which - after erasure -
+         * is exactly as much a reference array as TYPE_CLASS is; the
+         * "Create the array" logic just above already treats it
+         * that way (falling through to its own "Default to
+         * Object[]" ANEWARRAY branch), but this boxing check never
+         * matched it, so an int literal argument got AASTORE'd
+         * unboxed (VerifyError: "Bad type on operand stack",
+         * "Type integer ... is not assignable to 'java/lang/Object'").
+         * The correct test mirrors the array-creation logic itself:
+         * box exactly when the array being built is NOT one of the
+         * primitive-element arrays created via NEWARRAY above. */
+        bool va_array_is_primitive = elem_type && type_kind_to_atype(elem_type->kind) >= 0;
+        if (!va_array_is_primitive &&
+            va_kind >= TYPE_BOOLEAN && va_kind <= TYPE_DOUBLE) {
+            emit_boxing(mg, cp, va_kind);
+        } else if (va_array_is_primitive && va_kind >= TYPE_BOOLEAN && va_kind <= TYPE_DOUBLE &&
+                   va_kind != elem_type->kind) {
+            /* Widen a narrower primitive argument to the varargs
+             * array's own declared primitive element type (JLS
+             * 5.1.2) - e.g. an int literal argument like "1" or
+             * "1000" passed for a "double... buckets" parameter
+             * (Arrays.asList-style mixed literals, matching
+             * gumdrop's own DoubleHistogram.Builder.
+             * setExplicitBuckets(0.5, 1, 2, 5, ..., 1000)) leaves a
+             * plain int on the stack, never widened to double -
+             * the subsequent DASTORE (selected from elem_type,
+             * correctly DOUBLE) then rejected it (VerifyError:
+             * "Bad type on operand stack", "Type integer ... is
+             * not assignable to double"). coerce_stack_value()
+             * already implements exactly this widening for
+             * ordinary (non-varargs) arguments via
+             * coerce_arg_to_param() below - reuse it here instead
+             * of duplicating the widen-opcode selection logic. */
+            coerce_stack_value(mg, cp, va_kind, NULL, elem_type->kind, NULL);
+        }
+
+        /* Store into array */
+        if (elem_type && elem_type->kind >= TYPE_BOOLEAN && 
+            elem_type->kind <= TYPE_DOUBLE) {
+            uint8_t store_op = OP_AASTORE;
+            switch (elem_type->kind) {
+                case TYPE_BYTE:
+                case TYPE_BOOLEAN: store_op = OP_BASTORE; break;
+                case TYPE_CHAR:    store_op = OP_CASTORE; break;
+                case TYPE_SHORT:   store_op = OP_SASTORE; break;
+                case TYPE_INT:     store_op = OP_IASTORE; break;
+                case TYPE_LONG:    store_op = OP_LASTORE; break;
+                case TYPE_FLOAT:   store_op = OP_FASTORE; break;
+                case TYPE_DOUBLE:  store_op = OP_DASTORE; break;
+                default: store_op = OP_AASTORE;
+            }
+            bc_emit(mg->code, store_op);
+            if (elem_type->kind == TYPE_LONG || elem_type->kind == TYPE_DOUBLE) {
+                /* A long/double value occupies an extra word beyond
+                 * the uniform "1 word" the shared pop below
+                 * accounts for - mirrors the identical extra pop
+                 * already done for LASTORE/DASTORE in ordinary
+                 * (non-varargs) array-element assignment codegen
+                 * a little later in this file. Without it,
+                 * mg->stack_depth (and the stackmap's own mirrored
+                 * word count, both tracked in real JVM words, not
+                 * per-value entries - confirmed via
+                 * stackmap_push_long/double(), which each push
+                 * TWO entries) under-popped by one word per wide
+                 * varargs element, drifting further out of sync
+                 * with the actual bytecode on every iteration of
+                 * a multi-element wide-typed varargs array (e.g.
+                 * a "double... buckets" call with several
+                 * elements) until a later stack-depth-sensitive
+                 * check (an ifeq's own stack-size verification)
+                 * finally caught the accumulated mismatch. */
+                mg_pop_typed(mg, 1);
+            }
+        } else {
+            bc_emit(mg->code, OP_AASTORE);
+        }
+        mg_pop_typed(mg, 3);  /* Pop array, index, value */
+    }
+    
+    free(array_type_str);
+    return true;
+}
+
 static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 {
     if (!expr || expr->type != AST_METHOD_CALL) {
@@ -5860,349 +6296,13 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         
         /* Check if we've hit the varargs position */
         if (is_varargs_method && arg_index == fixed_param_count && varargs_param) {
-            /* Count remaining arguments */
-            int varargs_count = 0;
-            for (slist_t *n = node; n; n = n->next) varargs_count++;
-
-            /* Get element type from varargs array type */
-            type_t *elem_type = varargs_element_type(varargs_param->type);
-
-            /* Check for array-to-varargs conversion:
-             * If there's exactly one argument at the varargs position and it's
-             * already an array of the compatible type, pass it directly */
-            if (varargs_count == 1) {
-                bool is_array_arg = false;
-                const char *arg_elem_class = NULL;
-                type_kind_t arg_elem_kind = TYPE_VOID;
-                
-                /* Check if argument is an identifier referencing an array local */
-                if (arg->type == AST_IDENTIFIER && arg->data.leaf.name) {
-                    const char *var_name = arg->data.leaf.name;
-                    if (mg_local_is_array(mg, var_name)) {
-                        is_array_arg = true;
-                        arg_elem_class = mg_local_array_elem_class(mg, var_name);
-                        arg_elem_kind = mg_local_array_elem_kind(mg, var_name);
-                    }
-                    /* Also check sem_type for identifiers - important for method return values etc. */
-                    else if (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) {
-                        is_array_arg = true;
-                        type_t *arg_elem = arg->sem_type->data.array_type.element_type;
-                        if (arg_elem) {
-                            arg_elem_kind = arg_elem->kind;
-                            if (arg_elem->kind == TYPE_CLASS) {
-                                arg_elem_class = arg_elem->data.class_type.name;
-                            }
-                        }
-                    }
-                }
-                /* Check for new Type[] or new Type[]{...} expression */
-                else if (arg->type == AST_NEW_ARRAY) {
-                    is_array_arg = true;
-                    /* Get element type from AST_NEW_ARRAY's first child (type node) */
-                    slist_t *arr_children = arg->data.node.children;
-                    if (arr_children) {
-                        ast_node_t *elem_type_node = (ast_node_t *)arr_children->data;
-                        if (elem_type_node->type == AST_PRIMITIVE_TYPE) {
-                            const char *prim_name = elem_type_node->data.leaf.name;
-                            if (strcmp(prim_name, "int") == 0) arg_elem_kind = TYPE_INT;
-                            else if (strcmp(prim_name, "long") == 0) arg_elem_kind = TYPE_LONG;
-                            else if (strcmp(prim_name, "double") == 0) arg_elem_kind = TYPE_DOUBLE;
-                            else if (strcmp(prim_name, "float") == 0) arg_elem_kind = TYPE_FLOAT;
-                            else if (strcmp(prim_name, "boolean") == 0) arg_elem_kind = TYPE_BOOLEAN;
-                            else if (strcmp(prim_name, "byte") == 0) arg_elem_kind = TYPE_BYTE;
-                            else if (strcmp(prim_name, "char") == 0) arg_elem_kind = TYPE_CHAR;
-                            else if (strcmp(prim_name, "short") == 0) arg_elem_kind = TYPE_SHORT;
-                        } else if (elem_type_node->type == AST_CLASS_TYPE || 
-                                   elem_type_node->type == AST_IDENTIFIER) {
-                            arg_elem_kind = TYPE_CLASS;
-                            arg_elem_class = elem_type_node->data.node.name ? 
-                                elem_type_node->data.node.name : elem_type_node->data.leaf.name;
-                        }
-                    }
-                    /* Also check sem_type if available */
-                    if (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) {
-                        type_t *arg_elem = arg->sem_type->data.array_type.element_type;
-                        if (arg_elem) {
-                            arg_elem_kind = arg_elem->kind;
-                            if (arg_elem->kind == TYPE_CLASS) {
-                                arg_elem_class = arg_elem->data.class_type.name;
-                            }
-                        }
-                    }
-                }
-                /* Also check sem_type for other array expressions (field access, etc.) */
-                else if (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) {
-                    is_array_arg = true;
-                    type_t *arg_elem = arg->sem_type->data.array_type.element_type;
-                    if (arg_elem) {
-                        arg_elem_kind = arg_elem->kind;
-                        if (arg_elem->kind == TYPE_CLASS) {
-                            arg_elem_class = arg_elem->data.class_type.name;
-                        }
-                    }
-                }
-                
-                /* A real resolved type_t for the argument's own element
-                 * type, when available (semantic analysis annotates most
-                 * expressions with sem_type regardless of which branch
-                 * above actually set is_array_arg/arg_elem_class) - used
-                 * below for a genuine assignability check (does the
-                 * argument's element type IMPLEMENT/EXTEND the varargs
-                 * parameter's element type), not just an exact-name
-                 * match. Without this, passing a "StandardOpenOption[]"
-                 * array directly to a "OpenOption... options" varargs
-                 * parameter (StandardOpenOption implements OpenOption -
-                 * exactly java.nio.file.channels.FileChannel.open()'s
-                 * own signature) never counted as "compatible" (the
-                 * class-name strings "StandardOpenOption" and
-                 * "OpenOption" are simply different), so the array got
-                 * wrapped as a single vararg element instead of passed
-                 * through - "ArrayStoreException:
-                 * [Ljava.nio.file.StandardOpenOption;" the moment the
-                 * call actually ran (storing the whole array into a
-                 * slot that expects one OpenOption). Confirmed against
-                 * gumdrop's own BasicFTPFileSystem.openForWriting()'s
-                 * "FileChannel.open(filePath, options)". */
-                type_t *arg_elem_type_full = (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) ?
-                    arg->sem_type->data.array_type.element_type : NULL;
-
-                if (is_array_arg && elem_type) {
-                    bool compatible = false;
-
-                    /* Handle type variable (e.g., T in Stream.of(T...)) - any reference array is compatible */
-                    if (elem_type->kind == TYPE_TYPEVAR) {
-                        /* Type variable accepts any reference type */
-                        compatible = (arg_elem_kind == TYPE_CLASS);
-                    }
-                    else if (elem_type->kind == TYPE_CLASS) {
-                        /* Object[] is compatible with any reference array */
-                        if (strcmp(elem_type->data.class_type.name, "java.lang.Object") == 0) {
-                            compatible = (arg_elem_kind == TYPE_CLASS);
-                        }
-                        /* Same class type */
-                        else if (arg_elem_class) {
-                            const char *expected = elem_type->data.class_type.name;
-                            /* Handle qualified vs simple names */
-                            const char *simple = strrchr(expected, '.');
-                            if (simple) simple++; else simple = expected;
-                            const char *arg_simple = strrchr(arg_elem_class, '/');
-                            if (arg_simple) arg_simple++; else {
-                                arg_simple = strrchr(arg_elem_class, '.');
-                                if (arg_simple) arg_simple++; else arg_simple = arg_elem_class;
-                            }
-                            compatible = (strcmp(simple, arg_simple) == 0 ||
-                                         strcmp(expected, arg_elem_class) == 0);
-                        }
-                        /* Exact name match failed - fall back to a real
-                         * assignability check (does the argument's
-                         * element type implement/extend the parameter's
-                         * element type), when a resolved type_t for it
-                         * is available. See arg_elem_type_full's own
-                         * comment above for why this is needed at all. */
-                        if (!compatible && arg_elem_type_full) {
-                            compatible = type_assignable(elem_type, arg_elem_type_full);
-                        }
-                    } else {
-                        /* Primitive array - check exact type match */
-                        compatible = (elem_type->kind == arg_elem_kind);
-                    }
-                    
-                    if (compatible) {
-                        /* Pass array directly - just generate the expression */
-                        if (!codegen_expr(mg, arg, cp)) {
-                            if (custom_descriptor) free(custom_descriptor);
-                            if (static_import_class) free(static_import_class);
-                            return false;
-                        }
-                        break;  /* Done with arguments */
-                    }
-                }
-            }
-            
-            /* Create array: push size */
-            if (varargs_count <= 5) {
-                bc_emit(mg->code, OP_ICONST_0 + varargs_count);
-            } else if (varargs_count <= 127) {
-                bc_emit(mg->code, OP_BIPUSH);
-                bc_emit_u1(mg->code, varargs_count);
-            } else {
-                bc_emit(mg->code, OP_SIPUSH);
-                bc_emit_u2(mg->code, varargs_count);
-            }
-            mg_push_int(mg);  /* Array size is an integer */
-            
-            /* Build array type string for stackmap tracking BEFORE array creation */
-            char *array_type_str = NULL;
-            if (elem_type && elem_type->kind == TYPE_CLASS) {
-                char *internal = class_to_internal_name(elem_type->data.class_type.name);
-                size_t len = strlen(internal) + 4;  /* "[L" + name + ";" + null */
-                array_type_str = malloc(len);
-                snprintf(array_type_str, len, "[L%s;", internal);
-                free(internal);
-            } else if (elem_type && elem_type->kind == TYPE_ARRAY) {
-                /* e.g. "byte[]... parts" - each element is itself an
-                 * array ("byte[]"), so the synthetic array being built
-                 * here is "byte[][]" ("[[B"), not the generic
-                 * "[Ljava/lang/Object;" fallback below (which isn't
-                 * assignable to the method's real, exact parameter
-                 * type). */
-                char *elem_desc = type_to_descriptor(elem_type);
-                size_t len = strlen(elem_desc) + 2;  /* "[" + desc + null */
-                array_type_str = malloc(len);
-                snprintf(array_type_str, len, "[%s", elem_desc);
-                free(elem_desc);
-            } else {
-                array_type_str = strdup("[Ljava/lang/Object;");
+            /* Everything from here on goes into the varargs array */
+            if (!codegen_varargs_tail(mg, cp, varargs_param, node, false)) {
+                if (custom_descriptor) free(custom_descriptor);
+                if (static_import_class) free(static_import_class);
+                return false;
             }
 
-            /* Create the array */
-            if (elem_type && elem_type->kind == TYPE_CLASS) {
-                char *internal = class_to_internal_name(elem_type->data.class_type.name);
-                uint16_t class_ref = cp_add_class(cp, internal);
-                bc_emit(mg->code, OP_ANEWARRAY);
-                bc_emit_u2(mg->code, class_ref);
-                free(internal);
-            } else if (elem_type && elem_type->kind == TYPE_ARRAY) {
-                /* ANEWARRAY's class constant for an array element type is
-                 * the element's own full descriptor ("[B"), not an
-                 * unwrapped internal name (JVMS 4.4.1). */
-                char *elem_desc = type_to_descriptor(elem_type);
-                uint16_t class_ref = cp_add_class(cp, elem_desc);
-                bc_emit(mg->code, OP_ANEWARRAY);
-                bc_emit_u2(mg->code, class_ref);
-                free(elem_desc);
-            } else if (elem_type && type_kind_to_atype(elem_type->kind) >= 0) {
-                /* Primitive array - use NEWARRAY */
-                bc_emit(mg->code, OP_NEWARRAY);
-                bc_emit_u1(mg->code, (uint8_t)type_kind_to_atype(elem_type->kind));
-            } else {
-                /* Default to Object[] */
-                uint16_t obj_ref = cp_add_class(cp, "java/lang/Object");
-                bc_emit(mg->code, OP_ANEWARRAY);
-                bc_emit_u2(mg->code, obj_ref);
-            }
-            /* Array is now on stack (replaced size).
-             * Update stackmap: pop int (size), push array type */
-            mg_pop_typed(mg, 1);  /* Pop the int size from stackmap */
-            mg_push_object(mg, array_type_str);  /* Push array type */
-            
-            /* Store each varargs element */
-            int va_idx = 0;
-            for (slist_t *va_node = node; va_node; va_node = va_node->next, va_idx++) {
-                ast_node_t *va_arg = (ast_node_t *)va_node->data;
-                
-                /* Dup array ref */
-                bc_emit(mg->code, OP_DUP);
-                mg_push_object(mg, array_type_str);  /* Duplicated array reference */
-                
-                /* Push index */
-                if (va_idx <= 5) {
-                    bc_emit(mg->code, OP_ICONST_0 + va_idx);
-                } else if (va_idx <= 127) {
-                    bc_emit(mg->code, OP_BIPUSH);
-                    bc_emit_u1(mg->code, va_idx);
-                } else {
-                    bc_emit(mg->code, OP_SIPUSH);
-                    bc_emit_u2(mg->code, va_idx);
-                }
-                mg_push_int(mg);  /* Array index is an integer */
-                
-                /* Generate value */
-                if (!codegen_expr(mg, va_arg, cp)) {
-                    if (custom_descriptor) free(custom_descriptor);
-                    if (static_import_class) free(static_import_class);
-                    return false;
-                }
-                
-                /* Box primitive if needed for Object[] */
-                type_kind_t va_kind = get_expr_type_kind(mg, va_arg);
-                if (va_arg->sem_type) va_kind = va_arg->sem_type->kind;
-
-                /* elem_type->kind == TYPE_CLASS alone missed a generic
-                 * varargs parameter (e.g. "<T> List<T> asList(T... a)",
-                 * matching java.util.Arrays.asList - gumdrop calls it with
-                 * mixed int/String arguments) whose own element type is a
-                 * bare type variable (TYPE_TYPEVAR), which - after erasure -
-                 * is exactly as much a reference array as TYPE_CLASS is; the
-                 * "Create the array" logic just above already treats it
-                 * that way (falling through to its own "Default to
-                 * Object[]" ANEWARRAY branch), but this boxing check never
-                 * matched it, so an int literal argument got AASTORE'd
-                 * unboxed (VerifyError: "Bad type on operand stack",
-                 * "Type integer ... is not assignable to 'java/lang/Object'").
-                 * The correct test mirrors the array-creation logic itself:
-                 * box exactly when the array being built is NOT one of the
-                 * primitive-element arrays created via NEWARRAY above. */
-                bool va_array_is_primitive = elem_type && type_kind_to_atype(elem_type->kind) >= 0;
-                if (!va_array_is_primitive &&
-                    va_kind >= TYPE_BOOLEAN && va_kind <= TYPE_DOUBLE) {
-                    emit_boxing(mg, cp, va_kind);
-                } else if (va_array_is_primitive && va_kind >= TYPE_BOOLEAN && va_kind <= TYPE_DOUBLE &&
-                           va_kind != elem_type->kind) {
-                    /* Widen a narrower primitive argument to the varargs
-                     * array's own declared primitive element type (JLS
-                     * 5.1.2) - e.g. an int literal argument like "1" or
-                     * "1000" passed for a "double... buckets" parameter
-                     * (Arrays.asList-style mixed literals, matching
-                     * gumdrop's own DoubleHistogram.Builder.
-                     * setExplicitBuckets(0.5, 1, 2, 5, ..., 1000)) leaves a
-                     * plain int on the stack, never widened to double -
-                     * the subsequent DASTORE (selected from elem_type,
-                     * correctly DOUBLE) then rejected it (VerifyError:
-                     * "Bad type on operand stack", "Type integer ... is
-                     * not assignable to double"). coerce_stack_value()
-                     * already implements exactly this widening for
-                     * ordinary (non-varargs) arguments via
-                     * coerce_arg_to_param() below - reuse it here instead
-                     * of duplicating the widen-opcode selection logic. */
-                    coerce_stack_value(mg, cp, va_kind, NULL, elem_type->kind, NULL);
-                }
-
-                /* Store into array */
-                if (elem_type && elem_type->kind >= TYPE_BOOLEAN && 
-                    elem_type->kind <= TYPE_DOUBLE) {
-                    uint8_t store_op = OP_AASTORE;
-                    switch (elem_type->kind) {
-                        case TYPE_BYTE:
-                        case TYPE_BOOLEAN: store_op = OP_BASTORE; break;
-                        case TYPE_CHAR:    store_op = OP_CASTORE; break;
-                        case TYPE_SHORT:   store_op = OP_SASTORE; break;
-                        case TYPE_INT:     store_op = OP_IASTORE; break;
-                        case TYPE_LONG:    store_op = OP_LASTORE; break;
-                        case TYPE_FLOAT:   store_op = OP_FASTORE; break;
-                        case TYPE_DOUBLE:  store_op = OP_DASTORE; break;
-                        default: store_op = OP_AASTORE;
-                    }
-                    bc_emit(mg->code, store_op);
-                    if (elem_type->kind == TYPE_LONG || elem_type->kind == TYPE_DOUBLE) {
-                        /* A long/double value occupies an extra word beyond
-                         * the uniform "1 word" the shared pop below
-                         * accounts for - mirrors the identical extra pop
-                         * already done for LASTORE/DASTORE in ordinary
-                         * (non-varargs) array-element assignment codegen
-                         * a little later in this file. Without it,
-                         * mg->stack_depth (and the stackmap's own mirrored
-                         * word count, both tracked in real JVM words, not
-                         * per-value entries - confirmed via
-                         * stackmap_push_long/double(), which each push
-                         * TWO entries) under-popped by one word per wide
-                         * varargs element, drifting further out of sync
-                         * with the actual bytecode on every iteration of
-                         * a multi-element wide-typed varargs array (e.g.
-                         * a "double... buckets" call with several
-                         * elements) until a later stack-depth-sensitive
-                         * check (an ifeq's own stack-size verification)
-                         * finally caught the accumulated mismatch. */
-                        mg_pop_typed(mg, 1);
-                    }
-                } else {
-                    bc_emit(mg->code, OP_AASTORE);
-                }
-                mg_pop_typed(mg, 3);  /* Pop array, index, value */
-            }
-            
-            free(array_type_str);
-            
             /* Skip remaining args since we processed them */
             break;
         }
@@ -6230,40 +6330,11 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         
         /* If we have exactly the fixed params (no varargs provided), create empty array */
         if (arg_count == fixed_param_count) {
-            /* Get element type from varargs array type */
-            type_t *elem_type = varargs_element_type(varargs_param->type);
-            
-            /* Push 0 (empty array size) */
-            bc_emit(mg->code, OP_ICONST_0);
-            mg_push_int(mg);
-            
-            /* Create the empty array */
-            if (elem_type && elem_type->kind == TYPE_CLASS) {
-                char *internal = class_to_internal_name(elem_type->data.class_type.name);
-                uint16_t class_ref = cp_add_class(cp, internal);
-                bc_emit(mg->code, OP_ANEWARRAY);
-                bc_emit_u2(mg->code, class_ref);
-                free(internal);
-            } else if (elem_type && elem_type->kind == TYPE_ARRAY) {
-                /* e.g. an empty "byte[]... parts" call site needs a
-                 * "byte[][]" (0-length) array - ANEWARRAY's class
-                 * constant for an array element type is the element's
-                 * own full descriptor ("[B"), not an unwrapped internal
-                 * name (JVMS 4.4.1). */
-                char *elem_desc = type_to_descriptor(elem_type);
-                uint16_t class_ref = cp_add_class(cp, elem_desc);
-                bc_emit(mg->code, OP_ANEWARRAY);
-                bc_emit_u2(mg->code, class_ref);
-                free(elem_desc);
-            } else if (elem_type && type_kind_to_atype(elem_type->kind) >= 0) {
-                bc_emit(mg->code, OP_NEWARRAY);
-                bc_emit_u1(mg->code, (uint8_t)type_kind_to_atype(elem_type->kind));
-            } else {
-                uint16_t obj_ref = cp_add_class(cp, "java/lang/Object");
-                bc_emit(mg->code, OP_ANEWARRAY);
-                bc_emit_u2(mg->code, obj_ref);
+            if (!codegen_varargs_tail(mg, cp, varargs_param, NULL, false)) {
+                if (custom_descriptor) free(custom_descriptor);
+                if (static_import_class) free(static_import_class);
+                return false;
             }
-            /* Array replaces size on stack - no net change */
         }
     }
     
@@ -7129,131 +7200,10 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         /* Check if we've hit the varargs position */
         if (is_varargs_ctor && arg_index == fixed_param_count && varargs_param) {
             varargs_array_pushed = true;
-            /* Count remaining arguments */
-            int varargs_count = 0;
-            for (slist_t *n = node; n; n = n->next) {
-                ast_node_t *a = (ast_node_t *)n->data;
-                if (is_anonymous_class && a->type == AST_BLOCK && !n->next) break;
-                varargs_count++;
-            }
-            
-            /* Get element type from varargs array type */
-            type_t *elem_type = varargs_element_type(varargs_param->type);
-            
-            /* Check for array-to-varargs conversion (single array argument) */
-            bool passed_directly = false;
-            if (varargs_count == 1 && elem_type) {
-                bool is_array_arg = false;
-                type_kind_t arg_elem_kind = TYPE_VOID;
-                
-                if (arg->type == AST_IDENTIFIER && arg->data.leaf.name) {
-                    const char *var_name = arg->data.leaf.name;
-                    if (mg_local_is_array(mg, var_name)) {
-                        is_array_arg = true;
-                        arg_elem_kind = mg_local_array_elem_kind(mg, var_name);
-                    } else if (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) {
-                        is_array_arg = true;
-                        type_t *arg_elem = arg->sem_type->data.array_type.element_type;
-                        if (arg_elem) arg_elem_kind = arg_elem->kind;
-                    }
-                } else if (arg->sem_type && arg->sem_type->kind == TYPE_ARRAY) {
-                    is_array_arg = true;
-                    type_t *arg_elem = arg->sem_type->data.array_type.element_type;
-                    if (arg_elem) arg_elem_kind = arg_elem->kind;
-                }
-                
-                if (is_array_arg) {
-                    bool compatible = false;
-                    if (elem_type->kind == TYPE_TYPEVAR) {
-                        compatible = (arg_elem_kind == TYPE_CLASS);
-                    } else if (elem_type->kind == TYPE_CLASS) {
-                        if (strcmp(elem_type->data.class_type.name, "java.lang.Object") == 0 ||
-                            strcmp(elem_type->data.class_type.name, "java.lang.String") == 0) {
-                            compatible = (arg_elem_kind == TYPE_CLASS);
-                        }
-                    }
-                    
-                    if (compatible) {
-                        if (!codegen_expr(mg, arg, cp)) {
-                            free(internal_name);
-                            if (outer_internal) free(outer_internal);
-                            return false;
-                        }
-                        passed_directly = true;
-                    }
-                }
-            }
-            
-            if (!passed_directly) {
-                /* Build array type string for stackmap tracking */
-                char *ctor_array_type_str = NULL;
-                if (elem_type && elem_type->kind == TYPE_CLASS) {
-                    char *internal = class_to_internal_name(elem_type->data.class_type.name);
-                    size_t len = strlen(internal) + 4;
-                    ctor_array_type_str = malloc(len);
-                    snprintf(ctor_array_type_str, len, "[L%s;", internal);
-                    free(internal);
-                } else {
-                    ctor_array_type_str = strdup("[Ljava/lang/Object;");
-                }
-                
-                /* Create array for varargs */
-                if (varargs_count <= 5) {
-                    bc_emit(mg->code, OP_ICONST_0 + varargs_count);
-                } else if (varargs_count <= 127) {
-                    bc_emit(mg->code, OP_BIPUSH);
-                    bc_emit_u1(mg->code, varargs_count);
-                } else {
-                    bc_emit(mg->code, OP_SIPUSH);
-                    bc_emit_u2(mg->code, varargs_count);
-                }
-                mg_push_int(mg);
-                
-                /* Create the array */
-                if (elem_type && elem_type->kind == TYPE_CLASS) {
-                    char *internal = class_to_internal_name(elem_type->data.class_type.name);
-                    uint16_t class_ref = cp_add_class(cp, internal);
-                    bc_emit(mg->code, OP_ANEWARRAY);
-                    bc_emit_u2(mg->code, class_ref);
-                    free(internal);
-                } else {
-                    /* Default to Object[] */
-                    uint16_t class_ref = cp_add_class(cp, "java/lang/Object");
-                    bc_emit(mg->code, OP_ANEWARRAY);
-                    bc_emit_u2(mg->code, class_ref);
-                }
-                mg_pop_typed(mg, 1);  /* Pop size, push array ref */
-                mg_push_object(mg, ctor_array_type_str);  /* Array reference */
-                
-                /* Store each vararg into the array */
-                int vararg_idx = 0;
-                for (slist_t *n = node; n; n = n->next) {
-                    ast_node_t *vararg = (ast_node_t *)n->data;
-                    if (is_anonymous_class && vararg->type == AST_BLOCK && !n->next) break;
-                    
-                    bc_emit(mg->code, OP_DUP);
-                    mg_push_object(mg, ctor_array_type_str);  /* Dup array ref */
-                    
-                    if (vararg_idx <= 5) {
-                        bc_emit(mg->code, OP_ICONST_0 + vararg_idx);
-                    } else {
-                        bc_emit(mg->code, OP_BIPUSH);
-                        bc_emit_u1(mg->code, vararg_idx);
-                    }
-                    mg_push_int(mg);
-                    
-                    if (!codegen_expr(mg, vararg, cp)) {
-                        free(internal_name);
-                        if (outer_internal) free(outer_internal);
-                        return false;
-                    }
-                    
-                    bc_emit(mg->code, OP_AASTORE);
-                    mg_pop_typed(mg, 3);  /* Pop array ref, index, value */
-                    
-                    vararg_idx++;
-                }
-                free(ctor_array_type_str);
+            if (!codegen_varargs_tail(mg, cp, varargs_param, node, is_anonymous_class)) {
+                free(internal_name);
+                if (outer_internal) free(outer_internal);
+                return false;
             }
             break;  /* Done with arguments */
         }
@@ -7294,30 +7244,11 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
      * argument" - wrongly pushing a second, spurious empty array in the
      * latter case. */
     if (is_varargs_ctor && varargs_param && !varargs_array_pushed) {
-        type_t *elem_type = varargs_element_type(varargs_param->type);
-        bc_emit(mg->code, OP_ICONST_0);
-        mg_push_int(mg);
-        if (elem_type && elem_type->kind == TYPE_CLASS) {
-            char *internal = class_to_internal_name(elem_type->data.class_type.name);
-            uint16_t class_ref = cp_add_class(cp, internal);
-            bc_emit(mg->code, OP_ANEWARRAY);
-            bc_emit_u2(mg->code, class_ref);
-            free(internal);
-        } else if (elem_type && elem_type->kind == TYPE_ARRAY) {
-            char *elem_desc = type_to_descriptor(elem_type);
-            uint16_t class_ref = cp_add_class(cp, elem_desc);
-            bc_emit(mg->code, OP_ANEWARRAY);
-            bc_emit_u2(mg->code, class_ref);
-            free(elem_desc);
-        } else if (elem_type && type_kind_to_atype(elem_type->kind) >= 0) {
-            bc_emit(mg->code, OP_NEWARRAY);
-            bc_emit_u1(mg->code, (uint8_t)type_kind_to_atype(elem_type->kind));
-        } else {
-            uint16_t obj_ref = cp_add_class(cp, "java/lang/Object");
-            bc_emit(mg->code, OP_ANEWARRAY);
-            bc_emit_u2(mg->code, obj_ref);
+        if (!codegen_varargs_tail(mg, cp, varargs_param, NULL, false)) {
+            free(internal_name);
+            if (outer_internal) free(outer_internal);
+            return false;
         }
-        /* Array replaces size on stack - no net change. */
     }
 
     /* Build constructor descriptor */

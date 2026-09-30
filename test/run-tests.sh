@@ -338,6 +338,28 @@ else
     failed=$((failed + 1))
 fi
 
+printf "%-30s ... " "ExternalVarargsFlag"
+if "$GENESIS" -cp "$ext_lib" -d "$ext_out" \
+       "$TEST_SRC/external/ExternalVarargsFlagTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ext_out:$ext_lib" ExternalVarargsFlagTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "ExternalVarargsArrayElement"
+if "$GENESIS" -cp "$ext_lib" -d "$ext_out" \
+       "$TEST_SRC/external/ExternalVarargsArrayElementTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ext_out:$ext_lib" ExternalVarargsArrayElementTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "--- RUNTIME-retention annotation defined outside the JDK builtins ---"
 # The annotation type is compiled first, then the client is compiled
@@ -802,6 +824,69 @@ else
     echo FAIL
     failed=$((failed + 1))
 fi
+
+echo
+echo "--- @Override of a cross-file method with a primitive varargs parameter ---"
+printf "%-30s ... " "PrimitiveVarargsOverride"
+pvo_out="$TEST_BUILD/primitivevarargsoverride-out"
+rm -rf "$pvo_out"
+mkdir -p "$pvo_out"
+if "$GENESIS" -source 8 -d "$pvo_out" \
+       "$TEST_SRC/src/java8/primitivevarargsoverride/Base.java" \
+       "$TEST_SRC/src/java8/primitivevarargsoverride/PrimitiveVarargsOverrideVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$pvo_out" primitivevarargsoverride.PrimitiveVarargsOverrideVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Varargs parameter whose element type is itself an array, cross-file ---"
+printf "%-30s ... " "VarargsArrayElement"
+vae_out="$TEST_BUILD/varargsarrayelement-out"
+rm -rf "$vae_out"
+mkdir -p "$vae_out"
+if "$GENESIS" -source 8 -d "$vae_out" \
+       "$TEST_SRC/src/java8/varargsarrayelement/Session.java" \
+       "$TEST_SRC/src/java8/varargsarrayelement/Impl.java" \
+       "$TEST_SRC/src/java8/varargsarrayelement/VarargsArrayElementVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$vae_out" varargsarrayelement.VarargsArrayElementVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Classes reached only through -sourcepath ---"
+# One file on the command line; everything it uses lives under a separate
+# -sourcepath root and must be both resolved and compiled from there.
+# Fresh output directory, and run with ONLY that directory on the class
+# path, so the dependencies' class files have to have been written too.
+# check_sourcepath <label> <file relative to test/sourcepath/src> <main class>
+check_sourcepath() {
+    printf "%-30s ... " "$1"
+    sp_out="$TEST_BUILD/sourcepath-out"
+    rm -rf "$sp_out"
+    mkdir -p "$sp_out"
+    if (cd "$sp_out" && "$GENESIS" -source 8 -d "$sp_out" \
+           -sourcepath "$TEST_SRC/sourcepath/lib" \
+           "$TEST_SRC/sourcepath/src/$2" >/dev/null 2>&1) && \
+       "$JAVA" -cp "$sp_out" "$3" >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+}
+check_sourcepath SamePackageSourcepath spdep/SamePackageSourcepathTest.java spdep.SamePackageSourcepathTest
+check_sourcepath ImportSourcepath spuser/ImportSourcepathTest.java spuser.ImportSourcepathTest
 
 echo
 echo "=== Results: $passed passed, $failed failed ==="

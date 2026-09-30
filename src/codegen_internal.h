@@ -221,6 +221,11 @@ void mg_add_exception_handler(method_gen_t *mg, uint16_t start_pc,
  */
 bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp);
 
+/* Generate the single array argument for a call's varargs position
+ * (see codegen_expr.c). */
+bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_param,
+                          slist_t *node, bool skip_trailing_block);
+
 /**
  * One pending false-branch collected by
  * codegen_condition_and_chain_false_branch: a bytecode position still
