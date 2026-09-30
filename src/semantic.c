@@ -8100,9 +8100,40 @@ static char *resolve_type_name_with_imports(const char *simple_name,
         if (len > 2 && import_name[len-1] == '*' && import_name[len-2] == '.') {
             /* Try package.SimpleName */
             char qualified[512];
-            snprintf(qualified, sizeof(qualified), "%.*s%s", 
+            snprintf(qualified, sizeof(qualified), "%.*s%s",
                      (int)(len - 1), import_name, simple_name);
-            
+
+            /* Check the in-memory type registry FIRST - a source type from
+             * another file in the SAME compile batch, passed directly on
+             * the command line (the common case; no -sourcepath needed,
+             * since genesis's own Phase 2 already registered every such
+             * file by the time this Phase 2b qualification pass runs).
+             * Without this, a type visible ONLY through a wildcard import
+             * from another file in the same batch (e.g. gumdrop's own
+             * "import org.bluezoo.gumdrop.mqtt.server.*;" for
+             * ConnectHandler, a source type, not a classpath jar entry)
+             * never qualified here at all - class_exists_on_sourcepath()
+             * only finds a MATCHING .java FILE ON A GIVEN -sourcepath
+             * DIRECTORY TREE, which is simply absent for a batch compiled
+             * by passing files directly - leaving the method's parameter
+             * type node unqualified (still bare "ConnectHandler") for
+             * Phase 3 to resolve, which THEN failed too (same underlying
+             * gap: it walks the registry via resolve_unresolved_type(),
+             * which also never checks wildcard imports at all). The
+             * parameter's own type stayed NULL forever, and
+             * build_method_descriptor_from_symbol() silently defaulted it
+             * to "I" for any OTHER file's call site: VerifyError "Bad
+             * type on operand stack ... is not assignable to integer".
+             * Confirmed against gumdrop's own
+             * MqttServer.createProtocolHandler()'s
+             * "handler.setConnectHandler(ch)", where
+             * MqttProtocolHandler.setConnectHandler's own "ConnectHandler"
+             * parameter is visible only via
+             * "import org.bluezoo.gumdrop.mqtt.server.*;". */
+            if (registry && type_registry_lookup(registry, qualified)) {
+                return strdup(qualified);
+            }
+
             /* Verify the class exists in classpath or sourcepath */
             if (classpath) {
                 classfile_t *cf = classpath_load_class(classpath, qualified);
@@ -10517,7 +10548,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                 sym = symbol_new(kind, name);
                             }
                             sym->modifiers = node->data.node.flags;
-                            
+
                             /* Check for illegal modifiers on top-level classes */
                             if (!sem->current_class) {
                                 /* This is a top-level class */
@@ -21291,7 +21322,7 @@ define_local_var:
                                 /* Track seen case values for duplicate detection */
                                 hashtable_t *seen_cases = hashtable_new();
                                 bool seen_default = false;
-                                
+
                                 /* Check if selector is an enum type */
                                 /* If the type doesn't have a symbol yet, try to load it */
                                 if (sel_type && sel_type->kind == TYPE_CLASS &&
@@ -21302,7 +21333,24 @@ define_local_var:
                                         sel_type->data.class_type.symbol = sym;
                                     }
                                 }
-                                
+
+                                /* Per JLS 14.11.1, a bare case label in a switch over an
+                                 * enum type is ALWAYS resolved as an enum constant of
+                                 * that exact type - never via general scope, class-
+                                 * member, or static-import lookup, even when a same-
+                                 * named constant is separately visible through one of
+                                 * those (e.g. a static-imported "byte" constant with the
+                                 * same name as one of the enum's own constants). Used
+                                 * below to skip the GENERIC "duplicate case label" loop's
+                                 * own identifier resolution for an enum switch - it
+                                 * doesn't know about this rule and, given such a name
+                                 * collision, OVERWRITES the correct ordinal (already
+                                 * resolved by the enum-specific block right below) with
+                                 * the unrelated same-named constant's own value. */
+                                bool is_enum_switch = (sel_type && sel_type->kind == TYPE_CLASS &&
+                                    sel_type->data.class_type.symbol &&
+                                    sel_type->data.class_type.symbol->kind == SYM_ENUM);
+
                                 if (sel_type && sel_type->kind == TYPE_CLASS &&
                                     sel_type->data.class_type.symbol &&
                                     sel_type->data.class_type.symbol->kind == SYM_ENUM) {
@@ -21408,8 +21456,30 @@ define_local_var:
                                                         hashtable_insert(seen_cases, val, (void *)1);
                                                     }
                                                 }
-                                            } else if (case_expr && case_expr->type == AST_IDENTIFIER) {
-                                                /* Must be a constant (final static field or enum constant) */
+                                            } else if (case_expr && case_expr->type == AST_IDENTIFIER && !is_enum_switch) {
+                                                /* Must be a constant (final static field, imported
+                                                 * via static import, or inherited). Skipped entirely
+                                                 * for an enum switch - see is_enum_switch's own
+                                                 * comment above: its case labels are ALREADY
+                                                 * correctly resolved as enum constants by the
+                                                 * dedicated block above, and re-resolving them here
+                                                 * via general scope/static-import lookup is not just
+                                                 * redundant but wrong whenever a same-named constant
+                                                 * happens to be visible some other way (e.g. a
+                                                 * statically-imported "byte" constant sharing a name
+                                                 * with one of the enum's own constants) - it would
+                                                 * silently overwrite the correct ordinal with that
+                                                 * unrelated constant's own value. Confirmed against
+                                                 * gumdrop's own SocksProtocolHandler.receive()'s
+                                                 * "switch (state)": its State enum's own
+                                                 * SOCKS5_AUTH_USERNAME_PASSWORD/SOCKS5_AUTH_GSSAPI
+                                                 * share names with two unrelated "byte" constants on
+                                                 * SocksConstants, brought in via this same file's
+                                                 * "import static ...SocksConstants.*;" - both
+                                                 * ordinals got silently overwritten (3->2, 4->1),
+                                                 * colliding with SOCKS5_METHOD_NEGOTIATION/
+                                                 * SOCKS4_REQUEST: VerifyError/ClassFormatError "Bad
+                                                 * lookupswitch instruction". */
                                                 const char *name = case_expr->data.leaf.name;
                                                 symbol_t *sym = scope_lookup(sem->current_scope, name);
 

@@ -3487,6 +3487,31 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
                                 get_primitive_for_wrapper(left->sem_type->data.class_type.name) != TYPE_UNKNOWN) {
                                 left_is_wrapper = true;
                             }
+                        } else if (left->sem_type && (left->sem_type->kind == TYPE_CLASS ||
+                                   left->sem_type->kind == TYPE_ARRAY || left->sem_type->kind == TYPE_NULL)) {
+                            /* mg_local_is_ref() only knows about tracked LOCAL
+                             * variables/parameters - it has no entry at all for
+                             * a bare identifier that's actually an instance or
+                             * static FIELD (e.g. "version" referring to
+                             * "this.version" via Java's implicit unqualified
+                             * field access), so it returns false and left this
+                             * branch never reached for one. Fall back to the
+                             * expression's own resolved sem_type here, exactly
+                             * like the AST_METHOD_CALL/AST_FIELD_ACCESS/
+                             * AST_ARRAY_ACCESS/AST_CAST_EXPR branch below
+                             * already does - without it, "version !=
+                             * initialVersion" (both enum-typed instance
+                             * fields) wrongly used an int comparison
+                             * (IF_ICMPNE) on two REFERENCES: VerifyError "Bad
+                             * type on operand stack ... is not assignable to
+                             * integer". Confirmed against gumdrop's own
+                             * QuicConnection.canAdoptVersion(). */
+                            left_is_ref = true;
+                            if (left->sem_type->kind == TYPE_CLASS &&
+                                left->sem_type->data.class_type.name &&
+                                get_primitive_for_wrapper(left->sem_type->data.class_type.name) != TYPE_UNKNOWN) {
+                                left_is_wrapper = true;
+                            }
                         }
                     } else if (left->type == AST_NEW_OBJECT || left->type == AST_NEW_ARRAY ||
                                left->type == AST_THIS_EXPR || is_string_type(left)) {
@@ -3516,6 +3541,17 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
                             right_is_ref = true;
                             /* Check if it's a wrapper type (e.g., Integer parameter) */
                             if (right->sem_type && right->sem_type->kind == TYPE_CLASS &&
+                                right->sem_type->data.class_type.name &&
+                                get_primitive_for_wrapper(right->sem_type->data.class_type.name) != TYPE_UNKNOWN) {
+                                right_is_wrapper = true;
+                            }
+                        } else if (right->sem_type && (right->sem_type->kind == TYPE_CLASS ||
+                                   right->sem_type->kind == TYPE_ARRAY || right->sem_type->kind == TYPE_NULL)) {
+                            /* Same fallback as the left operand above, for the
+                             * same reason - a bare identifier referring to an
+                             * instance/static FIELD (not a tracked local). */
+                            right_is_ref = true;
+                            if (right->sem_type->kind == TYPE_CLASS &&
                                 right->sem_type->data.class_type.name &&
                                 get_primitive_for_wrapper(right->sem_type->data.class_type.name) != TYPE_UNKNOWN) {
                                 right_is_wrapper = true;
@@ -7564,9 +7600,39 @@ static bool codegen_array_init(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             } else if (expr_kind == TYPE_FLOAT && elem_kind == TYPE_DOUBLE) {
                 bc_emit(mg->code, OP_F2D);
                 mg_push(mg, 1);  /* float -> double gains a slot */
+            } else if (elem_kind == TYPE_CLASS && expr_kind >= TYPE_BOOLEAN && expr_kind <= TYPE_DOUBLE &&
+                       !(elem_expr->sem_type && elem_expr->sem_type->kind == TYPE_CLASS)) {
+                /* Array element type is a reference (e.g. "Object[] pair =
+                 * { someLongExpr, someEnum };") but this particular
+                 * element's own expression is primitive - box it before
+                 * the AASTORE below, exactly like a plain assignment or
+                 * method-call argument already would. Without this, a raw
+                 * primitive (e.g. a `long`, 2 stack words) got stored
+                 * straight into a reference-typed array slot: VerifyError
+                 * "Bad type on operand stack ... not assignable to
+                 * 'java/lang/Object'" (or java.lang.Long/etc., depending
+                 * on the array's own element type). Confirmed against
+                 * gumdrop's own LossDetector.ptoTimeAndSpace()'s "new
+                 * Object[] { nowMillis + duration, space }".
+                 *
+                 * The extra `elem_expr->sem_type->kind == TYPE_CLASS`
+                 * exclusion matters: get_expr_type_kind() deliberately
+                 * reports a WRAPPER-typed expression's own UNDERLYING
+                 * PRIMITIVE kind "for arithmetic" (see its own comment) -
+                 * e.g. "Long.valueOf(7)" (genuinely sem_type TYPE_CLASS
+                 * "Long", already a reference on the stack) comes back as
+                 * expr_kind == TYPE_LONG from that call. Without this
+                 * exclusion, an ALREADY-boxed wrapper value got re-boxed
+                 * here - emit_boxing(TYPE_LONG) expects a genuine 2-word
+                 * primitive long on the stack, not the 1-word reference
+                 * actually there, corrupting the stack outright.
+                 * Confirmed against gumdrop-shaped
+                 * "Object[] ids = { Long.valueOf(7), ... }" (this
+                 * session's own CastToArrayTypeVerifyTest). */
+                emit_boxing(mg, cp, expr_kind);
             }
         }
-        
+
         /* Store element */
         uint8_t store_op;
         if (arr_dims > 1) {
@@ -10912,7 +10978,39 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     return true;
                 }
                 
-                /* Emit conversion opcodes */
+                /* Emit conversion opcodes. Every branch below pops the
+                 * source value's own stackmap entry/entries (by WORD
+                 * count: 1 for int/float, 2 for long/double) and pushes a
+                 * freshly, correctly-typed replacement via the type-aware
+                 * mg_push_*() helpers - never a raw mg_push()/mg_pop() or
+                 * a bare mg_pop_typed() left unpaired. Two distinct gaps
+                 * existed here before: (1) a conversion between two
+                 * category-2 (wide) types or two category-1 types with
+                 * the SAME word count either side (I2F, L2D, F2I, D2L)
+                 * did nothing at all, leaving the SOURCE type's own stale
+                 * tag on mg->stackmap even though the real runtime value
+                 * had changed type - invisible for straight-line code,
+                 * but baked into any StackMapTable frame recorded while
+                 * that value is still on the stack (e.g. a ternary branch
+                 * evaluating "(long) (doubleExpr)"): VerifyError
+                 * "Inconsistent stackmap frames ... Type long ... is not
+                 * assignable to double" (or the reverse). Confirmed
+                 * against gumdrop's own
+                 * MdnsCache.scheduleNextRefreshStage()'s ternary,
+                 * "stage == 0 ? (long) (...) : (long) (...)". (2) a
+                 * conversion INTO or OUT OF a wide type via a bare
+                 * mg_push(mg,1)/mg_pop_typed(mg,1) adjusted the RAW WORD
+                 * COUNT correctly but, for the wide side, only
+                 * touched/removed ONE of that type's two required
+                 * stackmap entries - e.g. L2I's own mg_pop_typed(mg,1)
+                 * discarded only the long's trailing TOP placeholder,
+                 * leaving the actual VT_LONG entry itself behind
+                 * (mis-tagged) as the new top-of-stack instead of a fresh
+                 * VT_INTEGER. Byte/short/char are deliberately folded
+                 * into the "integer" verification type throughout (JVMS
+                 * 4.10.1.2: the JVM operand stack has no separate
+                 * byte/short/char type) - only int/long/float/double ever
+                 * need a distinct mg_push_*() call here. */
                 switch (source_kind) {
                     case TYPE_INT:
                     case TYPE_BYTE:
@@ -10920,9 +11018,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     case TYPE_CHAR:
                     case TYPE_BOOLEAN:
                         switch (target_kind) {
-                            case TYPE_LONG:   bc_emit(mg->code, OP_I2L); mg_push(mg, 1); break;
-                            case TYPE_FLOAT:  bc_emit(mg->code, OP_I2F); break;
-                            case TYPE_DOUBLE: bc_emit(mg->code, OP_I2D); mg_push(mg, 1); break;
+                            case TYPE_LONG:   bc_emit(mg->code, OP_I2L); mg_pop_typed(mg, 1); mg_push_long(mg); break;
+                            case TYPE_FLOAT:  bc_emit(mg->code, OP_I2F); mg_pop_typed(mg, 1); mg_push_float(mg); break;
+                            case TYPE_DOUBLE: bc_emit(mg->code, OP_I2D); mg_pop_typed(mg, 1); mg_push_double(mg); break;
                             case TYPE_BYTE:   bc_emit(mg->code, OP_I2B); break;
                             case TYPE_SHORT:  bc_emit(mg->code, OP_I2S); break;
                             case TYPE_CHAR:   bc_emit(mg->code, OP_I2C); break;
@@ -10936,13 +11034,14 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             case TYPE_SHORT:
                             case TYPE_CHAR:
                                 bc_emit(mg->code, OP_L2I);
-                                mg_pop_typed(mg, 1);
+                                mg_pop_typed(mg, 2);
+                                mg_push_int(mg);
                                 if (target_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
                                 else if (target_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
                                 else if (target_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
                                 break;
-                            case TYPE_FLOAT:  bc_emit(mg->code, OP_L2F); mg_pop_typed(mg, 1); break;
-                            case TYPE_DOUBLE: bc_emit(mg->code, OP_L2D); break;
+                            case TYPE_FLOAT:  bc_emit(mg->code, OP_L2F); mg_pop_typed(mg, 2); mg_push_float(mg); break;
+                            case TYPE_DOUBLE: bc_emit(mg->code, OP_L2D); mg_pop_typed(mg, 2); mg_push_double(mg); break;
                             default: break;
                         }
                         break;
@@ -10953,12 +11052,14 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             case TYPE_SHORT:
                             case TYPE_CHAR:
                                 bc_emit(mg->code, OP_F2I);
+                                mg_pop_typed(mg, 1);
+                                mg_push_int(mg);
                                 if (target_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
                                 else if (target_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
                                 else if (target_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
                                 break;
-                            case TYPE_LONG:   bc_emit(mg->code, OP_F2L); mg_push(mg, 1); break;
-                            case TYPE_DOUBLE: bc_emit(mg->code, OP_F2D); mg_push(mg, 1); break;
+                            case TYPE_LONG:   bc_emit(mg->code, OP_F2L); mg_pop_typed(mg, 1); mg_push_long(mg); break;
+                            case TYPE_DOUBLE: bc_emit(mg->code, OP_F2D); mg_pop_typed(mg, 1); mg_push_double(mg); break;
                             default: break;
                         }
                         break;
@@ -10969,13 +11070,14 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             case TYPE_SHORT:
                             case TYPE_CHAR:
                                 bc_emit(mg->code, OP_D2I);
-                                mg_pop_typed(mg, 1);
+                                mg_pop_typed(mg, 2);
+                                mg_push_int(mg);
                                 if (target_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
                                 else if (target_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
                                 else if (target_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
                                 break;
-                            case TYPE_LONG:   bc_emit(mg->code, OP_D2L); break;
-                            case TYPE_FLOAT:  bc_emit(mg->code, OP_D2F); mg_pop_typed(mg, 1); break;
+                            case TYPE_LONG:   bc_emit(mg->code, OP_D2L); mg_pop_typed(mg, 2); mg_push_long(mg); break;
+                            case TYPE_FLOAT:  bc_emit(mg->code, OP_D2F); mg_pop_typed(mg, 2); mg_push_float(mg); break;
                             default: break;
                         }
                         break;

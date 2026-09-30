@@ -213,6 +213,35 @@ else
     failed=$((failed + 1))
 fi
 
+printf "%-30s ... " "WildcardImportParamType"
+wipt_out="$TEST_BUILD/wildcard-import-param-type-out"
+rm -rf "$wipt_out"
+mkdir -p "$wipt_out"
+if "$GENESIS" -d "$wipt_out" "$TEST_SRC/external/wcimport/server/ConnectHandler.java" \
+       "$TEST_SRC/external/wcimport/Handler.java" \
+       "$TEST_SRC/external/wcimport/server/WildcardImportParamTypeTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$wipt_out" wcimport.server.WildcardImportParamTypeTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "EnumSwitchStaticImportCollide"
+essic_out="$TEST_BUILD/enum-switch-static-import-collide-out"
+rm -rf "$essic_out"
+mkdir -p "$essic_out"
+if "$GENESIS" -d "$essic_out" "$TEST_SRC/external/genesislib/SharedNameConsts.java" \
+       "$TEST_SRC/external/EnumSwitchStaticImportNameCollisionTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$essic_out" EnumSwitchStaticImportNameCollisionTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 printf "%-30s ... " "StaticImportSwitchCaseLabel"
 sisc_out="$TEST_BUILD/static-import-switch-out"
 rm -rf "$sisc_out"

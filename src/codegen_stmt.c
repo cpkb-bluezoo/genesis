@@ -3230,6 +3230,44 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                     bc_emit(mg->code, OP_CHECKCAST);
                                     bc_emit_u2(mg->code, class_idx);
                                 }
+                            } else if (var_kind == TYPE_ARRAY && type_node) {
+                                /* Same need as the TYPE_CLASS case just above, for
+                                 * a loop variable whose OWN declared type is
+                                 * itself an array (iterating a "long[][]" as
+                                 * "for (long[] range : ackRanges)") - AALOAD
+                                 * always returns a plain Object reference; only
+                                 * this checkcast narrows it to the real element
+                                 * array type. Without it, mg->stackmap's own
+                                 * tracked type for the loop variable (see the
+                                 * matching stackmap fix a few lines below) was
+                                 * the only place the narrower type ever got
+                                 * recorded - itself wrongly defaulting to
+                                 * "java/lang/Object" for exactly the same
+                                 * TYPE_CLASS-only oversight - so every access
+                                 * into the loop variable (e.g. "range[0]",
+                                 * needing LALOAD) saw a stack value the
+                                 * verifier could only regard as Object, not
+                                 * '[J': VerifyError "Bad type on operand stack
+                                 * ... is not assignable to '[J'". Confirmed
+                                 * against gumdrop's own
+                                 * LossDetector.detectAndRemoveAckedPackets()'s
+                                 * "for (long[] range : ackRanges)". This loop
+                                 * variable's own type_node is NOT semantically
+                                 * annotated with a sem_type the way an ordinary
+                                 * local variable declaration's type node is
+                                 * (confirmed by instrumenting this exact spot -
+                                 * same finding as the parallel ITERABLE-source
+                                 * path's own identical comment further below in
+                                 * this file) - ast_type_to_descriptor() walks
+                                 * the AST_ARRAY_TYPE chain directly instead of
+                                 * relying on it. */
+                                char *arr_desc = ast_type_to_descriptor(type_node);
+                                if (arr_desc) {
+                                    uint16_t class_idx = cp_add_class(mg->cp, arr_desc);
+                                    bc_emit(mg->code, OP_CHECKCAST);
+                                    bc_emit_u2(mg->code, class_idx);
+                                    free(arr_desc);
+                                }
                             }
                             break;
                         default:
@@ -3253,12 +3291,37 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             case TYPE_FLOAT:
                                 stackmap_set_local_float(mg->stackmap, var_slot);
                                 break;
-                            case TYPE_CLASS:
                             case TYPE_ARRAY:
+                                if (type_node) {
+                                    /* Loop variable's own declared type is itself
+                                     * an array (e.g. "long[] range" iterating a
+                                     * "long[][]") - track its REAL array
+                                     * descriptor (e.g. "[J"), not a generic
+                                     * Object, matching the checkcast added just
+                                     * above for the same shape (see its own
+                                     * comment for why ast_type_to_descriptor()
+                                     * rather than sem_type). Without this, every
+                                     * later access into the loop variable saw it
+                                     * as plain Object on mg->stackmap's own
+                                     * bookkeeping, regardless of the checkcast
+                                     * actually having narrowed the REAL runtime
+                                     * type. */
+                                    char *arr_desc = ast_type_to_descriptor(type_node);
+                                    if (arr_desc) {
+                                        stackmap_set_local_object(mg->stackmap, var_slot, mg->cp, arr_desc);
+                                        free(arr_desc);
+                                    } else {
+                                        stackmap_set_local_object(mg->stackmap, var_slot, mg->cp, "java/lang/Object");
+                                    }
+                                } else {
+                                    stackmap_set_local_object(mg->stackmap, var_slot, mg->cp, "java/lang/Object");
+                                }
+                                break;
+                            case TYPE_CLASS:
                                 {
                                     /* Use the actual element type from the type node */
                                     const char *type_name = "java/lang/Object";
-                                    if (type_node && type_node->sem_type && 
+                                    if (type_node && type_node->sem_type &&
                                         type_node->sem_type->kind == TYPE_CLASS) {
                                         type_name = type_node->sem_type->data.class_type.name;
                                     } else if (type_node && type_node->type == AST_CLASS_TYPE) {
@@ -4934,10 +4997,30 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 if (last_op == OP_RETURN || last_op == OP_IRETURN ||
                     last_op == OP_LRETURN || last_op == OP_FRETURN ||
                     last_op == OP_DRETURN || last_op == OP_ARETURN ||
-                    last_op == OP_ATHROW) {
+                    last_op == OP_ATHROW || last_op == OP_GOTO) {
+                    /* OP_GOTO here can only mean a break/continue reaching
+                     * outside the try body (see try_body_ends_with_return's
+                     * own identical inclusion just above, and
+                     * AST_BREAK_STMT/AST_CONTINUE_STMT's "Track for dead
+                     * code detection" comment) - just as terminating for
+                     * this purpose as an actual return/throw: the try
+                     * body already jumped away on its own, so the "jump
+                     * past all catch handlers" goto below would be
+                     * unreachable dead code with no recorded frame.
+                     * Missing this (unlike try_body_ends_with_return,
+                     * which already had it) meant a try body ending in
+                     * `break`/`continue` still got this spurious trailing
+                     * goto emitted right after its own break/continue
+                     * goto: VerifyError "Expecting a stack map frame" (or
+                     * "Inconsistent stackmap frames", depending on what
+                     * happens to occupy that dead offset). Confirmed
+                     * against gumdrop's own QuicConnection.close()'s
+                     * "try { sendConnectionClose(...); break; } catch
+                     * (PacketProtectionException e) { ...; }" inside a
+                     * for-loop. */
                     try_ends_with_return = true;
                 }
-                
+
                 /* Jump past all catch handlers if try block doesn't end with return/throw.
                  * Note: We DON'T emit a GOTO if try_ends_with_return is true, even if there
                  * are catch handlers, because if the try block ends with return, any branches
