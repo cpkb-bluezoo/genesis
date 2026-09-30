@@ -4695,7 +4695,29 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
     
     /* For enums, set ACC_ENUM flag and superclass to java.lang.Enum */
     if (is_enum) {
-        cg->access_flags |= ACC_ENUM | ACC_FINAL;
+        cg->access_flags |= ACC_ENUM;
+        /* An enum with any constant-specific class body ("P(2) { ... }")
+         * is NOT final: each such constant is actually an anonymous
+         * subclass of this enum (see codegen_anonymous_class()'s own
+         * enum-superclass handling below), and a final class cannot be
+         * extended. Real javac omits ACC_FINAL from exactly such enums;
+         * emitting it here anyway is a real verifier-visible bug (the
+         * classfile for the anonymous subclass declares this enum as its
+         * superclass, "Illegal class modifiers in class ... : 0x11" /
+         * "class ... cannot inherit from final class"), not just a
+         * cosmetic mismatch. */
+        bool any_constant_has_body = false;
+        for (slist_t *c = class_decl->data.node.children; c && !any_constant_has_body; c = c->next) {
+            ast_node_t *child = (ast_node_t *)c->data;
+            if (child->type == AST_ENUM_CONSTANT && child->sem_symbol &&
+                child->sem_symbol->kind == SYM_FIELD &&
+                child->sem_symbol->data.var_data.enum_constant_anon_class) {
+                any_constant_has_body = true;
+            }
+        }
+        if (!any_constant_has_body) {
+            cg->access_flags |= ACC_FINAL;
+        }
         if (cg->superclass) free(cg->superclass);
         cg->superclass = strdup("java/lang/Enum");
         cg->super_class = cp_add_class(cg->cp, cg->superclass);
@@ -5846,9 +5868,43 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             for (slist_t *ec = enum_constants; ec; ec = ec->next) {
                 ast_node_t *enum_const = (ast_node_t *)ec->data;
                 const char *const_name = enum_const->data.node.name;
-                
-                /* new EnumClass */
-                uint16_t class_idx = cp_add_class(cg->cp, cg->internal_name);
+
+                /* A constant declared with its own class body ("P(2) {
+                 * ... }") is actually an instance of the anonymous
+                 * subclass semantic analysis created for it (see
+                 * semantic.c's AST_ENUM_CONSTANT case in
+                 * pass1_collect_declarations), not of the enum itself -
+                 * real javac does exactly this (confirmed by decompiling
+                 * an equivalent enum): "new W$1(...)" / "invokespecial
+                 * W$1.<init>", not "new W". Plain constants (the common
+                 * case) are unaffected: anon_sym stays NULL and every
+                 * class-target below still resolves to the enum's own
+                 * internal name, matching this function's previous
+                 * behavior exactly. */
+                symbol_t *enum_const_field = enum_const->sem_symbol;
+                symbol_t *anon_sym = (enum_const_field && enum_const_field->kind == SYM_FIELD) ?
+                    enum_const_field->data.var_data.enum_constant_anon_class : NULL;
+                char *anon_internal = anon_sym ?
+                    class_to_internal_name(anon_sym->qualified_name) : NULL;
+                const char *ctor_target_internal = anon_internal ? anon_internal : cg->internal_name;
+
+                if (anon_sym && cg->anonymous_classes == NULL) {
+                    cg->anonymous_classes = slist_new(anon_sym);
+                } else if (anon_sym) {
+                    bool already_added = false;
+                    for (slist_t *ac = cg->anonymous_classes; ac; ac = ac->next) {
+                        if (ac->data == anon_sym) {
+                            already_added = true;
+                            break;
+                        }
+                    }
+                    if (!already_added) {
+                        slist_append(cg->anonymous_classes, anon_sym);
+                    }
+                }
+
+                /* new EnumClass (or the constant's own anonymous subclass) */
+                uint16_t class_idx = cp_add_class(cg->cp, ctor_target_internal);
                 bc_emit(mg->code, OP_NEW);
                 bc_emit_u2(mg->code, class_idx);
                 mg_push(mg, 1);
@@ -6031,8 +6087,16 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 }
                 string_append(ctor_desc, ")V");
                 
-                /* invokespecial EnumClass.<init>(descriptor) */
-                uint16_t init_ref = cp_add_methodref(cg->cp, cg->internal_name,
+                /* invokespecial EnumClass.<init>(descriptor), or the
+                 * constant's own anonymous subclass's <init> - see
+                 * ctor_target_internal's own comment above. That
+                 * subclass's synthesized constructor (codegen_anonymous_class(),
+                 * codegen.c) declares exactly this same
+                 * "(Ljava/lang/String;I<user params>)V" shape and simply
+                 * forwards to the enum's own constructor via super(), so
+                 * ctor_desc itself needs no change - only the target
+                 * class does. */
+                uint16_t init_ref = cp_add_methodref(cg->cp, ctor_target_internal,
                     "<init>", ctor_desc->str);
                 bc_emit(mg->code, OP_INVOKESPECIAL);
                 bc_emit_u2(mg->code, init_ref);
@@ -6075,7 +6139,8 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 bc_emit(mg->code, OP_PUTSTATIC);
                 bc_emit_u2(mg->code, field_ref);
                 mg_pop(mg, 1);
-                
+
+                free(anon_internal);
                 ordinal++;
             }
         }
@@ -7173,6 +7238,251 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
  * ======================================================================== */
 
 /**
+ * Generate the synthesized constructor for an enum constant's class body
+ * ("P(2) { ... }", compiled as an anonymous subclass of the enum itself).
+ * Unlike a regular anonymous class, this constructor never has an outer
+ * instance, captured variables, or explicit super-constructor-argument
+ * EXPRESSIONS to evaluate - it's never created inside a method. It's
+ * invoked from exactly one place (the enum's own <clinit>, see the
+ * enum-constant instantiation loop in the <clinit> generation above) with
+ * the already-evaluated name/ordinal/user arguments as real parameters,
+ * and its entire body is just forwarding those same parameter values on
+ * to the enum's own (JLS 8.9.2 implicitly-private) constructor via
+ * super(name, ordinal, ...). `init` is a freshly allocated, zeroed
+ * method_info_gen_t with access_flags/name_index already set by the
+ * caller; this function fills in the rest and appends it to cg->methods. */
+static void codegen_enum_constant_anon_constructor(class_gen_t *cg,
+    method_info_gen_t *init, symbol_t *enum_owner)
+{
+    /* Count this enum constant's own actual argument expressions
+     * (excluding class-body members), to match the enum's declared
+     * constructor by arity - same computation as the <clinit>
+     * instantiation loop above, which built the identical descriptor for
+     * the invokespecial that calls this very constructor. */
+    int decl_arg_count = 0;
+    ast_node_t *const_node = cg->class_sym ? cg->class_sym->ast : NULL;
+    if (const_node) {
+        for (slist_t *n = const_node->data.node.children; n; n = n->next) {
+            ast_node_t *a = (ast_node_t *)n->data;
+            if (a->type != AST_METHOD_DECL && a->type != AST_CONSTRUCTOR_DECL &&
+                a->type != AST_FIELD_DECL && a->type != AST_INITIALIZER_BLOCK) {
+                decl_arg_count++;
+            }
+        }
+    }
+
+    symbol_t *enum_ctor = NULL;
+    symbol_t *enum_varargs_ctor = NULL;
+    if (enum_owner->data.class_data.members && enum_owner->data.class_data.members->symbols) {
+        hashtable_t *mht = enum_owner->data.class_data.members->symbols;
+        for (size_t mi = 0; mi < mht->size && !enum_ctor; mi++) {
+            hashtable_entry_t *ment = mht->buckets[mi];
+            while (ment && !enum_ctor) {
+                symbol_t *msym = (symbol_t *)ment->value;
+                if (msym && msym->kind == SYM_CONSTRUCTOR) {
+                    int nparams = (int)slist_length(msym->data.method_data.parameters);
+                    if (msym->modifiers & MOD_VARARGS) {
+                        if (nparams > 0 && decl_arg_count >= nparams - 1 && !enum_varargs_ctor) {
+                            enum_varargs_ctor = msym;
+                        }
+                    } else if (nparams == decl_arg_count) {
+                        enum_ctor = msym;
+                    }
+                }
+                ment = ment->next;
+            }
+        }
+    }
+    if (!enum_ctor) {
+        enum_ctor = enum_varargs_ctor;
+    }
+
+    /* Build the one descriptor shared by this constructor and the
+     * super() call it makes - identical, since this constructor does
+     * nothing but forward every parameter straight through. */
+    string_t *desc = string_new("(Ljava/lang/String;I");
+    if (enum_ctor) {
+        for (slist_t *pn = enum_ctor->data.method_data.parameters; pn; pn = pn->next) {
+            symbol_t *param_sym = (symbol_t *)pn->data;
+            if (param_sym && param_sym->type) {
+                char *pd = type_to_descriptor(param_sym->type);
+                string_append(desc, pd);
+                free(pd);
+            }
+        }
+    }
+    string_append(desc, ")V");
+    init->descriptor_index = cp_add_utf8(cg->cp, desc->str);
+
+    method_gen_t *mg = calloc(1, sizeof(method_gen_t));
+    mg->code = bytecode_new();
+    mg->cp = cg->cp;
+    mg->class_gen = cg;
+    mg->locals = hashtable_new();
+    mg->is_static = false;
+    mg->is_constructor = true;
+    mg->stackmap = stackmap_new();
+    if (mg->stackmap && cg->internal_name) {
+        stackmap_init_method(mg->stackmap, mg, mg->is_static, cg->internal_name);
+    }
+
+    /* Slot layout: this=0, name=1, ordinal=2, then each param in order. */
+    mg->next_slot = 3;
+    mg->max_locals = 3;
+
+    if (cg->internal_name) {
+        char *this_desc = calloc(1, strlen(cg->internal_name) + 3);
+        sprintf(this_desc, "L%s;", cg->internal_name);
+        mg_record_local_var(mg, "this", this_desc, 0, 0, NULL);
+        free(this_desc);
+    }
+
+    bc_emit(mg->code, OP_ALOAD_0);
+    mg_push(mg, 1);
+    bc_emit(mg->code, OP_ALOAD_1);
+    mg_push(mg, 1);
+    bc_emit(mg->code, OP_ILOAD_2);
+    mg_push(mg, 1);
+    int super_arg_count = 2;
+
+    uint16_t slot = 3;
+    if (enum_ctor) {
+        for (slist_t *pn = enum_ctor->data.method_data.parameters; pn; pn = pn->next) {
+            symbol_t *param_sym = (symbol_t *)pn->data;
+            type_t *ptype = param_sym ? param_sym->type : NULL;
+            type_kind_t kind = ptype ? ptype->kind : TYPE_CLASS;
+            if (kind == TYPE_LONG) {
+                if (slot <= 3) {
+                    bc_emit(mg->code, OP_LLOAD_0 + slot);
+                } else {
+                    bc_emit(mg->code, OP_LLOAD);
+                    bc_emit_u1(mg->code, (uint8_t)slot);
+                }
+                mg_push(mg, 2);
+                slot += 2;
+            } else if (kind == TYPE_DOUBLE) {
+                if (slot <= 3) {
+                    bc_emit(mg->code, OP_DLOAD_0 + slot);
+                } else {
+                    bc_emit(mg->code, OP_DLOAD);
+                    bc_emit_u1(mg->code, (uint8_t)slot);
+                }
+                mg_push(mg, 2);
+                slot += 2;
+            } else if (kind == TYPE_FLOAT) {
+                if (slot <= 3) {
+                    bc_emit(mg->code, OP_FLOAD_0 + slot);
+                } else {
+                    bc_emit(mg->code, OP_FLOAD);
+                    bc_emit_u1(mg->code, (uint8_t)slot);
+                }
+                mg_push(mg, 1);
+                slot++;
+            } else if (kind == TYPE_BOOLEAN || kind == TYPE_BYTE ||
+                       kind == TYPE_CHAR || kind == TYPE_SHORT ||
+                       kind == TYPE_INT) {
+                if (slot <= 3) {
+                    bc_emit(mg->code, OP_ILOAD_0 + slot);
+                } else {
+                    bc_emit(mg->code, OP_ILOAD);
+                    bc_emit_u1(mg->code, (uint8_t)slot);
+                }
+                mg_push(mg, 1);
+                slot++;
+            } else {
+                /* Reference or array type */
+                if (slot <= 3) {
+                    bc_emit(mg->code, OP_ALOAD_0 + slot);
+                } else {
+                    bc_emit(mg->code, OP_ALOAD);
+                    bc_emit_u1(mg->code, (uint8_t)slot);
+                }
+                mg_push(mg, 1);
+                slot++;
+            }
+            if (slot > mg->next_slot) {
+                mg->next_slot = slot;
+                mg->max_locals = slot;
+            }
+            super_arg_count++;
+        }
+    }
+
+    uint16_t super_init = cp_add_methodref(cg->cp, cg->superclass, "<init>", desc->str);
+    bc_emit(mg->code, OP_INVOKESPECIAL);
+    bc_emit_u2(mg->code, super_init);
+    mg_pop(mg, 1 + super_arg_count);
+
+    /* Mark 'this' as initialized in stackmap after super() */
+    if (mg->stackmap && cg->internal_name) {
+        stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+    }
+
+    string_free(desc, true);
+
+    /* Inject instance field initializers / instance initializer blocks -
+     * an enum constant class body can declare its own instance fields
+     * with initializers just like any other anonymous class body, same
+     * as the general anonymous-class constructor path below. */
+    for (slist_t *node = cg->instance_field_inits; node; node = node->next) {
+        ast_node_t *assign = (ast_node_t *)node->data;
+        slist_t *assign_children = assign->data.node.children;
+        if (assign_children && assign_children->next) {
+            ast_node_t *field_id = (ast_node_t *)assign_children->data;
+            ast_node_t *init_expr = (ast_node_t *)assign_children->next->data;
+            const char *field_name = field_id->data.leaf.name;
+
+            field_gen_t *field = hashtable_lookup(cg->field_map, field_name);
+            if (field) {
+                bc_emit(mg->code, OP_ALOAD_0);
+                mg_push_object(mg, cg->internal_name);
+                codegen_expr(mg, init_expr, cg->cp);
+                coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
+                uint16_t field_ref = cp_add_fieldref(cg->cp,
+                    cg->internal_name, field_name, field->descriptor);
+                bc_emit(mg->code, OP_PUTFIELD);
+                bc_emit_u2(mg->code, field_ref);
+                mg_pop_typed(mg, (field->descriptor[0] == 'J' || field->descriptor[0] == 'D') ? 3 : 2);
+            }
+        }
+    }
+    for (slist_t *node = cg->instance_initializers; node; node = node->next) {
+        ast_node_t *init_block = (ast_node_t *)node->data;
+        if (init_block->data.node.children) {
+            ast_node_t *block = (ast_node_t *)init_block->data.node.children->data;
+            codegen_statement(mg, block);
+        }
+    }
+
+    bc_emit(mg->code, OP_RETURN);
+
+    mg->code->max_stack = mg->max_stack;
+    mg->code->max_locals = mg->max_locals;
+
+    init->code = mg->code;
+    mg->code = NULL;
+
+    init->line_numbers = mg->line_numbers;
+    mg->line_numbers = NULL;
+    init->local_var_table = mg->local_var_table;
+    mg->local_var_table = NULL;
+
+    if (mg->stackmap && mg->stackmap->num_entries > 0) {
+        init->stackmap = mg->stackmap;
+        mg->stackmap = NULL;
+        cg->use_stackmap = true;
+    }
+
+    method_gen_free(mg);
+
+    if (!cg->methods) {
+        cg->methods = slist_new(init);
+    } else {
+        slist_append(cg->methods, init);
+    }
+}
+
+/**
  * Generate bytecode for an anonymous class.
  * Anonymous classes don't have AST_CLASS_DECL nodes - they have a symbol
  * with an anonymous_body (AST_BLOCK containing members).
@@ -7328,7 +7638,22 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         method_info_gen_t *init = calloc(1, sizeof(method_info_gen_t));
         init->access_flags = 0x0000;  /* Package-private for anonymous classes */
         init->name_index = cp_add_utf8(cg->cp, "<init>");
-        
+
+        /* An enum constant's class body ("P(2) { ... }") is compiled as an
+         * anonymous subclass of the enum itself - its synthesized
+         * constructor follows a completely different calling convention
+         * (implicit String/int name/ordinal prefix, forwarded straight to
+         * the enum's own constructor; never an outer instance, captured
+         * variable, or explicit super-ctor-argument expression, since it's
+         * never created inside a method) from the general case below, so
+         * it's generated by a dedicated function instead. */
+        symbol_t *enum_owner = (cg->class_sym && cg->class_sym->data.class_data.superclass &&
+            cg->class_sym->data.class_data.superclass->kind == SYM_ENUM) ?
+            cg->class_sym->data.class_data.superclass : NULL;
+
+        if (enum_owner) {
+            codegen_enum_constant_anon_constructor(cg, init, enum_owner);
+        } else {
         /* Build constructor descriptor */
         string_t *desc = string_new("(");
         string_t *super_desc = string_new("(");  /* For calling super() */
@@ -7808,8 +8133,9 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         } else {
             slist_append(cg->methods, init);
         }
+        }
     }
-    
+
     /* Generate <clinit> if we have static initializers or field inits */
     if (static_field_inits || static_initializers) {
         method_info_gen_t *clinit = calloc(1, sizeof(method_info_gen_t));

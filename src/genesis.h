@@ -692,6 +692,14 @@ struct symbol
             bool initialized;           /* Has been assigned a value */
             bool is_enum_constant;      /* True if this is an enum constant */
             int enum_ordinal;           /* Ordinal value (for enum constants) */
+            symbol_t *enum_constant_anon_class; /* For an enum constant declared
+                                          * with a class body ("P(2) { ... }"),
+                                          * the synthesized anonymous subclass
+                                          * symbol (is_anonymous_class=true,
+                                          * superclass=the enum itself) that
+                                          * actually gets instantiated for this
+                                          * constant - NULL for an ordinary
+                                          * constant with no body. */
             void *unresolved_type;      /* unresolved_type_t* for field type */
             bool has_const_value;       /* True if const_value below is populated -
                                           * a classfile-loaded "static final" field's
@@ -872,6 +880,15 @@ retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const 
 char *semantic_resolve_annotation_element_descriptor(semantic_t *sem,
                                                        const char *annotation_name,
                                                        const char *element_name);
+
+/* Load an annotation type's own classfile (trying each dot as a possible
+ * '$' nesting boundary, not just the plain dotted name - see the static
+ * classpath_load_class_with_nested_fallback() this wraps, in semantic.c,
+ * for why), so its type descriptor can be written from the classfile's own
+ * authoritative binary name instead of a guessed dot-to-slash conversion.
+ * Returns NULL if unresolvable. Defined in semantic.c; used by
+ * classwriter.c. */
+struct classfile *semantic_load_annotation_classfile(semantic_t *sem, const char *qualified_name);
 
 /*
  * Shared Type Registry for Parallel Compilation

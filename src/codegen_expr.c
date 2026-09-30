@@ -1424,7 +1424,74 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
             }
             /* Instance field access in static context - error handled below */
         }
-        
+
+        /* Check if this is an inherited field from OUR OWN superclass chain
+         * (set by semantic analysis) BEFORE checking enclosing classes below -
+         * JLS 6.5.6.1's member-lookup precedence considers a class's own
+         * inherited members before an enclosing scope's members, and doing
+         * this the other way round breaks whenever an enclosing class is
+         * ALSO this class's own superclass (an enum constant's own
+         * constant-specific class body, e.g. "P(2) { int twice() { return
+         * n * 2; } }", is compiled as an anonymous subclass of the enum
+         * itself - so the enum is simultaneously both its enclosing_class,
+         * needed for NestHost/InnerClasses attribute generation, and its
+         * superclass, the real reason its own inherited field "n" is
+         * accessible at all here). The "enclosing classes" search below
+         * finds "n" via `enclosing` too (same symbol), but requires an
+         * outer-instance this$0 walk to reach it - which a static nested
+         * class (this one always is; enum constants have no real lexical
+         * enclosing instance) can never have, hard-failing codegen with
+         * "cannot access instance field ... from static context" even
+         * though plain inheritance (a bare GETFIELD on `this`, no outer
+         * instance needed at all) trivially reaches the same field.
+         * Confirmed against gumdrop-parity work on exactly this shape. */
+        if (ident->sem_symbol && ident->sem_symbol->kind == SYM_FIELD &&
+            !(ident->sem_symbol->modifiers & MOD_STATIC) && !mg->is_static) {
+            symbol_t *field_sym = ident->sem_symbol;
+            /* Find which class the field belongs to by checking superclass chain */
+            symbol_t *field_class = NULL;
+            if (mg->class_gen && mg->class_gen->class_sym) {
+                symbol_t *search = mg->class_gen->class_sym->data.class_data.superclass;
+                while (search) {
+                    if (search->data.class_data.members &&
+                        scope_lookup_local(search->data.class_data.members, name) == field_sym) {
+                        field_class = search;
+                        break;
+                    }
+                    search = search->data.class_data.superclass;
+                }
+            }
+
+            if (field_class && field_class->qualified_name) {
+                char *class_internal = class_to_internal_name(field_class->qualified_name);
+                char *field_desc = type_to_descriptor(field_sym->type);
+
+                /* Load 'this' first */
+                bc_emit(mg->code, OP_ALOAD_0);
+                mg_push_object(mg, mg->class_gen->internal_name);
+
+                /* Emit getfield with superclass as owner */
+                uint16_t fieldref = cp_add_fieldref(mg->cp, class_internal, name, field_desc);
+                bc_emit(mg->code, OP_GETFIELD);
+                bc_emit_u2(mg->code, fieldref);
+
+                /* getfield pops object ref, pushes field value */
+                mg_pop_typed(mg, 1);
+                switch (field_desc[0]) {
+                    case 'J': mg_push_long(mg); break;
+                    case 'D': mg_push_double(mg); break;
+                    case 'F': mg_push_float(mg); break;
+                    case 'L':
+                    case '[': mg_push_object_from_descriptor(mg, field_desc); break;
+                    default:  mg_push_int(mg); break;
+                }
+
+                free(class_internal);
+                free(field_desc);
+                return true;
+            }
+        }
+
         /* Check all enclosing classes for nested/local/anonymous classes.
          * Also check the superclass chain of each enclosing class for inherited fields. */
         symbol_t *class_sym = mg->class_gen->class_sym;
@@ -1509,55 +1576,7 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
             enclosing = enclosing->data.class_data.enclosing_class;
         }
     }
-    
-    /* Check if this is an inherited field from superclass (set by semantic analysis) */
-    if (ident->sem_symbol && ident->sem_symbol->kind == SYM_FIELD &&
-        !(ident->sem_symbol->modifiers & MOD_STATIC) && !mg->is_static) {
-        symbol_t *field_sym = ident->sem_symbol;
-        /* Find which class the field belongs to by checking superclass chain */
-        symbol_t *field_class = NULL;
-        if (mg->class_gen && mg->class_gen->class_sym) {
-            symbol_t *search = mg->class_gen->class_sym->data.class_data.superclass;
-            while (search) {
-                if (search->data.class_data.members &&
-                    scope_lookup_local(search->data.class_data.members, name) == field_sym) {
-                    field_class = search;
-                    break;
-                }
-                search = search->data.class_data.superclass;
-            }
-        }
-        
-        if (field_class && field_class->qualified_name) {
-            char *class_internal = class_to_internal_name(field_class->qualified_name);
-            char *field_desc = type_to_descriptor(field_sym->type);
-            
-            /* Load 'this' first */
-            bc_emit(mg->code, OP_ALOAD_0);
-            mg_push_object(mg, mg->class_gen->internal_name);
-            
-            /* Emit getfield with superclass as owner */
-            uint16_t fieldref = cp_add_fieldref(mg->cp, class_internal, name, field_desc);
-            bc_emit(mg->code, OP_GETFIELD);
-            bc_emit_u2(mg->code, fieldref);
-            
-            /* getfield pops object ref, pushes field value */
-            mg_pop_typed(mg, 1);
-            switch (field_desc[0]) {
-                case 'J': mg_push_long(mg); break;
-                case 'D': mg_push_double(mg); break;
-                case 'F': mg_push_float(mg); break;
-                case 'L': 
-                case '[': mg_push_object_from_descriptor(mg, field_desc); break;
-                default:  mg_push_int(mg); break;
-            }
-            
-            free(class_internal);
-            free(field_desc);
-            return true;
-        }
-    }
-    
+
     /* Check if this is a statically imported field */
     if (ident->sem_symbol && ident->sem_symbol->kind == SYM_FIELD &&
         (ident->sem_symbol->modifiers & MOD_STATIC)) {

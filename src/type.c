@@ -816,29 +816,81 @@ type_kind_t get_primitive_for_wrapper(const char *class_name)
     return TYPE_UNKNOWN;
 }
 
+/**
+ * Whether a primitive value of kind `source` can be boxed (JLS 5.1.7) and
+ * the boxed result assigned to reference type `target` - Object, source's
+ * own exact wrapper class, or (for a numeric primitive) java.lang.Number.
+ *
+ * Factored out of type_assignable()'s own inline "Auto-boxing" case so it
+ * can ALSO be the one true answer for type_needs_boxing() below, instead
+ * of each keeping a separate, driftable copy of the same rule - which is
+ * exactly what happened before: type_needs_boxing() only recognized
+ * target being source's exact wrapper class, missing Object and Number,
+ * which type_assignable() already handled correctly here. That caused a
+ * caller scoring overload candidates (find_best_method_by_types() in
+ * semantic.c) to treat a boxing conversion (needs_boxing false, so scored
+ * via a generic type_assignable() fallback at the SAME priority as a
+ * genuine primitive WIDENING conversion) as tied with, instead of lower
+ * priority than, the correct widening overload. For a classfile-loaded
+ * overload set with both an assertEquals(String,long,long) and an
+ * assertEquals(String,Object,Object), that tie - broken only by
+ * candidate-list order, not by JLS-mandated priority - could make the
+ * Object,Object overload win for a char/byte argument pair; JUnit's own
+ * Object.equals(Object) then compared a boxed Character against a boxed
+ * Byte and always failed, regardless of their numeric value. Confirmed
+ * against gumdrop's own Base64DecoderTest, whose
+ * "assertEquals(msg, 'H', someByte)" depends on this exact resolution.
+ *
+ * type_needs_boxing() must call THIS, not type_assignable() itself -
+ * type_assignable() falls back to calling type_needs_boxing() further
+ * down for cases this function doesn't directly handle, so the reverse
+ * call would recurse forever (stack overflow) whenever both say no for
+ * the same target/source pair.
+ */
+static bool primitive_boxes_to(type_t *target, type_t *source)
+{
+    if (target->kind != TYPE_CLASS || source->kind < TYPE_BOOLEAN || source->kind > TYPE_DOUBLE) {
+        return false;
+    }
+
+    const char *target_name = target->data.class_type.name;
+    if (!target_name) {
+        return false;
+    }
+
+    if (strcmp(target_name, "java.lang.Object") == 0) {
+        return true;
+    }
+
+    const char *expected_wrapper = NULL;
+    switch (source->kind) {
+        case TYPE_BOOLEAN: expected_wrapper = "java.lang.Boolean"; break;
+        case TYPE_BYTE:    expected_wrapper = "java.lang.Byte"; break;
+        case TYPE_CHAR:    expected_wrapper = "java.lang.Character"; break;
+        case TYPE_SHORT:   expected_wrapper = "java.lang.Short"; break;
+        case TYPE_INT:     expected_wrapper = "java.lang.Integer"; break;
+        case TYPE_LONG:    expected_wrapper = "java.lang.Long"; break;
+        case TYPE_FLOAT:   expected_wrapper = "java.lang.Float"; break;
+        case TYPE_DOUBLE:  expected_wrapper = "java.lang.Double"; break;
+        default: break;
+    }
+    if (expected_wrapper && strcmp(target_name, expected_wrapper) == 0) {
+        return true;
+    }
+
+    if (type_is_numeric(source) && strcmp(target_name, "java.lang.Number") == 0) {
+        return true;
+    }
+
+    return false;
+}
+
 bool type_needs_boxing(type_t *target, type_t *source)
 {
     if (!target || !source) {
         return false;
     }
-    if (target->kind != TYPE_CLASS) {
-        return false;
-    }
-    if (!type_is_numeric(source) && source->kind != TYPE_BOOLEAN) {
-        return false;
-    }
-    
-    const char *wrapper = get_wrapper_class(source->kind);
-    if (!wrapper) {
-        return false;
-    }
-    
-    if (!target->data.class_type.name) {
-        return false;
-    }
-    
-    return strcmp(target->data.class_type.name, wrapper) == 0 ||
-           strcmp(target->data.class_type.name, wrapper + 10) == 0;  /* Skip "java.lang." */
+    return primitive_boxes_to(target, source);
 }
 
 bool type_needs_unboxing(type_t *target, type_t *source)
@@ -1142,46 +1194,15 @@ bool type_assignable(type_t *target, type_t *source)
         return target_rank >= source_rank;
     }
     
-    /* Auto-boxing: primitive to Object or wrapper class */
-    if (target->kind == TYPE_CLASS && 
-        (source->kind >= TYPE_BOOLEAN && source->kind <= TYPE_DOUBLE)) {
-        const char *target_name = target->data.class_type.name;
-        if (!target_name) {
-            return false;
-        }
-        
-        /* Any primitive can be boxed and widened to Object */
-        if (strcmp(target_name, "java.lang.Object") == 0) {
-            return true;
-        }
-        
-        /* Check primitive-to-wrapper compatibility */
-        const char *expected_wrapper = NULL;
-        switch (source->kind) {
-            case TYPE_BOOLEAN: expected_wrapper = "java.lang.Boolean"; break;
-            case TYPE_BYTE:    expected_wrapper = "java.lang.Byte"; break;
-            case TYPE_CHAR:    expected_wrapper = "java.lang.Character"; break;
-            case TYPE_SHORT:   expected_wrapper = "java.lang.Short"; break;
-            case TYPE_INT:     expected_wrapper = "java.lang.Integer"; break;
-            case TYPE_LONG:    expected_wrapper = "java.lang.Long"; break;
-            case TYPE_FLOAT:   expected_wrapper = "java.lang.Float"; break;
-            case TYPE_DOUBLE:  expected_wrapper = "java.lang.Double"; break;
-            default: break;
-        }
-        
-        if (expected_wrapper && strcmp(target_name, expected_wrapper) == 0) {
-            return true;
-        }
-        
-        /* Also allow widening after boxing: int -> Long, Integer -> Number, etc. */
-        /* For simplicity, just allow boxing to Number for numeric types */
-        if (type_is_numeric(source)) {
-            if (strcmp(target_name, "java.lang.Number") == 0) {
-                return true;
-            }
-        }
+    /* Auto-boxing: primitive to Object, source's own wrapper class, or
+     * (for a numeric primitive) java.lang.Number - see primitive_boxes_to()'s
+     * own doc comment (above, near type_needs_boxing()) for why this is
+     * factored out: shared with type_needs_boxing(), which must not call
+     * back into this function (infinite recursion). */
+    if (primitive_boxes_to(target, source)) {
+        return true;
     }
-    
+
     /* Reference type widening (subtyping) */
     if (target->kind == TYPE_CLASS && source->kind == TYPE_CLASS) {
         /* Object is assignable from any class */

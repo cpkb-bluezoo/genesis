@@ -7912,6 +7912,77 @@ char *semantic_resolve_annotation_type_name(semantic_t *sem, const char *simple_
 }
 
 /**
+ * Load a classfile by a dotted name that may actually name a NESTED type
+ * (e.g. "org.junit.runners.Parameterized.Parameters", whose real classfile
+ * path uses '$' at that boundary: "Parameterized$Parameters.class", not
+ * "Parameterized/Parameters.class"). Tries the name as-is first, then - like
+ * load_external_class_impl()'s own "class candidates" fallback above, whose
+ * comment there has the full rationale - retries with each dot converted to
+ * '$' working from the right, until one loads or all have been tried.
+ *
+ * A qualified annotation type name reaching semantic_resolve_annotation_
+ * retention()/semantic_resolve_annotation_element_descriptor() below is
+ * frequently built by simply concatenating source-level dotted syntax
+ * (resolve_import()'s single-type-import match, or an annotation_name
+ * that already contained a dot when passed in) rather than through
+ * load_external_class()'s own nested-aware resolution, so a bare
+ * classpath_load_class() call on it silently fails to find a nested
+ * annotation type at all - confirmed against gumdrop's own
+ * @org.junit.runners.Parameterized.Parameters(name = "...") on
+ * DecoderTest/EncoderTest's data() method: the annotation was dropped from
+ * the compiled class entirely (no RuntimeVisibleAnnotations for it, visible
+ * or invisible), so JUnit's Parameterized runner found no @Parameters
+ * method and failed every test in both suites with "No public static
+ * parameters method". */
+static classfile_t *classpath_load_class_with_nested_fallback(semantic_t *sem, const char *qualified_name)
+{
+    if (!sem || !sem->classpath || !qualified_name) {
+        return NULL;
+    }
+
+    classfile_t *cf = classpath_load_class(sem->classpath, qualified_name);
+    if (cf) {
+        return cf;
+    }
+
+    char *candidate = strdup(qualified_name);
+    char *p = candidate + strlen(candidate) - 1;
+    while (p > candidate) {
+        while (p > candidate && *p != '.') {
+            p--;
+        }
+        if (*p == '.') {
+            *p = '$';
+            cf = classpath_load_class(sem->classpath, candidate);
+            if (cf) {
+                free(candidate);
+                return cf;
+            }
+            p--;
+        }
+    }
+
+    free(candidate);
+    return NULL;
+}
+
+/**
+ * Public wrapper around classpath_load_class_with_nested_fallback(), for
+ * write_annotation() (classwriter.c) to get an annotation type's own
+ * authoritative binary name (classfile_t::this_class_name) when writing its
+ * RuntimeVisibleAnnotations/RuntimeInvisibleAnnotations type descriptor -
+ * see that function's own doc comment above for why a plain classpath
+ * lookup on the dotted qualified name isn't enough for a nested annotation
+ * type. Returns NULL if the type can't be loaded (e.g. still source-defined
+ * and not yet on the classpath); callers must fall back to their own
+ * best-effort descriptor in that case.
+ */
+struct classfile *semantic_load_annotation_classfile(semantic_t *sem, const char *qualified_name)
+{
+    return classpath_load_class_with_nested_fallback(sem, qualified_name);
+}
+
+/**
  * Determine the real retention policy of an externally-defined annotation
  * (e.g. org.junit.Test) by resolving its simple name through this file's
  * imports and inspecting its own @Retention meta-annotation on the
@@ -7932,7 +8003,7 @@ retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const 
     }
 
     retention_policy_t result = RETENTION_CLASS;
-    classfile_t *cf = classpath_load_class(sem->classpath, qualified);
+    classfile_t *cf = classpath_load_class_with_nested_fallback(sem, qualified);
     if (cf) {
         char *policy_name = classfile_get_retention_policy_name(cf);
         if (policy_name) {
@@ -7972,7 +8043,7 @@ char *semantic_resolve_annotation_element_descriptor(semantic_t *sem,
         return NULL;
     }
 
-    classfile_t *cf = classpath_load_class(sem->classpath, qualified);
+    classfile_t *cf = classpath_load_class_with_nested_fallback(sem, qualified);
     free(qualified);
     if (!cf) {
         return NULL;
@@ -8539,6 +8610,29 @@ static symbol_t *resolve_static_import_field(semantic_t *sem, const char *field_
 }
 
 /**
+ * Numeric primitive widening rank (JLS 5.1.2's byte->short->int->long->
+ * float->double chain, with char alongside short), for scoring how
+ * SPECIFIC a widening conversion is - mirrors type_assignable()'s own
+ * identical table in type.c (kept as a separate, deliberately small
+ * duplicate rather than a shared export, since this is the only caller
+ * outside that file that needs the raw ranks rather than a yes/no
+ * "assignable" answer). 0 for a non-numeric kind (not ordered here).
+ */
+static int primitive_widening_rank(type_kind_t kind)
+{
+    switch (kind) {
+        case TYPE_DOUBLE: return 6;
+        case TYPE_FLOAT:  return 5;
+        case TYPE_LONG:   return 4;
+        case TYPE_INT:    return 3;
+        case TYPE_SHORT:  return 2;
+        case TYPE_CHAR:   return 2;
+        case TYPE_BYTE:   return 1;
+        default:          return 0;
+    }
+}
+
+/**
  * Find the best method overload from a list of candidates based on argument types.
  * @param sem The semantic analyzer
  * @param candidates List of method symbols
@@ -9010,6 +9104,37 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                             }
                         } else if (needs_boxing || needs_unboxing) {
                             score += 40;  /* Lower priority - boxing/unboxing */
+                        } else if (primitive_widening_rank(compare_type->kind) > 0 &&
+                                   primitive_widening_rank(arg_type->kind) > 0) {
+                            /* Primitive-to-primitive widening (JLS 5.1.2):
+                             * scored by how far the conversion widens, not
+                             * a single flat bucket - a NARROWER applicable
+                             * target is more specific than a wider one
+                             * (JLS 15.12.2.5), so e.g. int->long must
+                             * outscore int->double, or overload resolution
+                             * can't tell them apart when a candidate
+                             * exists for each. Previously both fell into
+                             * the same flat-50 "other compatible
+                             * conversions" bucket below as boxing/Object
+                             * conversions once were (see type_needs_boxing()'s
+                             * own fix in type.c for that sibling bug) -
+                             * whichever candidate the caller happened to
+                             * examine first silently won a tie it should
+                             * never have been in. Confirmed against
+                             * gumdrop's own Base64DecoderTest, whose
+                             * "assertEquals(msg, expectedInt, actualInt)"
+                             * (JUnit's real assertEquals(String,long,long)
+                             * vs. its deprecated, always-failing
+                             * assertEquals(String,double,double)) depends
+                             * on int->long outscoring int->double here. */
+                            int target_rank = primitive_widening_rank(compare_type->kind);
+                            int source_rank = primitive_widening_rank(arg_type->kind);
+                            if (target_rank >= source_rank) {
+                                score += 90 - (target_rank - source_rank);
+                            } else {
+                                type_mismatch = true;
+                                break;
+                            }
                         } else if (type_assignable(compare_type, arg_type)) {
                             score += 50;  /* Other compatible conversions */
                     }
@@ -10538,9 +10663,34 @@ static void semantic_define_pattern_vars(semantic_t *sem, ast_node_t *pattern, s
     /* AST_UNNAMED_PATTERN has no variables to define */
 }
 
+/**
+ * Whether an AST_ENUM_CONSTANT node ("P(2) { ... }") declares a
+ * constant-specific class body - any child that is a real member
+ * declaration rather than a constructor-argument expression. Constructor
+ * arguments and class-body members are both plain children of the same
+ * node (the parser appends them in that order, see parser.c's own enum
+ * constant parsing), so this is the same test already used elsewhere to
+ * separate the two groups (e.g. the arg-count loop in the enum <clinit>
+ * codegen, codegen.c) - kept as a single shared helper instead of a third
+ * copy of the same condition.
+ */
+static bool enum_constant_has_class_body(ast_node_t *node)
+{
+    for (slist_t *c = node->data.node.children; c; c = c->next) {
+        ast_node_t *child = (ast_node_t *)c->data;
+        if (child->type == AST_METHOD_DECL || child->type == AST_CONSTRUCTOR_DECL ||
+            child->type == AST_FIELD_DECL || child->type == AST_INITIALIZER_BLOCK ||
+            child->type == AST_CLASS_DECL || child->type == AST_INTERFACE_DECL ||
+            child->type == AST_ENUM_DECL || child->type == AST_RECORD_DECL) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* ========================================================================
  * Pass 1: Collect Declarations
- * 
+ *
  * Walks the AST and registers all type declarations (classes, interfaces)
  * and their members (fields, methods) in the symbol table.
  * ======================================================================== */
@@ -11461,38 +11611,118 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                         {
                             /* Enum constants are public static final fields of the enum type */
                             const char *name = node->data.node.name;
-                            
+                            symbol_t *sym = NULL;
+
                             /* Check if already pre-registered (from preregister_nested_types) */
                             symbol_t *existing = scope_lookup_local(sem->current_scope, name);
                             if (existing && existing->kind == SYM_FIELD &&
                                 existing->data.var_data.is_enum_constant) {
                                 node->sem_symbol = existing;
-                                break;
+                                sym = existing;
+                            } else {
+                                sym = symbol_new(SYM_FIELD, name);
+                                sym->modifiers = MOD_PUBLIC | MOD_STATIC | MOD_FINAL;
+                                /* Type is the enclosing enum type */
+                                if (sem->current_class && sem->current_class->type) {
+                                    sym->type = sem->current_class->type;
+                                }
+                                sym->ast = node;
+                                sym->line = node->line;
+                                sym->column = node->column;
+                                sym->data.var_data.is_enum_constant = true;
+                                /* Ordinal was pre-assigned and stored in flags field during enum decl processing */
+                                sym->data.var_data.enum_ordinal = node->data.node.flags;
+
+                                if (!scope_define(sem->current_scope, sym)) {
+                                    semantic_error(sem, node->line, node->column,
+                                                  "Duplicate enum constant: %s", name);
+                                }
+
+                                /* Store symbol on AST for codegen */
+                                node->sem_symbol = sym;
                             }
-                            
-                            symbol_t *sym = symbol_new(SYM_FIELD, name);
-                            sym->modifiers = MOD_PUBLIC | MOD_STATIC | MOD_FINAL;
-                            /* Type is the enclosing enum type */
-                            if (sem->current_class && sem->current_class->type) {
-                                sym->type = sem->current_class->type;
+
+                            /* A constant with its own class body ("P(2) {
+                             * ... }") is compiled as an anonymous subclass
+                             * of the enum, exactly like "new Enclosing() {
+                             * ... }" elsewhere in this same pass (see the
+                             * AST_NEW_OBJECT case above) - create that
+                             * subclass symbol here (guarded by
+                             * enum_constant_anon_class so a constant
+                             * revisited via a later re-entry of this same
+                             * walk isn't given a second, different
+                             * subclass) and switch context into it so
+                             * this constant's own method/field
+                             * declarations - its children, walked next via
+                             * the same WALK_CHILDREN mechanism as any
+                             * other node - get registered into the
+                             * SUBCLASS's own member scope instead of
+                             * silently overwriting the enum's own
+                             * same-named method. That silent overwrite is
+                             * the actual mechanism of the bug this fixes:
+                             * both used to land in the enum's single
+                             * shared member scope under the same key (e.g.
+                             * "twice()"), so the constant's own override
+                             * was simply clobbered by the enum's own
+                             * later-declared method of the same name
+                             * (scope_define()/hashtable_insert() replaces
+                             * on a colliding key) - P.twice() silently ran
+                             * the enum's base method instead of the
+                             * override, with no error of any kind.
+                             * Mirrors the AST_NEW_OBJECT case's own
+                             * save/switch pattern; WALK_EXIT below
+                             * restores it the same way. */
+                            if (sym && !sym->data.var_data.enum_constant_anon_class &&
+                                enum_constant_has_class_body(node) &&
+                                sem->current_class && sem->current_class->qualified_name) {
+                                int anon_id = ++sem->current_class->data.class_data.local_class_counter;
+                                char anon_name[256];
+                                snprintf(anon_name, sizeof(anon_name), "%s$%d",
+                                         sem->current_class->qualified_name, anon_id);
+
+                                symbol_t *anon_sym = symbol_new(SYM_CLASS, anon_name);
+                                anon_sym->qualified_name = strdup(anon_name);
+                                anon_sym->ast = node;
+                                anon_sym->data.class_data.enclosing_class = sem->current_class;
+                                anon_sym->data.class_data.is_anonymous_class = true;
+                                /* anonymous_body points at this same
+                                 * AST_ENUM_CONSTANT node, not a nested
+                                 * AST_BLOCK (enum constant bodies are not
+                                 * parsed with one) - codegen_anonymous_class()
+                                 * iterates body->data.node.children and
+                                 * already silently ignores any child whose
+                                 * type it doesn't recognize as a member
+                                 * declaration, which is exactly what the
+                                 * constant's own leading constructor-argument
+                                 * expression children are. */
+                                anon_sym->data.class_data.anonymous_body = node;
+                                anon_sym->data.class_data.superclass = sem->current_class;
+                                anon_sym->modifiers = MOD_STATIC;
+
+                                type_t *anon_type = type_new_class(anon_name);
+                                anon_type->data.class_type.symbol = anon_sym;
+                                anon_sym->type = anon_type;
+                                hashtable_insert(sem->types, anon_name, anon_type);
+
+                                scope_t *class_scope = scope_new(SCOPE_CLASS, sem->current_scope);
+                                class_scope->owner = anon_sym;
+                                anon_sym->data.class_data.members = class_scope;
+
+                                sym->data.var_data.enum_constant_anon_class = anon_sym;
                             }
-                            sym->ast = node;
-                            sym->line = node->line;
-                            sym->column = node->column;
-                            sym->data.var_data.is_enum_constant = true;
-                            /* Ordinal was pre-assigned and stored in flags field during enum decl processing */
-                            sym->data.var_data.enum_ordinal = node->data.node.flags;
-                            
-                            if (!scope_define(sem->current_scope, sym)) {
-                                semantic_error(sem, node->line, node->column,
-                                              "Duplicate enum constant: %s", name);
+
+                            if (sym && sym->data.var_data.enum_constant_anon_class) {
+                                symbol_t *anon_sym = sym->data.var_data.enum_constant_anon_class;
+                                frame->saved_class = sem->current_class;
+                                frame->saved_scope = sem->current_scope;
+                                sem->current_class = anon_sym;
+                                if (anon_sym->data.class_data.members) {
+                                    sem->current_scope = anon_sym->data.class_data.members;
+                                }
                             }
-                            
-                            /* Store symbol on AST for codegen */
-                            node->sem_symbol = sym;
                         }
                         break;
-                    
+
                     case AST_PARAMETER:
                         {
                             /* Record components - register as field and accessor method */
@@ -12373,7 +12603,24 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             }
                         }
                         break;
-                    
+
+                    case AST_ENUM_CONSTANT:
+                        /* Restore context if WALK_ENTER switched into this
+                         * constant's own anonymous-subclass symbol - see
+                         * the matching save/switch there for the full
+                         * explanation. Guard on saved_scope/saved_class
+                         * being non-NULL (not on the constant having a
+                         * class body, which would need re-deriving the
+                         * same symbol here) since WALK_ENTER never sets
+                         * either field for a plain, body-less constant. */
+                        if (frame->saved_scope) {
+                            sem->current_scope = frame->saved_scope;
+                        }
+                        if (frame->saved_class) {
+                            sem->current_class = frame->saved_class;
+                        }
+                        break;
+
                     default:
                         break;
                 }
@@ -20136,6 +20383,37 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                         }
                         break;
                     
+                    case AST_ENUM_CONSTANT:
+                        {
+                            /* A constant with its own class body ("P(2) {
+                             * ... }") was given an anonymous subclass
+                             * symbol in pass1 (see that case's own
+                             * comment, semantic.c's AST_ENUM_CONSTANT case
+                             * in pass1_collect_declarations) - switch into
+                             * it here so the constant's own method bodies
+                             * (its children, walked next) get fully
+                             * type-checked with the correct
+                             * current_class/current_scope, mirroring
+                             * AST_BLOCK's identical handling for a regular
+                             * anonymous class body just above. A plain
+                             * constant with no body has no such symbol and
+                             * is walked unchanged, exactly as before this
+                             * fix. */
+                            symbol_t *field_sym = node->sem_symbol;
+                            symbol_t *anon_sym = (field_sym && field_sym->kind == SYM_FIELD) ?
+                                field_sym->data.var_data.enum_constant_anon_class : NULL;
+                            if (anon_sym) {
+                                frame->saved_scope = sem->current_scope;
+                                frame->saved_class = sem->current_class;
+                                if (anon_sym->data.class_data.members) {
+                                    anon_sym->data.class_data.members->parent = sem->current_scope;
+                                    sem->current_scope = anon_sym->data.class_data.members;
+                                }
+                                sem->current_class = anon_sym;
+                            }
+                        }
+                        break;
+
                     case AST_CATCH_CLAUSE:
                         {
                             /* Catch clause: catch (ExceptionType varName) { body },
@@ -22141,7 +22419,21 @@ define_local_var:
                          * The scopes will be freed when semantic_free is called. */
                         }
                         break;
-                    
+
+                    case AST_ENUM_CONSTANT:
+                        /* Restore context if WALK_ENTER switched into this
+                         * constant's own anonymous-subclass symbol - see
+                         * the matching save/switch there. A plain
+                         * constant with no body never sets saved_scope/
+                         * saved_class, so this is a no-op for it. */
+                        if (frame->saved_scope) {
+                            sem->current_scope = frame->saved_scope;
+                        }
+                        if (frame->saved_class) {
+                            sem->current_class = frame->saved_class;
+                        }
+                        break;
+
                     case AST_SWITCH_RULE:
                         /* Restore scope if we created one */
                         if (frame->saved_scope) {

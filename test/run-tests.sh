@@ -383,6 +383,46 @@ else
     failed=$((failed + 1))
 fi
 
+# The annotation type is NESTED inside another class and compiled first, so
+# its real classfile path is "Markers$Marker.class" - the client's own
+# retention lookup and type-descriptor writing must resolve that '$'
+# boundary correctly, not just naively slash every dot in the dotted name.
+printf "%-30s ... " "NestedAnnotationRetentionTest"
+nanno_lib="$TEST_BUILD/nestedannotest-lib"
+nanno_out="$TEST_BUILD/nestedannotest-out"
+rm -rf "$nanno_lib" "$nanno_out"
+mkdir -p "$nanno_lib" "$nanno_out"
+if "$GENESIS" -d "$nanno_lib" "$TEST_SRC"/external/nestedannotest/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$nanno_lib" -d "$nanno_out" \
+       "$TEST_SRC/external/NestedAnnotationRetentionTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$nanno_out:$nanno_lib" NestedAnnotationRetentionTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The overloaded "check" methods are compiled first, so resolving a call
+# against them exercises overload resolution over CLASSFILE-loaded method
+# symbols, not same-compilation-unit ones (see Checker.java's own comment
+# for why that distinction matters here).
+printf "%-30s ... " "PrimitiveOverloadResolutionTest"
+pov_lib="$TEST_BUILD/overloadlib-lib"
+pov_out="$TEST_BUILD/overloadlib-out"
+rm -rf "$pov_lib" "$pov_out"
+mkdir -p "$pov_lib" "$pov_out"
+if "$GENESIS" -d "$pov_lib" "$TEST_SRC"/external/overloadlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$pov_lib" -d "$pov_out" \
+       "$TEST_SRC/external/PrimitiveOverloadResolutionTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$pov_out:$pov_lib" PrimitiveOverloadResolutionTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "--- Class file version (-source/-target/-release) ---"
 # With no -target the version is computed from the features used (floor 52,

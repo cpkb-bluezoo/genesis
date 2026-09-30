@@ -1031,22 +1031,22 @@ static void lexer_scan_string(lexer_t *lexer)
                     break;
                 }
                 case 'u': {
-                    /* Unicode escape \uXXXX (JLS 3.3) - mirrors
-                     * lexer_scan_char's identical handling (only BMP
-                     * characters that fit in a byte are supported, same
-                     * limitation as that existing implementation).
-                     * Falling through to the default case (which kept
-                     * the literal 'u' character, leaving the following
-                     * hex digits as ordinary text - inflating the
-                     * string's length by 5 bytes per escape instead of
-                     * producing the single intended byte) silently
-                     * corrupted any string literal using this escape -
-                     * e.g. gumdrop's own SASL OAUTHBEARER credential
-                     * parsing, which uses "\u0001" (control-A) as its
-                     * RFC 7628 field separator; every indexOf('\u0001')
-                     * against such a corrupted literal (the CHAR literal
-                     * '\u0001' itself was already handled correctly, see
-                     * lexer_scan_char below) failed to find a match. */
+                    /* Unicode escape \uXXXX (JLS 3.3). Falling through to
+                     * the default case (which kept the literal 'u'
+                     * character, leaving the following hex digits as
+                     * ordinary text - inflating the string's length by 5
+                     * bytes per escape instead of producing the single
+                     * intended byte) silently corrupted any string
+                     * literal using this escape - e.g. gumdrop's own SASL
+                     * OAUTHBEARER credential parsing, which uses
+                     * "\u0001" (control-A) as its RFC 7628 field
+                     * separator; every indexOf('\u0001') against such a
+                     * corrupted literal (the CHAR literal '\u0001' itself
+                     * was already handled correctly, see
+                     * lexer_scan_char's own, separate value-truncating
+                     * implementation below - fine there since a 'char'
+                     * literal's value is read back as a plain integer,
+                     * never as UTF-8 text) failed to find a match. */
                     lexer_advance_char(lexer);  /* Skip 'u', move to 1st hex digit */
                     int value = 0;
                     int digits;
@@ -1060,7 +1060,52 @@ static void lexer_scan_string(lexer_t *lexer)
                             lexer_advance_char(lexer);
                         }
                     }
-                    esc = (digits == 4) ? (char)(value & 0xFF) : 'u';
+                    if (digits != 4) {
+                        esc = 'u';
+                        break;
+                    }
+                    /* Encode the code unit as UTF-8 (1-3 bytes; \uXXXX
+                     * names one UTF-16 code unit, so never more). This
+                     * text buffer holds plain UTF-8 throughout the rest
+                     * of the compiler - a downstream constant-pool writer
+                     * already converts an embedded 0x00 byte to the
+                     * classfile's special 2-byte "modified UTF-8"
+                     * encoding uniformly, however it got there (confirmed
+                     * against the "\0" octal escape just above, which
+                     * already produces a raw 0x00 byte here and comes out
+                     * correctly downstream), so \u0000 is deliberately
+                     * left as a single raw 0x00 byte rather than
+                     * special-cased here too.
+                     *
+                     * Previously this just truncated to (char)(value &
+                     * 0xFF) - correct by accident for value <= 0x7F
+                     * (ASCII, one byte either way), but silently
+                     * corrupting any escape for a Latin-1-range or higher
+                     * character (value >= 0x80) into a single byte that
+                     * is not valid UTF-8 on its own:
+                     * java.lang.ClassFormatError "Illegal UTF8 string in
+                     * constant pool" at class-LOAD time, even though
+                     * genesis itself compiled and wrote the class file
+                     * without complaint - the JVM's own class-file
+                     * verifier is the only thing that ever caught this.
+                     * Confirmed against gumdrop's own HTTPUtilsTest,
+                     * whose "café" literal depends on exactly this. */
+                    if (value <= 0x7F) {
+                        esc = (char)value;
+                    } else if (value <= 0x7FF) {
+                        if (buf_pos < sizeof(lexer->text_buf) - 1) {
+                            lexer->text_buf[buf_pos++] = (char)(0xC0 | (value >> 6));
+                        }
+                        esc = (char)(0x80 | (value & 0x3F));
+                    } else {
+                        if (buf_pos < sizeof(lexer->text_buf) - 1) {
+                            lexer->text_buf[buf_pos++] = (char)(0xE0 | (value >> 12));
+                        }
+                        if (buf_pos < sizeof(lexer->text_buf) - 1) {
+                            lexer->text_buf[buf_pos++] = (char)(0x80 | ((value >> 6) & 0x3F));
+                        }
+                        esc = (char)(0x80 | (value & 0x3F));
+                    }
                     break;
                 }
                 default:   esc = c; break;
@@ -1069,13 +1114,61 @@ static void lexer_scan_string(lexer_t *lexer)
                 lexer->text_buf[buf_pos++] = esc;
             }
         } else {
-            if (buf_pos < sizeof(lexer->text_buf) - 1) {
+            /* A 4-byte UTF-8 lead byte (0xF0-0xF4) in the SOURCE TEXT
+             * itself (as opposed to a \uXXXX escape, which can only ever
+             * name a single BMP code point and was already fixed
+             * separately above) encodes a supplementary character
+             * (U+10000-U+10FFFF) - valid standard UTF-8, but the
+             * classfile format's "modified UTF-8" explicitly forbids
+             * 4-byte sequences, requiring the code point's UTF-16
+             * surrogate pair instead, each half encoded as its own
+             * ordinary 3-byte sequence (6 bytes total) - matching how
+             * the resulting String/char[] actually represents it. Just
+             * copying the 4 source bytes through unchanged (as this used
+             * to do, same as any other non-escaped character) wrote a
+             * classfile-illegal 4-byte sequence straight into the
+             * constant pool: java.lang.ClassFormatError "Illegal UTF8
+             * string in constant pool" at class-load time - same
+             * symptom as the \uXXXX bug above, different cause.
+             * Confirmed against gumdrop's own MessageIndexEntryTest,
+             * whose test data includes a literal emoji written directly
+             * in the source. */
+            bool handled_astral = false;
+            if ((unsigned char)c >= 0xF0 && (unsigned char)c <= 0xF4) {
+                unsigned char b1 = (unsigned char)lexer_peek_ahead(lexer, 1);
+                unsigned char b2 = (unsigned char)lexer_peek_ahead(lexer, 2);
+                unsigned char b3 = (unsigned char)lexer_peek_ahead(lexer, 3);
+                if ((b1 & 0xC0) == 0x80 && (b2 & 0xC0) == 0x80 && (b3 & 0xC0) == 0x80) {
+                    unsigned int cp = (((unsigned int)(unsigned char)c & 0x07) << 18) |
+                                      (((unsigned int)b1 & 0x3F) << 12) |
+                                      (((unsigned int)b2 & 0x3F) << 6) |
+                                      ((unsigned int)b3 & 0x3F);
+                    if (cp >= 0x10000 && cp <= 0x10FFFF) {
+                        unsigned int v = cp - 0x10000;
+                        unsigned int hi = 0xD800 + (v >> 10);
+                        unsigned int lo = 0xDC00 + (v & 0x3FF);
+                        if (buf_pos + 6 <= sizeof(lexer->text_buf) - 1) {
+                            lexer->text_buf[buf_pos++] = (char)(0xE0 | (hi >> 12));
+                            lexer->text_buf[buf_pos++] = (char)(0x80 | ((hi >> 6) & 0x3F));
+                            lexer->text_buf[buf_pos++] = (char)(0x80 | (hi & 0x3F));
+                            lexer->text_buf[buf_pos++] = (char)(0xE0 | (lo >> 12));
+                            lexer->text_buf[buf_pos++] = (char)(0x80 | ((lo >> 6) & 0x3F));
+                            lexer->text_buf[buf_pos++] = (char)(0x80 | (lo & 0x3F));
+                        }
+                        lexer_advance_char(lexer);  /* consume b1 */
+                        lexer_advance_char(lexer);  /* consume b2 */
+                        lexer_advance_char(lexer);  /* consume b3 */
+                        handled_astral = true;
+                    }
+                }
+            }
+            if (!handled_astral && buf_pos < sizeof(lexer->text_buf) - 1) {
                 lexer->text_buf[buf_pos++] = c;
             }
         }
         lexer_advance_char(lexer);
     }
-    
+
     if (lexer_peek(lexer) == '"') {
         lexer_advance_char(lexer);  /* Skip closing quote */
     }

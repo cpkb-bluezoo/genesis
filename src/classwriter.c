@@ -467,11 +467,40 @@ static int write_annotation(uint8_t **p, const_pool_t *cp, ast_node_t *annot)
 
     /* type_index - descriptor for annotation type */
     const char *qualified_name = resolve_annotation_qualified_name(annot->data.node.name);
-    char *type_desc = calloc(strlen(qualified_name) + 4, 1);
-    sprintf(type_desc, "L%s;", qualified_name);
-    /* Convert dots to slashes */
-    for (char *c = type_desc; *c; c++) {
-        if (*c == '.') *c = '/';
+    char *type_desc = NULL;
+
+    /* qualified_name's dots are ambiguous: most are package separators
+     * ('/'), but if the annotation type is NESTED inside another class
+     * (e.g. "org.junit.runners.Parameterized.Parameters"), the dot at
+     * that boundary is really a '$' in the type's real binary name.
+     * Blindly slashing every dot writes a descriptor
+     * ("Lorg/junit/runners/Parameterized/Parameters;") naming a class
+     * that doesn't exist - the JVM's own annotation parser tolerates an
+     * unresolvable element type by silently EXCLUDING the whole
+     * annotation from getAnnotations()/getAnnotation(), not by erroring,
+     * so this was invisible at both compile time and class-load time.
+     * Confirmed against gumdrop's own DecoderTest/EncoderTest: their
+     * data() method's "@Parameters(name = "...")" wrote a syntactically
+     * well-formed but wrongly-named annotation, so JUnit's Parameterized
+     * runner still found no @Parameters method. A classfile actually on
+     * the classpath carries its own authoritative binary name (with '$'
+     * already in the right place); prefer that over guessing whenever
+     * the type can be loaded. */
+    if (g_classwriter_sem) {
+        struct classfile *cf = semantic_load_annotation_classfile(g_classwriter_sem, qualified_name);
+        if (cf && cf->this_class_name) {
+            type_desc = calloc(strlen(cf->this_class_name) + 4, 1);
+            sprintf(type_desc, "L%s;", cf->this_class_name);
+        }
+    }
+    if (!type_desc) {
+        /* Best effort for a source-defined type not yet on the classpath,
+         * or one that couldn't be resolved above. */
+        type_desc = calloc(strlen(qualified_name) + 4, 1);
+        sprintf(type_desc, "L%s;", qualified_name);
+        for (char *c = type_desc; *c; c++) {
+            if (*c == '.') *c = '/';
+        }
     }
     uint16_t type_idx = cp_add_utf8(cp, type_desc);
     free(type_desc);
@@ -1114,13 +1143,33 @@ static void preadd_annotation_cp_entries(const_pool_t *cp, ast_node_t *annot)
      * name exactly - the constant pool is serialized before write_annotation()
      * runs, so any string it needs (like the fully-qualified descriptor) has
      * to already exist by the time this pre-add pass is done. Also used
-     * below to resolve each element's own declared return type. */
+     * below to resolve each element's own declared return type. See
+     * write_annotation()'s own matching comment for why this can't just be
+     * a blind dot-to-slash conversion of qualified_name: a NESTED
+     * annotation type's real binary name has '$' at the nesting boundary,
+     * and getting this pre-add pass out of sync with write_annotation()'s
+     * own resolution - as it was before both were fixed together - adds a
+     * DIFFERENT Utf8 entry than the one actually referenced, one index
+     * past the end of the already-serialized constant pool
+     * ("IllegalArgumentException: Constant pool index out of bounds" at
+     * reflection time, even though the class loads and javap silently
+     * shows no annotation on the member at all). */
     const char *qualified_name = resolve_annotation_qualified_name(annot->data.node.name);
     if (annot->data.node.name) {
-        char *type_desc = calloc(strlen(qualified_name) + 4, 1);
-        sprintf(type_desc, "L%s;", qualified_name);
-        for (char *c = type_desc; *c; c++) {
-            if (*c == '.') *c = '/';
+        char *type_desc = NULL;
+        if (g_classwriter_sem) {
+            struct classfile *cf = semantic_load_annotation_classfile(g_classwriter_sem, qualified_name);
+            if (cf && cf->this_class_name) {
+                type_desc = calloc(strlen(cf->this_class_name) + 4, 1);
+                sprintf(type_desc, "L%s;", cf->this_class_name);
+            }
+        }
+        if (!type_desc) {
+            type_desc = calloc(strlen(qualified_name) + 4, 1);
+            sprintf(type_desc, "L%s;", qualified_name);
+            for (char *c = type_desc; *c; c++) {
+                if (*c == '.') *c = '/';
+            }
         }
         cp_add_utf8(cp, type_desc);
         free(type_desc);
