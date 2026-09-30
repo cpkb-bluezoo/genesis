@@ -1948,7 +1948,21 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
             
             /* Emit arraylength instruction */
             bc_emit(mg->code, OP_ARRAYLENGTH);
-            /* Stack: arrayref -> int (length) - net effect 0 */
+            /* Stack: arrayref -> int (length) - net word-count effect 0, but
+             * mg->stackmap's own tracked TYPE for this slot must change from
+             * the array's reference type to integer - a raw mg_pop(1)/
+             * mg_push(1) (or no update at all, as here previously) leaves
+             * the array's own type sitting on top of mg->stackmap's simulated
+             * stack. Invisible in straight-line code (nothing ever reads
+             * that stale type back out), but a real bug the moment a
+             * stackmap frame is recorded while the length is still on the
+             * stack - e.g. as one operand of a ternary merged with another
+             * int-typed branch (VerifyError: "Type integer ... is not
+             * assignable to '[B'"). Confirmed against gumdrop's own
+             * Encoder.encode() (org.bluezoo.gumdrop.http.hpack), whose
+             * "useHuffman ? hname.length : rname.length" hits exactly this. */
+            mg_pop_typed(mg, 1);
+            mg_push_int(mg);
             return true;
         }
     }
@@ -3209,6 +3223,28 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
     bool is_null_comparison = (op == TOK_EQ || op == TOK_NE) &&
         ((left->type == AST_LITERAL && left->data.leaf.token_type == TOK_NULL) ||
          (right->type == AST_LITERAL && right->data.leaf.token_type == TOK_NULL));
+
+    /* Per JLS 15.21, "==" / "!=" between two operands that are BOTH of
+     * reference type - including two WRAPPER types, e.g.
+     * "Boolean.TRUE == someBooleanField" - is a REFERENCE comparison
+     * (object identity), not a numeric one; unboxing only applies when
+     * exactly one side is a genuine primitive (JLS 15.21's other case).
+     * Without this check, the unconditional auto-unbox below fired for
+     * EACH operand independently, based solely on that operand's own
+     * type, unboxing BOTH sides of a wrapper-vs-wrapper "==" - the
+     * is_ref_compare decision further below (unaffected by this, since it
+     * reads static sem_type, not what was actually pushed) then still
+     * correctly chose IF_ACMPEQ/NE for what were now two unboxed ints on
+     * the stack: VerifyError "Bad type on operand stack ... not
+     * assignable to reference type". Confirmed against gumdrop's own
+     * Request.isRequestedSessionIdFromCookie() (org.bluezoo.gumdrop.
+     * servlet): "Boolean.TRUE == sessionType". */
+    bool left_is_refish = left->sem_type && (left->sem_type->kind == TYPE_CLASS ||
+        left->sem_type->kind == TYPE_ARRAY || left->sem_type->kind == TYPE_NULL);
+    bool right_is_refish = right->sem_type && (right->sem_type->kind == TYPE_CLASS ||
+        right->sem_type->kind == TYPE_ARRAY || right->sem_type->kind == TYPE_NULL);
+    bool suppress_unboxing_for_ref_eq = (op == TOK_EQ || op == TOK_NE) &&
+        left_is_refish && right_is_refish;
     
     /* Determine operand types and result type for widening.
      * Shifts are not subject to binary numeric promotion (JLS 15.19): each
@@ -3242,8 +3278,11 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
         return false;
     }
     
-    /* Auto-unbox left operand if it's a wrapper type (but not for null comparisons) */
-    if (!is_null_comparison && left->sem_type && left->sem_type->kind == TYPE_CLASS && 
+    /* Auto-unbox left operand if it's a wrapper type (but not for null
+     * comparisons, nor a wrapper-vs-wrapper "=="/"!=" - see
+     * suppress_unboxing_for_ref_eq's own comment above). */
+    if (!is_null_comparison && !suppress_unboxing_for_ref_eq &&
+        left->sem_type && left->sem_type->kind == TYPE_CLASS &&
         left->sem_type->data.class_type.name) {
         type_kind_t prim = get_primitive_for_wrapper(left->sem_type->data.class_type.name);
         if (prim != TYPE_UNKNOWN) {
@@ -3314,8 +3353,11 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
         return false;
     }
     
-    /* Auto-unbox right operand if it's a wrapper type (but not for null comparisons) */
-    if (!is_null_comparison && right->sem_type && right->sem_type->kind == TYPE_CLASS &&
+    /* Auto-unbox right operand if it's a wrapper type (but not for null
+     * comparisons, nor a wrapper-vs-wrapper "=="/"!=" - see
+     * suppress_unboxing_for_ref_eq's own comment above). */
+    if (!is_null_comparison && !suppress_unboxing_for_ref_eq &&
+        right->sem_type && right->sem_type->kind == TYPE_CLASS &&
         right->sem_type->data.class_type.name) {
         type_kind_t prim = get_primitive_for_wrapper(right->sem_type->data.class_type.name);
         if (prim != TYPE_UNKNOWN) {
@@ -3325,6 +3367,27 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
         }
     }
     
+    /* A `long`-typed shift count (e.g. "1L << someLongVariable") is legal
+     * Java - JLS 15.19 does not require the shift count itself to be int,
+     * only its LOW-ORDER bits are ever used (6 for a long shift, 5 for an
+     * int shift) - but ISHL/LSHL/ISHR/LSHR/IUSHR/LUSHR all require that
+     * count as a single-word INT on the operand stack regardless of the
+     * left operand's own width. right_type/op_type's shared computation
+     * above only widens for non-shift operators (see is_shift's own
+     * comment on op_type), so a genuinely 2-word `long` shift count was
+     * left as-is: LSHL then saw a long_2nd where it needs an int,
+     * VerifyError "Bad type on operand stack ... long_2nd ... not
+     * assignable to integer". Narrow it down with L2I - real javac does
+     * the same (masking to the relevant low bits is the shift opcode's
+     * own job at runtime, not something that needs doing here). Confirmed
+     * against gumdrop's own DtlsReplayWindow.mayAccept(): "1L << delta"
+     * where "long delta = highestSeq - combinedSeq;". */
+    if (is_shift && right_type == TYPE_LONG) {
+        bc_emit(mg->code, OP_L2I);
+        mg_pop_typed(mg, 2);
+        mg_push_int(mg);
+    }
+
     /* Emit widening conversion for right operand if needed. Never for a
      * shift: the count is not part of the promotion that decided op_type
      * (see above) and must stay int-shaped on the stack. */
@@ -4610,7 +4673,24 @@ static void codegen_load_enclosing_this(method_gen_t *mg, const_pool_t *cp, symb
 
         bc_emit(mg->code, OP_GETFIELD);
         bc_emit_u2(mg->code, this0_ref);
-        /* Stack unchanged: popped old, pushed enclosing */
+        /* Word count unchanged (popped old, pushed enclosing), but
+         * mg->stackmap's own tracked TYPE for this slot must change from
+         * the inner class to the enclosing class - a raw "no update at
+         * all" (as here previously) leaves the INNER class's own type
+         * sitting on top of mg->stackmap's simulated stack. Invisible
+         * whenever this value is consumed immediately (e.g. as a direct
+         * method-call receiver with nothing else pending), but a real bug
+         * the moment a stackmap frame is recorded while it's still on the
+         * stack UNDERNEATH something else being evaluated - e.g. as the
+         * receiver of an outer method call whose argument is itself a
+         * ternary (VerifyError: "Type Pop3ProtocolHandler ... is not
+         * assignable to Pop3ProtocolHandler$23"). Confirmed against
+         * gumdrop's own Pop3ProtocolHandler's RETR-offload failure
+         * callback: "recordSessionException(error instanceof Exception ?
+         * (Exception) error : new Exception(error))" from within an
+         * anonymous StorageExecutor.Callback. */
+        mg_pop_typed(mg, 1);
+        mg_push_object(mg, enc_internal);
 
         free(cur_internal);
         free(enc_internal);
@@ -5624,7 +5704,51 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         }
                     }
                     if (!is_inherited) {
-                        implicit_call_enclosing_owner = owner_class;
+                        /* owner_class might not be a LEXICALLY enclosing
+                         * class at all - it could be a superclass of one
+                         * instead (e.g. an anonymous class defined inside
+                         * an instance method of class B extends A, calling
+                         * A's own inherited method unqualified: the
+                         * method's declaring symbol is A, but A is never
+                         * itself in the this$0 chain here - B is, and B
+                         * IS-A A). codegen_load_enclosing_this() walks the
+                         * this$0 chain by exact enclosing-class identity,
+                         * so asking it for a class that isn't actually
+                         * anywhere in that chain makes it walk straight
+                         * past the real target (B) all the way to the
+                         * outermost enclosing class instead: VerifyError
+                         * "Bad type on operand stack", the outermost
+                         * class's own type not assignable to A. Walk the
+                         * enclosing chain looking for the nearest class
+                         * that either IS owner_class or INHERITS from it,
+                         * and target that class instead. Confirmed against
+                         * gumdrop's own CertificateCompressor.BrotliStream
+                         * (extends Decompressor), whose constructor's
+                         * anonymous BrotliDefaultHandler calls "emit(data)"
+                         * unqualified - Decompressor.emit(), inherited by
+                         * BrotliStream, never lexically enclosing anything
+                         * here; BrotliStream itself is. */
+                        symbol_t *walk_target = NULL;
+                        for (symbol_t *enc = class_sym->data.class_data.enclosing_class; enc;
+                             enc = enc->data.class_data.enclosing_class) {
+                            if (enc == owner_class) {
+                                walk_target = enc;
+                                break;
+                            }
+                            bool enc_inherits = false;
+                            for (symbol_t *s = enc->data.class_data.superclass; s;
+                                 s = s->data.class_data.superclass) {
+                                if (s == owner_class) {
+                                    enc_inherits = true;
+                                    break;
+                                }
+                            }
+                            if (enc_inherits) {
+                                walk_target = enc;
+                                break;
+                            }
+                        }
+                        implicit_call_enclosing_owner = walk_target ? walk_target : owner_class;
                     }
                 }
             } else {
@@ -7997,13 +8121,24 @@ static bool codegen_compound_rhs(method_gen_t *mg, const_pool_t *cp, ast_node_t 
         const char *raw_rhs_class;
         value_kind_and_class(mg, value, &raw_rhs_kind, &raw_rhs_class);
         if (is_shift) {
+            type_kind_t effective_rhs_kind = raw_rhs_kind;
             if (raw_rhs_kind == TYPE_CLASS && raw_rhs_class) {
                 type_kind_t unboxed = get_primitive_for_wrapper(raw_rhs_class);
                 if (unboxed != TYPE_UNKNOWN) {
                     char *internal = class_to_internal_name(raw_rhs_class);
                     emit_unboxing(mg, cp, unboxed, internal);
                     free(internal);
+                    effective_rhs_kind = unboxed;
                 }
+            }
+            /* A `long`-typed shift count needs narrowing to a single-word
+             * int for ISHL/LSHL/etc - see the identical fix (and its full
+             * explanation) in codegen_binary_expr() for the plain "<<"/
+             * ">>"/">>>" operators. */
+            if (effective_rhs_kind == TYPE_LONG) {
+                bc_emit(mg->code, OP_L2I);
+                mg_pop_typed(mg, 2);
+                mg_push_int(mg);
             }
         } else {
             coerce_stack_value(mg, cp, raw_rhs_kind, raw_rhs_class, op_type, NULL);
@@ -9738,12 +9873,49 @@ static void checkcast_generic_field(method_gen_t *mg, const_pool_t *cp, ast_node
         }
     }
     if (!field || field->kind != SYM_FIELD || !field->type ||
-        field->type->kind != TYPE_TYPEVAR ||
-        !expr->sem_type || expr->sem_type->kind != TYPE_CLASS ||
-        !expr->sem_type->data.class_type.name) {
+        field->type->kind != TYPE_TYPEVAR || !expr->sem_type) {
         return;
     }
-    
+
+    /* The type variable's resolved use-site type can itself be an array
+     * (e.g. "T value" in FieldValue<byte[]>) - JVMS 4.4.1 allows a
+     * CHECKCAST's class constant to be either a binary class name or an
+     * array descriptor, so this needs its own branch rather than being
+     * folded into the TYPE_CLASS case below. Without it, this whole
+     * function returned early for an array-resolved type variable, never
+     * emitting any checkcast at all: the erased field stayed typed as
+     * Object, rejected the moment it was used somewhere requiring the
+     * real array type (e.g. as a byte[] argument to another call):
+     * VerifyError "Bad type on operand stack ... Object ... is not
+     * assignable to '[B'". Confirmed against gumdrop's own
+     * ProtobufParserTest, whose generic "FieldValue<byte[]>.value" hits
+     * exactly this via "new String(handler.bytes.get(0).value, ...)". */
+    if (expr->sem_type->kind == TYPE_ARRAY) {
+        char *array_desc = type_to_descriptor(expr->sem_type);
+        if (!array_desc) {
+            return;
+        }
+        uint16_t class_idx = cp_add_class(cp, array_desc);
+        bc_emit(mg->code, OP_CHECKCAST);
+        bc_emit_u2(mg->code, class_idx);
+        /* CHECKCAST changes the verifier's own tracked type for this
+         * slot from the field's erased declaration (Object) to the real
+         * array type - without updating mg->stackmap to match, a later
+         * frame recorded while this value is still on the stack (e.g. as
+         * one argument of a multi-argument call) would still show the
+         * stale Object type. Mirrors the identical fix already applied
+         * to arraylength and the this$0-walking GETFIELD earlier this
+         * session. */
+        mg_pop_typed(mg, 1);
+        mg_push_object_from_descriptor(mg, array_desc);
+        free(array_desc);
+        return;
+    }
+
+    if (expr->sem_type->kind != TYPE_CLASS || !expr->sem_type->data.class_type.name) {
+        return;
+    }
+
     const char *target = expr->sem_type->data.class_type.name;
     const char *erased = "java.lang.Object";
     type_t *bound = field->type->data.type_var.bound;
@@ -9753,12 +9925,14 @@ static void checkcast_generic_field(method_gen_t *mg, const_pool_t *cp, ast_node
     if (strcmp(target, erased) == 0) {
         return;
     }
-    
+
     char *internal = class_to_internal_name(target);
     uint16_t class_idx = cp_add_class(cp, internal);
-    free(internal);
     bc_emit(mg->code, OP_CHECKCAST);
     bc_emit_u2(mg->code, class_idx);
+    mg_pop_typed(mg, 1);
+    mg_push_object(mg, internal);
+    free(internal);
 }
 
 bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
@@ -10967,12 +11141,48 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     return true;
                 }
                 
+                /* A reference-typed operand (e.g. Object, as returned by
+                 * java.lang.reflect.Method.invoke()) cast to a primitive
+                 * type is an UNBOXING cast (JLS 5.5): checkcast to the
+                 * target's own wrapper class, then unbox - never a
+                 * primitive-to-primitive conversion opcode, which the
+                 * switch below (keyed on a PRIMITIVE source_kind) has no
+                 * case for at all. A boxed/reference source silently fell
+                 * through with NO conversion emitted at all, leaving the
+                 * raw reference on the stack: VerifyError "Bad type on
+                 * operand stack ... Object ... is not assignable to
+                 * integer". Confirmed against gumdrop's own
+                 * H3ClientStreamTest.testExtractStatusReturns200(): "int
+                 * result = (int) m.invoke(null, ...);". */
+                if (source_kind == TYPE_CLASS) {
+                    const char *wrapper_class;
+                    switch (target_kind) {
+                        case TYPE_INT: wrapper_class = "java/lang/Integer"; break;
+                        case TYPE_LONG: wrapper_class = "java/lang/Long"; break;
+                        case TYPE_DOUBLE: wrapper_class = "java/lang/Double"; break;
+                        case TYPE_FLOAT: wrapper_class = "java/lang/Float"; break;
+                        case TYPE_BYTE: wrapper_class = "java/lang/Byte"; break;
+                        case TYPE_SHORT: wrapper_class = "java/lang/Short"; break;
+                        case TYPE_CHAR: wrapper_class = "java/lang/Character"; break;
+                        case TYPE_BOOLEAN: wrapper_class = "java/lang/Boolean"; break;
+                        default: wrapper_class = NULL; break;
+                    }
+                    if (wrapper_class) {
+                        uint16_t class_index = cp_add_class(cp, wrapper_class);
+                        bc_emit(mg->code, OP_CHECKCAST);
+                        bc_emit_u2(mg->code, class_index);
+                        emit_unboxing(mg, cp, target_kind, wrapper_class);
+                    }
+                    free(target_class_owned);
+                    return true;
+                }
+
                 /* Primitive cast: emit conversion instruction */
                 /* Determine source type - default to int if unknown */
                 if (source_kind == TYPE_UNKNOWN) {
                     source_kind = TYPE_INT;  /* Assume int for unknown types */
                 }
-                
+
                 /* No conversion needed if same type */
                 if (source_kind == target_kind) {
                     return true;

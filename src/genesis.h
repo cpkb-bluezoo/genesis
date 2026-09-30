@@ -651,6 +651,13 @@ struct symbol
             slist_t *captured_vars;     /* Captured local variables (for local classes) */
             ast_node_t *anonymous_body; /* AST body for anonymous classes */
             slist_t *super_ctor_args;   /* Constructor args to pass to superclass (anonymous classes) */
+            symbol_t *resolved_super_ctor; /* The superclass SYM_CONSTRUCTOR overload
+                                         * chosen for super_ctor_args (anonymous classes) -
+                                         * set directly here rather than relying on the
+                                         * AST_NEW_OBJECT expression's own sem_symbol, which
+                                         * codegen cannot reliably reach: anon_sym->ast may
+                                         * have already been pointed at the class body block
+                                         * by an earlier pre-scan pass, not the expression. */
             char *package;              /* Package name (for stub types) */
             char *unresolved_superclass; /* Unresolved superclass name (for phased compilation) */
             void *unresolved_superclass_type; /* unresolved_type_t* with type args (e.g., extends List<String>) */

@@ -15545,7 +15545,31 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         if (!base_sym) {
                             base_sym = resolve_anon_base_symbol(sem, base_type, type_node);
                         }
-                        
+
+                        /* A classfile-loaded superclass (e.g. java.io.
+                         * FilterInputStream) has its members populated
+                         * lazily via a completer, and may not have run it
+                         * yet at this point - data.class_data.members would
+                         * then still be NULL/empty, silently skipping the
+                         * whole constructor-overload lookup below (never
+                         * even calling scope_find_all_methods). Without a
+                         * resolved constructor, codegen later had to derive
+                         * the invokespecial's own descriptor from the
+                         * argument expression's own (possibly narrower)
+                         * static type instead of the real declared
+                         * parameter type - e.g. passing a
+                         * ByteArrayInputStream where FilterInputStream's
+                         * constructor declares InputStream referenced a
+                         * constructor overload that doesn't exist:
+                         * NoSuchMethodError
+                         * 'FilterInputStream.<init>(ByteArrayInputStream)'
+                         * at runtime. symbol_complete() is idempotent (a
+                         * no-op once already completed), so this is safe to
+                         * call unconditionally. */
+                        if (base_sym) {
+                            symbol_complete(base_sym);
+                        }
+
                         if (ctor_args && base_sym && base_sym->data.class_data.members) {
                             slist_t *ctors = scope_find_all_methods(
                                 base_sym->data.class_data.members, "<init>");
@@ -15555,6 +15579,14 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                             if (ctors) {
                                 symbol_t *ctor = find_best_method_by_types(sem, ctors, ctor_args, NULL);
+                                /* Store directly on the class symbol - see
+                                 * resolved_super_ctor's own doc comment in
+                                 * genesis.h for why anon_sym->ast->sem_symbol
+                                 * (the more obvious place to look) cannot be
+                                 * relied on here. */
+                                if (ctor) {
+                                    anon_sym->data.class_data.resolved_super_ctor = ctor;
+                                }
                                 if (ctor && ctor->data.method_data.parameters) {
                                     slist_t *piter = ctor->data.method_data.parameters;
                                     slist_t *aiter = ctor_args;
@@ -15687,7 +15719,14 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         } else {
                             /* Extending a class */
                             anon_sym->data.class_data.superclass = base_sym;
-                            
+
+                            /* Ensure a classfile-loaded superclass's members
+                             * are populated before looking up its
+                             * constructors - see the identical fix (and its
+                             * full explanation) a little further up, in the
+                             * "already set up from pass1" branch. */
+                            symbol_complete(base_sym);
+
                             /* Bind lambda/method-ref arguments to base class constructor parameters */
                             if (ctor_args && base_sym->data.class_data.members) {
                                 /* Find constructors in base class */
@@ -15699,6 +15738,15 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 }
                                 if (ctors) {
                                     symbol_t *ctor = find_best_method_by_types(sem, ctors, ctor_args, NULL);
+                                    /* Store directly on the class symbol -
+                                     * see resolved_super_ctor's own doc
+                                     * comment in genesis.h for why
+                                     * anon_sym->ast->sem_symbol (the more
+                                     * obvious place to look) cannot be
+                                     * relied on here. */
+                                    if (ctor) {
+                                        anon_sym->data.class_data.resolved_super_ctor = ctor;
+                                    }
                                     if (ctor && ctor->data.method_data.parameters) {
                                         /* Bind lambdas/method-refs to parameter types */
                                         slist_t *piter = ctor->data.method_data.parameters;

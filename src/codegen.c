@@ -2405,13 +2405,39 @@ static bool codegen_interface_method(class_gen_t *cg, ast_node_t *method_decl)
             slist_t *pchildren = child->data.node.children;
             if (pchildren) {
                 char *param_desc = ast_type_to_descriptor((ast_node_t *)pchildren->data);
+                /* A varargs parameter's own type node describes only the
+                 * ELEMENT type (e.g. "String" for "String... keys") - its
+                 * real parameter type has one more array dimension on top,
+                 * unconditionally (even over an already-array element
+                 * type, e.g. "byte[]... parts" is really "byte[][]...").
+                 * Unlike the concrete-method parameter loop in
+                 * codegen_method() (which detects this via MOD_VARARGS and
+                 * switches to TYPE_ARRAY before building its own
+                 * descriptor), this interface-method path just used the
+                 * element descriptor as-is, leaving an interface method's
+                 * own compiled signature missing the array dimension
+                 * entirely - callers built a correct
+                 * "(...[Ljava/lang/String;)V" invokeinterface reference
+                 * (matching what real javac expects), but the interface's
+                 * own declared method never matched it: NoSuchMethodError
+                 * at runtime. Confirmed against gumdrop's own
+                 * RedisSession.xread(int, long, ArrayResultHandler,
+                 * String... keysAndIds). */
+                if (child->data.node.flags & MOD_VARARGS) {
+                    size_t len = strlen(param_desc);
+                    char *array_desc = malloc(len + 2);
+                    array_desc[0] = '[';
+                    strcpy(array_desc + 1, param_desc);
+                    free(param_desc);
+                    param_desc = array_desc;
+                }
                 string_append(desc, param_desc);
                 free(param_desc);
             }
         }
         children = children->next;
     }
-    
+
     string_append(desc, ")");
     
     /* Add return type */
@@ -2497,15 +2523,40 @@ static bool codegen_abstract_method(class_gen_t *cg, ast_node_t *method_decl)
             slist_t *pchildren = child->data.node.children;
             if (pchildren) {
                 char *param_desc = ast_type_to_descriptor((ast_node_t *)pchildren->data);
+                /* A varargs parameter's own type node describes only the
+                 * ELEMENT type (e.g. "String" for "String... keys") - its
+                 * real parameter type has one more array dimension on top,
+                 * unconditionally (even over an already-array element
+                 * type, e.g. "byte[]... parts" is really "byte[][]...").
+                 * Unlike the concrete-method parameter loop in
+                 * codegen_method() (which detects this via MOD_VARARGS and
+                 * switches to TYPE_ARRAY before building its own
+                 * descriptor), this abstract-method path just used the
+                 * element descriptor as-is, leaving an abstract method's
+                 * own compiled signature missing the array dimension
+                 * entirely - callers built a correct
+                 * "(...[Ljava/lang/String;)V" invoke reference (matching
+                 * what real javac expects), but the declared method never
+                 * matched it: NoSuchMethodError at runtime. Mirrors the
+                 * identical fix in codegen_interface_method() just above,
+                 * for the equivalent abstract-interface-method case. */
+                if (child->data.node.flags & MOD_VARARGS) {
+                    size_t len = strlen(param_desc);
+                    char *array_desc = malloc(len + 2);
+                    array_desc[0] = '[';
+                    strcpy(array_desc + 1, param_desc);
+                    free(param_desc);
+                    param_desc = array_desc;
+                }
                 string_append(desc, param_desc);
                 free(param_desc);
             }
         }
         children = children->next;
     }
-    
+
     string_append(desc, ")");
-    
+
     /* Add return type */
     if (return_type) {
         char *ret_desc = ast_type_to_descriptor(return_type);
@@ -2514,14 +2565,14 @@ static bool codegen_abstract_method(class_gen_t *cg, ast_node_t *method_decl)
     } else {
         string_append(desc, "V");  /* Default to void */
     }
-    
+
     /* Create method info */
     method_info_gen_t *mi = calloc(1, sizeof(method_info_gen_t));
     if (!mi) {
         string_free(desc, true);
         return false;
     }
-    
+
     /* Keep declared modifiers - convert MOD_ flags to ACC_ flags
      * For abstract methods, ensure ACC_ABSTRACT is set
      * For native methods, ACC_NATIVE is already set by mods_to_access_flags */
@@ -7196,27 +7247,27 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             }
         }
         
-        /* Add superclass constructor argument types (for anonymous classes) */
-        slist_t *super_ctor_args = NULL;
-        if (cg->class_sym && cg->class_sym->data.class_data.super_ctor_args) {
-            super_ctor_args = cg->class_sym->data.class_data.super_ctor_args;
-            for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
-                ast_node_t *arg_node = (ast_node_t *)arg->data;
-                /* Use sem_type if available, otherwise try to get expression type */
-                type_t *arg_type = arg_node ? arg_node->sem_type : NULL;
-                if (!arg_type && arg_node && cg->sem) {
-                    arg_type = get_expression_type(cg->sem, arg_node);
-                }
-                if (arg_type) {
-                    char *arg_desc = type_to_descriptor(arg_type);
-                    string_append(desc, arg_desc);
-                    string_append(super_desc, arg_desc);
-                    free(arg_desc);
-                }
-            }
-        }
-        
-        /* Add captured variable types */
+        /* Add captured variable types. These come BEFORE any explicit
+         * superclass constructor arguments in the synthesized constructor's
+         * own parameter list - outer instance, then captures, then the
+         * explicit super-constructor args last - matching real javac's own
+         * synthesized-constructor parameter order (see the matching,
+         * already-correct comment/ordering in codegen_class()'s equivalent
+         * default-constructor path a few hundred lines up, verified there
+         * against real javac directly) and the call site in
+         * codegen_expr.c's AST_NEW_OBJECT handling, which pushes captured
+         * variables before the explicit constructor arguments. This
+         * function previously built the descriptor with super_ctor_args
+         * BEFORE captures instead - self-consistent (its own body-
+         * generation below used a matching, equally wrong slot order) but
+         * disagreeing with the call site actually invoking this
+         * constructor: NoSuchMethodError for any anonymous class with
+         * both explicit superclass constructor arguments and captured
+         * variables. Confirmed against gumdrop's own
+         * DefaultServletCopyBufferTest, whose "new FilterInputStream(new
+         * ByteArrayInputStream(payload)) { ... }" anonymous subclass
+         * captures both a local int and a local int[] alongside the
+         * explicit ByteArrayInputStream constructor argument. */
         if (cg->captured_vars) {
             for (slist_t *cap = cg->captured_vars; cap; cap = cap->next) {
                 symbol_t *var_sym = (symbol_t *)cap->data;
@@ -7227,7 +7278,78 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 }
             }
         }
-        
+
+        /* Add superclass constructor argument types (for anonymous classes) */
+        slist_t *super_ctor_args = NULL;
+        if (cg->class_sym && cg->class_sym->data.class_data.super_ctor_args) {
+            super_ctor_args = cg->class_sym->data.class_data.super_ctor_args;
+
+            /* The resolved superclass constructor symbol, if semantic
+             * analysis found one - see resolved_super_ctor's own doc
+             * comment in genesis.h for why this is read from a dedicated
+             * field instead of the more obvious cg->class_sym->ast->
+             * sem_symbol (the AST_NEW_OBJECT expression's own resolved
+             * symbol): an earlier pre-scan pass can point anon_sym->ast at
+             * the class body block instead, well before this expression is
+             * even visited, leaving that chain pointing at the class
+             * symbol itself (kind SYM_CLASS) rather than the constructor. */
+            symbol_t *resolved_super_ctor = cg->class_sym->data.class_data.resolved_super_ctor;
+
+            /* `desc` (this anonymous class's OWN synthesized constructor)
+             * always uses each argument's own static type - matching what
+             * the AST_NEW_OBJECT call site (codegen_expr.c) actually
+             * pushes for it. `super_desc` (the invokespecial target,
+             * calling the REAL superclass constructor) must instead use
+             * THAT constructor's own DECLARED parameter types: invokespecial
+             * resolves by exact descriptor match, not by mere assignability,
+             * so deriving it from a narrower argument type - e.g. passing a
+             * ByteArrayInputStream where FilterInputStream's constructor
+             * declares InputStream - referenced a constructor overload that
+             * doesn't exist: NoSuchMethodError
+             * 'FilterInputStream.<init>(ByteArrayInputStream)' at runtime
+             * (the real one takes InputStream). Confirmed against gumdrop's
+             * own DefaultServletCopyBufferTest, whose "new
+             * FilterInputStream(new ByteArrayInputStream(payload)) { ... }"
+             * hit exactly this. A classfile-loaded constructor (as here)
+             * already carries its own exact descriptor in
+             * method_data.descriptor; used directly rather than
+             * reconstructed param-by-param. */
+            const char *super_ctor_full_desc = (resolved_super_ctor &&
+                resolved_super_ctor->data.method_data.descriptor) ?
+                resolved_super_ctor->data.method_data.descriptor : NULL;
+            const char *super_ctor_close_paren = super_ctor_full_desc ?
+                strrchr(super_ctor_full_desc, ')') : NULL;
+            if (super_ctor_full_desc && super_ctor_full_desc[0] == '(' && super_ctor_close_paren) {
+                size_t param_len = (size_t)(super_ctor_close_paren - (super_ctor_full_desc + 1));
+                char *params_only = malloc(param_len + 1);
+                memcpy(params_only, super_ctor_full_desc + 1, param_len);
+                params_only[param_len] = '\0';
+                string_append(super_desc, params_only);
+                free(params_only);
+            }
+
+            for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
+                ast_node_t *arg_node = (ast_node_t *)arg->data;
+                /* Use sem_type if available, otherwise try to get expression type */
+                type_t *arg_type = arg_node ? arg_node->sem_type : NULL;
+                if (!arg_type && arg_node && cg->sem) {
+                    arg_type = get_expression_type(cg->sem, arg_node);
+                }
+                if (arg_type) {
+                    char *arg_desc = type_to_descriptor(arg_type);
+                    string_append(desc, arg_desc);
+                    if (!super_ctor_full_desc) {
+                        /* No resolved descriptor to fall back on - use the
+                         * argument's own type, as before (correct whenever
+                         * it exactly matches the declared parameter type,
+                         * which is the common case). */
+                        string_append(super_desc, arg_desc);
+                    }
+                    free(arg_desc);
+                }
+            }
+        }
+
         string_append(desc, ")V");
         string_append(super_desc, ")V");
         init->descriptor_index = cp_add_utf8(cg->cp, desc->str);
@@ -7261,7 +7383,23 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             mg->max_locals = 2;
         }
         
-        /* Account for superclass constructor arguments */
+        /* Account for captured variables - these occupy the parameter
+         * slots right after this/outer-instance, BEFORE any explicit
+         * superclass constructor arguments (see the matching descriptor-
+         * order comment above). */
+        if (cg->captured_vars) {
+            for (slist_t *cap = cg->captured_vars; cap; cap = cap->next) {
+                symbol_t *var_sym = (symbol_t *)cap->data;
+                if (var_sym && var_sym->type) {
+                    int size = (var_sym->type->kind == TYPE_LONG ||
+                               var_sym->type->kind == TYPE_DOUBLE) ? 2 : 1;
+                    mg->next_slot += size;
+                    mg->max_locals = mg->next_slot;
+                }
+            }
+        }
+
+        /* Account for superclass constructor arguments - these come last */
         uint16_t super_arg_start_slot = mg->next_slot;
         if (super_ctor_args) {
             for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
@@ -7278,20 +7416,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 }
             }
         }
-        
-        /* Account for captured variables */
-        if (cg->captured_vars) {
-            for (slist_t *cap = cg->captured_vars; cap; cap = cap->next) {
-                symbol_t *var_sym = (symbol_t *)cap->data;
-                if (var_sym && var_sym->type) {
-                    int size = (var_sym->type->kind == TYPE_LONG || 
-                               var_sym->type->kind == TYPE_DOUBLE) ? 2 : 1;
-                    mg->next_slot += size;
-                    mg->max_locals = mg->next_slot;
-                }
-            }
-        }
-        
+
         /* Record 'this' in LocalVariableTable */
         if (cg->internal_name) {
             char *this_desc = calloc(1, strlen(cg->internal_name) + 3);

@@ -944,7 +944,22 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
     /* Normal path: close resources in reverse order (only if try block doesn't return) */
     size_t normal_exit_goto = 0;
     bool has_normal_exit = !try_ends_with_return;
-    
+
+    /* Full stackmap snapshot as of the normal path's own exit goto, taken
+     * before the exception-handler segment below restores mg->stackmap to
+     * try_entry_state and mutates it for its own bookkeeping (primary
+     * exception storage, per-resource suppression handling, any user catch
+     * clauses). Without this, the join-point frame recorded after the whole
+     * construct (where normal_exit_goto lands) would reflect whatever the
+     * LAST-generated branch left mg->stackmap in - not the normal path that
+     * actually reaches there - exactly the same class of bug already fixed
+     * for plain AST_TRY_STMT via try_exit_state (see below). Confirmed
+     * against gumdrop's own MailboxIdFile.load(), where a local assigned
+     * only inside the try-with-resources body was seen as "top"
+     * (unassigned) immediately after the construct. */
+    stackmap_state_t *normal_exit_state = NULL;
+    uint16_t normal_exit_locals_count = 0;
+
     if (has_normal_exit) {
         for (int i = resource_count - 1; i >= 0; i--) {
             uint16_t slot = resource_slots[i];
@@ -995,8 +1010,15 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
         normal_exit_goto = mg->code->length;
         bc_emit(mg->code, OP_GOTO);
         bc_emit_u2(mg->code, 0);  /* Placeholder */
+
+        /* Snapshot the normal path's own exit state now, while mg->stackmap
+         * still reflects it - see normal_exit_state's own comment above. */
+        if (mg->stackmap) {
+            normal_exit_locals_count = mg->stackmap->current_locals_count;
+            normal_exit_state = stackmap_save_state(mg->stackmap);
+        }
     }
-    
+
     uint16_t try_end = (uint16_t)mg->code->length;
     
     /* Exception handler: store exception, close resources with suppression */
@@ -1132,7 +1154,7 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
      * These catch exceptions from the entire TWR including re-thrown exceptions. */
     slist_t *catch_gotos = NULL;
     bool has_user_catches = (catch_clauses != NULL);
-    
+
     /* Save locals count before catch handlers - locals allocated in catch blocks
      * should not be visible at the join point after all handlers */
     uint16_t saved_locals_count = 0;
@@ -1141,7 +1163,16 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
         saved_locals_count = mg_save_locals_count(mg);
         saved_slot = mg->next_slot;
     }
-    
+
+    /* Smallest (safest) stackmap snapshot among any user catch clause that
+     * falls through normally - mirrors normal_exit_state above and
+     * try_exit_state/catch_exit_state in the plain AST_TRY_STMT handling,
+     * for the same reason: mg->stackmap's "current" state after this loop
+     * reflects only the LAST catch clause processed, not a real predecessor
+     * set for the join point. */
+    stackmap_state_t *catch_exit_state = NULL;
+    uint16_t catch_exit_locals_count = 0;
+
     for (slist_t *node = catch_clauses; node; node = node->next) {
         ast_node_t *catch_clause = (ast_node_t *)node->data;
         slist_t *catch_children = catch_clause->data.node.children;
@@ -1304,6 +1335,8 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
             slist_free(catch_clauses);
             slist_free(catch_gotos);
             stackmap_state_free(try_entry_state);
+            stackmap_state_free(normal_exit_state);
+            stackmap_state_free(catch_exit_state);
             return false;
         }
 
@@ -1332,33 +1365,82 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
             catch_gotos = slist_prepend(catch_gotos, goto_pos);
             bc_emit(mg->code, OP_GOTO);
             bc_emit_u2(mg->code, 0);  /* Placeholder */
+
+            /* Keep the smallest snapshot across multiple falling-through
+             * catch clauses - see catch_exit_state's own comment above. */
+            if (mg->stackmap) {
+                uint16_t this_catch_locals = mg->stackmap->current_locals_count;
+                if (!catch_exit_state || this_catch_locals < catch_exit_locals_count) {
+                    if (catch_exit_state) {
+                        stackmap_state_free(catch_exit_state);
+                    }
+                    catch_exit_locals_count = this_catch_locals;
+                    catch_exit_state = stackmap_save_state(mg->stackmap);
+                }
+            }
         }
     }
-    
+
     /* Note: If we have no gotos to patch, all catches ended with return/throw */
     (void)catch_clauses;  /* Used in iteration above */
     
     /* Patch normal exit goto if it exists */
     uint16_t after_try = (uint16_t)mg->code->length;
-    
-    /* Restore locals count before recording join point frame - locals allocated
+
+    /* Restore next_slot before recording join point frame - locals allocated
      * in catch blocks should not be visible at the join point */
     if (has_user_catches) {
         mg_restore_locals_count(mg, saved_locals_count);
         mg->next_slot = saved_slot;
-        if (mg->stackmap) {
-            mg->stackmap->current_locals_count = saved_locals_count;
-        }
     }
-    
+
     /* Record frame at end of try-with-resources (join point) only if:
      * 1. There's a normal exit (try block doesn't return), or
-     * 2. There are catch gotos to patch (some catch path falls through) */
+     * 2. There are catch gotos to patch (some catch path falls through)
+     *
+     * By this point mg->stackmap's "current" state reflects whichever
+     * branch was generated LAST (the exception-handling/suppression
+     * segment, or the last user catch clause) - never a real predecessor
+     * of this join point when the normal path is also live, and not
+     * necessarily even the right catch predecessor when several catch
+     * clauses fall through. Always restore explicitly from the real saved
+     * snapshot(s) of whichever edge(s) actually reach here, mirroring the
+     * identical fix for plain AST_TRY_STMT's try_exit_state/catch_exit_state. */
     bool needs_join_frame = has_normal_exit || (catch_gotos != NULL);
     if (needs_join_frame) {
+        if (mg->stackmap) {
+            if (has_normal_exit && !catch_gotos && normal_exit_state) {
+                stackmap_restore_state(mg->stackmap, normal_exit_state);
+            } else if (catch_gotos && !has_normal_exit && catch_exit_state) {
+                stackmap_restore_state(mg->stackmap, catch_exit_state);
+            } else if (has_normal_exit && catch_gotos &&
+                       normal_exit_state && catch_exit_state) {
+                if (normal_exit_locals_count <= catch_exit_locals_count) {
+                    stackmap_restore_state(mg->stackmap, normal_exit_state);
+                    if (catch_exit_locals_count < mg->stackmap->current_locals_count) {
+                        mg_restore_locals_count(mg, catch_exit_locals_count);
+                    }
+                } else {
+                    stackmap_restore_state(mg->stackmap, catch_exit_state);
+                    if (normal_exit_locals_count < mg->stackmap->current_locals_count) {
+                        mg_restore_locals_count(mg, normal_exit_locals_count);
+                    }
+                }
+            } else if (has_normal_exit && normal_exit_state) {
+                stackmap_restore_state(mg->stackmap, normal_exit_state);
+            } else if (catch_exit_state) {
+                stackmap_restore_state(mg->stackmap, catch_exit_state);
+            }
+            if (has_user_catches) {
+                mg->stackmap->current_locals_count = saved_locals_count < mg->stackmap->current_locals_count ?
+                    saved_locals_count : mg->stackmap->current_locals_count;
+            }
+        }
         mg_record_frame(mg);
     }
-    
+    stackmap_state_free(normal_exit_state);
+    stackmap_state_free(catch_exit_state);
+
     if (has_normal_exit) {
         int16_t exit_offset = (int16_t)(after_try - normal_exit_goto);
         mg->code->code[normal_exit_goto + 1] = (exit_offset >> 8) & 0xFF;
@@ -1755,8 +1837,51 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         }
                     }
                     
-                    emit_pending_finally_blocks(mg, 0);
-                    emit_pending_monitorexits(mg);
+                    /* A pending finally block (emit_pending_finally_blocks
+                     * below) is regenerated inline right here, and may
+                     * itself contain arbitrary statements - including its
+                     * own try/catch. The return value currently sitting on
+                     * the operand stack does NOT reliably survive that: if
+                     * an exception is thrown and caught inside the
+                     * finally's own nested try, the JVM discards the
+                     * ENTIRE operand stack on handler entry, keeping only
+                     * the caught exception - so any bytecode path that
+                     * goes through that handler and rejoins the finally's
+                     * own normal flow afterward is really left with an
+                     * empty stack where genesis's own tracking still
+                     * (correctly, for the OTHER edge) expects the pending
+                     * return value: VerifyError "Current frame's stack
+                     * size doesn't match stackmap." Store the return value
+                     * to a synthetic temp local before running the finally
+                     * block, then reload it right before the actual
+                     * return - exactly what real javac always does for
+                     * this reason, and immune to whatever branches the
+                     * finally block's own code contains. Confirmed against
+                     * gumdrop's own MaildirMailbox.endAppendMessage(),
+                     * whose finally block's own "appendChannel.close()" is
+                     * wrapped in a nested try/catch. */
+                    if (mg->finally_stack) {
+                        type_kind_t tmp_kind;
+                        switch (return_op) {
+                            case OP_LRETURN: tmp_kind = TYPE_LONG; break;
+                            case OP_FRETURN: tmp_kind = TYPE_FLOAT; break;
+                            case OP_DRETURN: tmp_kind = TYPE_DOUBLE; break;
+                            case OP_ARETURN: tmp_kind = TYPE_CLASS; break;
+                            default: tmp_kind = TYPE_INT; break;
+                        }
+                        type_t *tmp_type = (tmp_kind == TYPE_CLASS) ?
+                            type_new_class("java/lang/Object") : type_new_primitive(tmp_kind);
+                        uint16_t saved_slot_for_tmp = mg->next_slot;
+                        uint16_t tmp_slot = mg_allocate_local(mg, "__pending_return", tmp_type);
+                        mg_emit_store_local(mg, tmp_slot, tmp_kind);
+                        emit_pending_finally_blocks(mg, 0);
+                        emit_pending_monitorexits(mg);
+                        mg_emit_load_local(mg, tmp_slot, tmp_kind);
+                        mg->next_slot = saved_slot_for_tmp;
+                    } else {
+                        emit_pending_finally_blocks(mg, 0);
+                        emit_pending_monitorexits(mg);
+                    }
                     bc_emit(mg->code, return_op);
                     mg->last_opcode = return_op;
                     /* LRETURN/DRETURN consume a 2-slot value; popping a fixed 1
@@ -2414,6 +2539,41 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         if (pre_then_state && mg->stackmap) {
                             if (else_ends_with_return && then_exit_state) {
                                 stackmap_restore_state(mg->stackmap, then_exit_state);
+                            } else if (then_exit_state) {
+                                /* Both branches fall through to this join
+                                 * point - it needs a REAL per-local LUB merge
+                                 * of both edges (JVMS 4.10.1.4: slots that
+                                 * disagree become "top"), not just whichever
+                                 * branch's own ambient state mg->stackmap
+                                 * happens to still hold (the else branch's,
+                                 * since it was generated last). A local
+                                 * declared before the if and assigned in only
+                                 * ONE branch (e.g. the then branch sets a
+                                 * different field entirely and leaves this
+                                 * local untouched, while the else branch
+                                 * assigns it) must come out "top" here, not
+                                 * the assigning branch's own type - otherwise
+                                 * a later stackmap frame reached only via the
+                                 * non-assigning branch's edge wrongly
+                                 * inherits a type that was never actually set
+                                 * on that path. Confirmed against gumdrop's
+                                 * own DotStuffer.processChunk() (org.bluezoo.
+                                 * gumdrop.smtp.client): a "case SAW_CR:"
+                                 * whose then-branch only updates `state`
+                                 * while its else-branch also assigns
+                                 * `currentPos`/`saveLimit` (declared, unset,
+                                 * before the enclosing while-loop). Reuses
+                                 * merge_stackmap_states_into() - the same
+                                 * general LUB merge already used for a
+                                 * switch statement's own shared exit frame. */
+                                stackmap_state_t *else_exit_state =
+                                    stackmap_save_state(mg->stackmap);
+                                slist_t *merge_inputs = NULL;
+                                merge_inputs = slist_prepend(merge_inputs, then_exit_state);
+                                merge_inputs = slist_prepend(merge_inputs, else_exit_state);
+                                merge_stackmap_states_into(mg->stackmap, merge_inputs);
+                                slist_free(merge_inputs);
+                                stackmap_state_free(else_exit_state);
                             }
                             /* Only restore the slot allocation, not the stackmap types */
                             mg_restore_locals_count(mg, pre_then_locals_count);
@@ -2801,13 +2961,23 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * Variables declared in the loop body shouldn't appear in the
                  * stackmap frame at loop_start (they're not defined on first entry). */
                 uint16_t saved_locals_count = mg_save_locals_count(mg);
-                
+
+                /* Full stackmap snapshot as of right before the condition/body,
+                 * used to record the correct frame at loop_end below - see its
+                 * own comment for why. Mirrors the identical loop_entry_state
+                 * already used for this same purpose in the enhanced-for
+                 * (array and iterator) loop handling elsewhere in this file. */
+                stackmap_state_t *loop_entry_state = NULL;
+                if (mg->stackmap) {
+                    loop_entry_state = stackmap_save_state(mg->stackmap);
+                }
+
                 /* loop_start: (condition check) */
                 size_t loop_start = mg->code->length;
-                
+
                 /* Record frame at loop start (back-edge target) */
                 mg_record_frame(mg);
-                
+
                 size_t branch_pos = 0;
                 if (condition && condition->type != AST_EMPTY_STMT) {
                     /* Generate condition */
@@ -2926,17 +3096,38 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* loop_end: */
                 size_t loop_end = mg->code->length;
 
-                /* Record frame at loop end (break target). Note: if this
-                 * loop has no break at all AND is the very last thing
-                 * generated for the enclosing method (nothing follows this
-                 * position, ever), this frame would dangle past the
-                 * methods actual final instruction - handled centrally by
-                 * stackmap_prune_out_of_bounds_frame() at method
-                 * finalization (see codegen.c), rather than predicted here
-                 * (this code cannot know in advance whether an implicit
-                 * trailing return, or more enclosing statements, will end
-                 * up following this exact position). */
+                /* Record frame at loop end (break target). Restore to the
+                 * pre-body snapshot first - the condition-false edge into
+                 * this point (the loop runs zero times) is a REAL
+                 * predecessor whenever a condition is present, and by now
+                 * mg->stackmap's "current" state instead reflects the body
+                 * having actually executed at least once (e.g. a local
+                 * declared before the loop and assigned only inside its
+                 * body is genuinely "top"/unassigned on that zero-iteration
+                 * edge, not whatever type the body's own assignment gives
+                 * it) - the same class of bug already fixed for the
+                 * enhanced-for loop's own loop_end via loop_entry_state,
+                 * just missing here. Confirmed against gumdrop's own
+                 * Encoder.main() (org.bluezoo.gumdrop.http.hpack), whose
+                 * "for (int i = 0; i < encoded.length && success; i++)"
+                 * loops are immediately followed by a read of a
+                 * loop-body-assigned local.
+                 *
+                 * Note: if this loop has no break at all AND is the very
+                 * last thing generated for the enclosing method (nothing
+                 * follows this position, ever), this frame would dangle
+                 * past the methods actual final instruction - handled
+                 * centrally by stackmap_prune_out_of_bounds_frame() at
+                 * method finalization (see codegen.c), rather than
+                 * predicted here (this code cannot know in advance whether
+                 * an implicit trailing return, or more enclosing
+                 * statements, will end up following this exact
+                 * position). */
+                if (loop_entry_state && mg->stackmap) {
+                    stackmap_restore_state(mg->stackmap, loop_entry_state);
+                }
                 mg_record_frame(mg);
+                stackmap_state_free(loop_entry_state);
 
                 /* Patch forward branch if we have a condition.
                  * "condition" is non-NULL even for "for (;;)" - the parser
