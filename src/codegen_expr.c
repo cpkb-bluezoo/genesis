@@ -58,7 +58,9 @@
  */
 static char *descriptor_to_class_name(const char *descriptor)
 {
-    if (!descriptor || !descriptor[0]) return NULL;
+    if (!descriptor || !descriptor[0]) {
+        return NULL;
+    }
     
     if (descriptor[0] == '[') {
         /* Array type - use descriptor as-is */
@@ -66,7 +68,9 @@ static char *descriptor_to_class_name(const char *descriptor)
     } else if (descriptor[0] == 'L') {
         /* Object type - strip L prefix and ; suffix */
         size_t len = strlen(descriptor);
-        if (len < 3) return NULL;  /* At least "L;" */
+        if (len < 3) {
+            return NULL;
+        }  /* At least "L;" */
         char *name = malloc(len - 1);  /* -2 for L and ;, +1 for null */
         memcpy(name, descriptor + 1, len - 2);
         name[len - 2] = '\0';
@@ -82,7 +86,9 @@ static char *descriptor_to_class_name(const char *descriptor)
  */
 static void mg_push_object_from_descriptor(method_gen_t *mg, const char *descriptor)
 {
-    if (!mg || !descriptor) return;
+    if (!mg || !descriptor) {
+        return;
+    }
     
     char *class_name = descriptor_to_class_name(descriptor);
     if (class_name) {
@@ -351,7 +357,9 @@ static symbol_t *lookup_method_in_hierarchy(symbol_t *class_sym, const char *met
 static symbol_t *lookup_method_in_interfaces(symbol_t *iface, const char *method_name, 
                                               symbol_t **owner_class)
 {
-    if (!iface) return NULL;
+    if (!iface) {
+        return NULL;
+    }
     
     /* Check direct members of this interface */
     if (iface->data.class_data.members) {
@@ -656,7 +664,9 @@ bool emit_unboxing_if_needed(method_gen_t *mg, const_pool_t *cp, type_t *target,
  */
 static type_kind_t get_arg_type_kind(method_gen_t *mg, ast_node_t *arg)
 {
-    if (!arg) return TYPE_INT;
+    if (!arg) {
+        return TYPE_INT;
+    }
     
     /* Check semantic type first */
     if (arg->sem_type) {
@@ -962,7 +972,9 @@ type_kind_t get_expr_type_kind(method_gen_t *mg, ast_node_t *expr)
                     /* Convert internal name to qualified name */
                     char *qualified = strdup(local_class);
                     for (char *p = qualified; *p; p++) {
-                        if (*p == '/') *p = '.';
+                        if (*p == '/') {
+                            *p = '.';
+                        }
                     }
                     type_t *class_type = hashtable_lookup(mg->class_gen->sem->types, qualified);
                     if (class_type && class_type->kind == TYPE_CLASS) {
@@ -1042,13 +1054,27 @@ type_kind_t get_expr_type_kind(method_gen_t *mg, ast_node_t *expr)
             ast_node_t *type_node = (ast_node_t *)children->data;
             if (type_node->type == AST_PRIMITIVE_TYPE) {
                 const char *prim = type_node->data.leaf.name;
-                if (strcmp(prim, "long") == 0) return TYPE_LONG;
-                if (strcmp(prim, "double") == 0) return TYPE_DOUBLE;
-                if (strcmp(prim, "float") == 0) return TYPE_FLOAT;
-                if (strcmp(prim, "byte") == 0) return TYPE_BYTE;
-                if (strcmp(prim, "short") == 0) return TYPE_SHORT;
-                if (strcmp(prim, "char") == 0) return TYPE_CHAR;
-                if (strcmp(prim, "boolean") == 0) return TYPE_BOOLEAN;
+                if (strcmp(prim, "long") == 0) {
+                    return TYPE_LONG;
+                }
+                if (strcmp(prim, "double") == 0) {
+                    return TYPE_DOUBLE;
+                }
+                if (strcmp(prim, "float") == 0) {
+                    return TYPE_FLOAT;
+                }
+                if (strcmp(prim, "byte") == 0) {
+                    return TYPE_BYTE;
+                }
+                if (strcmp(prim, "short") == 0) {
+                    return TYPE_SHORT;
+                }
+                if (strcmp(prim, "char") == 0) {
+                    return TYPE_CHAR;
+                }
+                if (strcmp(prim, "boolean") == 0) {
+                    return TYPE_BOOLEAN;
+                }
                 return TYPE_INT;
             } else {
                 return TYPE_CLASS;  /* Reference cast */
@@ -1299,7 +1325,9 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
                 mg_push_object_from_descriptor(mg, array_desc);
                 mg->stack_depth--;  /* mg_push_object_from_descriptor increments, but we already pushed */
             }
-            if (array_desc) free(array_desc);
+            if (array_desc) {
+                free(array_desc);
+            }
         }
         return true;
     }
@@ -1953,15 +1981,25 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
             const char *prim_name = receiver->data.leaf.name;
             const char *wrapper_class = NULL;
             
-            if (strcmp(prim_name, "boolean") == 0) wrapper_class = "java/lang/Boolean";
-            else if (strcmp(prim_name, "byte") == 0) wrapper_class = "java/lang/Byte";
-            else if (strcmp(prim_name, "char") == 0) wrapper_class = "java/lang/Character";
-            else if (strcmp(prim_name, "short") == 0) wrapper_class = "java/lang/Short";
-            else if (strcmp(prim_name, "int") == 0) wrapper_class = "java/lang/Integer";
-            else if (strcmp(prim_name, "long") == 0) wrapper_class = "java/lang/Long";
-            else if (strcmp(prim_name, "float") == 0) wrapper_class = "java/lang/Float";
-            else if (strcmp(prim_name, "double") == 0) wrapper_class = "java/lang/Double";
-            else if (strcmp(prim_name, "void") == 0) wrapper_class = "java/lang/Void";
+            if (strcmp(prim_name, "boolean") == 0) {
+                wrapper_class = "java/lang/Boolean";
+            } else if (strcmp(prim_name, "byte") == 0) {
+                wrapper_class = "java/lang/Byte";
+            } else if (strcmp(prim_name, "char") == 0) {
+                wrapper_class = "java/lang/Character";
+            } else if (strcmp(prim_name, "short") == 0) {
+                wrapper_class = "java/lang/Short";
+            } else if (strcmp(prim_name, "int") == 0) {
+                wrapper_class = "java/lang/Integer";
+            } else if (strcmp(prim_name, "long") == 0) {
+                wrapper_class = "java/lang/Long";
+            } else if (strcmp(prim_name, "float") == 0) {
+                wrapper_class = "java/lang/Float";
+            } else if (strcmp(prim_name, "double") == 0) {
+                wrapper_class = "java/lang/Double";
+            } else if (strcmp(prim_name, "void") == 0) {
+                wrapper_class = "java/lang/Void";
+            }
             
             if (wrapper_class) {
                 uint16_t fieldref = cp_add_fieldref(cp, wrapper_class, "TYPE", "Ljava/lang/Class;");
@@ -2139,8 +2177,12 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                     /* Fix stack tracking - we should have the enclosing class type */
                     if (current_class->qualified_name) {
                         char *internal = class_to_internal_name(current_class->qualified_name);
-                        /* Pop the current tracking and push the correct type */
-                        mg_pop(mg, 1);
+                        /* Pop the current tracking and push the correct type.
+                         * Must be the type-aware mg_pop_typed(), not plain
+                         * mg_pop() - see the identical fix and full
+                         * explanation at this same function's multi-hop
+                         * GETFIELD loop below. */
+                        mg_pop_typed(mg, 1);
                         mg_push_object(mg, internal);
                         free(internal);
                     }
@@ -2185,8 +2227,27 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                 bc_emit(mg->code, OP_GETFIELD);
                 bc_emit_u2(mg->code, fieldref);
                 
-                /* Update stack tracking */
-                mg_pop(mg, 1);  /* Pop current class */
+                /* Update stack tracking. Must be the type-aware
+                 * mg_pop_typed(), not plain mg_pop() - the latter only
+                 * adjusts mg->stack_depth (the abstract counter used for
+                 * max_stack), never mg->stackmap's own operand-stack type
+                 * array, which only mg_pop_typed()/the "_typed" push
+                 * helpers touch. Using plain mg_pop() here left mg->stack_depth
+                 * correct (net 0 per hop, matching the GETFIELD above,
+                 * which just replaces the top stack slot) but left ONE
+                 * STALE entry in mg->stackmap's type array per hop - for
+                 * an enclosing instance reached via two or more hops (e.g.
+                 * "Outer.this" from an anonymous class nested inside
+                 * another anonymous class), those stale entries corrupted
+                 * any StackMapTable frame recorded at a later branch
+                 * target in the same expression: "ClassFormatError:
+                 * StackMapTable format error: bad type array size". A
+                 * single hop (the immediate-enclosing-class fast path a
+                 * few lines above this loop) already used the correct
+                 * mg_pop_typed() - only this general, multi-hop loop had
+                 * the bug, which is why nesting only one level deep never
+                 * surfaced it. */
+                mg_pop_typed(mg, 1);  /* Pop current class */
                 mg_push_object(mg, enclosing_internal);  /* Push enclosing class */
                 
                 free(current_internal);
@@ -2426,7 +2487,9 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                     /* Try looking up by the class name */
                     char *dotted = strdup(local_class);
                     for (char *p = dotted; *p; p++) {
-                        if (*p == '/') *p = '.';
+                        if (*p == '/') {
+                            *p = '.';
+                        }
                     }
                     local_type = hashtable_lookup(mg->class_gen->sem->types, dotted);
                     free(dotted);
@@ -3948,7 +4011,9 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
  */
 static const char *infer_arg_descriptor(ast_node_t *arg)
 {
-    if (!arg) return "I";
+    if (!arg) {
+        return "I";
+    }
     
     switch (arg->type) {
         case AST_LITERAL:
@@ -4002,7 +4067,9 @@ static const char *infer_arg_descriptor(ast_node_t *arg)
                     snprintf(class_desc, sizeof(class_desc), "L%s;", name);
                     /* Convert dots to slashes */
                     for (char *p = class_desc + 1; *p != ';'; p++) {
-                        if (*p == '.') *p = '/';
+                        if (*p == '.') {
+                            *p = '/';
+                        }
                     }
                     return class_desc;
                 }
@@ -4093,7 +4160,9 @@ static const char *infer_arg_descriptor(ast_node_t *arg)
                             const char *qn = arg->sem_type->data.class_type.symbol->qualified_name;
                             snprintf(sem_desc, sizeof(sem_desc), "L%s;", qn);
                             for (char *p = sem_desc + 1; *p != ';'; p++) {
-                                if (*p == '.') *p = '/';
+                                if (*p == '.') {
+                                    *p = '/';
+                                }
                             }
                             return sem_desc;
                         }
@@ -4756,7 +4825,9 @@ static void coerce_arg_to_param(method_gen_t *mg, const_pool_t *cp, ast_node_t *
  */
 static void codegen_load_enclosing_this(method_gen_t *mg, const_pool_t *cp, symbol_t *target_owner)
 {
-    if (!mg->class_gen || !mg->class_gen->class_sym) return;
+    if (!mg->class_gen || !mg->class_gen->class_sym) {
+        return;
+    }
 
     /* Start with 'this' */
     bc_emit(mg->code, OP_ALOAD_0);
@@ -4772,7 +4843,9 @@ static void codegen_load_enclosing_this(method_gen_t *mg, const_pool_t *cp, symb
 
     while (current && current != target_owner) {
         symbol_t *cur_enclosing = current->data.class_data.enclosing_class;
-        if (!cur_enclosing) break;
+        if (!cur_enclosing) {
+            break;
+        }
 
         /* Get this$0 from current class to get to cur_enclosing */
         char *cur_internal = class_to_internal_name(current->qualified_name);
@@ -4953,7 +5026,9 @@ bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_
     int varargs_count = 0;
     for (slist_t *n = node; n; n = n->next) {
         ast_node_t *a = (ast_node_t *)n->data;
-        if (skip_trailing_block && a && a->type == AST_BLOCK && !n->next) break;
+        if (skip_trailing_block && a && a->type == AST_BLOCK && !n->next) {
+            break;
+        }
         varargs_count++;
     }
     ast_node_t *arg = node ? (ast_node_t *)node->data : NULL;
@@ -4998,14 +5073,23 @@ bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_
                 ast_node_t *elem_type_node = (ast_node_t *)arr_children->data;
                 if (elem_type_node->type == AST_PRIMITIVE_TYPE) {
                     const char *prim_name = elem_type_node->data.leaf.name;
-                    if (strcmp(prim_name, "int") == 0) arg_elem_kind = TYPE_INT;
-                    else if (strcmp(prim_name, "long") == 0) arg_elem_kind = TYPE_LONG;
-                    else if (strcmp(prim_name, "double") == 0) arg_elem_kind = TYPE_DOUBLE;
-                    else if (strcmp(prim_name, "float") == 0) arg_elem_kind = TYPE_FLOAT;
-                    else if (strcmp(prim_name, "boolean") == 0) arg_elem_kind = TYPE_BOOLEAN;
-                    else if (strcmp(prim_name, "byte") == 0) arg_elem_kind = TYPE_BYTE;
-                    else if (strcmp(prim_name, "char") == 0) arg_elem_kind = TYPE_CHAR;
-                    else if (strcmp(prim_name, "short") == 0) arg_elem_kind = TYPE_SHORT;
+                    if (strcmp(prim_name, "int") == 0) {
+                        arg_elem_kind = TYPE_INT;
+                    } else if (strcmp(prim_name, "long") == 0) {
+                        arg_elem_kind = TYPE_LONG;
+                    } else if (strcmp(prim_name, "double") == 0) {
+                        arg_elem_kind = TYPE_DOUBLE;
+                    } else if (strcmp(prim_name, "float") == 0) {
+                        arg_elem_kind = TYPE_FLOAT;
+                    } else if (strcmp(prim_name, "boolean") == 0) {
+                        arg_elem_kind = TYPE_BOOLEAN;
+                    } else if (strcmp(prim_name, "byte") == 0) {
+                        arg_elem_kind = TYPE_BYTE;
+                    } else if (strcmp(prim_name, "char") == 0) {
+                        arg_elem_kind = TYPE_CHAR;
+                    } else if (strcmp(prim_name, "short") == 0) {
+                        arg_elem_kind = TYPE_SHORT;
+                    }
                 } else if (elem_type_node->type == AST_CLASS_TYPE || 
                            elem_type_node->type == AST_IDENTIFIER) {
                     arg_elem_kind = TYPE_CLASS;
@@ -5078,11 +5162,21 @@ bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_
                     const char *expected = elem_type->data.class_type.name;
                     /* Handle qualified vs simple names */
                     const char *simple = strrchr(expected, '.');
-                    if (simple) simple++; else simple = expected;
+                    if (simple) {
+                        simple++;
+                    } else  {
+                        simple = expected;
+                    }
                     const char *arg_simple = strrchr(arg_elem_class, '/');
-                    if (arg_simple) arg_simple++; else {
+                    if (arg_simple) {
+                        arg_simple++;
+                    } else {
                         arg_simple = strrchr(arg_elem_class, '.');
-                        if (arg_simple) arg_simple++; else arg_simple = arg_elem_class;
+                        if (arg_simple) {
+                            arg_simple++;
+                        } else  {
+                            arg_simple = arg_elem_class;
+                        }
                     }
                     compatible = (strcmp(simple, arg_simple) == 0 ||
                                  strcmp(expected, arg_elem_class) == 0);
@@ -5231,7 +5325,9 @@ bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_
         
         /* Box primitive if needed for Object[] */
         type_kind_t va_kind = get_expr_type_kind(mg, va_arg);
-        if (va_arg->sem_type) va_kind = va_arg->sem_type->kind;
+        if (va_arg->sem_type) {
+            va_kind = va_arg->sem_type->kind;
+        }
 
         /* elem_type->kind == TYPE_CLASS alone missed a generic
          * varargs parameter (e.g. "<T> List<T> asList(T... a)",
@@ -5335,7 +5431,19 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
     slist_t *children = expr->data.node.children;
     
     bool is_static = false;
-    bool is_interface_call = false;  /* Track if receiver is an interface type */
+    /* Track if receiver is an interface type (needs invokeinterface, not
+     * invokevirtual). Every one of this function's own
+     * "is_interface_call = (...)" assignments below checks kind ==
+     * SYM_INTERFACE || kind == SYM_ANNOTATION - an annotation type
+     * declaration is ALWAYS, unconditionally an interface at the JVM
+     * level too (JLS 9.6), but genesis represents it as its own distinct
+     * SYM_ANNOTATION symbol kind rather than SYM_INTERFACE. Missing the
+     * SYM_ANNOTATION half anywhere here emits an illegal invokevirtual
+     * for a call on an annotation-typed receiver/element method (e.g.
+     * "marker.value()") instead of invokeinterface: IncompatibleClassChangeError
+     * ("Found interface X, but class was expected") at runtime. Confirmed
+     * against GitHub issue #1's own nested-annotation-reflection repro. */
+    bool is_interface_call = false;
     bool use_invokespecial = false;  /* For super.method() and K.super.method() calls */
     const char *target_class = NULL;
     ast_node_t *receiver = NULL;
@@ -5509,7 +5617,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                             
                             /* Use invokespecial for qualified super calls */
                             use_invokespecial = true;
-                            is_interface_call = (qualifier_sym->kind == SYM_INTERFACE);
+                            is_interface_call = (qualifier_sym->kind == SYM_INTERFACE || qualifier_sym->kind == SYM_ANNOTATION);
                             
                             /* Skip the receiver in argument list */
                             args = children->next;
@@ -5545,7 +5653,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 target_class = class_sym->qualified_name ?
                     class_to_internal_name(class_sym->qualified_name) :
                     class_to_internal_name(class_sym->name);
-                is_interface_call = (class_sym->kind == SYM_INTERFACE);
+                is_interface_call = (class_sym->kind == SYM_INTERFACE || class_sym->kind == SYM_ANNOTATION);
                 
                 /* Handle synthetic enum methods values() and valueOf() */
                 if (class_sym->kind == SYM_ENUM) {
@@ -5585,7 +5693,9 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 if (!expr->sem_symbol && class_sym->data.class_data.members) {
                     /* Count arguments for overload resolution */
                     int arg_count = 0;
-                    for (slist_t *a = args; a; a = a->next) arg_count++;
+                    for (slist_t *a = args; a; a = a->next) {
+                        arg_count++;
+                    }
 
                     symbol_t *fqn_method = scope_lookup_method_with_args(
                         class_sym->data.class_data.members, method_name, arg_count);
@@ -5616,7 +5726,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 /* Check if the field's type is an interface */
                 if (first->sem_type && first->sem_type->kind == TYPE_CLASS &&
                     first->sem_type->data.class_type.symbol) {
-                    is_interface_call = (first->sem_type->data.class_type.symbol->kind == SYM_INTERFACE);
+                    is_interface_call = (first->sem_type->data.class_type.symbol->kind == SYM_INTERFACE || first->sem_type->data.class_type.symbol->kind == SYM_ANNOTATION);
                 }
                 
                 /* Check for PrintStream.println/print */
@@ -5656,7 +5766,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                     if (method_sym && method_sym->kind == SYM_METHOD) {
                         is_static = (method_sym->modifiers & MOD_STATIC) != 0;
                         target_class = mg->class_gen->internal_name;
-                        is_interface_call = (class_sym->kind == SYM_INTERFACE);
+                        is_interface_call = (class_sym->kind == SYM_INTERFACE || class_sym->kind == SYM_ANNOTATION);
                     }
                 }
             }
@@ -5696,7 +5806,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 /* It's a class reference resolved via import (e.g., Objects after import java.util.Objects) */
                 is_class_ref = true;
                 is_static = true;
-                is_interface_call = (first->sem_symbol->kind == SYM_INTERFACE);
+                is_interface_call = (first->sem_symbol->kind == SYM_INTERFACE || first->sem_symbol->kind == SYM_ANNOTATION);
                 args = children->next;  /* Skip the class reference */
                 
                 symbol_t *class_sym = first->sem_symbol;
@@ -5741,7 +5851,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         /* It's a static call on a nested type */
                         is_class_ref = true;
                         is_static = true;
-                        is_interface_call = (nested->kind == SYM_INTERFACE);
+                        is_interface_call = (nested->kind == SYM_INTERFACE || nested->kind == SYM_ANNOTATION);
                         args = children->next;  /* Skip the class reference */
                         
                         /* Build the internal class name */
@@ -5798,7 +5908,9 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                                 is_static = true;
                                 args = children->next;  /* Skip the class reference */
                                 target_class = strdup(ext_class);
-                                if (!method_sym) method_sym = found_method;
+                                if (!method_sym) {
+                                    method_sym = found_method;
+                                }
                             }
                         }
                     }
@@ -5825,7 +5937,9 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                             target_class = src_class_sym->qualified_name ?
                                 class_to_internal_name(src_class_sym->qualified_name) :
                                 class_to_internal_name(name);
-                            if (!method_sym) method_sym = found_method;
+                            if (!method_sym) {
+                                method_sym = found_method;
+                            }
                         }
                     }
                 }
@@ -5861,7 +5975,9 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         /* Convert internal name (com/example/Foo) back to qualified (com.example.Foo) */
                         char *qualified = strdup(local_class);
                         for (char *p = qualified; *p; p++) {
-                            if (*p == '/') *p = '.';
+                            if (*p == '/') {
+                                *p = '.';
+                            }
                         }
                         
                         /* Load from classpath to get full class hierarchy */
@@ -5905,7 +6021,9 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         receiver = first;
                         args = children->next;
                         /* Prefer semantic analysis result for correct overload */
-                        if (!method_sym) method_sym = found_method;
+                        if (!method_sym) {
+                            method_sym = found_method;
+                        }
                         is_static = (method_sym->modifiers & MOD_STATIC) != 0;
                         /* Reference the RECEIVER's own static type in the
                          * invoke's constant-pool entry, not owner_class (the
@@ -5933,7 +6051,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         target_class = target_owner->qualified_name ?
                             class_to_internal_name(target_owner->qualified_name) :
                             mg->class_gen->internal_name;
-                        is_interface_call = (target_owner->kind == SYM_INTERFACE);
+                        is_interface_call = (target_owner->kind == SYM_INTERFACE || target_owner->kind == SYM_ANNOTATION);
                     }
                 }
                 
@@ -5987,7 +6105,9 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                             receiver = first;
                             args = children->next;
                             /* Prefer semantic analysis result for correct overload */
-                            if (!method_sym) method_sym = found_method;
+                            if (!method_sym) {
+                                method_sym = found_method;
+                            }
                             is_static = (method_sym->modifiers & MOD_STATIC) != 0;
                             /* Reference the FIELD's own declared type in the
                              * invoke's constant-pool entry, not owner_class
@@ -6011,7 +6131,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                             target_class = target_owner->qualified_name ?
                                 class_to_internal_name(target_owner->qualified_name) :
                                 class_to_internal_name(recv_class_sym->qualified_name);
-                            is_interface_call = (target_owner->kind == SYM_INTERFACE);
+                            is_interface_call = (target_owner->kind == SYM_INTERFACE || target_owner->kind == SYM_ANNOTATION);
                         }
                     }
                 }
@@ -6049,7 +6169,9 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                     
                     /* Count arguments for overload resolution (receiver is first) */
                     int arg_count = 0;
-                    for (slist_t *a = children->next; a; a = a->next) arg_count++;
+                    for (slist_t *a = children->next; a; a = a->next) {
+                        arg_count++;
+                    }
                     
                     symbol_t *found_method = scope_lookup_method_with_args(
                         recv_class_sym->data.class_data.members, method_name, arg_count);
@@ -6079,14 +6201,16 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         receiver = first;
                         args = children->next;
                         /* Prefer semantic analysis result for correct overload */
-                        if (!method_sym) method_sym = found_method;
+                        if (!method_sym) {
+                            method_sym = found_method;
+                        }
                         is_static = (method_sym->modifiers & MOD_STATIC) != 0;
                         /* Use original receiver class for target, not the interface where method was found */
                         target_class = original_recv_class->qualified_name ?
                             class_to_internal_name(original_recv_class->qualified_name) :
                             mg->class_gen->internal_name;
                         /* Only use interface call if receiver itself is an interface type */
-                        is_interface_call = (original_recv_class->kind == SYM_INTERFACE);
+                        is_interface_call = (original_recv_class->kind == SYM_INTERFACE || original_recv_class->kind == SYM_ANNOTATION);
                     }
                 }
             } else if (mg->class_gen && mg->class_gen->class_sym) {
@@ -6099,7 +6223,9 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         receiver = first;
                         args = children->next;
                         /* Prefer semantic analysis result for correct overload */
-                        if (!method_sym) method_sym = found_method;
+                        if (!method_sym) {
+                            method_sym = found_method;
+                        }
                         is_static = (method_sym->modifiers & MOD_STATIC) != 0;
                         target_class = mg->class_gen->internal_name;
                     }
@@ -6132,13 +6258,13 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                     /* Use receiver's type as target - correct for virtual dispatch */
                     target_class = class_to_internal_name(first->sem_type->data.class_type.name);
                     symbol_t *recv_sym = first->sem_type->data.class_type.symbol;
-                    is_interface_call = (recv_sym && recv_sym->kind == SYM_INTERFACE);
+                    is_interface_call = (recv_sym && (recv_sym->kind == SYM_INTERFACE || recv_sym->kind == SYM_ANNOTATION));
                 } else {
                     /* Static method or no receiver type - use method's owner */
                     symbol_t *owner_class = method_sym->scope ? method_sym->scope->owner : NULL;
                     if (owner_class && owner_class->qualified_name) {
                         target_class = class_to_internal_name(owner_class->qualified_name);
-                        is_interface_call = (owner_class->kind == SYM_INTERFACE);
+                        is_interface_call = (owner_class->kind == SYM_INTERFACE || owner_class->kind == SYM_ANNOTATION);
                     }
                 }
             }
@@ -6184,7 +6310,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                     recv_type->data.class_type.name) {
                     target_class = class_to_internal_name(recv_type->data.class_type.name);
                     symbol_t *recv_sym = recv_type->data.class_type.symbol;
-                    is_interface_call = (recv_sym && recv_sym->kind == SYM_INTERFACE);
+                    is_interface_call = (recv_sym && (recv_sym->kind == SYM_INTERFACE || recv_sym->kind == SYM_ANNOTATION));
                 }
             }
             break;
@@ -6231,7 +6357,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
             if (owner_class && owner_class->qualified_name) {
                 /* Method belongs to a different class (e.g., static import) */
                 target_class = class_to_internal_name(owner_class->qualified_name);
-                is_interface_call = (owner_class->kind == SYM_INTERFACE);
+                is_interface_call = (owner_class->kind == SYM_INTERFACE || owner_class->kind == SYM_ANNOTATION);
 
                 /* An unqualified instance-method call resolved to a class
                  * other than our own is either an INHERITED method
@@ -6308,7 +6434,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
             } else {
                 /* Method belongs to current class */
                 target_class = mg->class_gen->internal_name;
-                is_interface_call = (class_sym->kind == SYM_INTERFACE);
+                is_interface_call = (class_sym->kind == SYM_INTERFACE || class_sym->kind == SYM_ANNOTATION);
             }
             /* All children are arguments only when there is no explicit receiver */
             if (!receiver) {
@@ -6324,7 +6450,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 is_static = (method_sym->modifiers & MOD_STATIC) != 0;
                 target_class = mg->class_gen->internal_name;
                 /* If current class is an interface, use invokeinterface for instance methods */
-                is_interface_call = (class_sym->kind == SYM_INTERFACE);
+                is_interface_call = (class_sym->kind == SYM_INTERFACE || class_sym->kind == SYM_ANNOTATION);
                 
                 /* For static methods or implicit this in instance methods */
                 if (is_static || !mg->is_static) {
@@ -6357,8 +6483,12 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         if (receiver) {
             /* Explicit receiver */
             if (!codegen_expr(mg, receiver, cp)) {
-                if (custom_descriptor) free(custom_descriptor);
-                if (static_import_class) free(static_import_class);
+                if (custom_descriptor) {
+                    free(custom_descriptor);
+                }
+                if (static_import_class) {
+                    free(static_import_class);
+                }
                 return false;
             }
         } else if (implicit_call_enclosing_owner) {
@@ -6380,8 +6510,12 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         } else {
             /* Error: trying to call instance method without receiver in static context */
             fprintf(stderr, "codegen: cannot call instance method '%s' without receiver in static context\n", method_name);
-            if (custom_descriptor) free(custom_descriptor);
-            if (static_import_class) free(static_import_class);
+            if (custom_descriptor) {
+                free(custom_descriptor);
+            }
+            if (static_import_class) {
+                free(static_import_class);
+            }
             return false;
         }
     }
@@ -6416,8 +6550,12 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         if (is_varargs_method && arg_index == fixed_param_count && varargs_param) {
             /* Everything from here on goes into the varargs array */
             if (!codegen_varargs_tail(mg, cp, varargs_param, node, false)) {
-                if (custom_descriptor) free(custom_descriptor);
-                if (static_import_class) free(static_import_class);
+                if (custom_descriptor) {
+                    free(custom_descriptor);
+                }
+                if (static_import_class) {
+                    free(static_import_class);
+                }
                 return false;
             }
 
@@ -6427,8 +6565,12 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         
         /* Regular argument (not varargs) */
         if (!codegen_expr(mg, arg, cp)) {
-            if (custom_descriptor) free(custom_descriptor);
-            if (static_import_class) free(static_import_class);
+            if (custom_descriptor) {
+                free(custom_descriptor);
+            }
+            if (static_import_class) {
+                free(static_import_class);
+            }
             return false;
         }
         
@@ -6444,13 +6586,19 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
     if (is_varargs_method && varargs_param) {
         /* Count actual arguments */
         int arg_count = 0;
-        for (slist_t *n = args; n; n = n->next) arg_count++;
+        for (slist_t *n = args; n; n = n->next) {
+            arg_count++;
+        }
         
         /* If we have exactly the fixed params (no varargs provided), create empty array */
         if (arg_count == fixed_param_count) {
             if (!codegen_varargs_tail(mg, cp, varargs_param, NULL, false)) {
-                if (custom_descriptor) free(custom_descriptor);
-                if (static_import_class) free(static_import_class);
+                if (custom_descriptor) {
+                    free(custom_descriptor);
+                }
+                if (static_import_class) {
+                    free(static_import_class);
+                }
                 return false;
             }
         }
@@ -6513,7 +6661,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
             if (recv_type && recv_type->kind == TYPE_CLASS && recv_type->data.class_type.name) {
                 target_class = class_to_internal_name(recv_type->data.class_type.name);
                 symbol_t *recv_sym = recv_type->data.class_type.symbol;
-                is_interface_call = (recv_sym && recv_sym->kind == SYM_INTERFACE);
+                is_interface_call = (recv_sym && (recv_sym->kind == SYM_INTERFACE || recv_sym->kind == SYM_ANNOTATION));
             }
         }
         if (!target_class) {
@@ -6774,7 +6922,9 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         }
     }
     
-    if (static_import_class) free(static_import_class);
+    if (static_import_class) {
+        free(static_import_class);
+    }
     return true;
 }
 
@@ -7184,7 +7334,9 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                 
                 while (current && current != enclosing) {
                     symbol_t *cur_enclosing = current->data.class_data.enclosing_class;
-                    if (!cur_enclosing) break;
+                    if (!cur_enclosing) {
+                        break;
+                    }
                     
                     /* Get this$0 from current class to get to cur_enclosing */
                     char *cur_internal = class_to_internal_name(current->qualified_name);
@@ -7225,7 +7377,9 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
     if (is_local_class && captured_vars) {
         for (slist_t *cap = captured_vars; cap; cap = cap->next) {
             symbol_t *var_sym = (symbol_t *)cap->data;
-            if (!var_sym || !var_sym->name) continue;
+            if (!var_sym || !var_sym->name) {
+                continue;
+            }
             
             /* Load the captured variable from the enclosing method's scope */
             /* It should be a local variable in our current method context */
@@ -7349,7 +7503,9 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             varargs_array_pushed = true;
             if (!codegen_varargs_tail(mg, cp, varargs_param, node, is_anonymous_class)) {
                 free(internal_name);
-                if (outer_internal) free(outer_internal);
+                if (outer_internal) {
+                    free(outer_internal);
+                }
                 return false;
             }
             break;  /* Done with arguments */
@@ -7357,7 +7513,9 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         
         if (!codegen_expr(mg, arg, cp)) {
             free(internal_name);
-            if (outer_internal) free(outer_internal);
+            if (outer_internal) {
+                free(outer_internal);
+            }
             return false;
         }
         
@@ -7393,7 +7551,9 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
     if (is_varargs_ctor && varargs_param && !varargs_array_pushed) {
         if (!codegen_varargs_tail(mg, cp, varargs_param, NULL, false)) {
             free(internal_name);
-            if (outer_internal) free(outer_internal);
+            if (outer_internal) {
+                free(outer_internal);
+            }
             return false;
         }
     }
@@ -7464,7 +7624,9 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
     string_append(desc, ")V");
     char *descriptor = string_free(desc, false);
     
-    if (outer_internal) free(outer_internal);
+    if (outer_internal) {
+        free(outer_internal);
+    }
     
     /* Emit: invokespecial <init> */
     uint16_t init_ref = cp_add_methodref(cp, internal_name, "<init>", descriptor);
@@ -7477,7 +7639,9 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
     /* But we have a dup'd reference still on stack */
     /* Calculate stack slots consumed (long/double take 2 slots) */
     int arg_slots = 0;
-    if (is_inner_class) arg_slots++;  /* Outer instance */
+    if (is_inner_class) {
+        arg_slots++;
+    }  /* Outer instance */
     if (is_local_class && captured_vars) {
         for (slist_t *cap = captured_vars; cap; cap = cap->next) {
             symbol_t *var_sym = (symbol_t *)cap->data;
@@ -7511,7 +7675,9 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             type_kind_t kind = param && param->type ? param->type->kind
                                                       : get_expr_type_kind(mg, (ast_node_t *)node->data);
             arg_slots += (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
-            if (slot_param) slot_param = slot_param->next;
+            if (slot_param) {
+                slot_param = slot_param->next;
+            }
         }
         arg_slots += 1;  /* The varargs array itself - always 1 slot. */
     } else {
@@ -7521,7 +7687,9 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         }
         for (slist_t *node = children->next; node; node = node->next) {
             ast_node_t *arg = (ast_node_t *)node->data;
-            if (is_anonymous_class && arg->type == AST_BLOCK && !node->next) break;
+            if (is_anonymous_class && arg->type == AST_BLOCK && !node->next) {
+                break;
+            }
             type_kind_t kind = get_expr_type_kind(mg, arg);
             if (slot_param) {
                 symbol_t *param = (symbol_t *)slot_param->data;
@@ -7623,15 +7791,23 @@ static bool codegen_array_init(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         /* Multi-dimensional: elements are arrays, use anewarray with inner array type */
         /* Build descriptor for the inner array type (one less dimension) */
         char *elem_desc;
-        if (elem_kind == TYPE_BOOLEAN) elem_desc = strdup("Z");
-        else if (elem_kind == TYPE_BYTE) elem_desc = strdup("B");
-        else if (elem_kind == TYPE_CHAR) elem_desc = strdup("C");
-        else if (elem_kind == TYPE_SHORT) elem_desc = strdup("S");
-        else if (elem_kind == TYPE_INT) elem_desc = strdup("I");
-        else if (elem_kind == TYPE_LONG) elem_desc = strdup("J");
-        else if (elem_kind == TYPE_FLOAT) elem_desc = strdup("F");
-        else if (elem_kind == TYPE_DOUBLE) elem_desc = strdup("D");
-        else if (elem_kind == TYPE_CLASS && elem_type && elem_type->data.class_type.name) {
+        if (elem_kind == TYPE_BOOLEAN) {
+            elem_desc = strdup("Z");
+        } else if (elem_kind == TYPE_BYTE) {
+            elem_desc = strdup("B");
+        } else if (elem_kind == TYPE_CHAR) {
+            elem_desc = strdup("C");
+        } else if (elem_kind == TYPE_SHORT) {
+            elem_desc = strdup("S");
+        } else if (elem_kind == TYPE_INT) {
+            elem_desc = strdup("I");
+        } else if (elem_kind == TYPE_LONG) {
+            elem_desc = strdup("J");
+        } else if (elem_kind == TYPE_FLOAT) {
+            elem_desc = strdup("F");
+        } else if (elem_kind == TYPE_DOUBLE) {
+            elem_desc = strdup("D");
+        } else if (elem_kind == TYPE_CLASS && elem_type && elem_type->data.class_type.name) {
             char *internal = class_to_internal_name(elem_type->data.class_type.name);
             size_t len = strlen(internal) + 3;
             elem_desc = malloc(len);
@@ -8325,17 +8501,25 @@ static bool codegen_compound_rhs(method_gen_t *mg, const_pool_t *cp, ast_node_t 
     if (!lhs_boolean && op_type != lhs_kind) {
         switch (op_type) {
             case TYPE_INT:
-                if (lhs_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
-                else if (lhs_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
-                else if (lhs_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                if (lhs_kind == TYPE_BYTE) {
+                    bc_emit(mg->code, OP_I2B);
+                } else if (lhs_kind == TYPE_SHORT) {
+                    bc_emit(mg->code, OP_I2S);
+                } else if (lhs_kind == TYPE_CHAR) {
+                    bc_emit(mg->code, OP_I2C);
+                }
                 break;
             case TYPE_LONG:
                 bc_emit(mg->code, OP_L2I);
                 mg_pop_typed(mg, 2);
                 mg_push_int(mg);
-                if (lhs_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
-                else if (lhs_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
-                else if (lhs_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                if (lhs_kind == TYPE_BYTE) {
+                    bc_emit(mg->code, OP_I2B);
+                } else if (lhs_kind == TYPE_SHORT) {
+                    bc_emit(mg->code, OP_I2S);
+                } else if (lhs_kind == TYPE_CHAR) {
+                    bc_emit(mg->code, OP_I2C);
+                }
                 break;
             case TYPE_FLOAT:
                 if (lhs_kind == TYPE_LONG) {
@@ -8346,9 +8530,13 @@ static bool codegen_compound_rhs(method_gen_t *mg, const_pool_t *cp, ast_node_t 
                     bc_emit(mg->code, OP_F2I);
                     mg_pop_typed(mg, 1);
                     mg_push_int(mg);
-                    if (lhs_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
-                    else if (lhs_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
-                    else if (lhs_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                    if (lhs_kind == TYPE_BYTE) {
+                        bc_emit(mg->code, OP_I2B);
+                    } else if (lhs_kind == TYPE_SHORT) {
+                        bc_emit(mg->code, OP_I2S);
+                    } else if (lhs_kind == TYPE_CHAR) {
+                        bc_emit(mg->code, OP_I2C);
+                    }
                 }
                 break;
             case TYPE_DOUBLE:
@@ -8365,9 +8553,13 @@ static bool codegen_compound_rhs(method_gen_t *mg, const_pool_t *cp, ast_node_t 
                         bc_emit(mg->code, OP_D2I);
                         mg_pop_typed(mg, 1);
                         mg_push_int(mg);
-                        if (lhs_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
-                        else if (lhs_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
-                        else if (lhs_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                        if (lhs_kind == TYPE_BYTE) {
+                            bc_emit(mg->code, OP_I2B);
+                        } else if (lhs_kind == TYPE_SHORT) {
+                            bc_emit(mg->code, OP_I2S);
+                        } else if (lhs_kind == TYPE_CHAR) {
+                            bc_emit(mg->code, OP_I2C);
+                        }
                         break;
                 }
                 break;
@@ -9130,7 +9322,9 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
 
         /* Generate receiver */
         if (!codegen_expr(mg, receiver, cp)) {
-            if (field_desc_owned) free((char *)field_desc);
+            if (field_desc_owned) {
+                free((char *)field_desc);
+            }
             return false;
         }
 
@@ -9159,13 +9353,17 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                                       field_class_name, sizeof(field_class_name));
             if (!codegen_compound_rhs(mg, cp, value, field_kind,
                                       field_class_name[0] ? field_class_name : NULL, op)) {
-                if (field_desc_owned) free((char *)field_desc);
+                if (field_desc_owned) {
+                    free((char *)field_desc);
+                }
                 return false;
             }
         } else {
             /* Generate value, then box, unbox or widen to the field's type */
             if (!codegen_expr(mg, value, cp)) {
-                if (field_desc_owned) free((char *)field_desc);
+                if (field_desc_owned) {
+                    free((char *)field_desc);
+                }
                 return false;
             }
             coerce_value_to_descriptor(mg, cp, value, field_desc);
@@ -9193,7 +9391,9 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
          * DUP2_X1 copy remains */
         mg_pop_typed(mg, field_is_wide ? 3 : 2);
 
-        if (field_desc_owned) free((char *)field_desc);
+        if (field_desc_owned) {
+            free((char *)field_desc);
+        }
         return true;
     }
     
@@ -9495,7 +9695,9 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
     /* Process each rule */
     for (slist_t *node = children->next; node; node = node->next) {
         ast_node_t *rule = (ast_node_t *)node->data;
-        if (rule->type != AST_SWITCH_RULE) continue;
+        if (rule->type != AST_SWITCH_RULE) {
+            continue;
+        }
         
         /* Check for default */
         if (rule->data.node.name && strcmp(rule->data.node.name, "default") == 0) {
@@ -9577,12 +9779,16 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
             body = child;  /* Last child is the body */
         }
         
-        if (!pattern) continue;
+        if (!pattern) {
+            continue;
+        }
         
         /* Get pattern type and variable */
         const char *var_name = pattern->data.node.name;
         slist_t *pattern_children = pattern->data.node.children;
-        if (!pattern_children) continue;
+        if (!pattern_children) {
+            continue;
+        }
         
         /* Get type internal name from pattern's semantic type (set by semantic pass) */
         char *type_internal = NULL;
@@ -9601,7 +9807,9 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
             }
         }
         
-        if (!type_internal) continue;
+        if (!type_internal) {
+            continue;
+        }
         
         /* Save stackmap state before pattern binding - each case should
          * start with the same state (only selector in scope) */
@@ -9740,7 +9948,9 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                         
                         /* Store in local */
                         type_kind_t kind = TYPE_CLASS;
-                        if (comp_type) kind = comp_type->kind;
+                        if (comp_type) {
+                            kind = comp_type->kind;
+                        }
                         
                         if (kind == TYPE_INT || kind == TYPE_BOOLEAN || 
                             kind == TYPE_CHAR || kind == TYPE_SHORT || kind == TYPE_BYTE) {
@@ -11137,14 +11347,23 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 
                 if (type_node->type == AST_PRIMITIVE_TYPE) {
                     const char *prim_name = type_node->data.leaf.name;
-                    if (strcmp(prim_name, "int") == 0) target_kind = TYPE_INT;
-                    else if (strcmp(prim_name, "long") == 0) target_kind = TYPE_LONG;
-                    else if (strcmp(prim_name, "float") == 0) target_kind = TYPE_FLOAT;
-                    else if (strcmp(prim_name, "double") == 0) target_kind = TYPE_DOUBLE;
-                    else if (strcmp(prim_name, "byte") == 0) target_kind = TYPE_BYTE;
-                    else if (strcmp(prim_name, "short") == 0) target_kind = TYPE_SHORT;
-                    else if (strcmp(prim_name, "char") == 0) target_kind = TYPE_CHAR;
-                    else if (strcmp(prim_name, "boolean") == 0) target_kind = TYPE_BOOLEAN;
+                    if (strcmp(prim_name, "int") == 0) {
+                        target_kind = TYPE_INT;
+                    } else if (strcmp(prim_name, "long") == 0) {
+                        target_kind = TYPE_LONG;
+                    } else if (strcmp(prim_name, "float") == 0) {
+                        target_kind = TYPE_FLOAT;
+                    } else if (strcmp(prim_name, "double") == 0) {
+                        target_kind = TYPE_DOUBLE;
+                    } else if (strcmp(prim_name, "byte") == 0) {
+                        target_kind = TYPE_BYTE;
+                    } else if (strcmp(prim_name, "short") == 0) {
+                        target_kind = TYPE_SHORT;
+                    } else if (strcmp(prim_name, "char") == 0) {
+                        target_kind = TYPE_CHAR;
+                    } else if (strcmp(prim_name, "boolean") == 0) {
+                        target_kind = TYPE_BOOLEAN;
+                    }
                 } else if (type_node->type == AST_CLASS_TYPE) {
                     target_kind = TYPE_CLASS;
                     /* Use sem_type if resolved, otherwise fall back to AST name */
@@ -11372,9 +11591,13 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 bc_emit(mg->code, OP_L2I);
                                 mg_pop_typed(mg, 2);
                                 mg_push_int(mg);
-                                if (target_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
-                                else if (target_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
-                                else if (target_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                                if (target_kind == TYPE_BYTE) {
+                                    bc_emit(mg->code, OP_I2B);
+                                } else if (target_kind == TYPE_SHORT) {
+                                    bc_emit(mg->code, OP_I2S);
+                                } else if (target_kind == TYPE_CHAR) {
+                                    bc_emit(mg->code, OP_I2C);
+                                }
                                 break;
                             case TYPE_FLOAT:  bc_emit(mg->code, OP_L2F); mg_pop_typed(mg, 2); mg_push_float(mg); break;
                             case TYPE_DOUBLE: bc_emit(mg->code, OP_L2D); mg_pop_typed(mg, 2); mg_push_double(mg); break;
@@ -11390,9 +11613,13 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 bc_emit(mg->code, OP_F2I);
                                 mg_pop_typed(mg, 1);
                                 mg_push_int(mg);
-                                if (target_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
-                                else if (target_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
-                                else if (target_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                                if (target_kind == TYPE_BYTE) {
+                                    bc_emit(mg->code, OP_I2B);
+                                } else if (target_kind == TYPE_SHORT) {
+                                    bc_emit(mg->code, OP_I2S);
+                                } else if (target_kind == TYPE_CHAR) {
+                                    bc_emit(mg->code, OP_I2C);
+                                }
                                 break;
                             case TYPE_LONG:   bc_emit(mg->code, OP_F2L); mg_pop_typed(mg, 1); mg_push_long(mg); break;
                             case TYPE_DOUBLE: bc_emit(mg->code, OP_F2D); mg_pop_typed(mg, 1); mg_push_double(mg); break;
@@ -11408,9 +11635,13 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 bc_emit(mg->code, OP_D2I);
                                 mg_pop_typed(mg, 2);
                                 mg_push_int(mg);
-                                if (target_kind == TYPE_BYTE) bc_emit(mg->code, OP_I2B);
-                                else if (target_kind == TYPE_SHORT) bc_emit(mg->code, OP_I2S);
-                                else if (target_kind == TYPE_CHAR) bc_emit(mg->code, OP_I2C);
+                                if (target_kind == TYPE_BYTE) {
+                                    bc_emit(mg->code, OP_I2B);
+                                } else if (target_kind == TYPE_SHORT) {
+                                    bc_emit(mg->code, OP_I2S);
+                                } else if (target_kind == TYPE_CHAR) {
+                                    bc_emit(mg->code, OP_I2C);
+                                }
                                 break;
                             case TYPE_LONG:   bc_emit(mg->code, OP_D2L); mg_pop_typed(mg, 2); mg_push_long(mg); break;
                             case TYPE_FLOAT:  bc_emit(mg->code, OP_D2F); mg_pop_typed(mg, 2); mg_push_float(mg); break;
@@ -11616,7 +11847,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 break;
                             }
                         }
-                        if (has_type_patterns) break;
+                        if (has_type_patterns) {
+                            break;
+                        }
                     }
                 }
                 
@@ -12017,7 +12250,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         
                         while (stack_top > 0) {
                             ast_node_t *node = stack[--stack_top];
-                            if (!node) continue;
+                            if (!node) {
+                                continue;
+                            }
                             
                             if (node->type == AST_IDENTIFIER) {
                                 if (node->sem_type && actual_param_count < 16) {
@@ -12047,7 +12282,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 
                                 while (stack_top > 0) {
                                     ast_node_t *node = stack[--stack_top];
-                                    if (!node) continue;
+                                    if (!node) {
+                                        continue;
+                                    }
                                     
                                     if (node->type == AST_IDENTIFIER && node->sem_type) {
                                         if (actual_param_count < 16) {
@@ -12150,7 +12387,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     if (var_sym && var_sym->name && var_sym->type) {
                         type_kind_t cap_kind = var_sym->type->kind;
                         /* Type variables erase to Object (reference type) */
-                        if (cap_kind == TYPE_TYPEVAR) cap_kind = TYPE_CLASS;
+                        if (cap_kind == TYPE_TYPEVAR) {
+                            cap_kind = TYPE_CLASS;
+                        }
                         local_var_info_t *info = local_var_info_new(slot, cap_kind);
                         info->is_ref = (cap_kind == TYPE_CLASS || cap_kind == TYPE_ARRAY);
                         hashtable_insert(lambda_mg->locals, var_sym->name, info);
@@ -12193,7 +12432,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     
                     while (stack_top > 0) {
                         ast_node_t *node = stack[--stack_top];
-                        if (!node) continue;
+                        if (!node) {
+                            continue;
+                        }
                         
                         if (node->type == AST_IDENTIFIER) {
                             if (param_count < 16) {
@@ -12257,7 +12498,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             
                             while (stack_top > 0) {
                                 ast_node_t *node = stack[--stack_top];
-                                if (!node) continue;
+                                if (!node) {
+                                    continue;
+                                }
                                 
                                 if (node->type == AST_IDENTIFIER) {
                                     if (param_count < 16) {
@@ -12300,7 +12543,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     slist_t *sp_node = sam_param;
                     for (slist_t *node = params_node->data.node.children; node; node = node->next) {
                         ast_node_t *param = (ast_node_t *)node->data;
-                        if (param->type != AST_PARAMETER) continue;
+                        if (param->type != AST_PARAMETER) {
+                            continue;
+                        }
                         
                         const char *param_name = param->data.node.name;
                         type_kind_t kind = TYPE_CLASS;
@@ -12791,7 +13036,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         /* Primitive array: newarray */
                         bc_emit_u1(synth_mg->code, OP_NEWARRAY);
                         int atype = type_kind_to_atype(elem_type->kind);
-                        if (atype < 0) atype = 10;  /* Default to T_INT */
+                        if (atype < 0) {
+                            atype = 10;
+                        }  /* Default to T_INT */
                         bc_emit_u1(synth_mg->code, atype);
                     }
                     
@@ -12940,12 +13187,18 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 for (int i = 0; i < type_var_count; i++) {
                                     if (strcmp(type_var_names[i], var_name) == 0) {
                                         slist_t *ta = type_args;
-                                        for (int j = 0; j < i && ta; j++) ta = ta->next;
-                                        if (ta) actual = (type_t *)ta->data;
+                                        for (int j = 0; j < i && ta; j++) {
+                                            ta = ta->next;
+                                        }
+                                        if (ta) {
+                                            actual = (type_t *)ta->data;
+                                        }
                                         break;
                                     }
                                 }
-                                if (actual) param_type = actual;
+                                if (actual) {
+                                    param_type = actual;
+                                }
                             }
                             char *desc = type_to_descriptor(param_type);
                             string_append(spec_desc, desc);
@@ -12963,12 +13216,18 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             for (int i = 0; i < type_var_count; i++) {
                                 if (strcmp(type_var_names[i], var_name) == 0) {
                                     slist_t *ta = type_args;
-                                    for (int j = 0; j < i && ta; j++) ta = ta->next;
-                                    if (ta) actual = (type_t *)ta->data;
+                                    for (int j = 0; j < i && ta; j++) {
+                                        ta = ta->next;
+                                    }
+                                    if (ta) {
+                                        actual = (type_t *)ta->data;
+                                    }
                                     break;
                                 }
                             }
-                            if (actual) ret_type = actual;
+                            if (actual) {
+                                ret_type = actual;
+                            }
                         }
                         char *ret_desc = type_to_descriptor(ret_type);
                         string_append(spec_desc, ret_desc);
@@ -13041,7 +13300,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     free(iface_internal);
                     free(sam_descriptor);
                     free(method_descriptor);
-                    if (specialized_sam_desc) free(specialized_sam_desc);
+                    if (specialized_sam_desc) {
+                        free(specialized_sam_desc);
+                    }
                     return false;
                 }
                 
@@ -13053,7 +13314,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     free(iface_internal);
                     free(sam_descriptor);
                     free(method_descriptor);
-                    if (specialized_sam_desc) free(specialized_sam_desc);
+                    if (specialized_sam_desc) {
+                        free(specialized_sam_desc);
+                    }
                     return false;
                 }
                 
@@ -13065,7 +13328,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     free(iface_internal);
                     free(sam_descriptor);
                     free(method_descriptor);
-                    if (specialized_sam_desc) free(specialized_sam_desc);
+                    if (specialized_sam_desc) {
+                        free(specialized_sam_desc);
+                    }
                     return false;
                 }
                 
@@ -13083,7 +13348,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     free(iface_internal);
                     free(sam_descriptor);
                     free(method_descriptor);
-                    if (specialized_sam_desc) free(specialized_sam_desc);
+                    if (specialized_sam_desc) {
+                        free(specialized_sam_desc);
+                    }
                     return false;
                 }
                 
@@ -13098,7 +13365,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     free(iface_internal);
                     free(sam_descriptor);
                     free(method_descriptor);
-                    if (specialized_sam_desc) free(specialized_sam_desc);
+                    if (specialized_sam_desc) {
+                        free(specialized_sam_desc);
+                    }
                     return false;
                 }
                 
@@ -13110,7 +13379,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     free(iface_internal);
                     free(sam_descriptor);
                     free(method_descriptor);
-                    if (specialized_sam_desc) free(specialized_sam_desc);
+                    if (specialized_sam_desc) {
+                        free(specialized_sam_desc);
+                    }
                     return false;
                 }
                 
@@ -13133,7 +13404,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 free(iface_internal);
                 free(sam_descriptor);
                 free(method_descriptor);
-                if (specialized_sam_desc) free(specialized_sam_desc);
+                if (specialized_sam_desc) {
+                    free(specialized_sam_desc);
+                }
                 
                 cg->uses_invokedynamic = true;
                 return true;
@@ -13154,15 +13427,25 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     const char *prim_name = type_node->data.leaf.name;
                     const char *wrapper_class = NULL;
                     
-                    if (strcmp(prim_name, "boolean") == 0) wrapper_class = "java/lang/Boolean";
-                    else if (strcmp(prim_name, "byte") == 0) wrapper_class = "java/lang/Byte";
-                    else if (strcmp(prim_name, "char") == 0) wrapper_class = "java/lang/Character";
-                    else if (strcmp(prim_name, "short") == 0) wrapper_class = "java/lang/Short";
-                    else if (strcmp(prim_name, "int") == 0) wrapper_class = "java/lang/Integer";
-                    else if (strcmp(prim_name, "long") == 0) wrapper_class = "java/lang/Long";
-                    else if (strcmp(prim_name, "float") == 0) wrapper_class = "java/lang/Float";
-                    else if (strcmp(prim_name, "double") == 0) wrapper_class = "java/lang/Double";
-                    else if (strcmp(prim_name, "void") == 0) wrapper_class = "java/lang/Void";
+                    if (strcmp(prim_name, "boolean") == 0) {
+                        wrapper_class = "java/lang/Boolean";
+                    } else if (strcmp(prim_name, "byte") == 0) {
+                        wrapper_class = "java/lang/Byte";
+                    } else if (strcmp(prim_name, "char") == 0) {
+                        wrapper_class = "java/lang/Character";
+                    } else if (strcmp(prim_name, "short") == 0) {
+                        wrapper_class = "java/lang/Short";
+                    } else if (strcmp(prim_name, "int") == 0) {
+                        wrapper_class = "java/lang/Integer";
+                    } else if (strcmp(prim_name, "long") == 0) {
+                        wrapper_class = "java/lang/Long";
+                    } else if (strcmp(prim_name, "float") == 0) {
+                        wrapper_class = "java/lang/Float";
+                    } else if (strcmp(prim_name, "double") == 0) {
+                        wrapper_class = "java/lang/Double";
+                    } else if (strcmp(prim_name, "void") == 0) {
+                        wrapper_class = "java/lang/Void";
+                    }
                     
                     if (wrapper_class) {
                         /* Use getstatic WrapperClass.TYPE */

@@ -99,7 +99,9 @@ verification_type_t vtype_uninitialized_this(void)
 stack_map_table_t *stackmap_new(void)
 {
     stack_map_table_t *smt = calloc(1, sizeof(stack_map_table_t));
-    if (!smt) return NULL;
+    if (!smt) {
+        return NULL;
+    }
     
     /* Initialize with small default capacities */
     smt->current_locals_capacity = 16;
@@ -113,7 +115,9 @@ stack_map_table_t *stackmap_new(void)
 
 void stackmap_free(stack_map_table_t *smt)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     
     /* Free all frames */
     stack_map_frame_t *frame = smt->frames;
@@ -137,7 +141,9 @@ void stackmap_free(stack_map_table_t *smt)
 void stackmap_init_method(stack_map_table_t *smt, method_gen_t *mg, 
                           bool is_static, const char *this_class)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     
     /* Reset state */
     smt->current_locals_count = 0;
@@ -162,7 +168,9 @@ static void ensure_locals_capacity(stack_map_table_t *smt, uint16_t slot)
 {
     if (slot >= smt->current_locals_capacity) {
         uint16_t new_cap = smt->current_locals_capacity * 2;
-        while (new_cap <= slot) new_cap *= 2;
+        while (new_cap <= slot) {
+            new_cap *= 2;
+        }
         smt->current_locals = realloc(smt->current_locals, 
                                       new_cap * sizeof(verification_type_t));
         /* Initialize new slots to TOP */
@@ -175,7 +183,9 @@ static void ensure_locals_capacity(stack_map_table_t *smt, uint16_t slot)
 
 void stackmap_set_local(stack_map_table_t *smt, uint16_t slot, verification_type_t type)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     
     ensure_locals_capacity(smt, slot);
     
@@ -209,31 +219,41 @@ void stackmap_set_local(stack_map_table_t *smt, uint16_t slot, verification_type
 void stackmap_set_local_object(stack_map_table_t *smt, uint16_t slot, 
                                const_pool_t *cp, const char *class_name)
 {
-    if (!smt || !cp || !class_name) return;
+    if (!smt || !cp || !class_name) {
+        return;
+    }
     stackmap_set_local(smt, slot, vtype_object(cp, class_name));
 }
 
 void stackmap_set_local_int(stack_map_table_t *smt, uint16_t slot)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     stackmap_set_local(smt, slot, vtype_int());
 }
 
 void stackmap_set_local_long(stack_map_table_t *smt, uint16_t slot)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     stackmap_set_local(smt, slot, vtype_long());
 }
 
 void stackmap_set_local_float(stack_map_table_t *smt, uint16_t slot)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     stackmap_set_local(smt, slot, vtype_float());
 }
 
 void stackmap_set_local_double(stack_map_table_t *smt, uint16_t slot)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     stackmap_set_local(smt, slot, vtype_double());
 }
 
@@ -245,7 +265,9 @@ static void ensure_stack_capacity(stack_map_table_t *smt, uint16_t size)
 {
     if (size >= smt->current_stack_capacity) {
         uint16_t new_cap = smt->current_stack_capacity * 2;
-        while (new_cap <= size) new_cap *= 2;
+        while (new_cap <= size) {
+            new_cap *= 2;
+        }
         smt->current_stack = realloc(smt->current_stack, 
                                      new_cap * sizeof(verification_type_t));
         smt->current_stack_capacity = new_cap;
@@ -254,7 +276,9 @@ static void ensure_stack_capacity(stack_map_table_t *smt, uint16_t size)
 
 void stackmap_push(stack_map_table_t *smt, verification_type_t type)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     
     ensure_stack_capacity(smt, smt->current_stack_size);
     smt->current_stack[smt->current_stack_size++] = type;
@@ -293,19 +317,25 @@ void stackmap_push_null(stack_map_table_t *smt)
 
 void stackmap_push_object(stack_map_table_t *smt, const_pool_t *cp, const char *class_name)
 {
-    if (!smt || !cp || !class_name) return;
+    if (!smt || !cp || !class_name) {
+        return;
+    }
     stackmap_push(smt, vtype_object(cp, class_name));
 }
 
 void stackmap_push_uninitialized(stack_map_table_t *smt, uint16_t new_offset)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     stackmap_push(smt, vtype_uninitialized(new_offset));
 }
 
 void stackmap_pop(stack_map_table_t *smt, uint16_t count)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     if (count > smt->current_stack_size) {
         smt->current_stack_size = 0;
     } else {
@@ -315,7 +345,9 @@ void stackmap_pop(stack_map_table_t *smt, uint16_t count)
 
 void stackmap_dup_x1(stack_map_table_t *smt)
 {
-    if (!smt || smt->current_stack_size < 2) return;
+    if (!smt || smt->current_stack_size < 2) {
+        return;
+    }
 
     verification_type_t a = smt->current_stack[smt->current_stack_size - 2];
     verification_type_t b = smt->current_stack[smt->current_stack_size - 1];
@@ -328,7 +360,9 @@ void stackmap_dup_x1(stack_map_table_t *smt)
 
 void stackmap_dup2_x1(stack_map_table_t *smt)
 {
-    if (!smt || smt->current_stack_size < 3) return;
+    if (!smt || smt->current_stack_size < 3) {
+        return;
+    }
 
     verification_type_t a    = smt->current_stack[smt->current_stack_size - 3];
     verification_type_t b_lo = smt->current_stack[smt->current_stack_size - 2];
@@ -344,7 +378,9 @@ void stackmap_dup2_x1(stack_map_table_t *smt)
 
 void stackmap_clear_stack(stack_map_table_t *smt)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     smt->current_stack_size = 0;
 }
 
@@ -355,7 +391,9 @@ uint16_t stackmap_get_locals_count(stack_map_table_t *smt)
 
 void stackmap_set_locals_count(stack_map_table_t *smt, uint16_t count)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
     if (count < smt->current_locals_count) {
         smt->current_locals_count = count;
     }
@@ -368,7 +406,9 @@ void stackmap_set_locals_count(stack_map_table_t *smt, uint16_t count)
 void stackmap_init_object(stack_map_table_t *smt, uint16_t new_offset, 
                           const_pool_t *cp, const char *class_name)
 {
-    if (!smt || !cp || !class_name) return;
+    if (!smt || !cp || !class_name) {
+        return;
+    }
     
     verification_type_t initialized = vtype_object(cp, class_name);
     
@@ -398,7 +438,9 @@ void stackmap_init_object(stack_map_table_t *smt, uint16_t new_offset,
 
 void stackmap_record_frame(stack_map_table_t *smt, uint16_t offset)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
 
     /* Check for existing frame at this offset */
     for (stack_map_frame_t *f = smt->frames; f; f = f->next) {
@@ -435,7 +477,9 @@ void stackmap_record_frame(stack_map_table_t *smt, uint16_t offset)
     
     /* Create new frame */
     stack_map_frame_t *frame = calloc(1, sizeof(stack_map_frame_t));
-    if (!frame) return;
+    if (!frame) {
+        return;
+    }
     
     frame->offset = offset;
     
@@ -479,7 +523,9 @@ void stackmap_record_frame(stack_map_table_t *smt, uint16_t offset)
 
 void stackmap_prune_out_of_bounds_frame(stack_map_table_t *smt, uint16_t code_length)
 {
-    if (!smt) return;
+    if (!smt) {
+        return;
+    }
 
     /* Frames are recorded in non-decreasing offset order as codegen
      * proceeds (stackmap_record_frame() inserts in sorted order), so only
@@ -511,7 +557,9 @@ void stackmap_prune_out_of_bounds_frame(stack_map_table_t *smt, uint16_t code_le
 
 stack_map_frame_t *stackmap_get_frame(stack_map_table_t *smt, uint16_t offset)
 {
-    if (!smt) return NULL;
+    if (!smt) {
+        return NULL;
+    }
     
     for (stack_map_frame_t *f = smt->frames; f; f = f->next) {
         if (f->offset == offset) {
@@ -527,10 +575,14 @@ stack_map_frame_t *stackmap_get_frame(stack_map_table_t *smt, uint16_t offset)
 
 stackmap_state_t *stackmap_save_state(stack_map_table_t *smt)
 {
-    if (!smt) return NULL;
+    if (!smt) {
+        return NULL;
+    }
     
     stackmap_state_t *state = calloc(1, sizeof(stackmap_state_t));
-    if (!state) return NULL;
+    if (!state) {
+        return NULL;
+    }
     
     /* Save locals */
     state->num_locals = smt->current_locals_count;
@@ -557,7 +609,9 @@ stackmap_state_t *stackmap_save_state(stack_map_table_t *smt)
 
 void stackmap_restore_state(stack_map_table_t *smt, stackmap_state_t *state)
 {
-    if (!smt || !state) return;
+    if (!smt || !state) {
+        return;
+    }
     
     /* Restore locals */
     smt->current_locals_count = state->num_locals;
@@ -578,7 +632,9 @@ void stackmap_restore_state(stack_map_table_t *smt, stackmap_state_t *state)
 
 void stackmap_restore_locals_only(stack_map_table_t *smt, stackmap_state_t *state)
 {
-    if (!smt || !state) return;
+    if (!smt || !state) {
+        return;
+    }
     
     /* Restore only locals - keep current stack */
     smt->current_locals_count = state->num_locals;
@@ -591,7 +647,9 @@ void stackmap_restore_locals_only(stack_map_table_t *smt, stackmap_state_t *stat
 
 void stackmap_state_free(stackmap_state_t *state)
 {
-    if (!state) return;
+    if (!state) {
+        return;
+    }
     free(state->locals);
     free(state->stack);
     free(state);
@@ -663,9 +721,13 @@ static int calc_vtypes_size(verification_type_t *locals, uint16_t start, uint16_
 /* Compare two frames to determine optimal encoding */
 static bool frames_locals_equal(stack_map_frame_t *prev, stack_map_frame_t *curr)
 {
-    if (prev->num_locals != curr->num_locals) return false;
+    if (prev->num_locals != curr->num_locals) {
+        return false;
+    }
     for (uint16_t i = 0; i < prev->num_locals; i++) {
-        if (prev->locals[i].tag != curr->locals[i].tag) return false;
+        if (prev->locals[i].tag != curr->locals[i].tag) {
+            return false;
+        }
         if (prev->locals[i].tag == VT_OBJECT &&
             prev->locals[i].data.cp_index != curr->locals[i].data.cp_index) {
             return false;
@@ -722,7 +784,9 @@ static int calculate_frame_size(stack_map_frame_t *prev, stack_map_frame_t *curr
             /* Check if first prev->num_locals are the same */
             bool prefix_same = true;
             for (uint16_t i = 0; i < prev->num_locals && prefix_same; i++) {
-                if (prev->locals[i].tag != curr->locals[i].tag) prefix_same = false;
+                if (prev->locals[i].tag != curr->locals[i].tag) {
+                    prefix_same = false;
+                }
                 if (prev->locals[i].tag == VT_OBJECT &&
                     prev->locals[i].data.cp_index != curr->locals[i].data.cp_index) {
                     prefix_same = false;
@@ -743,7 +807,9 @@ static int calculate_frame_size(stack_map_frame_t *prev, stack_map_frame_t *curr
             /* Check if first curr->num_locals are the same */
             bool prefix_same = true;
             for (uint16_t i = 0; i < curr->num_locals && prefix_same; i++) {
-                if (prev->locals[i].tag != curr->locals[i].tag) prefix_same = false;
+                if (prev->locals[i].tag != curr->locals[i].tag) {
+                    prefix_same = false;
+                }
                 if (prev->locals[i].tag == VT_OBJECT &&
                     prev->locals[i].data.cp_index != curr->locals[i].data.cp_index) {
                     prefix_same = false;

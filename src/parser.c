@@ -431,7 +431,9 @@ void ast_print(ast_node_t *node, int indent)
         }
         
         /* Print indentation and node info */
-        for (int i = 0; i < cur_indent; i++) printf("  ");
+        for (int i = 0; i < cur_indent; i++) {
+            printf("  ");
+        }
         printf("%s", ast_type_name(current->type));
         
         /* Print additional info based on node type */

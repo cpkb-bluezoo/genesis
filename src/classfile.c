@@ -806,7 +806,9 @@ const char *classfile_version_name(uint16_t major_version)
  */
 int classfile_version_from_string(const char *version)
 {
-    if (!version) return 0;
+    if (!version) {
+        return 0;
+    }
     
     /* Handle "1.x" legacy format */
     if (strncmp(version, "1.", 2) == 0) {
@@ -814,7 +816,9 @@ int classfile_version_from_string(const char *version)
     }
     
     int v = atoi(version);
-    if (v <= 0) return 0;
+    if (v <= 0) {
+        return 0;
+    }
     
     /* Java 1-4 have different mapping */
     if (v <= 4) {
@@ -829,8 +833,12 @@ int classfile_version_from_string(const char *version)
  */
 int classfile_java_version(int major_version)
 {
-    if (major_version < 45) return 0;
-    if (major_version <= 48) return major_version - 44;  /* 45->1, 46->2, 47->3, 48->4 */
+    if (major_version < 45) {
+        return 0;
+    }
+    if (major_version <= 48) {
+        return major_version - 44;
+    }  /* 45->1, 46->2, 47->3, 48->4 */
     return major_version - 44;  /* 49->5, 50->6, 51->7, 52->8, ... */
 }
 
@@ -866,20 +874,28 @@ char **classfile_get_module_exports(classfile_t *cf, int *count_out)
     const uint8_t *end = p + module_attr->attribute_length;
     
     /* module_name_index u2, module_flags u2, module_version_index u2 */
-    if (p + 6 > end) return NULL;
+    if (p + 6 > end) {
+        return NULL;
+    }
     p += 6;
     
     /* requires_count */
-    if (p + 2 > end) return NULL;
+    if (p + 2 > end) {
+        return NULL;
+    }
     uint16_t requires_count = ((uint16_t)p[0] << 8) | p[1];
     p += 2;
     for (uint16_t i = 0; i < requires_count; i++) {
         /* requires_index u2, requires_flags u2, requires_version_index u2 */
-        if (p + 6 > end) return NULL;
+        if (p + 6 > end) {
+            return NULL;
+        }
         p += 6;
     }
     
-    if (p + 2 > end) return NULL;
+    if (p + 2 > end) {
+        return NULL;
+    }
     uint16_t exports_count = ((uint16_t)p[0] << 8) | p[1];
     p += 2;
     
@@ -890,16 +906,22 @@ char **classfile_get_module_exports(classfile_t *cf, int *count_out)
     int n = 0;
     
     for (uint16_t i = 0; i < exports_count; i++) {
-        if (p + 4 > end) break;
+        if (p + 4 > end) {
+            break;
+        }
         uint16_t exports_index = ((uint16_t)p[0] << 8) | p[1];
         p += 2;
         /* exports_flags */
         p += 2;
-        if (p + 2 > end) break;
+        if (p + 2 > end) {
+            break;
+        }
         uint16_t exports_to_count = ((uint16_t)p[0] << 8) | p[1];
         p += 2;
         /* Skip qualified exports targets */
-        if (p + 2 * exports_to_count > end) break;
+        if (p + 2 * exports_to_count > end) {
+            break;
+        }
         p += 2 * exports_to_count;
         
         /* Package CP entry -> Utf8 internal name */
@@ -941,7 +963,9 @@ char **classfile_get_module_exports(classfile_t *cf, int *count_out)
  */
 static bool cf_read_u1(const uint8_t **p, const uint8_t *end, uint8_t *out)
 {
-    if (*p + 1 > end) return false;
+    if (*p + 1 > end) {
+        return false;
+    }
     *out = **p;
     *p += 1;
     return true;
@@ -949,7 +973,9 @@ static bool cf_read_u1(const uint8_t **p, const uint8_t *end, uint8_t *out)
 
 static bool cf_read_u2(const uint8_t **p, const uint8_t *end, uint16_t *out)
 {
-    if (*p + 2 > end) return false;
+    if (*p + 2 > end) {
+        return false;
+    }
     *out = ((uint16_t)(*p)[0] << 8) | (uint16_t)(*p)[1];
     *p += 2;
     return true;
@@ -961,7 +987,9 @@ static bool skip_annotation(const uint8_t **p, const uint8_t *end);
 static bool skip_element_value(const uint8_t **p, const uint8_t *end)
 {
     uint8_t tag;
-    if (!cf_read_u1(p, end, &tag)) return false;
+    if (!cf_read_u1(p, end, &tag)) {
+        return false;
+    }
 
     switch (tag) {
         case 'B': case 'C': case 'D': case 'F': case 'I': case 'J':
@@ -978,9 +1006,13 @@ static bool skip_element_value(const uint8_t **p, const uint8_t *end)
             return skip_annotation(p, end);
         case '[': {
             uint16_t num_values;
-            if (!cf_read_u2(p, end, &num_values)) return false;
+            if (!cf_read_u2(p, end, &num_values)) {
+                return false;
+            }
             for (uint16_t i = 0; i < num_values; i++) {
-                if (!skip_element_value(p, end)) return false;
+                if (!skip_element_value(p, end)) {
+                    return false;
+                }
             }
             return true;
         }
@@ -993,12 +1025,20 @@ static bool skip_element_value(const uint8_t **p, const uint8_t *end)
 static bool skip_annotation(const uint8_t **p, const uint8_t *end)
 {
     uint16_t type_index, num_pairs;
-    if (!cf_read_u2(p, end, &type_index)) return false;
-    if (!cf_read_u2(p, end, &num_pairs)) return false;
+    if (!cf_read_u2(p, end, &type_index)) {
+        return false;
+    }
+    if (!cf_read_u2(p, end, &num_pairs)) {
+        return false;
+    }
     for (uint16_t i = 0; i < num_pairs; i++) {
         uint16_t name_idx;
-        if (!cf_read_u2(p, end, &name_idx)) return false;
-        if (!skip_element_value(p, end)) return false;
+        if (!cf_read_u2(p, end, &name_idx)) {
+            return false;
+        }
+        if (!skip_element_value(p, end)) {
+            return false;
+        }
     }
     return true;
 }
@@ -1013,7 +1053,9 @@ static bool skip_annotation(const uint8_t **p, const uint8_t *end)
  */
 char *classfile_get_retention_policy_name(classfile_t *cf)
 {
-    if (!cf) return NULL;
+    if (!cf) {
+        return NULL;
+    }
 
     attribute_info_t *annots_attr = NULL;
     for (uint16_t i = 0; i < cf->attributes_count; i++) {
@@ -1025,24 +1067,32 @@ char *classfile_get_retention_policy_name(classfile_t *cf)
             break;
         }
     }
-    if (!annots_attr || !annots_attr->info) return NULL;
+    if (!annots_attr || !annots_attr->info) {
+        return NULL;
+    }
 
     const uint8_t *p = annots_attr->info;
     const uint8_t *end = p + annots_attr->attribute_length;
 
     uint16_t num_annotations;
-    if (!cf_read_u2(&p, end, &num_annotations)) return NULL;
+    if (!cf_read_u2(&p, end, &num_annotations)) {
+        return NULL;
+    }
 
     for (uint16_t i = 0; i < num_annotations; i++) {
         uint16_t type_index, num_pairs;
-        if (!cf_read_u2(&p, end, &type_index)) return NULL;
+        if (!cf_read_u2(&p, end, &type_index)) {
+            return NULL;
+        }
 
         char *type_desc = classfile_get_utf8(cf, type_index);
         bool is_retention = type_desc &&
             strcmp(type_desc, "Ljava/lang/annotation/Retention;") == 0;
         free(type_desc);
 
-        if (!cf_read_u2(&p, end, &num_pairs)) return NULL;
+        if (!cf_read_u2(&p, end, &num_pairs)) {
+            return NULL;
+        }
 
         char *result = NULL;
         for (uint16_t j = 0; j < num_pairs; j++) {
@@ -1057,7 +1107,9 @@ char *classfile_get_retention_policy_name(classfile_t *cf)
                 /* Expect an enum_const_value; peek the tag ourselves so we
                  * can extract the constant name instead of just skipping. */
                 uint8_t tag;
-                if (!cf_read_u1(&p, end, &tag)) return NULL;
+                if (!cf_read_u1(&p, end, &tag)) {
+                    return NULL;
+                }
                 if (tag == 'e') {
                     uint16_t etype_idx, econst_idx;
                     if (!cf_read_u2(&p, end, &etype_idx) ||
@@ -1072,17 +1124,25 @@ char *classfile_get_retention_policy_name(classfile_t *cf)
                         case 'B': case 'C': case 'D': case 'F': case 'I': case 'J':
                         case 'S': case 'Z': case 's': case 'c': {
                             uint16_t idx;
-                            if (!cf_read_u2(&p, end, &idx)) return NULL;
+                            if (!cf_read_u2(&p, end, &idx)) {
+                                return NULL;
+                            }
                             break;
                         }
                         case '@':
-                            if (!skip_annotation(&p, end)) return NULL;
+                            if (!skip_annotation(&p, end)) {
+                                return NULL;
+                            }
                             break;
                         case '[': {
                             uint16_t num_values;
-                            if (!cf_read_u2(&p, end, &num_values)) return NULL;
+                            if (!cf_read_u2(&p, end, &num_values)) {
+                                return NULL;
+                            }
                             for (uint16_t k = 0; k < num_values; k++) {
-                                if (!skip_element_value(&p, end)) return NULL;
+                                if (!skip_element_value(&p, end)) {
+                                    return NULL;
+                                }
                             }
                             break;
                         }
@@ -1106,7 +1166,9 @@ char *classfile_get_retention_policy_name(classfile_t *cf)
 
 char *classfile_get_method_descriptor(classfile_t *cf, const char *method_name)
 {
-    if (!cf || !method_name) return NULL;
+    if (!cf || !method_name) {
+        return NULL;
+    }
     for (uint16_t i = 0; i < cf->methods_count; i++) {
         method_info_t *m = &cf->methods[i];
         if (m->name && strcmp(m->name, method_name) == 0) {
@@ -1258,7 +1320,9 @@ static generic_type_t *parse_base_type(const char **sig)
  */
 static generic_type_t *parse_type_variable(const char **sig)
 {
-    if (**sig != 'T') return NULL;
+    if (**sig != 'T') {
+        return NULL;
+    }
     (*sig)++;  /* Skip 'T' */
     
     const char *start = *sig;
@@ -1266,7 +1330,9 @@ static generic_type_t *parse_type_variable(const char **sig)
         (*sig)++;
     }
     
-    if (**sig != ';') return NULL;
+    if (**sig != ';') {
+        return NULL;
+    }
     
     size_t len = *sig - start;
     generic_type_t *type = generic_type_new(GEN_TYPEVAR);
@@ -1283,11 +1349,15 @@ static generic_type_t *parse_type_variable(const char **sig)
  */
 static generic_type_t *parse_array_type(const char **sig)
 {
-    if (**sig != '[') return NULL;
+    if (**sig != '[') {
+        return NULL;
+    }
     (*sig)++;  /* Skip '[' */
     
     generic_type_t *elem = parse_type_signature(sig);
-    if (!elem) return NULL;
+    if (!elem) {
+        return NULL;
+    }
     
     generic_type_t *type = generic_type_new(GEN_ARRAY);
     if (type) {
@@ -1306,7 +1376,9 @@ static generic_type_t *parse_array_type(const char **sig)
  */
 static type_argument_t *parse_type_arguments(const char **sig)
 {
-    if (**sig != '<') return NULL;
+    if (**sig != '<') {
+        return NULL;
+    }
     (*sig)++;  /* Skip '<' */
     
     type_argument_t *head = NULL;
@@ -1314,7 +1386,9 @@ static type_argument_t *parse_type_arguments(const char **sig)
     
     while (**sig && **sig != '>') {
         type_argument_t *arg = calloc(1, sizeof(type_argument_t));
-        if (!arg) break;
+        if (!arg) {
+            break;
+        }
         
         if (**sig == '*') {
             /* Unbounded wildcard */
@@ -1384,7 +1458,9 @@ static void parse_class_segment(const char **sig, char **name, type_argument_t *
  */
 static generic_type_t *parse_class_type_signature(const char **sig)
 {
-    if (**sig != 'L') return NULL;
+    if (**sig != 'L') {
+        return NULL;
+    }
     (*sig)++;  /* Skip 'L' */
     
     /* Build the full class name, handling inner classes */
@@ -1403,7 +1479,9 @@ static generic_type_t *parse_class_type_signature(const char **sig)
             }
             /* Convert / to . for internal names */
             for (char *p = segment; *p; p++) {
-                if (*p == '/') *p = '.';
+                if (*p == '/') {
+                    *p = '.';
+                }
             }
             strcat(full_name, segment);
             free(segment);
@@ -1440,7 +1518,9 @@ static generic_type_t *parse_class_type_signature(const char **sig)
  */
 static generic_type_t *parse_type_signature(const char **sig)
 {
-    if (!sig || !*sig || !**sig) return NULL;
+    if (!sig || !*sig || !**sig) {
+        return NULL;
+    }
     
     switch (**sig) {
         case 'B': case 'C': case 'D': case 'F':
@@ -1450,7 +1530,9 @@ static generic_type_t *parse_type_signature(const char **sig)
             (*sig)++;
             {
                 generic_type_t *type = generic_type_new(GEN_PRIMITIVE);
-                if (type) type->data.primitive = 'V';
+                if (type) {
+                    type->data.primitive = 'V';
+                }
                 return type;
             }
         case 'L':
@@ -1473,7 +1555,9 @@ static generic_type_t *parse_type_signature(const char **sig)
  */
 static type_parameter_t *parse_type_parameters(const char **sig)
 {
-    if (**sig != '<') return NULL;
+    if (**sig != '<') {
+        return NULL;
+    }
     (*sig)++;  /* Skip '<' */
     
     type_parameter_t *head = NULL;
@@ -1481,7 +1565,9 @@ static type_parameter_t *parse_type_parameters(const char **sig)
     
     while (**sig && **sig != '>') {
         type_parameter_t *param = calloc(1, sizeof(type_parameter_t));
-        if (!param) break;
+        if (!param) {
+            break;
+        }
         
         /* Parse identifier */
         const char *start = *sig;
@@ -1539,10 +1625,14 @@ static type_parameter_t *parse_type_parameters(const char **sig)
  */
 method_signature_t *signature_parse_method(const char *sig)
 {
-    if (!sig) return NULL;
+    if (!sig) {
+        return NULL;
+    }
     
     method_signature_t *msig = calloc(1, sizeof(method_signature_t));
-    if (!msig) return NULL;
+    if (!msig) {
+        return NULL;
+    }
     
     const char *p = sig;
     
@@ -1606,10 +1696,14 @@ method_signature_t *signature_parse_method(const char *sig)
  */
 class_signature_t *signature_parse_class(const char *sig)
 {
-    if (!sig) return NULL;
+    if (!sig) {
+        return NULL;
+    }
     
     class_signature_t *csig = calloc(1, sizeof(class_signature_t));
-    if (!csig) return NULL;
+    if (!csig) {
+        return NULL;
+    }
     
     const char *p = sig;
     
@@ -1644,7 +1738,9 @@ class_signature_t *signature_parse_class(const char *sig)
  */
 generic_type_t *signature_parse_field(const char *sig)
 {
-    if (!sig) return NULL;
+    if (!sig) {
+        return NULL;
+    }
     const char *p = sig;
     return parse_type_signature(&p);
 }
@@ -1729,7 +1825,9 @@ void generic_type_free(generic_type_t *type)
  */
 void method_signature_free(method_signature_t *sig)
 {
-    if (!sig) return;
+    if (!sig) {
+        return;
+    }
     
     type_parameters_free(sig->type_params);
     generic_type_free(sig->params);
@@ -1743,7 +1841,9 @@ void method_signature_free(method_signature_t *sig)
  */
 void class_signature_free(class_signature_t *sig)
 {
-    if (!sig) return;
+    if (!sig) {
+        return;
+    }
     
     type_parameters_free(sig->type_params);
     generic_type_free(sig->superclass);
@@ -1756,7 +1856,9 @@ void class_signature_free(class_signature_t *sig)
  */
 char *generic_type_to_string(generic_type_t *type)
 {
-    if (!type) return strdup("<null>");
+    if (!type) {
+        return strdup("<null>");
+    }
     
     char buffer[1024] = "";
     
@@ -1782,7 +1884,9 @@ char *generic_type_to_string(generic_type_t *type)
                 type_argument_t *arg = type->data.class_type.type_args;
                 bool first = true;
                 while (arg) {
-                    if (!first) strcat(buffer, ", ");
+                    if (!first) {
+                        strcat(buffer, ", ");
+                    }
                     first = false;
                     
                     if (arg->bound_kind == WILDCARD_NONE && !arg->type) {

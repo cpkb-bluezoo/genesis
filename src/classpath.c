@@ -1088,25 +1088,33 @@ classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
     pthread_mutex_t *mutex = (pthread_mutex_t *)cp->cache_mutex;
     
     /* Lock for cache access */
-    if (mutex) pthread_mutex_lock(mutex);
+    if (mutex) {
+        pthread_mutex_lock(mutex);
+    }
     
     /* Check positive cache first */
     classfile_t *cached = (classfile_t *)hashtable_lookup(cp->cache, classname);
     if (cached) {
         cp->cache_hits++;
-        if (mutex) pthread_mutex_unlock(mutex);
+        if (mutex) {
+            pthread_mutex_unlock(mutex);
+        }
         return cached;
     }
     
     /* Check negative cache - avoid repeated failed lookups */
     if (cp->negative_cache && hashtable_lookup(cp->negative_cache, classname)) {
         cp->negative_cache_hits++;
-        if (mutex) pthread_mutex_unlock(mutex);
+        if (mutex) {
+            pthread_mutex_unlock(mutex);
+        }
         return NULL;
     }
     
     /* Unlock while doing I/O (which is slow) */
-    if (mutex) pthread_mutex_unlock(mutex);
+    if (mutex) {
+        pthread_mutex_unlock(mutex);
+    }
 
     char *path = classname_to_path(classname);
     if (!path) {
@@ -1128,7 +1136,9 @@ classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
     free(path);
 
     /* Lock for cache update */
-    if (mutex) pthread_mutex_lock(mutex);
+    if (mutex) {
+        pthread_mutex_lock(mutex);
+    }
     
     /* Check cache again - another thread may have loaded it while we were doing I/O */
     classfile_t *existing = (classfile_t *)hashtable_lookup(cp->cache, classname);
@@ -1138,7 +1148,9 @@ classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
             classfile_free(cf);
         }
         cp->cache_hits++;
-        if (mutex) pthread_mutex_unlock(mutex);
+        if (mutex) {
+            pthread_mutex_unlock(mutex);
+        }
         return existing;
     }
 
@@ -1151,7 +1163,9 @@ classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
         hashtable_insert(cp->negative_cache, classname, (void *)1);
     }
     
-    if (mutex) pthread_mutex_unlock(mutex);
+    if (mutex) {
+        pthread_mutex_unlock(mutex);
+    }
 
     return cf;
 }

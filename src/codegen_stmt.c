@@ -309,7 +309,9 @@ static const char *wrapper_class_for_primitive(type_kind_t kind)
  */
 static int32_t string_hashcode(const char *str)
 {
-    if (!str) return 0;
+    if (!str) {
+        return 0;
+    }
     int32_t h = 0;
     while (*str) {
         h = 31 * h + (unsigned char)*str;
@@ -335,8 +337,12 @@ static int compare_by_hashcode(const void *a, const void *b)
 {
     const string_case_info_t *ca = (const string_case_info_t *)a;
     const string_case_info_t *cb = (const string_case_info_t *)b;
-    if (ca->hashcode < cb->hashcode) return -1;
-    if (ca->hashcode > cb->hashcode) return 1;
+    if (ca->hashcode < cb->hashcode) {
+        return -1;
+    }
+    if (ca->hashcode > cb->hashcode) {
+        return 1;
+    }
     return 0;
 }
 
@@ -380,7 +386,9 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
     
     for (slist_t *node = children->next; node; node = node->next, ast_idx++) {
         ast_node_t *case_label = (ast_node_t *)node->data;
-        if (case_label->type != AST_CASE_LABEL) continue;
+        if (case_label->type != AST_CASE_LABEL) {
+            continue;
+        }
         
         if (case_label->data.node.name && 
             strcmp(case_label->data.node.name, "default") == 0) {
@@ -565,7 +573,9 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
 
     for (slist_t *node = children->next; node; node = node->next, ast_idx++) {
         ast_node_t *case_label = (ast_node_t *)node->data;
-        if (case_label->type != AST_CASE_LABEL) continue;
+        if (case_label->type != AST_CASE_LABEL) {
+            continue;
+        }
 
         bool is_default = (case_label->data.node.name &&
                           strcmp(case_label->data.node.name, "default") == 0);
@@ -3314,13 +3324,21 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 } else if (type_node->type == AST_PRIMITIVE_TYPE) {
                     const char *prim_name = type_node->data.leaf.name;
                     if (prim_name) {
-                        if (strcmp(prim_name, "long") == 0) var_kind = TYPE_LONG;
-                        else if (strcmp(prim_name, "float") == 0) var_kind = TYPE_FLOAT;
-                        else if (strcmp(prim_name, "double") == 0) var_kind = TYPE_DOUBLE;
-                        else if (strcmp(prim_name, "byte") == 0) var_kind = TYPE_BYTE;
-                        else if (strcmp(prim_name, "short") == 0) var_kind = TYPE_SHORT;
-                        else if (strcmp(prim_name, "char") == 0) var_kind = TYPE_CHAR;
-                        else if (strcmp(prim_name, "boolean") == 0) var_kind = TYPE_BOOLEAN;
+                        if (strcmp(prim_name, "long") == 0) {
+                            var_kind = TYPE_LONG;
+                        } else if (strcmp(prim_name, "float") == 0) {
+                            var_kind = TYPE_FLOAT;
+                        } else if (strcmp(prim_name, "double") == 0) {
+                            var_kind = TYPE_DOUBLE;
+                        } else if (strcmp(prim_name, "byte") == 0) {
+                            var_kind = TYPE_BYTE;
+                        } else if (strcmp(prim_name, "short") == 0) {
+                            var_kind = TYPE_SHORT;
+                        } else if (strcmp(prim_name, "char") == 0) {
+                            var_kind = TYPE_CHAR;
+                        } else if (strcmp(prim_name, "boolean") == 0) {
+                            var_kind = TYPE_BOOLEAN;
+                        }
                     }
                 }
                 
@@ -3795,13 +3813,21 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         } else if (cur && cur->type == AST_PRIMITIVE_TYPE && cur->data.leaf.name) {
                             const char *p = cur->data.leaf.name;
                             const char *d = "I";
-                            if (strcmp(p, "byte") == 0) d = "B";
-                            else if (strcmp(p, "short") == 0) d = "S";
-                            else if (strcmp(p, "char") == 0) d = "C";
-                            else if (strcmp(p, "long") == 0) d = "J";
-                            else if (strcmp(p, "float") == 0) d = "F";
-                            else if (strcmp(p, "double") == 0) d = "D";
-                            else if (strcmp(p, "boolean") == 0) d = "Z";
+                            if (strcmp(p, "byte") == 0) {
+                                d = "B";
+                            } else if (strcmp(p, "short") == 0) {
+                                d = "S";
+                            } else if (strcmp(p, "char") == 0) {
+                                d = "C";
+                            } else if (strcmp(p, "long") == 0) {
+                                d = "J";
+                            } else if (strcmp(p, "float") == 0) {
+                                d = "F";
+                            } else if (strcmp(p, "double") == 0) {
+                                d = "D";
+                            } else if (strcmp(p, "boolean") == 0) {
+                                d = "Z";
+                            }
                             snprintf(elem_desc, sizeof(elem_desc), "%s", d);
                         }
                         char full_desc[300];

@@ -549,6 +549,27 @@ else
     failed=$((failed + 1))
 fi
 
+# GitHub issue #2: the library is compiled with genesis itself, into a
+# separate classfile - the two-step shape that exercises reading a
+# constant's value back from its own classfile ConstantValue attribute,
+# as opposed to same-batch compilation, where the source AST's own
+# literal initializer is still available regardless.
+printf "%-30s ... " "SwitchClassfileConstantTest"
+scf_lib="$TEST_BUILD/switchclassfileconstlib-lib"
+scf_out="$TEST_BUILD/switchclassfileconstlib-out"
+rm -rf "$scf_lib" "$scf_out"
+mkdir -p "$scf_lib" "$scf_out"
+if "$GENESIS" -d "$scf_lib" "$TEST_SRC"/external/switchclassfileconstlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$scf_lib" -d "$scf_out" \
+       "$TEST_SRC/external/SwitchClassfileConstantTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$scf_out:$scf_lib" SwitchClassfileConstantTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "--- Class file version (-source/-target/-release) ---"
 # With no -target the version is computed from the features used (floor 52,
@@ -1068,6 +1089,26 @@ check_sourcepath() {
 }
 check_sourcepath SamePackageSourcepath spdep/SamePackageSourcepathTest.java spdep.SamePackageSourcepathTest
 check_sourcepath ImportSourcepath spuser/ImportSourcepathTest.java spuser.ImportSourcepathTest
+
+echo
+echo "--- A qualified reference to a genuinely nonexistent package must fail to compile ---"
+# "pkg2.Foo" doesn't exist anywhere under this sourcepath - only an
+# UNRELATED default-package Foo.java shares its simple name. This must be
+# rejected at compile time (matching real javac's "package pkg2 does not
+# exist"), not silently resolved to the unrelated class and left to fail
+# at runtime with NoClassDefFoundError instead.
+printf "%-30s ... " "DefaultPackageFallbackRejected"
+dpf_out="$TEST_BUILD/defaultpackagefallback-out"
+rm -rf "$dpf_out"
+mkdir -p "$dpf_out"
+if ! "$GENESIS" -sourcepath "$TEST_SRC/external/defaultpackagefallback" -d "$dpf_out" \
+       "$TEST_SRC/external/defaultpackagefallback/pkg1/UsesNonExistentQualifiedClass.java" >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
 
 echo
 echo "=== Results: $passed passed, $failed failed ==="

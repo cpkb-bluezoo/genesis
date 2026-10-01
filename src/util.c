@@ -716,7 +716,9 @@ char **str_split(const char *str, const char *delim, int max_tokens)
         }
         
         if (!result[i]) {
-            for (int j = 0; j < i; j++) free(result[j]);
+            for (int j = 0; j < i; j++) {
+                free(result[j]);
+            }
             free(result);
             return NULL;
         }
@@ -791,14 +793,18 @@ char *str_strip(char *str)
         return NULL;
     }
     
-    while (isspace((unsigned char)*str)) str++;
+    while (isspace((unsigned char)*str)) {
+        str++;
+    }
     
     if (*str == '\0') {
         return str;
     }
     
     char *end = str + strlen(str) - 1;
-    while (end > str && isspace((unsigned char)*end)) end--;
+    while (end > str && isspace((unsigned char)*end)) {
+        end--;
+    }
     *(end + 1) = '\0';
     
     return str;

@@ -136,8 +136,12 @@ static uint16_t field_gen_constant_value_index(const_pool_t *cp, field_gen_t *fg
                 }
                 return 0;
             case 'Z':
-                if (tt == TOK_TRUE) return cp_add_integer(cp, 1);
-                if (tt == TOK_FALSE) return cp_add_integer(cp, 0);
+                if (tt == TOK_TRUE) {
+                    return cp_add_integer(cp, 1);
+                }
+                if (tt == TOK_FALSE) {
+                    return cp_add_integer(cp, 0);
+                }
                 return 0;
             case 'C':
                 if (tt == TOK_CHAR_LITERAL && init_expr->data.leaf.value.str_val) {
@@ -300,7 +304,9 @@ static int write_annotation_value(uint8_t **p, const_pool_t *cp, ast_node_t *val
                                    const char *qualified_annotation_name,
                                    const char *element_name)
 {
-    if (!value) return 0;
+    if (!value) {
+        return 0;
+    }
 
     uint8_t *start = *p;
 
@@ -397,7 +403,9 @@ static int write_annotation_value(uint8_t **p, const_pool_t *cp, ast_node_t *val
         char *type_desc = calloc(strlen(qualified) + 4, 1);
         sprintf(type_desc, "L%s;", qualified);
         for (char *c = type_desc; *c; c++) {
-            if (*c == '.') *c = '/';
+            if (*c == '.') {
+                *c = '/';
+            }
         }
         uint16_t type_idx = cp_add_utf8(cp, type_desc);
         free(type_desc);
@@ -461,7 +469,9 @@ static int write_annotation_value(uint8_t **p, const_pool_t *cp, ast_node_t *val
  */
 static int write_annotation(uint8_t **p, const_pool_t *cp, ast_node_t *annot)
 {
-    if (!annot || annot->type != AST_ANNOTATION) return 0;
+    if (!annot || annot->type != AST_ANNOTATION) {
+        return 0;
+    }
     
     uint8_t *start = *p;
 
@@ -499,7 +509,9 @@ static int write_annotation(uint8_t **p, const_pool_t *cp, ast_node_t *annot)
         type_desc = calloc(strlen(qualified_name) + 4, 1);
         sprintf(type_desc, "L%s;", qualified_name);
         for (char *c = type_desc; *c; c++) {
-            if (*c == '.') *c = '/';
+            if (*c == '.') {
+                *c = '/';
+            }
         }
     }
     uint16_t type_idx = cp_add_utf8(cp, type_desc);
@@ -563,7 +575,9 @@ static int write_annotations_attribute(uint8_t **p, const_pool_t *cp,
     retention_policy_t target = runtime_visible ? RETENTION_RUNTIME : RETENTION_CLASS;
     int count = count_annotations_with_retention(annotations, target);
     
-    if (count == 0) return 0;
+    if (count == 0) {
+        return 0;
+    }
     
     uint8_t *start = *p;
     
@@ -625,7 +639,9 @@ static int write_annotations_attribute(uint8_t **p, const_pool_t *cp,
  */
 static int count_type_annotations(ast_node_t *type_node, retention_policy_t retention)
 {
-    if (!type_node) return 0;
+    if (!type_node) {
+        return 0;
+    }
     
     int count = 0;
     
@@ -721,7 +737,9 @@ static int write_type_annotation(uint8_t **p, const_pool_t *cp,
  */
 static ast_node_t *get_field_type_node(ast_node_t *field_decl)
 {
-    if (!field_decl) return NULL;
+    if (!field_decl) {
+        return NULL;
+    }
     
     slist_t *children = field_decl->data.node.children;
     for (slist_t *n = children; n; n = n->next) {
@@ -742,12 +760,16 @@ static ast_node_t *get_field_type_node(ast_node_t *field_decl)
 static int write_field_type_annotations_attribute(uint8_t **p, const_pool_t *cp,
                                                    ast_node_t *type_node, bool runtime_visible)
 {
-    if (!type_node) return 0;
+    if (!type_node) {
+        return 0;
+    }
     
     retention_policy_t target = runtime_visible ? RETENTION_RUNTIME : RETENTION_CLASS;
     int count = count_type_annotations(type_node, target);
     
-    if (count == 0) return 0;
+    if (count == 0) {
+        return 0;
+    }
     
     uint8_t *start = *p;
     
@@ -793,7 +815,9 @@ static int write_field_type_annotations_attribute(uint8_t **p, const_pool_t *cp,
  */
 static ast_node_t *get_method_return_type_node(ast_node_t *method_decl)
 {
-    if (!method_decl) return NULL;
+    if (!method_decl) {
+        return NULL;
+    }
     
     /* Return type is stored in data.node.extra for method decls */
     return (ast_node_t *)method_decl->data.node.extra;
@@ -805,7 +829,9 @@ static ast_node_t *get_method_return_type_node(ast_node_t *method_decl)
  */
 static int get_method_parameter_type_nodes(ast_node_t *method_decl, ast_node_t **types, int max_params)
 {
-    if (!method_decl) return 0;
+    if (!method_decl) {
+        return 0;
+    }
     
     int count = 0;
     slist_t *children = method_decl->data.node.children;
@@ -832,7 +858,9 @@ static int get_method_parameter_type_nodes(ast_node_t *method_decl, ast_node_t *
  */
 static int count_method_type_annotations(ast_node_t *method_ast, retention_policy_t retention)
 {
-    if (!method_ast) return 0;
+    if (!method_ast) {
+        return 0;
+    }
     
     int count = 0;
     
@@ -859,12 +887,16 @@ static int count_method_type_annotations(ast_node_t *method_ast, retention_polic
 static int write_method_type_annotations_attribute(uint8_t **p, const_pool_t *cp,
                                                     ast_node_t *method_ast, bool runtime_visible)
 {
-    if (!method_ast) return 0;
+    if (!method_ast) {
+        return 0;
+    }
     
     retention_policy_t target = runtime_visible ? RETENTION_RUNTIME : RETENTION_CLASS;
     int count = count_method_type_annotations(method_ast, target);
     
-    if (count == 0) return 0;
+    if (count == 0) {
+        return 0;
+    }
     
     uint8_t *start = *p;
     
@@ -952,12 +984,16 @@ static int count_local_var_type_annotations(slist_t *local_var_table, retention_
 static int write_local_var_type_annotations_attribute(uint8_t **p, const_pool_t *cp,
                                                        slist_t *local_var_table, bool runtime_visible)
 {
-    if (!local_var_table) return 0;
+    if (!local_var_table) {
+        return 0;
+    }
     
     retention_policy_t target = runtime_visible ? RETENTION_RUNTIME : RETENTION_CLASS;
     int count = count_local_var_type_annotations(local_var_table, target);
     
-    if (count == 0) return 0;
+    if (count == 0) {
+        return 0;
+    }
     
     uint8_t *start = *p;
     
@@ -1020,7 +1056,9 @@ static int write_local_var_type_annotations_attribute(uint8_t **p, const_pool_t 
  */
 static int count_method_parameter_annotations(ast_node_t *method_ast, retention_policy_t retention)
 {
-    if (!method_ast) return 0;
+    if (!method_ast) {
+        return 0;
+    }
     
     int total = 0;
     slist_t *children = method_ast->data.node.children;
@@ -1038,7 +1076,9 @@ static int count_method_parameter_annotations(ast_node_t *method_ast, retention_
  */
 static int count_method_parameters(ast_node_t *method_ast)
 {
-    if (!method_ast) return 0;
+    if (!method_ast) {
+        return 0;
+    }
     
     int count = 0;
     slist_t *children = method_ast->data.node.children;
@@ -1062,10 +1102,14 @@ static int write_parameter_annotations_attribute(uint8_t **p, const_pool_t *cp,
     
     /* Count total parameter annotations */
     int total_annots = count_method_parameter_annotations(method_ast, target);
-    if (total_annots == 0) return 0;
+    if (total_annots == 0) {
+        return 0;
+    }
     
     int num_params = count_method_parameters(method_ast);
-    if (num_params == 0) return 0;
+    if (num_params == 0) {
+        return 0;
+    }
     
     uint8_t *start = *p;
     
@@ -1121,7 +1165,9 @@ static int write_parameter_annotations_attribute(uint8_t **p, const_pool_t *cp,
 static void preadd_parameter_annotations_cp(const_pool_t *cp, ast_node_t *method_ast, 
                                              retention_policy_t retention)
 {
-    if (!method_ast) return;
+    if (!method_ast) {
+        return;
+    }
     
     slist_t *children = method_ast->data.node.children;
     for (slist_t *n = children; n; n = n->next) {
@@ -1137,7 +1183,9 @@ static void preadd_parameter_annotations_cp(const_pool_t *cp, ast_node_t *method
  */
 static void preadd_annotation_cp_entries(const_pool_t *cp, ast_node_t *annot)
 {
-    if (!annot || annot->type != AST_ANNOTATION) return;
+    if (!annot || annot->type != AST_ANNOTATION) {
+        return;
+    }
 
     /* Annotation type descriptor. Must match write_annotation()'s resolved
      * name exactly - the constant pool is serialized before write_annotation()
@@ -1168,7 +1216,9 @@ static void preadd_annotation_cp_entries(const_pool_t *cp, ast_node_t *annot)
             type_desc = calloc(strlen(qualified_name) + 4, 1);
             sprintf(type_desc, "L%s;", qualified_name);
             for (char *c = type_desc; *c; c++) {
-                if (*c == '.') *c = '/';
+                if (*c == '.') {
+                    *c = '/';
+                }
             }
         }
         cp_add_utf8(cp, type_desc);
@@ -1238,7 +1288,9 @@ static void preadd_annotation_cp_entries(const_pool_t *cp, ast_node_t *annot)
                         char *type_desc = calloc(strlen(qualified) + 4, 1);
                         sprintf(type_desc, "L%s;", qualified);
                         for (char *c = type_desc; *c; c++) {
-                            if (*c == '.') *c = '/';
+                            if (*c == '.') {
+                                *c = '/';
+                            }
                         }
                         cp_add_utf8(cp, type_desc);
                         free(type_desc);
@@ -1293,7 +1345,9 @@ static void preadd_annotations_list_cp(const_pool_t *cp, slist_t *annotations,
  */
 static void preadd_annotation_default_cp(const_pool_t *cp, ast_node_t *value)
 {
-    if (!value) return;
+    if (!value) {
+        return;
+    }
     
     if (value->type == AST_LITERAL) {
         token_type_t tok = value->data.leaf.token_type;
@@ -1328,7 +1382,9 @@ static void preadd_annotation_default_cp(const_pool_t *cp, ast_node_t *value)
 static int write_annotation_default_attribute(uint8_t **p, const_pool_t *cp, 
                                                ast_node_t *default_value)
 {
-    if (!default_value) return 0;
+    if (!default_value) {
+        return 0;
+    }
     
     uint8_t *start = *p;
     
@@ -1430,6 +1486,22 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
      * get_annotation_retention()/write_annotation() for the duration of
      * this call, so they can resolve bare annotation names like "Test". */
     g_classwriter_sem = cg->sem;
+
+    /* By the time code generation runs, semantic analysis has already
+     * finished for every file in this compilation, so sem->current_class
+     * is left over from whatever class pass2 analyzed last - not
+     * necessarily this one. Re-point it at the class actually being
+     * written here, so semantic_resolve_annotation_retention() can search
+     * ITS OWN nested-type members (and its enclosing/superclass chain)
+     * for an annotation type declared in the SAME compilation batch,
+     * which has no classfile on disk yet to read a @Retention
+     * meta-annotation from. Needed for a nested annotation type used on
+     * a member of its own enclosing class (e.g. "@Marker" inside the
+     * same class that declares "@interface Marker { ... }") - GitHub
+     * issue #1. */
+    if (cg->sem) {
+        cg->sem->current_class = cg->class_sym;
+    }
 
     bool emit_nest = false;
     int target_major = choose_class_version(cg, &emit_nest);
@@ -1716,7 +1788,9 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         if (fg->ast && fg->ast->annotations) {
             field_rt_annots = count_annotations_with_retention(fg->ast->annotations, RETENTION_RUNTIME);
         }
-        if (field_rt_annots > 0) field_attr_count++;
+        if (field_rt_annots > 0) {
+            field_attr_count++;
+        }
         
         /* Count field type annotations with RUNTIME retention */
         ast_node_t *field_type_node = get_field_type_node(fg->ast);
@@ -1724,17 +1798,23 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         if (field_type_node) {
             field_type_annots = count_type_annotations(field_type_node, RETENTION_RUNTIME);
         }
-        if (field_type_annots > 0) field_attr_count++;
+        if (field_type_annots > 0) {
+            field_attr_count++;
+        }
         
         /* Count Signature attribute */
-        if (fg->signature) field_attr_count++;
+        if (fg->signature) {
+            field_attr_count++;
+        }
 
         /* Count ConstantValue attribute - use the index already resolved
          * and cached in the pre-add pass above, NOT a fresh call to
          * field_gen_constant_value_index() (see that pre-add pass's own
          * comment for why: cp_add_string() doesn't dedupe). */
         uint16_t const_value_index = fg->const_value_cp_index;
-        if (const_value_index != 0) field_attr_count++;
+        if (const_value_index != 0) {
+            field_attr_count++;
+        }
 
         write_be_u2(&p, field_attr_count);
 
@@ -1805,16 +1885,30 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         if (mi->code == NULL) {
             /* Count throws types */
             int throws_count = 0;
-            for (slist_t *t = mi->throws; t; t = t->next) throws_count++;
+            for (slist_t *t = mi->throws; t; t = t->next) {
+                throws_count++;
+            }
             
             /* Count attributes: annotations + signature + parameter annotations + annotation default + type annotations + exceptions */
             int abstract_attr_count = 0;
-            if (throws_count > 0) abstract_attr_count++;  /* Exceptions attribute */
-            if (method_rt_annots > 0) abstract_attr_count++;
-            if (param_rt_annots > 0) abstract_attr_count++;
-            if (method_type_annots > 0) abstract_attr_count++;
-            if (mi->signature) abstract_attr_count++;
-            if (has_annotation_default) abstract_attr_count++;
+            if (throws_count > 0) {
+                abstract_attr_count++;
+            }  /* Exceptions attribute */
+            if (method_rt_annots > 0) {
+                abstract_attr_count++;
+            }
+            if (param_rt_annots > 0) {
+                abstract_attr_count++;
+            }
+            if (method_type_annots > 0) {
+                abstract_attr_count++;
+            }
+            if (mi->signature) {
+                abstract_attr_count++;
+            }
+            if (has_annotation_default) {
+                abstract_attr_count++;
+            }
             
             write_be_u2(&p, abstract_attr_count);
             
@@ -1859,15 +1953,27 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         
         /* Count throws types for Exceptions attribute */
         int concrete_throws_count = 0;
-        for (slist_t *t = mi->throws; t; t = t->next) concrete_throws_count++;
+        for (slist_t *t = mi->throws; t; t = t->next) {
+            concrete_throws_count++;
+        }
         
         /* Count method attributes: Code + optional Signature + optional annotations + parameter annotations + type annotations + exceptions */
         int method_attr_count = 1;  /* Code is always present for concrete methods */
-        if (concrete_throws_count > 0) method_attr_count++;  /* Exceptions attribute */
-        if (mi->signature) method_attr_count++;
-        if (method_rt_annots > 0) method_attr_count++;
-        if (param_rt_annots > 0) method_attr_count++;
-        if (method_type_annots > 0) method_attr_count++;
+        if (concrete_throws_count > 0) {
+            method_attr_count++;
+        }  /* Exceptions attribute */
+        if (mi->signature) {
+            method_attr_count++;
+        }
+        if (method_rt_annots > 0) {
+            method_attr_count++;
+        }
+        if (param_rt_annots > 0) {
+            method_attr_count++;
+        }
+        if (method_type_annots > 0) {
+            method_attr_count++;
+        }
         write_be_u2(&p, method_attr_count);
         
         /* Code attribute */
@@ -1916,10 +2022,18 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         
         /* Count Code sub-attributes */
         uint16_t code_attr_count_val = 0;
-        if (smt_data && smt_len > 0) code_attr_count_val++;
-        if (lnt_count > 0) code_attr_count_val++;
-        if (lvt_count > 0) code_attr_count_val++;
-        if (lvt_annot_data && lvt_annot_len > 0) code_attr_count_val++;
+        if (smt_data && smt_len > 0) {
+            code_attr_count_val++;
+        }
+        if (lnt_count > 0) {
+            code_attr_count_val++;
+        }
+        if (lvt_count > 0) {
+            code_attr_count_val++;
+        }
+        if (lvt_annot_data && lvt_annot_len > 0) {
+            code_attr_count_val++;
+        }
         
         /* Code attribute length:
          * 2 (max_stack) + 2 (max_locals) + 4 (code_length) + code_length
@@ -2050,19 +2164,33 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     
     /* Class attributes */
     uint16_t class_attr_count = 0;
-    if (cg->inner_class_entries) class_attr_count++;
-    if (cg->signature) class_attr_count++;
-    if (cg->bootstrap_methods && cg->bootstrap_methods->count > 0) class_attr_count++;
-    if (cg->permitted_subclasses) class_attr_count++;
-    if (emit_nest && cg->nest_members) class_attr_count++;  /* NestMembers (Java 11+) */
-    if (emit_nest && cg->nest_host) class_attr_count++;     /* NestHost (Java 11+) */
+    if (cg->inner_class_entries) {
+        class_attr_count++;
+    }
+    if (cg->signature) {
+        class_attr_count++;
+    }
+    if (cg->bootstrap_methods && cg->bootstrap_methods->count > 0) {
+        class_attr_count++;
+    }
+    if (cg->permitted_subclasses) {
+        class_attr_count++;
+    }
+    if (emit_nest && cg->nest_members) {
+        class_attr_count++;
+    }  /* NestMembers (Java 11+) */
+    if (emit_nest && cg->nest_host) {
+        class_attr_count++;
+    }     /* NestHost (Java 11+) */
     
     /* Check for class-level annotations with RUNTIME retention */
     int runtime_annot_count = 0;
     if (cg->class_ast && cg->class_ast->annotations) {
         runtime_annot_count = count_annotations_with_retention(
             cg->class_ast->annotations, RETENTION_RUNTIME);
-        if (runtime_annot_count > 0) class_attr_count++;
+        if (runtime_annot_count > 0) {
+            class_attr_count++;
+        }
     }
     
     write_be_u2(&p, class_attr_count);

@@ -71,7 +71,9 @@ void type_cache_disable(void) {
 
 /* Look up or create a canonical class type */
 static type_t *type_cache_get_or_create(const char *name) {
-    if (!name) return NULL;
+    if (!name) {
+        return NULL;
+    }
     
     unsigned int hash = hash_string(name) % TYPE_CACHE_SIZE;
     

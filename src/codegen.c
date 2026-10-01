@@ -161,7 +161,9 @@ void label_bind(label_t *label, bytecode_t *bc)
  */
 void mg_bind_label(method_gen_t *mg, label_t *label)
 {
-    if (!mg || !label) return;
+    if (!mg || !label) {
+        return;
+    }
     
     /* Bind the label */
     label_bind(label, mg->code);
@@ -178,7 +180,9 @@ void mg_bind_label(method_gen_t *mg, label_t *label)
  */
 void mg_record_frame(method_gen_t *mg)
 {
-    if (!mg || !mg->stackmap) return;
+    if (!mg || !mg->stackmap) {
+        return;
+    }
     stackmap_record_frame(mg->stackmap, (uint16_t)mg->code->length);
 }
 
@@ -192,7 +196,9 @@ void mg_record_frame(method_gen_t *mg)
  */
 void mg_record_exception_handler_frame(method_gen_t *mg, const char *exception_class)
 {
-    if (!mg || !mg->stackmap) return;
+    if (!mg || !mg->stackmap) {
+        return;
+    }
     
     /* At exception handler, stack is cleared and exception is pushed */
     stackmap_clear_stack(mg->stackmap);
@@ -213,7 +219,9 @@ void mg_record_exception_handler_frame(method_gen_t *mg, const char *exception_c
  */
 uint16_t mg_save_locals_count(method_gen_t *mg)
 {
-    if (!mg || !mg->stackmap) return 0;
+    if (!mg || !mg->stackmap) {
+        return 0;
+    }
     return stackmap_get_locals_count(mg->stackmap);
 }
 
@@ -223,7 +231,9 @@ uint16_t mg_save_locals_count(method_gen_t *mg)
  */
 void mg_restore_locals_count(method_gen_t *mg, uint16_t count)
 {
-    if (!mg || !mg->stackmap) return;
+    if (!mg || !mg->stackmap) {
+        return;
+    }
     stackmap_set_locals_count(mg->stackmap, count);
 }
 
@@ -274,22 +284,46 @@ static uint16_t mods_to_access_flags(uint16_t mods)
     uint16_t acc = 0;
     
     /* These match directly */
-    if (mods & MOD_PUBLIC)    acc |= ACC_PUBLIC;
-    if (mods & MOD_PRIVATE)   acc |= ACC_PRIVATE;
-    if (mods & MOD_PROTECTED) acc |= ACC_PROTECTED;
-    if (mods & MOD_STATIC)    acc |= ACC_STATIC;
-    if (mods & MOD_FINAL)     acc |= ACC_FINAL;
+    if (mods & MOD_PUBLIC) {
+        acc |= ACC_PUBLIC;
+    }
+    if (mods & MOD_PRIVATE) {
+        acc |= ACC_PRIVATE;
+    }
+    if (mods & MOD_PROTECTED) {
+        acc |= ACC_PROTECTED;
+    }
+    if (mods & MOD_STATIC) {
+        acc |= ACC_STATIC;
+    }
+    if (mods & MOD_FINAL) {
+        acc |= ACC_FINAL;
+    }
     
     /* These need translation */
-    if (mods & MOD_ABSTRACT)     acc |= ACC_ABSTRACT;
-    if (mods & MOD_NATIVE)       acc |= ACC_NATIVE;
-    if (mods & MOD_SYNCHRONIZED) acc |= ACC_SYNCHRONIZED;
-    if (mods & MOD_TRANSIENT)    acc |= ACC_TRANSIENT;
-    if (mods & MOD_VOLATILE)     acc |= ACC_VOLATILE;
-    if (mods & MOD_STRICTFP)     acc |= ACC_STRICT;
+    if (mods & MOD_ABSTRACT) {
+        acc |= ACC_ABSTRACT;
+    }
+    if (mods & MOD_NATIVE) {
+        acc |= ACC_NATIVE;
+    }
+    if (mods & MOD_SYNCHRONIZED) {
+        acc |= ACC_SYNCHRONIZED;
+    }
+    if (mods & MOD_TRANSIENT) {
+        acc |= ACC_TRANSIENT;
+    }
+    if (mods & MOD_VOLATILE) {
+        acc |= ACC_VOLATILE;
+    }
+    if (mods & MOD_STRICTFP) {
+        acc |= ACC_STRICT;
+    }
     
     /* MOD_VARARGS becomes ACC_VARARGS (both 0x0080 but for methods only) */
-    if (mods & MOD_VARARGS) acc |= ACC_VARARGS;
+    if (mods & MOD_VARARGS) {
+        acc |= ACC_VARARGS;
+    }
     
     return acc;
 }
@@ -964,31 +998,41 @@ void mg_pop(method_gen_t *mg, int slots)
 void mg_push_int(method_gen_t *mg)
 {
     mg_push(mg, 1);
-    if (mg->stackmap) stackmap_push_int(mg->stackmap);
+    if (mg->stackmap) {
+        stackmap_push_int(mg->stackmap);
+    }
 }
 
 void mg_push_long(method_gen_t *mg)
 {
     mg_push(mg, 2);
-    if (mg->stackmap) stackmap_push_long(mg->stackmap);
+    if (mg->stackmap) {
+        stackmap_push_long(mg->stackmap);
+    }
 }
 
 void mg_push_float(method_gen_t *mg)
 {
     mg_push(mg, 1);
-    if (mg->stackmap) stackmap_push_float(mg->stackmap);
+    if (mg->stackmap) {
+        stackmap_push_float(mg->stackmap);
+    }
 }
 
 void mg_push_double(method_gen_t *mg)
 {
     mg_push(mg, 2);
-    if (mg->stackmap) stackmap_push_double(mg->stackmap);
+    if (mg->stackmap) {
+        stackmap_push_double(mg->stackmap);
+    }
 }
 
 void mg_push_null(method_gen_t *mg)
 {
     mg_push(mg, 1);
-    if (mg->stackmap) stackmap_push_null(mg->stackmap);
+    if (mg->stackmap) {
+        stackmap_push_null(mg->stackmap);
+    }
 }
 
 void mg_push_object(method_gen_t *mg, const char *class_name)
@@ -1002,19 +1046,25 @@ void mg_push_object(method_gen_t *mg, const char *class_name)
 void mg_push_uninitialized(method_gen_t *mg, uint16_t new_offset)
 {
     mg_push(mg, 1);
-    if (mg->stackmap) stackmap_push_uninitialized(mg->stackmap, new_offset);
+    if (mg->stackmap) {
+        stackmap_push_uninitialized(mg->stackmap, new_offset);
+    }
 }
 
 void mg_push_uninitialized_this(method_gen_t *mg)
 {
     mg_push(mg, 1);
-    if (mg->stackmap) stackmap_push(mg->stackmap, vtype_uninitialized_this());
+    if (mg->stackmap) {
+        stackmap_push(mg->stackmap, vtype_uninitialized_this());
+    }
 }
 
 void mg_pop_typed(method_gen_t *mg, int slots)
 {
     mg_pop(mg, slots);
-    if (mg->stackmap) stackmap_pop(mg->stackmap, slots);
+    if (mg->stackmap) {
+        stackmap_pop(mg->stackmap, slots);
+    }
 }
 
 /* Type-aware counterparts of an emitted OP_DUP_X1/OP_DUP2_X1 - update
@@ -1024,13 +1074,17 @@ void mg_pop_typed(method_gen_t *mg, int slots)
 void mg_dup_x1(method_gen_t *mg)
 {
     mg_push(mg, 1);
-    if (mg->stackmap) stackmap_dup_x1(mg->stackmap);
+    if (mg->stackmap) {
+        stackmap_dup_x1(mg->stackmap);
+    }
 }
 
 void mg_dup2_x1(method_gen_t *mg)
 {
     mg_push(mg, 2);
-    if (mg->stackmap) stackmap_dup2_x1(mg->stackmap);
+    if (mg->stackmap) {
+        stackmap_dup2_x1(mg->stackmap);
+    }
 }
 
 /* ========================================================================
@@ -1363,7 +1417,9 @@ char *generate_class_signature(ast_node_t *class_decl, symbol_t *class_sym)
     
     for (slist_t *node = class_decl->data.node.children; node; node = node->next) {
         ast_node_t *child = (ast_node_t *)node->data;
-        if (!child) continue;
+        if (!child) {
+            continue;
+        }
         
         if (child->type == AST_TYPE_PARAMETER) {
             if (!type_params) {
@@ -2258,7 +2314,9 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
                 super_sym->data.class_data.captured_vars) {
                 for (slist_t *cap = super_sym->data.class_data.captured_vars; cap; cap = cap->next) {
                     symbol_t *var_sym = (symbol_t *)cap->data;
-                    if (!var_sym) continue;
+                    if (!var_sym) {
+                        continue;
+                    }
                     
                     /* Check if already in our captured_vars */
                     bool already_captured = false;
@@ -2285,7 +2343,9 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
             /* Add synthetic val$xxx fields for each captured variable */
             for (slist_t *node = cg->captured_vars; node; node = node->next) {
                 symbol_t *var_sym = (symbol_t *)node->data;
-                if (!var_sym || !var_sym->name) continue;
+                if (!var_sym || !var_sym->name) {
+                    continue;
+                }
                 
                 /* Create field name val$varname */
                 char field_name[256];
@@ -3003,11 +3063,15 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
             
             for (slist_t *cap = cg->captured_vars; cap; cap = cap->next) {
                 symbol_t *var_sym = (symbol_t *)cap->data;
-                if (!var_sym || !var_sym->name) continue;
+                if (!var_sym || !var_sym->name) {
+                    continue;
+                }
                 
                 /* Get the field ref for this captured variable */
                 void *ref_ptr = hashtable_lookup(cg->captured_field_refs, var_sym->name);
-                if (!ref_ptr) continue;
+                if (!ref_ptr) {
+                    continue;
+                }
                 uint16_t field_ref = (uint16_t)(uintptr_t)ref_ptr;
                 
                 /* aload_0 (this) */
@@ -3464,32 +3528,42 @@ static bool codegen_bridge_method(class_gen_t *cg, symbol_t *method_sym)
             switch (kind) {
                 case TYPE_LONG:
                     bc_emit(mg->code, slot <= 3 ? OP_LLOAD_0 + slot : OP_LLOAD);
-                    if (slot > 3) bc_emit_u1(mg->code, slot);
+                    if (slot > 3) {
+                        bc_emit_u1(mg->code, slot);
+                    }
                     mg_push(mg, 2);
                     slot += 2;
                     break;
                 case TYPE_DOUBLE:
                     bc_emit(mg->code, slot <= 3 ? OP_DLOAD_0 + slot : OP_DLOAD);
-                    if (slot > 3) bc_emit_u1(mg->code, slot);
+                    if (slot > 3) {
+                        bc_emit_u1(mg->code, slot);
+                    }
                     mg_push(mg, 2);
                     slot += 2;
                     break;
                 case TYPE_FLOAT:
                     bc_emit(mg->code, slot <= 3 ? OP_FLOAD_0 + slot : OP_FLOAD);
-                    if (slot > 3) bc_emit_u1(mg->code, slot);
+                    if (slot > 3) {
+                        bc_emit_u1(mg->code, slot);
+                    }
                     mg_push(mg, 1);
                     slot++;
                     break;
                 case TYPE_CLASS:
                 case TYPE_ARRAY:
                     bc_emit(mg->code, slot <= 3 ? OP_ALOAD_0 + slot : OP_ALOAD);
-                    if (slot > 3) bc_emit_u1(mg->code, slot);
+                    if (slot > 3) {
+                        bc_emit_u1(mg->code, slot);
+                    }
                     mg_push(mg, 1);
                     slot++;
                     break;
                 default:  /* int, byte, char, short, boolean */
                     bc_emit(mg->code, slot <= 3 ? OP_ILOAD_0 + slot : OP_ILOAD);
-                    if (slot > 3) bc_emit_u1(mg->code, slot);
+                    if (slot > 3) {
+                        bc_emit_u1(mg->code, slot);
+                    }
                     mg_push(mg, 1);
                     slot++;
                     break;
@@ -3507,7 +3581,9 @@ static bool codegen_bridge_method(class_gen_t *cg, symbol_t *method_sym)
     
     /* Pop args and receiver, push result */
     int arg_count = 0;
-    for (slist_t *node = params; node; node = node->next) arg_count++;
+    for (slist_t *node = params; node; node = node->next) {
+        arg_count++;
+    }
     mg_pop(mg, arg_count + 1);
     
     /* Return the result */
@@ -3665,10 +3741,12 @@ static void generate_superclass_bridges(class_gen_t *cg)
                                 /* Count parameters to match signature */
                                 int class_param_count = 0;
                                 int super_param_count = 0;
-                                for (slist_t *cp = class_method->data.method_data.parameters; cp; cp = cp->next)
+                                for (slist_t *cp = class_method->data.method_data.parameters; cp; cp = cp->next) {
                                     class_param_count++;
-                                for (slist_t *sp = method->data.method_data.parameters; sp; sp = sp->next)
+                                }
+                                for (slist_t *sp = method->data.method_data.parameters; sp; sp = sp->next) {
                                     super_param_count++;
+                                }
                                 if (class_param_count == super_param_count) {
                                     has_override = true;
                                 }
@@ -3756,19 +3834,25 @@ static void generate_superclass_bridges(class_gen_t *cg)
                     switch (kind) {
                         case TYPE_LONG:
                             bc_emit(code, slot <= 3 ? OP_LLOAD_0 + slot : OP_LLOAD);
-                            if (slot > 3) bc_emit_u1(code, slot);
+                            if (slot > 3) {
+                                bc_emit_u1(code, slot);
+                            }
                             max_stack += 2;
                             slot += 2;
                             break;
                         case TYPE_DOUBLE:
                             bc_emit(code, slot <= 3 ? OP_DLOAD_0 + slot : OP_DLOAD);
-                            if (slot > 3) bc_emit_u1(code, slot);
+                            if (slot > 3) {
+                                bc_emit_u1(code, slot);
+                            }
                             max_stack += 2;
                             slot += 2;
                             break;
                         case TYPE_FLOAT:
                             bc_emit(code, slot <= 3 ? OP_FLOAD_0 + slot : OP_FLOAD);
-                            if (slot > 3) bc_emit_u1(code, slot);
+                            if (slot > 3) {
+                                bc_emit_u1(code, slot);
+                            }
                             max_stack++;
                             slot++;
                             break;
@@ -3778,13 +3862,17 @@ static void generate_superclass_bridges(class_gen_t *cg)
                         case TYPE_SHORT:
                         case TYPE_INT:
                             bc_emit(code, slot <= 3 ? OP_ILOAD_0 + slot : OP_ILOAD);
-                            if (slot > 3) bc_emit_u1(code, slot);
+                            if (slot > 3) {
+                                bc_emit_u1(code, slot);
+                            }
                             max_stack++;
                             slot++;
                             break;
                         default:  /* CLASS, ARRAY, TYPEVAR -> aload */
                             bc_emit(code, slot <= 3 ? OP_ALOAD_0 + slot : OP_ALOAD);
-                            if (slot > 3) bc_emit_u1(code, slot);
+                            if (slot > 3) {
+                                bc_emit_u1(code, slot);
+                            }
                             max_stack++;
                             slot++;
                             break;
@@ -3800,7 +3888,9 @@ static void generate_superclass_bridges(class_gen_t *cg)
                 type_kind_t ret_kind = TYPE_VOID;
                 if (method->type) {
                     ret_kind = method->type->kind;
-                    if (ret_kind == TYPE_TYPEVAR) ret_kind = TYPE_CLASS;
+                    if (ret_kind == TYPE_TYPEVAR) {
+                        ret_kind = TYPE_CLASS;
+                    }
                 }
                 
                 switch (ret_kind) {
@@ -4216,19 +4306,25 @@ static void generate_interface_bridges(class_gen_t *cg)
                     switch (iparam_kind) {
                         case TYPE_LONG:
                             bc_emit(code, slot <= 3 ? OP_LLOAD_0 + slot : OP_LLOAD);
-                            if (slot > 3) bc_emit_u1(code, slot);
+                            if (slot > 3) {
+                                bc_emit_u1(code, slot);
+                            }
                             max_stack += 2;
                             slot_width = 2;
                             break;
                         case TYPE_DOUBLE:
                             bc_emit(code, slot <= 3 ? OP_DLOAD_0 + slot : OP_DLOAD);
-                            if (slot > 3) bc_emit_u1(code, slot);
+                            if (slot > 3) {
+                                bc_emit_u1(code, slot);
+                            }
                             max_stack += 2;
                             slot_width = 2;
                             break;
                         case TYPE_FLOAT:
                             bc_emit(code, slot <= 3 ? OP_FLOAD_0 + slot : OP_FLOAD);
-                            if (slot > 3) bc_emit_u1(code, slot);
+                            if (slot > 3) {
+                                bc_emit_u1(code, slot);
+                            }
                             max_stack++;
                             break;
                         case TYPE_BOOLEAN:
@@ -4237,12 +4333,16 @@ static void generate_interface_bridges(class_gen_t *cg)
                         case TYPE_SHORT:
                         case TYPE_INT:
                             bc_emit(code, slot <= 3 ? OP_ILOAD_0 + slot : OP_ILOAD);
-                            if (slot > 3) bc_emit_u1(code, slot);
+                            if (slot > 3) {
+                                bc_emit_u1(code, slot);
+                            }
                             max_stack++;
                             break;
                         default:  /* CLASS, ARRAY, TYPEVAR -> aload */
                             bc_emit(code, slot <= 3 ? OP_ALOAD_0 + slot : OP_ALOAD);
-                            if (slot > 3) bc_emit_u1(code, slot);
+                            if (slot > 3) {
+                                bc_emit_u1(code, slot);
+                            }
                             max_stack++;
                             break;
                     }
@@ -4255,7 +4355,9 @@ static void generate_interface_bridges(class_gen_t *cg)
                             /* Convert dots to slashes for internal name */
                             char *internal = strdup(cast_name);
                             for (char *p = internal; *p; p++) {
-                                if (*p == '.') *p = '/';
+                                if (*p == '.') {
+                                    *p = '/';
+                                }
                             }
                             uint16_t cast_class = cp_add_class(cg->cp, internal);
                             bc_emit(code, OP_CHECKCAST);
@@ -4477,8 +4579,12 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
                         !(class_method->modifiers & MOD_STATIC)) {
                         slist_t *cparams = class_method->data.method_data.parameters;
                         int super_count = 0, cand_count = 0;
-                        for (slist_t *t = super_params; t; t = t->next) super_count++;
-                        for (slist_t *t = cparams; t; t = t->next) cand_count++;
+                        for (slist_t *t = super_params; t; t = t->next) {
+                            super_count++;
+                        }
+                        for (slist_t *t = cparams; t; t = t->next) {
+                            cand_count++;
+                        }
 
                         bool positions_match = (super_count == cand_count);
                         slist_t *sp = super_params;
@@ -4573,7 +4679,9 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
             bool already_exists = false;
             for (slist_t *m = cg->methods; m && !already_exists; m = m->next) {
                 method_info_gen_t *existing = (method_info_gen_t *)m->data;
-                if (!existing) continue;
+                if (!existing) {
+                    continue;
+                }
                 const char *existing_name = NULL;
                 const char *existing_desc = NULL;
                 for (uint16_t idx = 1; idx < cg->cp->count; idx++) {
@@ -4640,19 +4748,25 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
                 switch (erased_kind) {
                     case TYPE_LONG:
                         bc_emit(code, slot <= 3 ? OP_LLOAD_0 + slot : OP_LLOAD);
-                        if (slot > 3) bc_emit_u1(code, slot);
+                        if (slot > 3) {
+                            bc_emit_u1(code, slot);
+                        }
                         max_stack += 2;
                         slot += 2;
                         break;
                     case TYPE_DOUBLE:
                         bc_emit(code, slot <= 3 ? OP_DLOAD_0 + slot : OP_DLOAD);
-                        if (slot > 3) bc_emit_u1(code, slot);
+                        if (slot > 3) {
+                            bc_emit_u1(code, slot);
+                        }
                         max_stack += 2;
                         slot += 2;
                         break;
                     case TYPE_FLOAT:
                         bc_emit(code, slot <= 3 ? OP_FLOAD_0 + slot : OP_FLOAD);
-                        if (slot > 3) bc_emit_u1(code, slot);
+                        if (slot > 3) {
+                            bc_emit_u1(code, slot);
+                        }
                         max_stack++;
                         slot++;
                         break;
@@ -4662,13 +4776,17 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
                     case TYPE_SHORT:
                     case TYPE_INT:
                         bc_emit(code, slot <= 3 ? OP_ILOAD_0 + slot : OP_ILOAD);
-                        if (slot > 3) bc_emit_u1(code, slot);
+                        if (slot > 3) {
+                            bc_emit_u1(code, slot);
+                        }
                         max_stack++;
                         slot++;
                         break;
                     default:  /* CLASS, ARRAY, TYPEVAR -> aload */
                         bc_emit(code, slot <= 3 ? OP_ALOAD_0 + slot : OP_ALOAD);
-                        if (slot > 3) bc_emit_u1(code, slot);
+                        if (slot > 3) {
+                            bc_emit_u1(code, slot);
+                        }
                         max_stack++;
                         slot++;
                         /* Superclass parameter erases to a type variable but
@@ -4861,7 +4979,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         if (!any_constant_has_body) {
             cg->access_flags |= ACC_FINAL;
         }
-        if (cg->superclass) free(cg->superclass);
+        if (cg->superclass) {
+            free(cg->superclass);
+        }
         cg->superclass = strdup("java/lang/Enum");
         cg->super_class = cp_add_class(cg->cp, cg->superclass);
     }
@@ -4870,7 +4990,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
     if (is_record) {
         cg->access_flags |= ACC_FINAL;
         cg->is_record = true;
-        if (cg->superclass) free(cg->superclass);
+        if (cg->superclass) {
+            free(cg->superclass);
+        }
         cg->superclass = strdup("java/lang/Record");
         cg->super_class = cp_add_class(cg->cp, cg->superclass);
     }
@@ -5524,11 +5646,15 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             
             for (slist_t *cap = cg->captured_vars; cap; cap = cap->next) {
                 symbol_t *var_sym = (symbol_t *)cap->data;
-                if (!var_sym || !var_sym->name) continue;
+                if (!var_sym || !var_sym->name) {
+                    continue;
+                }
                 
                 /* Get the field ref for this captured variable */
                 void *ref_ptr = hashtable_lookup(cg->captured_field_refs, var_sym->name);
-                if (!ref_ptr) continue;
+                if (!ref_ptr) {
+                    continue;
+                }
                 uint16_t field_ref = (uint16_t)(uintptr_t)ref_ptr;
                 
                 /* aload_0 (this) */
@@ -5633,7 +5759,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 symbol_t *current = our_enclosing;
                 while (current && current != super_enclosing) {
                     symbol_t *current_enc = current->data.class_data.enclosing_class;
-                    if (!current_enc) break;
+                    if (!current_enc) {
+                        break;
+                    }
                     
                     /* Get this$0 from current class (points to current_enc) */
                     char *cur_internal = class_to_internal_name(current->qualified_name);
@@ -5671,7 +5799,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 
                 for (slist_t *cap = super_captured; cap; cap = cap->next) {
                     symbol_t *var_sym = (symbol_t *)cap->data;
-                    if (!var_sym || !var_sym->type) continue;
+                    if (!var_sym || !var_sym->type) {
+                        continue;
+                    }
                     
                     /* Add type to descriptor */
                     char *cap_desc = type_to_descriptor(var_sym->type);
@@ -6441,7 +6571,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             /* ldc "ClassName" */
             char *class_name_dots = strdup(cg->internal_name);
             for (char *p = class_name_dots; *p; p++) {
-                if (*p == '/') *p = '.';
+                if (*p == '/') {
+                    *p = '.';
+                }
             }
             uint16_t class_name_str = cp_add_string(cg->cp, class_name_dots);
             free(class_name_dots);
@@ -6656,7 +6788,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             
             /* int i = 0; */
             bc_emit(mg->code, OP_ICONST_0);
-            if (mg->stackmap) stackmap_push_int(mg->stackmap);
+            if (mg->stackmap) {
+                stackmap_push_int(mg->stackmap);
+            }
             bc_emit(mg->code, OP_ISTORE_2);  /* slot 2: i */
             if (mg->stackmap) {
                 stackmap_pop(mg->stackmap, 1);
@@ -6857,7 +6991,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             
             /* Count components for array size */
             int num_components = 0;
-            for (slist_t *c = record_components; c; c = c->next) num_components++;
+            for (slist_t *c = record_components; c; c = c->next) {
+                num_components++;
+            }
             
             /* Create array for Objects.hash(...) */
             /* bipush/sipush count */
@@ -7249,7 +7385,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 if (!last_sep) {
                     last_sep = strrchr(cg->internal_name, '/');
                 }
-                if (last_sep) simple_name = last_sep + 1;
+                if (last_sep) {
+                    simple_name = last_sep + 1;
+                }
             }
             
             /* Build prefix: "ClassName[" */
@@ -8037,10 +8175,14 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             
             for (slist_t *cap = cg->captured_vars; cap; cap = cap->next) {
                 symbol_t *var_sym = (symbol_t *)cap->data;
-                if (!var_sym || !var_sym->name) continue;
+                if (!var_sym || !var_sym->name) {
+                    continue;
+                }
                 
                 void *ref_ptr = hashtable_lookup(cg->captured_field_refs, var_sym->name);
-                if (!ref_ptr) continue;
+                if (!ref_ptr) {
+                    continue;
+                }
                 uint16_t field_ref = (uint16_t)(uintptr_t)ref_ptr;
                 
                 bc_emit(mg->code, OP_ALOAD_0);
@@ -8112,7 +8254,9 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 symbol_t *current = our_enclosing;
                 while (current && current != super_enclosing) {
                     symbol_t *current_enc = current->data.class_data.enclosing_class;
-                    if (!current_enc) break;
+                    if (!current_enc) {
+                        break;
+                    }
                     
                     /* Get this$0 from current class (points to current_enc) */
                     char *cur_internal = class_to_internal_name(current->qualified_name);
@@ -8389,7 +8533,9 @@ static char *module_name_to_internal(const char *dotted)
 {
     char *internal = strdup(dotted);
     for (char *p = internal; *p; p++) {
-        if (*p == '.') *p = '/';
+        if (*p == '.') {
+            *p = '/';
+        }
     }
     return internal;
 }
@@ -8431,28 +8577,45 @@ uint8_t *codegen_module(ast_node_t *module_decl, size_t *size_out)
     
     for (slist_t *node = module_decl->data.node.children; node; node = node->next) {
         ast_node_t *directive = (ast_node_t *)node->data;
-        if (!directive) continue;
+        if (!directive) {
+            continue;
+        }
         
         switch (directive->type) {
             case AST_REQUIRES_DIRECTIVE:
-                if (!requires_list) requires_list = slist_new(directive);
-                else slist_append(requires_list, directive);
+                if (!requires_list) {
+                    requires_list = slist_new(directive);
+                } else  {
+                    slist_append(requires_list, directive);
+                }
                 break;
             case AST_EXPORTS_DIRECTIVE:
-                if (!exports_list) exports_list = slist_new(directive);
-                else slist_append(exports_list, directive);
+                if (!exports_list) {
+                    exports_list = slist_new(directive);
+                } else  {
+                    slist_append(exports_list, directive);
+                }
                 break;
             case AST_OPENS_DIRECTIVE:
-                if (!opens_list) opens_list = slist_new(directive);
-                else slist_append(opens_list, directive);
+                if (!opens_list) {
+                    opens_list = slist_new(directive);
+                } else  {
+                    slist_append(opens_list, directive);
+                }
                 break;
             case AST_USES_DIRECTIVE:
-                if (!uses_list) uses_list = slist_new(directive);
-                else slist_append(uses_list, directive);
+                if (!uses_list) {
+                    uses_list = slist_new(directive);
+                } else  {
+                    slist_append(uses_list, directive);
+                }
                 break;
             case AST_PROVIDES_DIRECTIVE:
-                if (!provides_list) provides_list = slist_new(directive);
-                else slist_append(provides_list, directive);
+                if (!provides_list) {
+                    provides_list = slist_new(directive);
+                } else  {
+                    slist_append(provides_list, directive);
+                }
                 break;
             default:
                 break;
@@ -8687,12 +8850,18 @@ uint8_t *codegen_module(ast_node_t *module_decl, size_t *size_out)
     if (!bytes) {
         const_pool_free(cp);
         free(requires_entries);
-        for (int i = 0; i < exports_count; i++) free(exports_entries[i].to_modules);
+        for (int i = 0; i < exports_count; i++) {
+            free(exports_entries[i].to_modules);
+        }
         free(exports_entries);
-        for (int i = 0; i < opens_count; i++) free(opens_entries[i].to_modules);
+        for (int i = 0; i < opens_count; i++) {
+            free(opens_entries[i].to_modules);
+        }
         free(opens_entries);
         free(uses_entries);
-        for (int i = 0; i < provides_count; i++) free(provides_entries[i].with_classes);
+        for (int i = 0; i < provides_count; i++) {
+            free(provides_entries[i].with_classes);
+        }
         free(provides_entries);
         slist_free(requires_list);
         slist_free(exports_list);
@@ -8748,7 +8917,9 @@ uint8_t *codegen_module(ast_node_t *module_decl, size_t *size_out)
     
     /* Access flags: ACC_MODULE (optionally | ACC_OPEN) */
     uint16_t access_flags = ACC_MODULE;
-    if (is_open) access_flags |= ACC_OPEN;
+    if (is_open) {
+        access_flags |= ACC_OPEN;
+    }
     *p++ = (access_flags >> 8) & 0xFF;
     *p++ = access_flags & 0xFF;
     
@@ -8870,12 +9041,18 @@ uint8_t *codegen_module(ast_node_t *module_decl, size_t *size_out)
     /* Clean up */
     const_pool_free(cp);
     free(requires_entries);
-    for (int i = 0; i < exports_count; i++) free(exports_entries[i].to_modules);
+    for (int i = 0; i < exports_count; i++) {
+        free(exports_entries[i].to_modules);
+    }
     free(exports_entries);
-    for (int i = 0; i < opens_count; i++) free(opens_entries[i].to_modules);
+    for (int i = 0; i < opens_count; i++) {
+        free(opens_entries[i].to_modules);
+    }
     free(opens_entries);
     free(uses_entries);
-    for (int i = 0; i < provides_count; i++) free(provides_entries[i].with_classes);
+    for (int i = 0; i < provides_count; i++) {
+        free(provides_entries[i].with_classes);
+    }
     free(provides_entries);
     slist_free(requires_list);
     slist_free(exports_list);
@@ -8923,7 +9100,9 @@ uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
     char *internal_name = malloc(pkg_len + 20);  /* room for /package-info */
     strcpy(internal_name, package_name);
     for (char *p = internal_name; *p; p++) {
-        if (*p == '.') *p = '/';
+        if (*p == '.') {
+            *p = '/';
+        }
     }
     strcat(internal_name, "/package-info");
     
@@ -8942,8 +9121,11 @@ uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
     for (slist_t *child = package_decl->data.node.children; child; child = child->next) {
         ast_node_t *annot = (ast_node_t *)child->data;
         if (annot && annot->type == AST_ANNOTATION) {
-            if (!all_annotations) all_annotations = slist_new(annot);
-            else slist_append(all_annotations, annot);
+            if (!all_annotations) {
+                all_annotations = slist_new(annot);
+            } else  {
+                slist_append(all_annotations, annot);
+            }
         }
     }
     
@@ -8951,8 +9133,11 @@ uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
     for (slist_t *node = annotations; node; node = node->next) {
         ast_node_t *annot = (ast_node_t *)node->data;
         if (annot && annot->type == AST_ANNOTATION) {
-            if (!all_annotations) all_annotations = slist_new(annot);
-            else slist_append(all_annotations, annot);
+            if (!all_annotations) {
+                all_annotations = slist_new(annot);
+            } else  {
+                slist_append(all_annotations, annot);
+            }
         }
     }
     
@@ -8999,7 +9184,9 @@ uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
             if (annot && annot->type == AST_ANNOTATION) {
                 /* Get annotation type name */
                 const char *annot_name = annot->data.node.name;
-                if (!annot_name) continue;
+                if (!annot_name) {
+                    continue;
+                }
                 
                 /* Resolve to fully qualified name if needed */
                 const char *full_name = annot_name;
@@ -9040,7 +9227,9 @@ uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
                 desc[0] = 'L';
                 strcpy(desc + 1, full_name);
                 for (char *c = desc + 1; *c; c++) {
-                    if (*c == '.') *c = '/';
+                    if (*c == '.') {
+                        *c = '/';
+                    }
                 }
                 strcat(desc, ";");
                 
@@ -9169,7 +9358,9 @@ uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
     
     /* attributes_count */
     int attr_count = 1;  /* SourceFile */
-    if (annotations_bytes) attr_count++;
+    if (annotations_bytes) {
+        attr_count++;
+    }
     *p++ = (attr_count >> 8) & 0xFF;
     *p++ = attr_count & 0xFF;
     

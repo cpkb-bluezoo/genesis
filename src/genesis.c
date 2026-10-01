@@ -849,7 +849,9 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
                     if (pkg_name) {
                         strcpy(qname, pkg_name);
                         for (char *p = qname; *p; p++) {
-                            if (*p == '.') *p = '/';
+                            if (*p == '.') {
+                                *p = '/';
+                            }
                         }
                         strcat(qname, "/package-info");
                     } else {
@@ -1158,7 +1160,9 @@ static void populate_interface_stub_methods(symbol_t *sym, ast_node_t *decl)
     /* Walk AST children looking for method declarations */
     for (slist_t *child = decl->data.node.children; child; child = child->next) {
         ast_node_t *member = (ast_node_t *)child->data;
-        if (!member) continue;
+        if (!member) {
+            continue;
+        }
         
         if (member->type == AST_METHOD_DECL) {
             const char *name = member->data.node.name;
@@ -1429,7 +1433,9 @@ static void register_types_from_ast(type_registry_t *reg, ast_node_t *ast,
             /* Count children of the class decl */
             if (getenv("GENESIS_DEBUG_REGISTRY")) {
                 int child_count = 0;
-                for (slist_t *c = child->data.node.children; c; c = c->next) child_count++;
+                for (slist_t *c = child->data.node.children; c; c = c->next) {
+                    child_count++;
+                }
                 fprintf(stderr, "DEBUG register: type '%s' has %d children (from package '%s', ast=%p, cu=%p)\n",
                         child->data.node.name ? child->data.node.name : "(null)", 
                         child_count,
