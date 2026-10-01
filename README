@@ -54,15 +54,12 @@ a large real-world project (644 source files, 942 class files) shows:
 
 ## Performance
 
-Genesis is approximately **2x faster** than javac, with parallel compilation enabled by default.
-
-| Compiler | Time (avg of 10) | Speedup |
-|----------|------------------|---------|
-| Genesis (parallel) | 1.79s | **2.03x** |
-| Genesis (-j1) | 1.97s | 1.84x |
-| javac | 3.62s | baseline |
-
-*Benchmark: 644 Java source files : 942 class files on macOS*
+Under review. Earlier figures here (644 source files, genesis ~2x faster
+than javac) predated the Java 25 parity work against gumdrop and are no
+longer current - a lot of correctness fixes landed since, some of which
+carry a real cost, and this section will be updated once a proper
+performance pass is done. Run `make bench` (see CONTRIBUTING) for current
+numbers on your own machine in the meantime.
 
 ## Building
 

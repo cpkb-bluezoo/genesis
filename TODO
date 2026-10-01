@@ -104,6 +104,43 @@ KNOWN BUGS
     only because codegen_compound_rhs handles it generically; it has not
     been separately tested with a wrapper of every primitive type.
 
+12. Same-batch TOP-LEVEL annotation retention gap: a method annotation
+    applied and used entirely within one compile, where the annotation
+    TYPE ITSELF is also top-level (not nested) and declared elsewhere in
+    the same file/batch, can silently end up with no
+    RuntimeVisibleAnnotations entry at all. semantic_resolve_annotation_
+    retention() (semantic.c) only reads @Retention from an already-
+    compiled classfile on the classpath, or from a type nested under the
+    current class's own enclosing/superclass chain, or (same-batch, via
+    import) from the shared type registry - none of those paths cover an
+    unrelated top-level type in the same batch with no import connecting
+    it. Not hit by gumdrop (only ever uses external, classfile-loaded
+    annotations like JUnit's own).
+
+13. -sourcepath compiles more files than javac would, for a real (not
+    cosmetic) reason: scan_package_for_type() (semantic.c) - the fallback
+    used to find a same-package type referenced by simple name with no
+    import - scans and loads every .java file in the matching package
+    directory before it reaches the one that declares the type actually
+    being looked up (or gives up having found nothing), and
+    load_class_from_source_impl()'s "track this file as a dependency"
+    step fires unconditionally for every file it parses, including ones
+    loaded only to rule them out - even when resolving a completely
+    unrelated bare identifier (e.g. "System"). A fix was attempted
+    (suppress the generic per-file tracking during a scan, explicitly
+    queue only the file a lookup actually confirms it needs) but
+    reverted: same-package type resolution turns out to be reimplemented
+    independently in at least 4 separate places in semantic.c (in
+    lookup_same_package_type()'s own cache-hit path, a duplicate direct
+    hashtable_lookup(sem->types, ...) check in method-call target-class
+    resolution, and at least one more for parameter/field type resolution
+    via resolve_unresolved_type()/the shared type registry, never fully
+    traced to its exact call site), each bypassing a single-choke-point
+    fix differently. Fixing 3 of the 4 got a simple repro working but
+    broke SamePackageSourcepathTest (NoClassDefFoundError on types used
+    only as parameter types, resolved through the 4th, untraced path).
+    Needs either auditing all the duplicate resolution paths individually,
+    or consolidating them to all go through lookup_same_package_type().
 
 ================================================================================
 OPTIONAL IMPROVEMENTS

@@ -6,16 +6,25 @@
 #
 # This file is part of genesis; see COPYING for the license terms.
 #
-# Clones a repository into a fresh temporary directory (never uses an existing
-# local checkout), prepares it, builds a javac-style @argument file listing
-# every compilation unit, then times monolithic compiles.
+# Copies an existing local checkout (GUMDROP_DIR), or clones a fresh one if
+# not set, into a temporary work directory (the original tree is never
+# modified), prepares it, builds a javac-style @argument file listing every
+# compilation unit, then times monolithic compiles. No Ant build/test harness
+# is involved in the timed path - this is a raw compiler-vs-compiler
+# comparison, not a functional/correctness check (see gumdrop-ant-test.sh
+# for that).
 #
 # Environment:
 #   GENESIS          path to genesis (default: ../src/genesis from repo root)
 #   JAVA_HOME        JDK for javac (required)
-#   BENCH_REPO_URL   git remote (default: gumdrop)
+#   GUMDROP_DIR      copy an existing local checkout instead of cloning
+#                    (skips BENCH_PREP entirely when its lib/ is already
+#                    populated - no Ant invocation at all in that case)
+#   BENCH_REPO_URL   git remote when cloning (default: gumdrop)
 #   BENCH_GIT_REF    optional branch, tag, or commit after clone
-#   BENCH_PREP       shell command run in repo root before compile (default: ant resolve-deps)
+#   BENCH_PREP       shell command run in repo root before compile (default:
+#                    "ant resolve-deps" when cloning; empty when GUMDROP_DIR's
+#                    lib/ already has jars)
 #   BENCH_SRC_DIR    directory to scan for .java files (default: src)
 #   BENCH_RELEASE    -release version (default: parse java.release.version from build.xml, else 25)
 #   BENCH_ITERATIONS timed iterations per compiler mode (default: 10)
@@ -34,7 +43,6 @@ JAVAC=${JAVAC:-${JAVA_HOME:+$JAVA_HOME/bin/javac}}
 JAVAC=${JAVAC:-javac}
 
 BENCH_REPO_URL=${BENCH_REPO_URL:-https://github.com/cpkb-bluezoo/gumdrop.git}
-BENCH_PREP=${BENCH_PREP:-ant resolve-deps}
 BENCH_SRC_DIR=${BENCH_SRC_DIR:-src}
 BENCH_ITERATIONS=${BENCH_ITERATIONS:-10}
 BENCH_WARMUP=${BENCH_WARMUP:-1}
@@ -95,19 +103,34 @@ mkdir -p "$OUT" "$META"
 
 echo "=== Genesis compiler benchmark ==="
 echo "Work directory: $WORKDIR"
-echo "Repository:     $BENCH_REPO_URL"
 echo "Genesis:        $GENESIS"
 echo "javac:          $JAVAC ($("$JAVAC" -version 2>&1))"
 echo "Iterations:     $BENCH_ITERATIONS (warmup $BENCH_WARMUP per mode)"
 echo
 
-git clone --depth 1 "$BENCH_REPO_URL" "$REPO"
-if [ -n "$BENCH_GIT_REF" ]; then
-    git -C "$REPO" fetch --depth 1 origin "$BENCH_GIT_REF"
-    git -C "$REPO" checkout FETCH_HEAD
+if [ -n "$GUMDROP_DIR" ]; then
+    src=$(cd "$GUMDROP_DIR" && pwd)
+    echo "Repository:     $src (local copy, original tree not modified)"
+    cp -R "$src" "$REPO"
+    BENCH_COMMIT=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "(not a git checkout)")
+    echo "Commit:         $BENCH_COMMIT"
+    if [ -d "$REPO/lib" ] && [ -n "$(find "$REPO/lib" -maxdepth 1 -name '*.jar' -print -quit 2>/dev/null)" ]; then
+        BENCH_PREP=${BENCH_PREP:-}
+        echo "Dependencies already resolved in lib/ - skipping BENCH_PREP (no Ant invocation)"
+    else
+        BENCH_PREP=${BENCH_PREP:-ant resolve-deps}
+    fi
+else
+    echo "Repository:     $BENCH_REPO_URL"
+    BENCH_PREP=${BENCH_PREP:-ant resolve-deps}
+    git clone --depth 1 "$BENCH_REPO_URL" "$REPO"
+    if [ -n "$BENCH_GIT_REF" ]; then
+        git -C "$REPO" fetch --depth 1 origin "$BENCH_GIT_REF"
+        git -C "$REPO" checkout FETCH_HEAD
+    fi
+    BENCH_COMMIT=$(git -C "$REPO" rev-parse HEAD)
+    echo "Checked out commit: $BENCH_COMMIT"
 fi
-BENCH_COMMIT=$(git -C "$REPO" rev-parse HEAD)
-echo "Checked out commit: $BENCH_COMMIT"
 echo
 
 if [ -n "$BENCH_PREP" ]; then
@@ -282,7 +305,11 @@ run_compile() {
         rm -f "$TIMEFILE"
         return "$status"
     fi
-    eval "$(sed -n 's/^\(real\|user\|sys\) \(.*\)$/\1=\2;/p' "$TIMEFILE")"
+    eval "$(sed -n \
+        -e 's/^real \(.*\)$/real=\1;/p' \
+        -e 's/^user \(.*\)$/user=\1;/p' \
+        -e 's/^sys \(.*\)$/sys=\1;/p' \
+        "$TIMEFILE")"
     rm -f "$TIMEFILE"
     return 0
 }
@@ -376,8 +403,9 @@ run_timed_mode javac javac "" "javac"
 echo
 
 echo "=== Results (seconds, successful runs only) ==="
-printf "%-22s %6s %10s %10s %10s %5s\n" "Compiler" "Runs" "real avg" "user avg" "sys avg" "class"
-printf "%-22s %6s %10s %10s %10s %5s\n" "--------" "----" "--------" "--------" "--------" "-----"
+echo "(real = wall clock; cpu = user+sys = total processor time across all threads)"
+printf "%-22s %6s %10s %10s %10s %10s %5s\n" "Compiler" "Runs" "real avg" "cpu avg" "user avg" "sys avg" "class"
+printf "%-22s %6s %10s %10s %10s %10s %5s\n" "--------" "----" "--------" "-------" "--------" "--------" "-----"
 
 JAVAC_REAL_AVG=$(awk '{s+=$1} END {printf "%.4f", s/NR}' "$META/stats.javac.real")
 
@@ -388,7 +416,8 @@ print_result_row() {
     avg_real=$(awk '{s+=$1} END {printf "%.2f", s/NR}' "$META/stats.$mode_id.real")
     avg_user=$(awk '{s+=$1} END {printf "%.2f", s/NR}' "$META/stats.$mode_id.user")
     avg_sys=$(awk '{s+=$1} END {printf "%.2f", s/NR}' "$META/stats.$mode_id.sys")
-    printf "%-22s %6s %10s %10s %10s %5s\n" "$name" "$n" "$avg_real" "$avg_user" "$avg_sys" "$JAVAC_CLASS_COUNT"
+    avg_cpu=$(awk -v u="$avg_user" -v s="$avg_sys" 'BEGIN { printf "%.2f", u + s }')
+    printf "%-22s %6s %10s %10s %10s %10s %5s\n" "$name" "$n" "$avg_real" "$avg_cpu" "$avg_user" "$avg_sys" "$JAVAC_CLASS_COUNT"
 }
 
 print_result_row parallel "Genesis (parallel)"

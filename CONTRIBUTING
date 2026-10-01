@@ -100,7 +100,37 @@ Testing
 
    Tests live in test/ and are not shipped in the release tarball.
 
-5. BUILDING
+5. GUMDROP SMOKE TEST AND BENCHMARK
+
+   These validate genesis against gumdrop (github.com/cpkb-bluezoo/gumdrop),
+   a large real-world codebase, instead of the small test/ suite above.
+   Both need JAVA_HOME set to a JDK matching gumdrop's own -release version.
+   Set GUMDROP_DIR to an existing local gumdrop checkout to reuse it (copied
+   into a temp dir, original tree untouched) instead of cloning fresh each
+   run; if GUMDROP_DIR's lib/ already has its dependency jars resolved,
+   neither target invokes Ant at all.
+
+   make gumdrop-smoke               - Functional: "ant test" (JUnit suite)
+                                       compiled entirely with genesis instead
+                                       of javac, every suite running
+                                       (haltonfailure=no) for a full picture.
+                                       See bench/gumdrop-ant-test.sh for all
+                                       environment variables.
+   make bench                       - Performance: genesis vs javac, straight
+                                       command-line invocations (no Ant) over
+                                       an explicit list of every gumdrop
+                                       .java file, timed (wall clock and
+                                       processor time) over several runs and
+                                       averaged. See bench/compare-
+                                       compilers.sh for all environment
+                                       variables (BENCH_ITERATIONS,
+                                       BENCH_WARMUP, etc).
+
+   Example:
+       GUMDROP_DIR=~/gumdrop JAVA_HOME=/path/to/jdk-25 make gumdrop-smoke
+       GUMDROP_DIR=~/gumdrop JAVA_HOME=/path/to/jdk-25 make bench
+
+6. BUILDING
 
    autoreconf -fi && ./configure && make
 
@@ -108,7 +138,7 @@ Testing
    Every .c file must include <config.h> (under HAVE_CONFIG_H) before any
    other header.
 
-6. TEST GUIDELINES
+7. TEST GUIDELINES
 
    - Tests should be self-contained (no external dependencies)
    - Tests should complete quickly (no long-running operations)
