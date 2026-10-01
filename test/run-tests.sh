@@ -1111,5 +1111,27 @@ else
 fi
 
 echo
+echo "--- Annotation nested in an imported, unrelated same-batch class ---"
+# Outer (and its nested @interface Marker) and the class using "@Marker"
+# via "import ...lib.Outer;" are compiled together, in the same batch - no
+# classfile exists yet for either. Own freshly emptied -d directory, same
+# reason as InheritedMemberType above.
+printf "%-30s ... " "ImportedAnnotationRetention"
+iar_out="$TEST_BUILD/importedannotest-out"
+rm -rf "$iar_out"
+mkdir -p "$iar_out"
+if (cd "$iar_out" && "$GENESIS" -source 8 -d "$iar_out" \
+       "$TEST_SRC/src/java8/importedannotest/lib/Outer.java" \
+       "$TEST_SRC/src/java8/importedannotest/main/ImportedAnnotationRetentionVerifyTest.java" \
+       >/dev/null 2>&1) && \
+   "$JAVA" -cp "$iar_out" importedannotest.main.ImportedAnnotationRetentionVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

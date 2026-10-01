@@ -6693,7 +6693,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                          * Don't cache by simple name - this is a dependency file,
                          * not the current compilation unit. */
                         hashtable_insert(sem->types, sym->qualified_name, type);
-                        
+
                         /* Pre-register all nested class/interface declarations recursively
                          * so that forward references between siblings can be resolved.
                          * This ensures methods can reference nested classes defined later,
@@ -7193,9 +7193,9 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                     other_sym->type = other_type;
                                     
                                     hashtable_insert(sem->types, other_qualified, other_type);
-                                    
+
                                     if (getenv("GENESIS_DEBUG_PKG_SCAN")) {
-                                        fprintf(stderr, "DEBUG load_class_from_source: also registered '%s' from same file\n", 
+                                        fprintf(stderr, "DEBUG load_class_from_source: also registered '%s' from same file\n",
                                                 other_qualified);
                                     }
                                 }
@@ -7218,7 +7218,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                         } else {
                             slist_append(sem->source_dependencies, dep_path);
                         }
-                        
+
                         /* Restore context */
                         if (dep_pkg) {
                             free(sem->current_package);
@@ -7308,7 +7308,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                             all_sym->type = all_type;
                             
                             hashtable_insert(sem->types, all_qualified, all_type);
-                            
+
                             /* Also populate methods for @Override checks */
                             for (slist_t *mc = all_decl->data.node.children; mc; mc = mc->next) {
                                 ast_node_t *member = (ast_node_t *)mc->data;
@@ -8065,7 +8065,8 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
                             simple_name, import_name, (void*)nested, nested ? nested->kind : -1);
                 }
             if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
-                           nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
+                           nested->kind == SYM_ENUM || nested->kind == SYM_RECORD ||
+                           nested->kind == SYM_ANNOTATION)) {
                 if (lookup_same_package_type(sem, simple_name)) {
                     continue;
                 }
@@ -8373,13 +8374,53 @@ retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const 
         }
     }
 
-    if (!sem->classpath) {
-        return RETENTION_CLASS;
-    }
-
+    /* Resolve the (possibly already-qualified) name once, regardless of
+     * whether a classpath is even set - needed for the same-batch registry
+     * check right below, which has nothing to do with the classpath.
+     * resolve_import() also finds a nested type of an IMPORTED class
+     * (e.g. "import Outer; ... @Marker(...)", Marker nested in Outer) - a
+     * case resolve_annotation_retention_same_batch() above doesn't cover,
+     * since Outer is neither the current class nor one of its ancestors. */
     char *qualified = strchr(annotation_name, '.') ?
         strdup(annotation_name) : resolve_import(sem, annotation_name);
     if (!qualified) {
+        return RETENTION_CLASS;
+    }
+
+    /* Same-batch type reached via import rather than nesting under the
+     * current class - look it up in the shared registry (populated for
+     * every type in this compilation batch, regardless of which file
+     * declares it) and read retention from its own source AST, exactly
+     * like resolve_annotation_retention_same_batch() does for the
+     * nested-in-current-class case. The registry stores a type's AST
+     * separately from its symbol (type_registry_get_ast(), not
+     * sym->ast - symbols registered this way are shared across files/
+     * threads and don't carry their declaring AST on the symbol itself). */
+    if (sem->shared_registry) {
+        symbol_t *reg_sym = type_registry_lookup(sem->shared_registry, qualified);
+        ast_node_t *reg_ast = type_registry_get_ast(sem->shared_registry, qualified);
+        /* Registry stubs collapse AST_ANNOTATION_DECL into SYM_INTERFACE
+         * (create_type_stub() in genesis.c has no SYM_ANNOTATION case), so
+         * the AST node's own type - not reg_sym->kind - is what actually
+         * distinguishes an annotation type here. */
+        if (reg_sym && reg_ast && reg_ast->type == AST_ANNOTATION_DECL && reg_ast->annotations) {
+            const char *policy = find_meta_annotation_enum_constant(
+                reg_ast->annotations, "Retention");
+            if (policy) {
+                free(qualified);
+                if (strcmp(policy, "RUNTIME") == 0) {
+                    return RETENTION_RUNTIME;
+                }
+                if (strcmp(policy, "SOURCE") == 0) {
+                    return RETENTION_SOURCE;
+                }
+                return RETENTION_CLASS;
+            }
+        }
+    }
+
+    if (!sem->classpath) {
+        free(qualified);
         return RETENTION_CLASS;
     }
 
@@ -9764,7 +9805,7 @@ static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, c
     if (sem->scanned_packages && hashtable_contains(sem->scanned_packages, package_name)) {
         return NULL;
     }
-    
+
     /* Build package directory path: srcpath/pkg/path/ */
     char pkg_path[512];
     strncpy(pkg_path, package_name, sizeof(pkg_path) - 1);
@@ -9812,43 +9853,43 @@ static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, c
             /* Build qualified name for the primary class */
             char qualified[512];
             snprintf(qualified, sizeof(qualified), "%s.%s", package_name, primary_class);
-            
+
             /* Skip if already loaded */
             if (hashtable_lookup(sem->types, qualified)) {
                 continue;
             }
-            
+
             if (getenv("GENESIS_DEBUG_PKG_SCAN")) {
                 fprintf(stderr, "DEBUG scan_package: loading '%s'\n", qualified);
             }
-            
+
             /* Load this source file - this will parse it and register all
              * top-level types (including interfaces, enums, etc.) */
             symbol_t *sym = load_external_class(sem, qualified);
-            
+
             /* After loading, check if we found the type we're looking for */
             if (sym) {
                 char target_qualified[512];
-                snprintf(target_qualified, sizeof(target_qualified), "%s.%s", 
+                snprintf(target_qualified, sizeof(target_qualified), "%s.%s",
                          package_name, type_name);
                 type_t *found_type = hashtable_lookup(sem->types, target_qualified);
-                if (found_type && found_type->kind == TYPE_CLASS && 
+                if (found_type && found_type->kind == TYPE_CLASS &&
                     found_type->data.class_type.symbol) {
                     closedir(dir);
                     if (getenv("GENESIS_DEBUG_PKG_SCAN")) {
-                        fprintf(stderr, "DEBUG scan_package: found '%s' after loading '%s'\n", 
+                        fprintf(stderr, "DEBUG scan_package: found '%s' after loading '%s'\n",
                                 type_name, qualified);
                     }
                     return found_type->data.class_type.symbol;
                 }
-                
+
                 /* Also check simple name cache */
                 found_type = hashtable_lookup(sem->types, type_name);
-                if (found_type && found_type->kind == TYPE_CLASS && 
+                if (found_type && found_type->kind == TYPE_CLASS &&
                     found_type->data.class_type.symbol) {
                     closedir(dir);
                     if (getenv("GENESIS_DEBUG_PKG_SCAN")) {
-                        fprintf(stderr, "DEBUG scan_package: found '%s' (simple) after loading '%s'\n", 
+                        fprintf(stderr, "DEBUG scan_package: found '%s' (simple) after loading '%s'\n",
                                 type_name, qualified);
                     }
                     return found_type->data.class_type.symbol;
@@ -9862,7 +9903,7 @@ static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, c
         sem->scanned_packages = hashtable_new();
     }
     hashtable_insert(sem->scanned_packages, package_name, (void *)1);
-    
+
     return NULL;
 }
 
