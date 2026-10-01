@@ -2739,7 +2739,7 @@ static slist_t *parse_type_annotations(parser_t *parser)
  */
 ast_node_t *parse_type(parser_t *parser)
 {
-    if (getenv("GENESIS_DEBUG_PARSER")) {
+    if (debug_getenv("GENESIS_DEBUG_PARSER")) {
         fprintf(stderr, "[PARSER] parse_type: entry, current_token=%d ('%s'), line=%d\n", 
                 parser_current_type(parser),
                 parser_current_type(parser) == TOK_IDENTIFIER ? parser_current_text(parser) : token_type_name(parser_current_type(parser)),
@@ -2794,7 +2794,7 @@ ast_node_t *parse_type(parser_t *parser)
         
         type_node->data.node.name = string_free(name, false);
         
-        if (getenv("GENESIS_DEBUG_PARSER")) {
+        if (debug_getenv("GENESIS_DEBUG_PARSER")) {
             fprintf(stderr, "[PARSER] parse_type: after parsing class name '%s', current_token=%d, line=%d\n", 
                     type_node->data.node.name,
                     parser_current_type(parser),
@@ -2949,7 +2949,7 @@ ast_node_t *parse_type(parser_t *parser)
         }
     }
     
-    if (getenv("GENESIS_DEBUG_PARSER")) {
+    if (debug_getenv("GENESIS_DEBUG_PARSER")) {
         fprintf(stderr, "[PARSER] parse_type: exit, returning %s, current_token=%d, line=%d\n", 
                 type_node ? "type" : "NULL",
                 parser_current_type(parser),
@@ -3064,7 +3064,7 @@ static ast_node_t *parse_statement(parser_t *parser)
             
         case TOK_FOR:
             {
-                if (getenv("GENESIS_DEBUG_PARSER")) {
+                if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                     fprintf(stderr, "[PARSER] Parsing FOR statement at line %d\n", line);
                 }
                 parser_advance(parser);
@@ -3123,11 +3123,11 @@ static ast_node_t *parse_statement(parser_t *parser)
                         if (parser_check(parser, TOK_LT)) {
                             int depth = 1;
                             parser_advance(parser);
-                            if (getenv("GENESIS_DEBUG_PARSER")) {
+                            if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                                 fprintf(stderr, "[PARSER] FOR lookahead: Skipping generics, depth=1\n");
                             }
                             while (depth > 0 && !parser_check(parser, TOK_EOF)) {
-                                if (getenv("GENESIS_DEBUG_PARSER")) {
+                                if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                                     fprintf(stderr, "[PARSER] FOR lookahead: token=%d, depth=%d\n", 
                                             parser_current_type(parser), depth);
                                 }
@@ -3138,7 +3138,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                                 }
                                 parser_advance(parser);
                             }
-                            if (getenv("GENESIS_DEBUG_PARSER")) {
+                            if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                                 fprintf(stderr, "[PARSER] FOR lookahead: Done with generics, depth=%d\n", depth);
                             }
                         }
@@ -3154,7 +3154,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                         if (parser_check_identifier_or_contextual(parser)) {
                             is_var_decl = true;
                         } else {
-                            if (getenv("GENESIS_DEBUG_PARSER")) {
+                            if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                                 fprintf(stderr, "[PARSER] FOR lookahead: after type, NOT identifier, token=%d\n", 
                                         parser_current_type(parser));
                             }
@@ -3164,13 +3164,13 @@ static ast_node_t *parse_statement(parser_t *parser)
                     }
                     
                     if (is_var_decl) {
-                        if (getenv("GENESIS_DEBUG_PARSER")) {
+                        if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                             fprintf(stderr, "[PARSER] FOR: Detected var declaration\n");
                         }
                         /* Parse type */
                         ast_node_t *type = parse_type(parser);
                         
-                        if (getenv("GENESIS_DEBUG_PARSER")) {
+                        if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                             fprintf(stderr, "[PARSER] FOR: after parsing type, current_token=%d\n", 
                                     parser_current_type(parser));
                         }
@@ -3183,7 +3183,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                             int var_col = parser_current_column(parser);
                             parser_advance(parser);
                             
-                            if (getenv("GENESIS_DEBUG_PARSER")) {
+                            if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                                 fprintf(stderr, "[PARSER] FOR: after var name '%s', checking for colon, current_token=%d\n", 
                                         var_name, parser_current_type(parser));
                             }
@@ -3211,7 +3211,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                                     ast_add_child(node, iterable);
                                 }
                                 
-                                if (getenv("GENESIS_DEBUG_PARSER")) {
+                                if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                                     fprintf(stderr, "[PARSER] Enhanced for: after parsing iterable, current_token=%d\n", 
                                             parser_current_type(parser));
                                 }
@@ -3223,7 +3223,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                                     return NULL;
                                 }
                                 
-                                if (getenv("GENESIS_DEBUG_PARSER")) {
+                                if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                                     fprintf(stderr, "[PARSER] Enhanced for: about to parse body, current_token=%d\n", 
                                             parser_current_type(parser));
                                 }
@@ -3234,7 +3234,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                                     ast_add_child(node, body);
                                 }
                                 
-                                if (getenv("GENESIS_DEBUG_PARSER")) {
+                                if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                                     fprintf(stderr, "[PARSER] Enhanced for: after parsing body, current_token=%d\n", 
                                             parser_current_type(parser));
                                 }
@@ -4399,7 +4399,7 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
     slist_t *annotations = NULL;
     uint32_t modifiers = parse_modifiers_with_annotations(parser, &annotations);
     
-    if (getenv("GENESIS_DEBUG_PARSER")) {
+    if (debug_getenv("GENESIS_DEBUG_PARSER")) {
         fprintf(stderr, "[PARSER] parse_class_member: modifiers=0x%x, current_token=%d", 
                 modifiers, parser_current_type(parser));
         if (parser_current_type(parser) == TOK_IDENTIFIER) {
@@ -4427,11 +4427,11 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
         parser_check(parser, TOK_ENUM) ||
         parser_check(parser, TOK_RECORD) ||
         is_at_interface) {  /* @interface only */
-        if (getenv("GENESIS_DEBUG_PARSER")) {
+        if (debug_getenv("GENESIS_DEBUG_PARSER")) {
             fprintf(stderr, "[PARSER] Detected nested type declaration! token=%d\n", parser_current_type(parser));
         }
         ast_node_t *nested = parse_type_decl_with_annotations(parser, modifiers, annotations);
-        if (getenv("GENESIS_DEBUG_PARSER")) {
+        if (debug_getenv("GENESIS_DEBUG_PARSER")) {
             fprintf(stderr, "[PARSER] After parsing nested type '%s', current token=%d (line %d)\n", 
                     nested ? nested->data.node.name : "(null)",
                     parser_current_type(parser),
@@ -4903,12 +4903,12 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
     }
     
     /* Parse class members (methods, fields, constructors) */
-    if (getenv("GENESIS_DEBUG_PARSER")) {
+    if (debug_getenv("GENESIS_DEBUG_PARSER")) {
         fprintf(stderr, "[PARSER] Parsing class body for: %s (type=%d)\n", decl->data.node.name, type);
     }
     int member_count = 0;
     while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
-        if (getenv("GENESIS_DEBUG_PARSER")) {
+        if (debug_getenv("GENESIS_DEBUG_PARSER")) {
             fprintf(stderr, "[PARSER] [%s] Loop iteration %d: current_token=%d, line=%d, check_rbrace=%d, check_eof=%d\n", 
                     decl->data.node.name, member_count, 
                     parser_current_type(parser), parser_current_line(parser),
@@ -4916,7 +4916,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
         }
         ast_node_t *member = parse_class_member(parser, decl->data.node.name);
         if (member) {
-            if (getenv("GENESIS_DEBUG_PARSER")) {
+            if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                 fprintf(stderr, "[PARSER] [%s] Got member type=%d, name=%s. After adding, current_token=%d, line=%d\n", 
                         decl->data.node.name, member->type, 
                         member->data.node.name ? member->data.node.name : "(null)",
@@ -4925,7 +4925,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
             ast_add_child(decl, member);
             member_count++;
         } else if (parser->error_msg) {
-            if (getenv("GENESIS_DEBUG_PARSER")) {
+            if (debug_getenv("GENESIS_DEBUG_PARSER")) {
                 fprintf(stderr, "[PARSER] Error parsing member: %s\n", parser->error_msg);
             }
             /* Error recovery */
@@ -4942,7 +4942,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
         }
     }
     
-    if (getenv("GENESIS_DEBUG_PARSER")) {
+    if (debug_getenv("GENESIS_DEBUG_PARSER")) {
         fprintf(stderr, "[PARSER] Finished parsing class body for: %s, member_count=%d, current_token=%d\n", 
                 decl->data.node.name, member_count, parser_current_type(parser));
     }

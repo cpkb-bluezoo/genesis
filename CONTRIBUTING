@@ -130,6 +130,22 @@ Testing
        GUMDROP_DIR=~/gumdrop JAVA_HOME=/path/to/jdk-25 make gumdrop-smoke
        GUMDROP_DIR=~/gumdrop JAVA_HOME=/path/to/jdk-25 make bench
 
+   To see where the time of a compilation goes:
+
+   GENESIS_DEBUG_TIMING=1           - Print the wall-clock time of each phase
+                                       (parse, qualify type names, enter
+                                       members, semantic analysis, code
+                                       generation, ...) on stderr.
+   GENESIS_DEBUG_PAUSE=<seconds>    - Wait before starting (and again at the
+                                       start of each worker process), so that
+                                       a profiler attaching to the running
+                                       process sees the first phases too.
+
+   Performance changes must not change the output. The class files genesis
+   writes are deterministic, so keep a copy of the binary from before the
+   change, compile the same sources (all of gumdrop is a good set) with
+   both, and compare the output directories with "diff -r".
+
 6. BUILDING
 
    autoreconf -fi && ./configure && make

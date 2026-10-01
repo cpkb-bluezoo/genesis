@@ -92,6 +92,10 @@ typedef struct const_pool
     uint16_t count;
     uint16_t capacity;
     hashtable_t *utf8_cache;        /* Cache for UTF8 deduplication */
+    uint16_t *class_by_name;        /* For each UTF8 entry index, the CONST_CLASS
+                                     * entry naming it (0: none yet); see
+                                     * cp_add_class() */
+    size_t class_by_name_size;      /* Elements allocated in class_by_name */
 } const_pool_t;
 
 /* ========================================================================

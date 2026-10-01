@@ -1319,7 +1319,7 @@ bool type_assignable(type_t *target, type_t *source)
             symbol_t *super = symbol_get_superclass(source_sym);
             int depth = 0;
             
-            if (getenv("GENESIS_DEBUG_SUBTYPE")) {
+            if (debug_getenv("GENESIS_DEBUG_SUBTYPE")) {
                 const char *src_name = symbol_get_qualified_name(source_sym);
                 fprintf(stderr, "DEBUG subtype: checking superclass chain for '%s' (sym=%p)\n", 
                         src_name ? src_name : "(null)", (void*)source_sym);
@@ -1330,7 +1330,7 @@ bool type_assignable(type_t *target, type_t *source)
             while (super && depth < 50) {  /* Limit depth to prevent infinite loops */
                 const char *super_name = symbol_get_qualified_name(super);
                 
-                if (getenv("GENESIS_DEBUG_SUBTYPE")) {
+                if (debug_getenv("GENESIS_DEBUG_SUBTYPE")) {
                     fprintf(stderr, "  depth=%d super='%s' (sym=%p)\n", depth, 
                             super_name ? super_name : "(null)", (void*)super);
                 }
@@ -1354,7 +1354,7 @@ bool type_assignable(type_t *target, type_t *source)
                         symbol_t *reloaded = load_external_class(sem, super_name);
                         if (reloaded && reloaded != super) {
                             next_super = symbol_get_superclass(reloaded);
-                            if (getenv("GENESIS_DEBUG_SUBTYPE")) {
+                            if (debug_getenv("GENESIS_DEBUG_SUBTYPE")) {
                                 fprintf(stderr, "    reloaded '%s' -> next_super=%p\n", 
                                         super_name, (void*)next_super);
                             }
@@ -1366,7 +1366,7 @@ bool type_assignable(type_t *target, type_t *source)
                 depth++;
             }
             
-            if (getenv("GENESIS_DEBUG_SUBTYPE")) {
+            if (debug_getenv("GENESIS_DEBUG_SUBTYPE")) {
                 fprintf(stderr, "  superclass chain did NOT match target\n");
             }
         }

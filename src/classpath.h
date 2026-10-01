@@ -59,6 +59,15 @@ typedef struct cp_entry
 
     /* For JAR files: cached central directory */
     void *jar_handle;               /* Opaque handle for JAR reading */
+
+    /* Position in the search order: boot entries first, then user entries */
+    int order;
+
+    /* For directories: package path ("java/util") -> hashtable_t* whose
+     * keys are the names of the files in that package's directory, read
+     * once on the first lookup in the package. Guarded by the classpath's
+     * cache lock. */
+    hashtable_t *dir_packages;
 } cp_entry_t;
 
 /*
@@ -78,13 +87,24 @@ typedef struct classpath
     /* Negative cache: classes we know don't exist (value is (void*)1) */
     hashtable_t *negative_cache;
 
-    /* Statistics (use atomic operations for thread safety) */
+    /* Package index, built on the first lookup (see
+     * classpath_build_package_index() in classpath.c): package path ->
+     * the JAR/JMOD entries holding classes of that package, in search
+     * order. A lookup goes straight to the archives that can hold the
+     * class rather than asking each entry in turn. */
+    hashtable_t *package_index;
+    cp_entry_t **dir_entries;       /* The directory entries, in search order */
+    int dir_entry_count;
+    int indexed_entry_count;        /* Entries present when the index was built */
+    hashtable_t *no_files;          /* Shared empty set: a package directory that does not exist */
+
+    int entry_count;                /* Boot and user entries together */
+
+    /* Statistics */
     int classes_loaded;
-    int cache_hits;
-    int negative_cache_hits;
     
     /* Thread safety for cache access */
-    void *cache_mutex;              /* pthread_mutex_t* (opaque for header portability) */
+    void *cache_lock;               /* pthread_mutex_t* (opaque for header portability) */
 } classpath_t;
 
 /*

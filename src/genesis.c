@@ -32,7 +32,45 @@
 
 #include <limits.h>    /* For PATH_MAX */
 #include <sys/stat.h>  /* For mkdir() */
+#include <sys/time.h>  /* For gettimeofday() */
+#include <sys/wait.h>  /* For waitpid() */
+#include <poll.h>      /* For poll() */
+#include <signal.h>    /* For SIGPIPE */
 #include <pthread.h>   /* For parallel compilation */
+
+/* ========================================================================
+ * Phase timing (GENESIS_DEBUG_TIMING)
+ * ======================================================================== */
+
+static double g_timing_last = 0.0;
+
+static double timing_now(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+/**
+ * With GENESIS_DEBUG_TIMING set, report on stderr the wall-clock time since
+ * the previous call (or since timing_start()) against the given phase name.
+ */
+static void timing_mark(const char *phase)
+{
+    if (!g_debug_timing) {
+        return;
+    }
+    double now = timing_now();
+    fprintf(stderr, "timing: %-28s %8.1f ms\n", phase, (now - g_timing_last) * 1000.0);
+    g_timing_last = now;
+}
+
+static void timing_start(void)
+{
+    if (g_debug_timing) {
+        g_timing_last = timing_now();
+    }
+}
 
 /* ========================================================================
  * Parallel Compilation Infrastructure
@@ -191,6 +229,9 @@ static compiler_options_t *g_opts = NULL;
 /* Global JAR writer for JAR output mode */
 static jar_writer_t *g_jar_writer = NULL;
 
+/* Serializes additions to g_jar_writer from the code generation threads */
+static pthread_mutex_t g_jar_output_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 /* Note: Shared type cache for parallel compilation was removed due to complexity.
  * Cross-file source dependencies require a more sophisticated multi-phase approach.
  * Current parallel compilation works well for independent files or files that only
@@ -281,13 +322,18 @@ static bool output_class(class_gen_t *cg, const char *qualified_name,
     bool success = false;
     
     if (g_jar_writer) {
-        /* JAR output mode */
+        /* JAR output mode. The writer is one shared stream, and code
+         * generation runs on several threads: entries are added one at a
+         * time. */
+        pthread_mutex_lock(&g_jar_output_mutex);
         success = jar_writer_add_class(g_jar_writer, qualified_name, bytes, size);
         if (success && opts->verbose) {
             printf("Added to JAR: %s.class\n", qualified_name);
         }
+        pthread_mutex_unlock(&g_jar_output_mutex);
     } else {
-        /* Directory output mode */
+        /* Directory output mode. Every class goes to its own file, so
+         * the code generation threads write without any locking. */
         const char *output_dir = opts->output_dir ? opts->output_dir : ".";
         char output_path[1024];
         
@@ -301,34 +347,50 @@ static bool output_class(class_gen_t *cg, const char *qualified_name,
         
         snprintf(output_path, sizeof(output_path), "%s/%s.class", output_dir, path_name);
         
-        /* Create parent directories */
-        char *last_slash = strrchr(output_path, '/');
-        if (last_slash) {
-            *last_slash = '\0';
-            char *slash = output_path;
-            while ((slash = strchr(slash + 1, '/')) != NULL) {
-                *slash = '\0';
+        /* Write file, with plain system calls: one class file is one
+         * write, and stdio only adds a buffer allocation and an fstat() per
+         * file to that. The package directory nearly always exists already
+         * (one mkdir per path component per class adds up to thousands of
+         * system calls on a large build), so the parent directories are
+         * only created when the open fails for want of one. */
+        int fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (fd < 0 && errno == ENOENT) {
+            char *last_slash = strrchr(output_path, '/');
+            if (last_slash) {
+                *last_slash = '\0';
+                char *slash = output_path;
+                while ((slash = strchr(slash + 1, '/')) != NULL) {
+                    *slash = '\0';
+                    mkdir(output_path, 0755);
+                    *slash = '/';
+                }
                 mkdir(output_path, 0755);
-                *slash = '/';
+                *last_slash = '/';
             }
-            mkdir(output_path, 0755);
-            *last_slash = '/';
+            fd = open(output_path, O_WRONLY | O_CREAT | O_TRUNC, 0666);
         }
-        
-        /* Write file */
-        FILE *fp = fopen(output_path, "wb");
-        if (fp) {
-            if (fwrite(bytes, 1, size, fp) == size) {
+        if (fd >= 0) {
+            size_t written = 0;
+            while (written < size) {
+                ssize_t n = write(fd, bytes + written, size - written);
+                if (n < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (n <= 0) {
+                    break;
+                }
+                written += (size_t)n;
+            }
+            if (close(fd) == 0 && written == size) {
                 success = true;
                 if (opts->verbose) {
                     printf("Generated: %s\n", output_path);
                 }
             } else {
-                fprintf(stderr, "output_class: fwrite failed for %s\n", output_path);
+                fprintf(stderr, "output_class: write failed for %s\n", output_path);
             }
-            fclose(fp);
         } else {
-            fprintf(stderr, "output_class: fopen failed for %s\n", output_path);
+            fprintf(stderr, "output_class: open failed for %s\n", output_path);
         }
         
         free(path_name);
@@ -1058,6 +1120,7 @@ typedef struct parse_result {
     int error_line;
     int error_column;
     semantic_t *sem;  /* Semantic analyzer (set after serial semantic phase) */
+    bool sem_failed;  /* Semantic analysis reported errors: no code generation */
 } parse_result_t;
 
 /* Mutex-protected counter shared between worker threads (C99 has no atomics) */
@@ -1392,7 +1455,7 @@ static void register_type_decl(type_registry_t *reg, ast_node_t *decl,
                 member->type == AST_ENUM_DECL ||
                 member->type == AST_RECORD_DECL ||
                 member->type == AST_ANNOTATION_DECL)) {
-                if (getenv("GENESIS_DEBUG_REGISTRY")) {
+                if (debug_getenv("GENESIS_DEBUG_REGISTRY")) {
                     fprintf(stderr, "DEBUG register: nested type '%s' in '%s'\n",
                             member->data.node.name ? member->data.node.name : "(null)",
                             qname ? qname : "(null)");
@@ -1431,7 +1494,7 @@ static void register_types_from_ast(type_registry_t *reg, ast_node_t *ast,
             child->type == AST_ANNOTATION_DECL)) {
             
             /* Count children of the class decl */
-            if (getenv("GENESIS_DEBUG_REGISTRY")) {
+            if (debug_getenv("GENESIS_DEBUG_REGISTRY")) {
                 int child_count = 0;
                 for (slist_t *c = child->data.node.children; c; c = c->next) {
                     child_count++;
@@ -1522,6 +1585,166 @@ static void *parse_phase_worker(void *arg)
     return NULL;
 }
 
+/* Shared state for the type name qualification phase (Phase 2b) */
+typedef struct qualify_phase_state {
+    parse_result_t *results;
+    int file_count;
+    shared_counter_t next_index;
+    slist_t *sourcepath_list;
+    type_registry_t *registry;
+} qualify_phase_state_t;
+
+/**
+ * Worker thread for Phase 2b: qualify the type names of one file at a time.
+ * A file's names are resolved from its own package and imports against the
+ * registry (complete, and only read from now on), the classpath (which
+ * locks its caches) and the sourcepath, and written into that file's own
+ * AST: the files do not affect one another.
+ *
+ * Each thread remembers what it has asked the classpath and the sourcepath
+ * (see resolve_types_in_compilation_unit_cached()). Without that the
+ * threads ask the classpath the same questions file after file, and spend
+ * their time queueing for its lock: the phase took longer on ten threads
+ * than on one.
+ */
+static void *qualify_phase_worker(void *arg)
+{
+    qualify_phase_state_t *state = (qualify_phase_state_t *)arg;
+    hashtable_t *probes = hashtable_new_sized(4096);
+
+    while (1) {
+        int idx = counter_fetch_add(&state->next_index, 1);
+        if (idx >= state->file_count) {
+            break;
+        }
+        parse_result_t *pr = &state->results[idx];
+        if (pr->ast && !pr->error_msg) {
+            resolve_types_in_compilation_unit_cached(pr->ast, g_classpath,
+                                                     state->sourcepath_list,
+                                                     state->registry, probes);
+        }
+    }
+
+    hashtable_free(probes);
+    return NULL;
+}
+
+/**
+ * Generate and write the class files of one analyzed source file. Returns
+ * the number of errors. `message_mutex`, when not NULL, serializes the
+ * error messages of the code generation threads.
+ */
+static int generate_file_code(parse_result_t *pr, compiler_options_t *opts,
+                              pthread_mutex_t *message_mutex)
+{
+    int errors = 0;
+
+    /* Skip files with parse errors or semantic errors */
+    if (pr->error_msg || !pr->ast || !pr->sem || pr->sem_failed) {
+        return 0;
+    }
+    
+    semantic_t *sem = pr->sem;
+    
+    /* Code generation for each top-level type */
+    slist_t *children = pr->ast->data.node.children;
+    while (children) {
+        ast_node_t *child = (ast_node_t *)children->data;
+        
+        if (child && (child->type == AST_CLASS_DECL ||
+            child->type == AST_INTERFACE_DECL ||
+            child->type == AST_ENUM_DECL ||
+            child->type == AST_RECORD_DECL ||
+            child->type == AST_ANNOTATION_DECL)) {
+            
+            const char *class_name = child->data.node.name;
+            if (!class_name) {
+                children = children->next;
+                continue;
+            }
+            
+            /* Get class symbol */
+            symbol_t *class_sym = child->sem_symbol;
+            if (!class_sym && sem->current_class) {
+                class_sym = sem->current_class;
+            }
+            
+            class_gen_t *cg = class_gen_new(sem, class_sym);
+            if (!cg) {
+                if (message_mutex) {
+                    pthread_mutex_lock(message_mutex);
+                }
+                fprintf(stderr, "error: cannot create class generator for %s\n",
+                        class_name);
+                if (message_mutex) {
+                    pthread_mutex_unlock(message_mutex);
+                }
+                errors++;
+                children = children->next;
+                continue;
+            }
+            
+            /* Target major version (0 = automatic); must be set before the
+             * class is generated and written */
+            int target_major = classfile_version_from_string(opts->target_version);
+            class_gen_set_target_version(cg, target_major);
+            
+            if (!codegen_class(cg, child)) {
+                if (message_mutex) {
+                    pthread_mutex_lock(message_mutex);
+                }
+                fprintf(stderr, "error: code generation failed for: %s\n",
+                        class_name);
+                if (message_mutex) {
+                    pthread_mutex_unlock(message_mutex);
+                }
+                errors++;
+                class_gen_free(cg);
+                children = children->next;
+                continue;
+            }
+            
+            /* Discover every nested/local/anonymous class at every
+             * depth below this one and add them all to this class's
+             * own NestMembers attribute before it's written out - see
+             * collect_nest_members_recursive()'s own comment. */
+            if (cg->nest_host == 0) {
+                collect_nest_members_recursive(sem, cg, cg->cp, &cg->nest_members, target_major);
+            }
+
+            /* A descendant discovered during that same recursive scan may
+             * have registered a synthetic field-accessor need on THIS
+             * class (see pending_field_accessor_t's own comment,
+             * genesis.h) - after codegen_class() already returned, so
+             * emit it now, before this class's bytes are finalized. */
+            generate_pending_field_accessors(cg);
+
+            /* Write class file */
+            const char *qname = class_sym ? class_sym->qualified_name : class_name;
+            bool write_ok = output_class(cg, qname, opts);
+            
+            if (!write_ok) {
+                errors++;
+            }
+            
+            /* Process nested classes (static and non-static inner classes) */
+            process_nested_classes(sem, cg, class_sym, opts, target_major);
+            
+            /* Process local classes (classes defined inside method bodies) */
+            process_local_classes(sem, cg, opts, target_major);
+            
+            /* Process anonymous classes */
+            process_anonymous_classes(sem, cg, opts, target_major);
+            
+            class_gen_free(cg);
+        }
+        
+        children = children->next;
+    }
+
+    return errors;
+}
+
 /**
  * Worker thread for parallel codegen ONLY.
  * Semantic analysis is done serially before this runs.
@@ -1537,103 +1760,10 @@ static void *codegen_phase_worker(void *arg)
             break;
         }
         
-        parse_result_t *pr = &state->results[idx];
-        
-        /* Skip files with parse errors or semantic errors (marked by NULL sem) */
-        if (pr->error_msg || !pr->ast || !pr->sem) {
-            continue;
-        }
-        
-        semantic_t *sem = pr->sem;
-        
-        /* Code generation for each top-level type */
-        slist_t *children = pr->ast->data.node.children;
-        while (children) {
-            ast_node_t *child = (ast_node_t *)children->data;
-            
-            if (child && (child->type == AST_CLASS_DECL ||
-                child->type == AST_INTERFACE_DECL ||
-                child->type == AST_ENUM_DECL ||
-                child->type == AST_RECORD_DECL ||
-                child->type == AST_ANNOTATION_DECL)) {
-                
-                const char *class_name = child->data.node.name;
-                if (!class_name) {
-                    children = children->next;
-                    continue;
-                }
-                
-                /* Get class symbol */
-                symbol_t *class_sym = child->sem_symbol;
-                if (!class_sym && sem->current_class) {
-                    class_sym = sem->current_class;
-                }
-                
-                class_gen_t *cg = class_gen_new(sem, class_sym);
-                if (!cg) {
-                    pthread_mutex_lock(&state->output_mutex);
-                    fprintf(stderr, "error: cannot create class generator for %s\n",
-                            class_name);
-                    pthread_mutex_unlock(&state->output_mutex);
-                    counter_fetch_add(&state->error_count, 1);
-                    children = children->next;
-                    continue;
-                }
-                
-                /* Target major version (0 = automatic); must be set before the
-                 * class is generated and written */
-                int target_major = classfile_version_from_string(state->opts->target_version);
-                class_gen_set_target_version(cg, target_major);
-                
-                if (!codegen_class(cg, child)) {
-                    pthread_mutex_lock(&state->output_mutex);
-                    fprintf(stderr, "error: code generation failed for: %s\n",
-                            class_name);
-                    pthread_mutex_unlock(&state->output_mutex);
-                    counter_fetch_add(&state->error_count, 1);
-                    class_gen_free(cg);
-                    children = children->next;
-                    continue;
-                }
-                
-                /* Discover every nested/local/anonymous class at every
-                 * depth below this one and add them all to this class's
-                 * own NestMembers attribute before it's written out - see
-                 * collect_nest_members_recursive()'s own comment. */
-                if (cg->nest_host == 0) {
-                    collect_nest_members_recursive(sem, cg, cg->cp, &cg->nest_members, target_major);
-                }
-
-                /* A descendant discovered during that same recursive scan may
-                 * have registered a synthetic field-accessor need on THIS
-                 * class (see pending_field_accessor_t's own comment,
-                 * genesis.h) - after codegen_class() already returned, so
-                 * emit it now, before this class's bytes are finalized. */
-                generate_pending_field_accessors(cg);
-
-                /* Write class file */
-                const char *qname = class_sym ? class_sym->qualified_name : class_name;
-                pthread_mutex_lock(&state->output_mutex);
-                bool write_ok = output_class(cg, qname, state->opts);
-                pthread_mutex_unlock(&state->output_mutex);
-                
-                if (!write_ok) {
-                    counter_fetch_add(&state->error_count, 1);
-                }
-                
-                /* Process nested classes (static and non-static inner classes) */
-                process_nested_classes(sem, cg, class_sym, state->opts, target_major);
-                
-                /* Process local classes (classes defined inside method bodies) */
-                process_local_classes(sem, cg, state->opts, target_major);
-                
-                /* Process anonymous classes */
-                process_anonymous_classes(sem, cg, state->opts, target_major);
-                
-                class_gen_free(cg);
-            }
-            
-            children = children->next;
+        int errors = generate_file_code(&state->results[idx], state->opts,
+                                        &state->output_mutex);
+        if (errors > 0) {
+            counter_fetch_add(&state->error_count, errors);
         }
     }
     
@@ -1641,12 +1771,738 @@ static void *codegen_phase_worker(void *arg)
 }
 
 /**
+ * Run semantic analysis on one parsed file, leaving the analyzer in
+ * pr->sem (NULL if one could not be created). Returns whether the analysis
+ * succeeded. Diagnostics stay in the analyzer; nothing is printed.
+ */
+static bool analyze_file(compiler_options_t *opts, type_registry_t *registry,
+                         parse_result_t *pr)
+{
+    /* Create semantic analyzer with shared registry for cross-file type resolution.
+     * The registry allows resolving types from other files in the same compilation batch. */
+    semantic_t *sem = semantic_new_with_registry(g_classpath, registry);
+    pr->sem = sem;
+    if (!sem) {
+        return false;
+    }
+    
+    sem->warnings_enabled = opts->warnings;
+    sem->werror = opts->werror;
+    sem->source_version = classfile_java_version(
+        classfile_version_from_string(opts->source_version));
+    
+    if (opts->sourcepath) {
+        semantic_set_sourcepath(sem, opts->sourcepath);
+    }
+    
+    /* Type names were already qualified in Phase 2b */
+    return semantic_analyze(sem, pr->ast, pr->source);
+}
+
+/* ========================================================================
+ * Semantic analysis and code generation in worker processes
+ * ========================================================================
+ *
+ * Semantic analysis is by far the largest part of a compilation, and it
+ * cannot run on several threads: analysing a file completes and updates
+ * symbols that every other file's analysis reads (the shared type registry,
+ * the symbols of the classes loaded from class files, the types hanging off
+ * all of them), none of it under any lock. One analyzer after another on a
+ * single thread, the rest of the machine sits idle for most of the run.
+ *
+ * What analysing a file does NOT depend on is the analysis of any other
+ * file: everything files need of one another was entered in the registry by
+ * the serial phases before (types, members, resolved signatures). So the
+ * work is divided between processes instead of threads. Once the registry is
+ * complete the compiler forks its workers; each inherits the whole state -
+ * ASTs, registry, classpath caches - as a private copy-on-write image, and
+ * analyses and generates code for the files it takes from a common queue,
+ * free to modify its own copy of every symbol exactly as the single
+ * analysing thread always did. Nothing is shared, so nothing races.
+ *
+ * The workers report to the compiler process over a pipe each: the
+ * diagnostics of every file (printed by the compiler process in the order
+ * of the files, once it is known that the batch stands), source files
+ * loaded through -sourcepath (which make the batch start over, as in the
+ * single-process path), and error counts. Code generation only starts when
+ * the compiler process says so, after every file has been analysed.
+ */
+
+/* A batch smaller than this is compiled in this process: forking and
+ * priming a set of workers costs more than it saves. */
+#define WORKER_MIN_FILES 32
+
+#define WORKERS_UNAVAILABLE (-2)
+
+/* Messages from a worker to the compiler process */
+#define WORKER_MSG_FILE 'F'         /* A file has been analysed: index, error
+                                     * count (-1: no analyzer), failed flag in
+                                     * `flag`, diagnostics text as payload */
+#define WORKER_MSG_DEPENDENCY 'P'   /* A file loaded through -sourcepath by
+                                     * file `index`: its path as payload */
+#define WORKER_MSG_ANALYZED 'A'     /* Analysis of this worker's files is over */
+#define WORKER_MSG_GENERATED 'C'    /* Code generation is over: errors in `value` */
+
+/* Replies from the compiler process */
+#define WORKER_CMD_GENERATE 'G'
+#define WORKER_CMD_ABANDON 'X'
+
+typedef struct worker_msg
+{
+    char type;
+    char flag;
+    int index;
+    int value;
+    unsigned int length;            /* Bytes of payload that follow */
+} worker_msg_t;
+
+typedef struct worker_proc
+{
+    pid_t pid;
+    int report_fd;                  /* Read end of the worker's report pipe */
+    int control_fd;                 /* Write end of the worker's control pipe */
+    char *buf;                      /* Report bytes not yet consumed */
+    size_t len;
+    size_t cap;
+    bool analyzed;                  /* WORKER_MSG_ANALYZED received */
+    bool closed;                    /* Report pipe at end of file */
+} worker_proc_t;
+
+/* What the workers reported about one file */
+typedef struct worker_file_report
+{
+    bool reported;
+    bool failed;
+    int error_count;
+    char *diagnostics;
+    slist_t *dependencies;          /* Paths (strings), in the order reported */
+    slist_t *dependencies_tail;
+} worker_file_report_t;
+
+static bool write_fully(int fd, const void *data, size_t size)
+{
+    const char *p = (const char *)data;
+    while (size > 0) {
+        ssize_t n = write(fd, p, size);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return false;
+        }
+        p += n;
+        size -= (size_t)n;
+    }
+    return true;
+}
+
+static bool worker_send(int fd, char type, char flag, int index, int value,
+                        const char *payload)
+{
+    worker_msg_t msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.type = type;
+    msg.flag = flag;
+    msg.index = index;
+    msg.value = value;
+    msg.length = payload ? (unsigned int)strlen(payload) : 0;
+    if (!write_fully(fd, &msg, sizeof(msg))) {
+        return false;
+    }
+    return msg.length == 0 || write_fully(fd, payload, msg.length);
+}
+
+/**
+ * The life of a worker process. Never returns.
+ */
+static void worker_process_run(compiler_options_t *opts, type_registry_t *registry,
+                               parse_result_t *results, int file_count,
+                               int queue_fd, int report_fd, int control_fd,
+                               bool report_dependencies)
+{
+    /* This process has one thread */
+    intern_set_concurrent(false);
+
+    /* GENESIS_DEBUG_PAUSE holds each worker at its start as well, for a
+     * profiler to attach to it */
+    if (g_debug_pause > 0) {
+        sleep((unsigned int)g_debug_pause);
+    }
+
+    int *claimed = malloc((size_t)(file_count > 0 ? file_count : 1) * sizeof(int));
+    int claimed_count = 0;
+    if (!claimed) {
+        _exit(3);
+    }
+
+    /* Analysis: files are taken from the queue one at a time until it is
+     * empty. Symbols built from class files are shared between this
+     * worker's own analyzers, as in the single-process path. */
+    type_registry_set_external_sharing(registry, true);
+    for (;;) {
+        int idx;
+        ssize_t n = read(queue_fd, &idx, sizeof(idx));
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n != (ssize_t)sizeof(idx)) {
+            break;
+        }
+        if (idx < 0 || idx >= file_count) {
+            _exit(3);
+        }
+        parse_result_t *pr = &results[idx];
+        claimed[claimed_count++] = idx;
+
+        bool sem_ok = analyze_file(opts, registry, pr);
+        semantic_t *sem = pr->sem;
+        if (!sem) {
+            if (!worker_send(report_fd, WORKER_MSG_FILE, 1, idx, -1, NULL)) {
+                _exit(3);
+            }
+            continue;
+        }
+        pr->sem_failed = !sem_ok;
+
+        if (report_dependencies) {
+            for (slist_t *dep = sem->source_dependencies; dep; dep = dep->next) {
+                const char *dep_path = (const char *)dep->data;
+                if (dep_path &&
+                    !worker_send(report_fd, WORKER_MSG_DEPENDENCY, 0, idx, 0, dep_path)) {
+                    _exit(3);
+                }
+            }
+        }
+
+        char *text = (sem->error_count > 0 || sem->warning_count > 0) ?
+            semantic_format_diagnostics(sem) : NULL;
+        if (!worker_send(report_fd, WORKER_MSG_FILE, sem_ok ? 0 : 1, idx,
+                         sem->error_count, text)) {
+            _exit(3);
+        }
+        free(text);
+    }
+    type_registry_set_external_sharing(registry, false);
+    close(queue_fd);
+
+    fflush(stdout);
+    fflush(stderr);
+    if (!worker_send(report_fd, WORKER_MSG_ANALYZED, 0, 0, 0, NULL)) {
+        _exit(3);
+    }
+
+    /* Code generation, if the compiler process says the batch stands */
+    char command = 0;
+    for (;;) {
+        ssize_t n = read(control_fd, &command, 1);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n != 1) {
+            command = WORKER_CMD_ABANDON;
+        }
+        break;
+    }
+    if (command != WORKER_CMD_GENERATE) {
+        _exit(0);
+    }
+
+    int errors = 0;
+    for (int i = 0; i < claimed_count; i++) {
+        errors += generate_file_code(&results[claimed[i]], opts, NULL);
+    }
+
+    fflush(stdout);
+    fflush(stderr);
+    if (!worker_send(report_fd, WORKER_MSG_GENERATED, 0, 0, errors, NULL)) {
+        _exit(3);
+    }
+    _exit(0);
+}
+
+/**
+ * Consume the complete messages in a worker's report buffer.
+ */
+static void worker_consume_reports(worker_proc_t *worker, worker_file_report_t *reports,
+                                   int file_count, int *codegen_errors, bool *protocol_error)
+{
+    size_t pos = 0;
+    while (worker->len - pos >= sizeof(worker_msg_t)) {
+        worker_msg_t msg;
+        memcpy(&msg, worker->buf + pos, sizeof(msg));
+        if (worker->len - pos - sizeof(msg) < msg.length) {
+            break;
+        }
+        const char *payload = worker->buf + pos + sizeof(msg);
+        pos += sizeof(msg) + msg.length;
+
+        switch (msg.type) {
+            case WORKER_MSG_FILE:
+            case WORKER_MSG_DEPENDENCY:
+                if (msg.index < 0 || msg.index >= file_count) {
+                    *protocol_error = true;
+                    break;
+                }
+                {
+                    worker_file_report_t *report = &reports[msg.index];
+                    char *text = msg.length ? malloc(msg.length + 1) : NULL;
+                    if (text) {
+                        memcpy(text, payload, msg.length);
+                        text[msg.length] = '\0';
+                    }
+                    if (msg.type == WORKER_MSG_FILE) {
+                        report->reported = true;
+                        report->failed = msg.flag != 0;
+                        report->error_count = msg.value;
+                        report->diagnostics = text;
+                    } else if (text) {
+                        slist_t *node = slist_new(text);
+                        if (report->dependencies_tail) {
+                            report->dependencies_tail->next = node;
+                        } else {
+                            report->dependencies = node;
+                        }
+                        report->dependencies_tail = node;
+                    }
+                }
+                break;
+            case WORKER_MSG_ANALYZED:
+                worker->analyzed = true;
+                break;
+            case WORKER_MSG_GENERATED:
+                *codegen_errors += msg.value;
+                break;
+            default:
+                *protocol_error = true;
+                break;
+        }
+    }
+    if (pos > 0) {
+        memmove(worker->buf, worker->buf + pos, worker->len - pos);
+        worker->len -= pos;
+    }
+}
+
+/* qsort() has no context argument: the files being ordered */
+static parse_result_t *g_queue_sort_results = NULL;
+
+/**
+ * Order file indexes by decreasing source size (and by index for equal
+ * sizes, so that the order is the same on every run).
+ */
+static int compare_queue_by_source_size(const void *a, const void *b)
+{
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    source_file_t *sa = g_queue_sort_results[ia].source;
+    source_file_t *sb = g_queue_sort_results[ib].source;
+    size_t la = sa ? sa->length : 0;
+    size_t lb = sb ? sb->length : 0;
+    if (la != lb) {
+        return la > lb ? -1 : 1;
+    }
+    return ia < ib ? -1 : (ia > ib ? 1 : 0);
+}
+
+/**
+ * Run semantic analysis and code generation for a batch in worker
+ * processes (see the comment at the head of this section).
+ *
+ * Returns 0 when the batch was compiled (*sem_errors and *codegen_errors
+ * are set), -1 when it has to start over with the files in
+ * *dependencies_out added, or WORKERS_UNAVAILABLE when the workers could
+ * not be started at all, in which case nothing has been done and the
+ * caller compiles the batch in this process.
+ */
+static int compile_with_worker_processes(compiler_options_t *opts, int worker_count,
+                                         parse_result_t *results, int file_count,
+                                         type_registry_t *registry,
+                                         slist_t **dependencies_out,
+                                         int *sem_errors, int *codegen_errors)
+{
+    int i;
+    int result = 0;
+
+    *sem_errors = 0;
+    *codegen_errors = 0;
+
+    /* The files to analyse */
+    int *queue = malloc((size_t)(file_count > 0 ? file_count : 1) * sizeof(int));
+    worker_file_report_t *reports = calloc((size_t)(file_count > 0 ? file_count : 1),
+                                           sizeof(worker_file_report_t));
+    worker_proc_t *workers = calloc((size_t)worker_count, sizeof(worker_proc_t));
+    struct pollfd *fds = calloc((size_t)worker_count + 1, sizeof(struct pollfd));
+    if (!queue || !reports || !workers || !fds) {
+        free(queue);
+        free(reports);
+        free(workers);
+        free(fds);
+        return WORKERS_UNAVAILABLE;
+    }
+    int queue_count = 0;
+    for (i = 0; i < file_count; i++) {
+        if (results[i].ast && !results[i].error_msg) {
+            queue[queue_count++] = i;
+        }
+    }
+    if (worker_count > queue_count) {
+        worker_count = queue_count;
+    }
+
+    /* Largest files first. The phase is over when the last worker is, and
+     * a very large file taken off the queue late leaves one worker busy
+     * with it long after the others have run out of work. */
+    g_queue_sort_results = results;
+    qsort(queue, (size_t)queue_count, sizeof(int), compare_queue_by_source_size);
+    g_queue_sort_results = NULL;
+
+    int queue_pipe[2];
+    if (worker_count < 2 || pipe(queue_pipe) != 0) {
+        free(queue);
+        free(reports);
+        free(workers);
+        free(fds);
+        return WORKERS_UNAVAILABLE;
+    }
+
+    /* Whatever is buffered must not be written once by each worker too */
+    fflush(stdout);
+    fflush(stderr);
+
+    /* A worker that died must cost an error, not a SIGPIPE */
+    void (*old_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+
+    int started = 0;
+    bool start_failed = false;
+    for (i = 0; i < worker_count; i++) {
+        int report_pipe[2];
+        int control_pipe[2];
+        if (pipe(report_pipe) != 0) {
+            start_failed = true;
+            break;
+        }
+        if (pipe(control_pipe) != 0) {
+            close(report_pipe[0]);
+            close(report_pipe[1]);
+            start_failed = true;
+            break;
+        }
+        pid_t pid = fork();
+        if (pid < 0) {
+            close(report_pipe[0]);
+            close(report_pipe[1]);
+            close(control_pipe[0]);
+            close(control_pipe[1]);
+            start_failed = true;
+            break;
+        }
+        if (pid == 0) {
+            /* Worker: keep only its own ends of the pipes */
+            close(queue_pipe[1]);
+            close(report_pipe[0]);
+            close(control_pipe[1]);
+            for (int w = 0; w < started; w++) {
+                close(workers[w].report_fd);
+                close(workers[w].control_fd);
+            }
+            signal(SIGPIPE, old_sigpipe == SIG_ERR ? SIG_DFL : old_sigpipe);
+            worker_process_run(opts, registry, results, file_count, queue_pipe[0],
+                               report_pipe[1], control_pipe[0], dependencies_out != NULL);
+            _exit(3);
+        }
+        close(report_pipe[1]);
+        close(control_pipe[0]);
+        workers[i].pid = pid;
+        workers[i].report_fd = report_pipe[0];
+        workers[i].control_fd = control_pipe[1];
+        started++;
+    }
+    close(queue_pipe[0]);
+
+    if (start_failed) {
+        /* Nothing has been handed out yet: call the workers off and let
+         * the caller do the work in this process */
+        close(queue_pipe[1]);
+        for (i = 0; i < started; i++) {
+            kill(workers[i].pid, SIGKILL);
+            close(workers[i].report_fd);
+            close(workers[i].control_fd);
+            waitpid(workers[i].pid, NULL, 0);
+        }
+        if (old_sigpipe != SIG_ERR) {
+            signal(SIGPIPE, old_sigpipe);
+        }
+        free(queue);
+        free(reports);
+        free(workers);
+        free(fds);
+        return WORKERS_UNAVAILABLE;
+    }
+
+    /* The queue is fed without ever blocking on it: this process must
+     * keep reading the reports, or a worker with a full report pipe would
+     * stop taking files off the queue. */
+    int queue_fd = queue_pipe[1];
+    int queue_flags = fcntl(queue_fd, F_GETFL, 0);
+    if (queue_flags >= 0) {
+        fcntl(queue_fd, F_SETFL, queue_flags | O_NONBLOCK);
+    }
+    int queue_pos = 0;
+
+    bool protocol_error = false;
+    bool decided = false;       /* The workers have been told what to do next */
+    bool abandon = false;
+    slist_t *new_dependencies = NULL;
+
+    for (;;) {
+        int nfds = 0;
+        for (i = 0; i < worker_count; i++) {
+            if (!workers[i].closed) {
+                fds[nfds].fd = workers[i].report_fd;
+                fds[nfds].events = POLLIN;
+                fds[nfds].revents = 0;
+                nfds++;
+            }
+        }
+        int report_fds = nfds;
+        if (queue_fd >= 0) {
+            fds[nfds].fd = queue_fd;
+            fds[nfds].events = POLLOUT;
+            fds[nfds].revents = 0;
+            nfds++;
+        }
+        if (report_fds == 0) {
+            break;
+        }
+        if (poll(fds, (nfds_t)nfds, -1) < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            protocol_error = true;
+            break;
+        }
+
+        /* Hand out more files. Each index goes out in a write of its own,
+         * which a pipe delivers whole to exactly one reader. */
+        if (queue_fd >= 0 && (fds[nfds - 1].revents & (POLLOUT | POLLERR | POLLHUP))) {
+            while (queue_pos < queue_count) {
+                ssize_t n = write(queue_fd, &queue[queue_pos], sizeof(int));
+                if (n == (ssize_t)sizeof(int)) {
+                    queue_pos++;
+                    continue;
+                }
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) {
+                    break;
+                }
+                /* No worker left to read the queue */
+                protocol_error = true;
+                queue_pos = queue_count;
+            }
+            if (queue_pos >= queue_count) {
+                close(queue_fd);
+                queue_fd = -1;
+            }
+        }
+
+        /* Read what the workers have to say */
+        int f = 0;
+        for (i = 0; i < worker_count; i++) {
+            worker_proc_t *worker = &workers[i];
+            if (worker->closed) {
+                continue;
+            }
+            short revents = fds[f++].revents;
+            if (!(revents & (POLLIN | POLLHUP | POLLERR))) {
+                continue;
+            }
+            if (worker->cap - worker->len < 65536) {
+                size_t cap = worker->cap ? worker->cap * 2 : 131072;
+                char *buf = realloc(worker->buf, cap);
+                if (!buf) {
+                    protocol_error = true;
+                    worker->closed = true;
+                    continue;
+                }
+                worker->buf = buf;
+                worker->cap = cap;
+            }
+            ssize_t n = read(worker->report_fd, worker->buf + worker->len,
+                             worker->cap - worker->len);
+            if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
+                continue;
+            }
+            if (n <= 0) {
+                worker->closed = true;
+                if (worker->len > 0) {
+                    protocol_error = true;   /* Died in the middle of a message */
+                }
+                continue;
+            }
+            worker->len += (size_t)n;
+            worker_consume_reports(worker, reports, file_count, codegen_errors,
+                                   &protocol_error);
+        }
+
+        /* Once every worker has analysed its files (or is gone), decide
+         * whether the batch stands, and tell them */
+        if (!decided) {
+            bool all_analyzed = queue_fd < 0;
+            for (i = 0; i < worker_count && all_analyzed; i++) {
+                if (!workers[i].analyzed && !workers[i].closed) {
+                    all_analyzed = false;
+                }
+            }
+            if (!all_analyzed) {
+                continue;
+            }
+            decided = true;
+
+            /* A worker that went away without finishing took the analysis
+             * of some files with it */
+            for (i = 0; i < worker_count; i++) {
+                if (!workers[i].analyzed) {
+                    protocol_error = true;
+                }
+            }
+            for (i = 0; i < queue_count && !protocol_error; i++) {
+                if (!reports[queue[i]].reported) {
+                    protocol_error = true;
+                }
+            }
+
+            /* Source files loaded through -sourcepath that are not already
+             * part of the compilation, in the order of the files that
+             * loaded them */
+            if (!protocol_error && dependencies_out) {
+                for (i = 0; i < file_count; i++) {
+                    for (slist_t *dep = reports[i].dependencies; dep; dep = dep->next) {
+                        const char *dep_path = (const char *)dep->data;
+                        if (is_source_compiled(dep_path)) {
+                            continue;
+                        }
+                        mark_source_compiled(dep_path);
+                        char *copy = strdup(dep_path);
+                        if (!new_dependencies) {
+                            new_dependencies = slist_new(copy);
+                        } else {
+                            slist_append(new_dependencies, copy);
+                        }
+                    }
+                }
+            }
+
+            abandon = protocol_error || new_dependencies != NULL;
+            if (!abandon) {
+                timing_mark("semantic analysis");
+
+                /* The batch stands: report on it, in the order of the files */
+                for (i = 0; i < file_count; i++) {
+                    worker_file_report_t *report = &reports[i];
+                    if (!report->reported) {
+                        continue;
+                    }
+                    if (report->error_count < 0) {
+                        fprintf(stderr, "error: cannot create semantic analyzer for %s\n",
+                                results[i].filename);
+                        (*sem_errors)++;
+                        continue;
+                    }
+                    if (report->diagnostics) {
+                        fputs(report->diagnostics, stderr);
+                    }
+                    if (report->failed) {
+                        fprintf(stderr, "%d error(s) in %s\n", report->error_count,
+                                results[i].filename);
+                        (*sem_errors)++;
+                    }
+                }
+                if (opts->verbose) {
+                    printf("Phase 5a complete: %d semantic errors\n", *sem_errors);
+                    printf("Phase 5b: Code generation in %d worker processes...\n",
+                           worker_count);
+                }
+                fflush(stdout);
+            }
+
+            char command = abandon ? WORKER_CMD_ABANDON : WORKER_CMD_GENERATE;
+            for (i = 0; i < worker_count; i++) {
+                if (!workers[i].closed && write(workers[i].control_fd, &command, 1) != 1) {
+                    protocol_error = true;
+                }
+                close(workers[i].control_fd);
+                workers[i].control_fd = -1;
+            }
+        }
+    }
+
+    if (queue_fd >= 0) {
+        close(queue_fd);
+    }
+
+    /* Collect the workers */
+    for (i = 0; i < worker_count; i++) {
+        if (workers[i].control_fd >= 0) {
+            close(workers[i].control_fd);
+        }
+        close(workers[i].report_fd);
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(workers[i].pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        if (waited < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            if (waited >= 0 && WIFSIGNALED(status)) {
+                fprintf(stderr, "error: compiler worker process terminated by signal %d\n",
+                        WTERMSIG(status));
+            } else {
+                fprintf(stderr, "error: compiler worker process failed\n");
+            }
+            protocol_error = true;
+        }
+        free(workers[i].buf);
+    }
+    if (old_sigpipe != SIG_ERR) {
+        signal(SIGPIPE, old_sigpipe);
+    }
+
+    if (protocol_error) {
+        /* Part of the batch was not compiled; what was said about the rest
+         * (if anything) stands, and the compilation fails */
+        slist_free_full(new_dependencies, free);
+        new_dependencies = NULL;
+        (*codegen_errors)++;
+        result = 0;
+    } else if (new_dependencies) {
+        *dependencies_out = new_dependencies;
+        result = -1;
+    }
+
+    for (i = 0; i < file_count; i++) {
+        free(reports[i].diagnostics);
+        slist_free_full(reports[i].dependencies, free);
+    }
+    free(queue);
+    free(reports);
+    free(workers);
+    free(fds);
+    return result;
+}
+
+/**
  * Compile one batch of source files through the full pipeline.
  *
- *   Phase 1: Parse all files in parallel (no shared state)
- *   Phase 2-4: Register types, enter members, resolve types (serial)
- *   Phase 5a: Semantic analysis (serial)
- *   Phase 5b: Code generation in parallel
+ *   Phase 1: Parse all files (threads; no shared state)
+ *   Phase 2: Register types (serial)
+ *   Phase 2b: Qualify type names (threads; each file's own AST)
+ *   Phase 3-4: Enter members, resolve member types (serial)
+ *   Phase 5a: Semantic analysis
+ *   Phase 5b: Code generation
+ *
+ * With more than one job allowed, phase 5 runs in worker processes, each
+ * analysing and then generating code for its share of the files (see
+ * compile_with_worker_processes()). Otherwise - -j1, JAR output, a small
+ * batch - the files are analysed one after another in this process and
+ * their code is generated by threads.
  *
  * Returns the number of errors. With dependencies_out set, the batch
  * stops after semantic analysis whenever that analysis had to load a
@@ -1714,6 +2570,7 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
         pthread_join(threads[i], NULL);
     }
     counter_destroy(&parse_state.next_index);
+    timing_mark("parse");
     
     /* Report parse errors */
     int parse_errors = 0;
@@ -1762,7 +2619,7 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
     int types_registered = 0;
     for (i = 0; i < file_count; i++) {
         if (parse_results[i].ast && !parse_results[i].error_msg) {
-            if (getenv("GENESIS_DEBUG_REGISTRY")) {
+            if (debug_getenv("GENESIS_DEBUG_REGISTRY")) {
                 fprintf(stderr, "DEBUG Phase 2: registering types from file[%d] = '%s'\n",
                         i, parse_results[i].filename ? parse_results[i].filename : "(null)");
             }
@@ -1771,12 +2628,16 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
         }
     }
     
+    /* Nothing registers a type after this point */
+    type_registry_seal(registry);
+
     if (opts->verbose) {
         printf("Phase 2 complete: types registered from %d files\n", types_registered);
     }
+    timing_mark("register types");
     
     /* ================================================================
-     * Phase 2b: Type Name Qualification (serial)
+     * Phase 2b: Type Name Qualification (parallel)
      * Resolve simple type names to fully qualified names using imports.
      * This MUST happen BEFORE member entry so that field/method types
      * are stored with fully qualified names, not simple names.
@@ -1787,13 +2648,22 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
     
     /* Resolve type names in all ASTs before extracting member signatures */
     slist_t *sp_list = sourcepath_parse(opts->sourcepath);
-    for (i = 0; i < file_count; i++) {
-        if (parse_results[i].ast && !parse_results[i].error_msg) {
-            resolve_types_in_compilation_unit(parse_results[i].ast, g_classpath, sp_list,
-                                              registry);
-        }
+    qualify_phase_state_t qualify_state = {
+        .results = parse_results,
+        .file_count = file_count,
+        .sourcepath_list = sp_list,
+        .registry = registry
+    };
+    counter_init(&qualify_state.next_index);
+    for (i = 0; i < thread_count; i++) {
+        pthread_create(&threads[i], &attr, qualify_phase_worker, &qualify_state);
     }
+    for (i = 0; i < thread_count; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    counter_destroy(&qualify_state.next_index);
     sourcepath_list_free(sp_list);
+    timing_mark("qualify type names");
     
     if (opts->verbose) {
         printf("Phase 2b complete: type names qualified\n");
@@ -1813,6 +2683,7 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
     }
     
     registry_enter_members(registry, g_classpath);
+    timing_mark("enter members");
     
     if (opts->verbose) {
         printf("Phase 3 complete: members entered\n");
@@ -1828,6 +2699,7 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
     }
     
     registry_resolve_types(registry, g_classpath);
+    timing_mark("resolve member types");
     
     /* Pre-load common JDK types into classpath cache */
     semantic_t *init_sem = semantic_new(g_classpath);
@@ -1839,7 +2711,7 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
         printf("Phase 4 complete: types resolved\n");
         
         /* Debug: print method return types */
-        if (getenv("GENESIS_DEBUG_REGISTRY")) {
+        if (debug_getenv("GENESIS_DEBUG_REGISTRY")) {
             for (size_t i = 0; i < registry->types->size; i++) {
                 hashtable_entry_t *entry = registry->types->buckets[i];
                 while (entry) {
@@ -1868,16 +2740,58 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
     }
     
     /* ================================================================
-     * Phase 5a: Serial Semantic Analysis
-     * Must be done serially to avoid race conditions in type resolution.
+     * Phase 5a: Semantic Analysis
+     * Never on several threads of one process: the analyzers update
+     * symbols they all share (see the comment on worker processes above).
      * ================================================================ */
     if (opts->verbose) {
-        printf("Phase 5a: Serial semantic analysis...\n");
+        printf("Phase 5a: Semantic analysis...\n");
     }
     
     int sem_errors = 0;
+
+    /* A batch of any size, compiled to a directory with more than one job
+     * allowed, is analysed and generated by worker processes - see
+     * compile_with_worker_processes(). (Class files are written by
+     * whichever worker generates them; a JAR is a single stream, written
+     * by this process.) */
+    if (thread_count > 1 && !g_jar_writer && file_count >= WORKER_MIN_FILES) {
+        int worker_sem_errors = 0;
+        int worker_codegen_errors = 0;
+        int outcome = compile_with_worker_processes(opts, thread_count, parse_results,
+                                                    file_count, registry, dependencies_out,
+                                                    &worker_sem_errors,
+                                                    &worker_codegen_errors);
+        if (outcome != WORKERS_UNAVAILABLE) {
+            int worker_total = outcome < 0 ? -1 :
+                parse_errors + worker_sem_errors + worker_codegen_errors;
+            if (outcome == 0) {
+                timing_mark("code generation");
+                if (opts->verbose) {
+                    printf("Phase 5b complete: %d codegen errors\n", worker_codegen_errors);
+                    printf("Total: %d parse + %d semantic + %d codegen = %d errors\n",
+                           parse_errors, worker_sem_errors, worker_codegen_errors,
+                           worker_total);
+                }
+            }
+            for (i = 0; i < file_count; i++) {
+                free(parse_results[i].error_msg);
+            }
+            free(parse_results);
+            free(threads);
+            pthread_attr_destroy(&attr);
+            type_registry_free(registry);
+            timing_mark("cleanup");
+            return worker_total;
+        }
+    }
+
     bool *sem_failed = calloc(file_count > 0 ? file_count : 1, sizeof(bool));
     slist_t *new_dependencies = NULL;
+
+    /* The analyzers run one after another here, so the symbols they build
+     * for classes loaded from class files can be shared between them. */
+    type_registry_set_external_sharing(registry, true);
     for (i = 0; i < file_count; i++) {
         parse_result_t *pr = &parse_results[i];
         
@@ -1887,33 +2801,16 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
             continue;
         }
         
-        /* Create semantic analyzer with shared registry for cross-file type resolution.
-         * The registry allows resolving types from other files in the same compilation batch.
-         * This is now safe because the intern table has mutex protection. */
-        semantic_t *sem = semantic_new_with_registry(g_classpath, registry);
+        /* Semantic analysis. Diagnostics are printed only once it is known
+         * that this batch is the final one (see below). */
+        bool sem_ok = analyze_file(opts, registry, pr);
+        semantic_t *sem = pr->sem;
         if (!sem) {
             fprintf(stderr, "error: cannot create semantic analyzer for %s\n", pr->filename);
-            pr->sem = NULL;
             sem_errors++;
             continue;
         }
-        
-        sem->warnings_enabled = opts->warnings;
-        sem->werror = opts->werror;
-        sem->source_version = classfile_java_version(
-            classfile_version_from_string(opts->source_version));
-        
-        if (opts->sourcepath) {
-            semantic_set_sourcepath(sem, opts->sourcepath);
-        }
-        
-        /* Type names were already qualified in Phase 2b */
-        
-        /* Semantic analysis. Diagnostics are printed only once it is known
-         * that this batch is the final one (see below). */
-        bool sem_ok = semantic_analyze(sem, pr->ast, pr->source);
         sem_failed[i] = !sem_ok;
-        pr->sem = sem;
 
         /* Source files this analyzer loaded through -sourcepath that are
          * not already part of the compilation */
@@ -1933,6 +2830,9 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
             }
         }
     }
+
+    type_registry_set_external_sharing(registry, false);
+    timing_mark("semantic analysis");
 
     /* Anything loaded through -sourcepath means this batch is incomplete:
      * hand the newly found files back so the caller can restart with them
@@ -1971,8 +2871,10 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
         if (sem_failed[i]) {
             fprintf(stderr, "%d error(s) in %s\n", sem->error_count, pr->filename);
             sem_errors++;
-            semantic_free(sem);
-            pr->sem = NULL;
+            /* The analyzer is kept until the end of the batch like the
+             * others (symbols shared between the analyzers may refer to
+             * this file's classes); the file just gets no code generated. */
+            pr->sem_failed = true;
         }
     }
     free(sem_failed);
@@ -1982,7 +2884,7 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
     }
     
     /* ================================================================
-     * Phase 5b: Parallel Code Generation
+     * Phase 5b: Parallel Code Generation (threads)
      * Semantic analysis is complete, codegen is stateless and safe.
      * ================================================================ */
     if (opts->verbose) {
@@ -2009,6 +2911,7 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
     pthread_attr_destroy(&attr);
     pthread_mutex_destroy(&codegen_state.output_mutex);
     free(threads);
+    timing_mark("code generation");
     
     /* Free semantic analyzers */
     for (i = 0; i < file_count; i++) {
@@ -2041,6 +2944,7 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
     if (registry) {
         type_registry_free(registry);
     }
+    timing_mark("cleanup");
 
     return total_errors;
 }
@@ -2049,10 +2953,9 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
  * Compile all source files named on the command line, then whatever they
  * pulled in through -sourcepath.
  * 
- * Three-phase approach:
- *   Phase 1: Parse all files in parallel (no shared state)
- *   Phase 2: Resolve types (uses thread-safe classpath cache)
- *   Phase 3: Analyze and codegen in parallel (thread-local semantic_t)
+ * `thread_count` is the number of jobs: threads for parsing, worker
+ * processes (or threads) for analysis and code generation - see
+ * compile_batch().
  */
 static int compile_parallel(compiler_options_t *opts, int thread_count)
 {
@@ -2078,12 +2981,19 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
         filenames[i++] = (char *)list->data;
     }
     
+    /* With a single worker the phases run strictly one after another
+     * (this thread only waits for it), so nothing needs the intern table's
+     * locks. */
+    intern_set_concurrent(thread_count > 1);
+
     /* Initialize classpath (thread-safe cache) */
     if (!init_classpath(opts)) {
         free(filenames);
         return 1;
     }
     
+    timing_mark("classpath setup");
+
     /* Set up global state */
     g_opts = opts;
     g_compiled_sources = hashtable_new();
@@ -2119,8 +3029,12 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
      * named on the command line. The restart repeats only when something
      * new was found, so an ordinary build with nothing to pull in runs
      * exactly once. */
-    for (i = 0; i < file_count; i++) {
-        mark_source_compiled(filenames[i]);
+    /* (Only a -sourcepath compilation ever asks whether a file is already
+     * part of the compilation, and canonicalizing every name is not free.) */
+    if (opts->sourcepath) {
+        for (i = 0; i < file_count; i++) {
+            mark_source_compiled(filenames[i]);
+        }
     }
     int total_errors;
     for (;;) {
@@ -2174,6 +3088,12 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
         g_jar_writer = NULL;
     }
     
+    if (g_debug_timing && g_classpath) {
+        fprintf(stderr, "timing: classpath: %d classes loaded, %zu names not found\n",
+                g_classpath->classes_loaded,
+                g_classpath->negative_cache ? g_classpath->negative_cache->count : (size_t)0);
+    }
+
     hashtable_free(g_compiled_sources);
     g_compiled_sources = NULL;
     g_opts = NULL;
@@ -2326,7 +3246,8 @@ void print_usage(const char *program_name)
     printf("  -nowarn             Disable warnings\n");
     printf("  -Werror             Treat warnings as errors\n");
     printf("  -verbose            Enable verbose output\n");
-    printf("  -j[N]               Use N threads (default: auto, -j1 for single-threaded)\n");
+    printf("  -j[N]               Run N jobs at once (default: one per processor;\n");
+    printf("                      -j1 compiles in a single thread of one process)\n");
     printf("  -version            Print version information\n");
     printf("  -help               Print this help message\n");
     printf("\nReport bugs to <" PACKAGE_BUGREPORT ">.\n");
@@ -2337,6 +3258,17 @@ void print_usage(const char *program_name)
  */
 int main(int argc, char **argv)
 {
+    /* Note whether any GENESIS_DEBUG_* tracing is requested */
+    debug_env_init();
+
+    /* GENESIS_DEBUG_PAUSE=<seconds>: wait before doing anything, so that a
+     * profiler attaching by process name catches the whole run (the first
+     * phases are over within a few hundred milliseconds). */
+    if (g_debug_pause > 0) {
+        sleep((unsigned int)g_debug_pause);
+    }
+    timing_start();
+
     /* Initialize string interning for performance */
     intern_init();
     

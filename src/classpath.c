@@ -27,6 +27,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <dirent.h>
+#include <unistd.h>
 #include <zlib.h>
 #include <pthread.h>
 #include "classpath.h"
@@ -349,11 +350,14 @@ uint8_t *jar_read_entry(void *handle, const char *entry_path, size_t *size)
     }
 
     /* Read local file header to find actual data offset */
-    /* Add base_offset for JMOD files */
+    /* Add base_offset for JMOD files.
+     * The archive is read with positioned reads on its descriptor: classes
+     * are loaded from several code generation threads at once, and a
+     * seek followed by a read on the one shared stream is not atomic. */
+    int fd = fileno(jar->fp);
     long local_offset = jar->base_offset + entry->local_header_offset;
-    fseek(jar->fp, local_offset, SEEK_SET);
     uint8_t local_header[30];
-    if (fread(local_header, 1, 30, jar->fp) != 30) {
+    if (pread(fd, local_header, 30, (off_t)local_offset) != 30) {
         return NULL;
     }
 
@@ -364,18 +368,21 @@ uint8_t *jar_read_entry(void *handle, const char *entry_path, size_t *size)
     uint16_t name_len = read_le16(local_header + 26);
     uint16_t extra_len = read_le16(local_header + 28);
 
-    /* Skip to compressed data */
-    fseek(jar->fp, local_offset + 30 + name_len + extra_len, SEEK_SET);
-
-    /* Read compressed data */
+    /* Read compressed data, which follows the header's name and extra field */
     uint8_t *compressed = malloc(entry->compressed_size);
     if (!compressed) {
         return NULL;
     }
 
-    if (fread(compressed, 1, entry->compressed_size, jar->fp) != entry->compressed_size) {
-        free(compressed);
-        return NULL;
+    size_t got = 0;
+    while (got < entry->compressed_size) {
+        ssize_t n = pread(fd, compressed + got, entry->compressed_size - got,
+                          (off_t)(local_offset + 30 + name_len + extra_len) + (off_t)got);
+        if (n <= 0) {
+            free(compressed);
+            return NULL;
+        }
+        got += (size_t)n;
     }
 
     uint8_t *result;
@@ -815,17 +822,18 @@ classpath_t *classpath_new(void)
     cp->entries = NULL;
     cp->cache = hashtable_new();
     cp->negative_cache = hashtable_new_sized(1024);  /* Pre-sized for common misses */
+    cp->no_files = hashtable_new();
 
-    if (!cp->cache || !cp->negative_cache) {
+    if (!cp->cache || !cp->negative_cache || !cp->no_files) {
         classpath_free(cp);
         return NULL;
     }
     
-    /* Initialize mutex for thread-safe cache access */
-    pthread_mutex_t *mutex = malloc(sizeof(pthread_mutex_t));
-    if (mutex) {
-        pthread_mutex_init(mutex, NULL);
-        cp->cache_mutex = mutex;
+    /* Initialize lock for thread-safe cache access */
+    pthread_mutex_t *lock = malloc(sizeof(pthread_mutex_t));
+    if (lock) {
+        pthread_mutex_init(lock, NULL);
+        cp->cache_lock = lock;
     }
 
     return cp;
@@ -841,10 +849,71 @@ static void free_classfile(void *data)
     classfile_free((classfile_t *)data);
 }
 
+/*
+ * Package index
+ */
+
+/* The JAR/JMOD entries holding classes of one package, in search order */
+typedef struct cp_package
+{
+    cp_entry_t **entries;
+    int count;
+    int capacity;
+} cp_package_t;
+
+static void cp_package_free(void *data)
+{
+    cp_package_t *pkg = (cp_package_t *)data;
+    if (pkg) {
+        free(pkg->entries);
+        free(pkg);
+    }
+}
+
+/* Free the per-package file listings of a directory entry */
+static void cp_entry_free_dir_packages(classpath_t *cp, cp_entry_t *entry)
+{
+    if (!entry || !entry->dir_packages) {
+        return;
+    }
+    for (size_t i = 0; i < entry->dir_packages->size; i++) {
+        for (hashtable_entry_t *e = entry->dir_packages->buckets[i]; e; e = e->next) {
+            if (e->value != cp->no_files) {
+                hashtable_free((hashtable_t *)e->value);
+            }
+        }
+    }
+    hashtable_free(entry->dir_packages);
+    entry->dir_packages = NULL;
+}
+
+static void classpath_free_package_index(classpath_t *cp)
+{
+    if (cp->package_index) {
+        hashtable_free_full(cp->package_index, cp_package_free);
+        cp->package_index = NULL;
+    }
+    free(cp->dir_entries);
+    cp->dir_entries = NULL;
+    cp->dir_entry_count = 0;
+    cp->indexed_entry_count = 0;
+}
+
 void classpath_free(classpath_t *cp)
 {
     if (!cp) {
         return;
+    }
+
+    classpath_free_package_index(cp);
+    for (slist_t *node = cp->boot_entries; node; node = node->next) {
+        cp_entry_free_dir_packages(cp, (cp_entry_t *)node->data);
+    }
+    for (slist_t *node = cp->entries; node; node = node->next) {
+        cp_entry_free_dir_packages(cp, (cp_entry_t *)node->data);
+    }
+    if (cp->no_files) {
+        hashtable_free(cp->no_files);
     }
 
     /* Free boot entries */
@@ -867,10 +936,10 @@ void classpath_free(classpath_t *cp)
         hashtable_free(cp->negative_cache);
     }
     
-    /* Destroy and free mutex */
-    if (cp->cache_mutex) {
-        pthread_mutex_destroy((pthread_mutex_t *)cp->cache_mutex);
-        free(cp->cache_mutex);
+    /* Destroy and free lock */
+    if (cp->cache_lock) {
+        pthread_mutex_destroy((pthread_mutex_t *)cp->cache_lock);
+        free(cp->cache_lock);
     }
 
     free(cp->java_home);
@@ -889,6 +958,7 @@ bool classpath_add_boot(classpath_t *cp, const char *path)
     } else {
         slist_append(cp->boot_entries, entry);
     }
+    cp->entry_count++;
     return true;
 }
 
@@ -904,6 +974,7 @@ bool classpath_add(classpath_t *cp, const char *path)
     } else {
         slist_append(cp->entries, entry);
     }
+    cp->entry_count++;
     return true;
 }
 
@@ -1036,30 +1107,22 @@ static classfile_t *load_from_jar(cp_entry_t *entry, const char *path)
     return cf;
 }
 
-static classfile_t *load_from_jmod(cp_entry_t *entry, const char *classname_internal)
+static classfile_t *load_from_jmod(cp_entry_t *entry, const char *path)
 {
     if (!entry->jar_handle) {
         return NULL;
     }
 
-    /* JMOD stores classes in classes/ directory */
-    /* The classname is already in internal form: java/lang/String.class */
-    /* We need to strip the .class suffix and pass just the class name */
-    size_t len = strlen(classname_internal);
-    char *classname = strdup(classname_internal);
-    if (!classname) {
+    /* JMOD stores classes under classes/: java/lang/String.class is the
+     * archive member classes/java/lang/String.class */
+    char member[1024];
+    int len = snprintf(member, sizeof(member), "classes/%s", path);
+    if (len < 0 || (size_t)len >= sizeof(member)) {
         return NULL;
     }
-    
-    /* Remove .class suffix if present */
-    if (len > 6 && strcmp(classname + len - 6, ".class") == 0) {
-        classname[len - 6] = '\0';
-    }
-    
+
     size_t size;
-    uint8_t *data = jmod_read_class(entry->jar_handle, classname, &size);
-    free(classname);
-    
+    uint8_t *data = jar_read_entry(entry->jar_handle, member, &size);
     if (!data) {
         return NULL;
     }
@@ -1083,61 +1146,325 @@ static classfile_t *load_from_entry(cp_entry_t *entry, const char *path)
     }
 }
 
+static void classpath_index_add(hashtable_t *index, const char *package, cp_entry_t *entry)
+{
+    cp_package_t *pkg = (cp_package_t *)hashtable_lookup(index, package);
+    if (!pkg) {
+        pkg = calloc(1, sizeof(cp_package_t));
+        if (!pkg) {
+            return;
+        }
+        hashtable_insert(index, package, pkg);
+    }
+    /* Archives are indexed one at a time, so an entry already listed for
+     * this package is the last one */
+    if (pkg->count > 0 && pkg->entries[pkg->count - 1] == entry) {
+        return;
+    }
+    if (pkg->count == pkg->capacity) {
+        int capacity = pkg->capacity ? pkg->capacity * 2 : 2;
+        cp_entry_t **entries = realloc(pkg->entries, (size_t)capacity * sizeof(cp_entry_t *));
+        if (!entries) {
+            return;
+        }
+        pkg->entries = entries;
+        pkg->capacity = capacity;
+    }
+    pkg->entries[pkg->count++] = entry;
+}
+
+/* Enter every package a JAR/JMOD entry holds classes of */
+static void classpath_index_archive(classpath_t *cp, cp_entry_t *entry)
+{
+    jar_handle_t *jar = (jar_handle_t *)entry->jar_handle;
+    if (!jar) {
+        return;
+    }
+    char package[1024];
+    for (zip_entry_t *e = jar->entries; e; e = e->next) {
+        const char *name = e->filename;
+        if (!name) {
+            continue;
+        }
+        if (entry->type == CP_JMOD) {
+            /* Classes of a JMOD are under classes/ */
+            if (strncmp(name, "classes/", 8) != 0) {
+                continue;
+            }
+            name += 8;
+        }
+        size_t len = strlen(name);
+        if (len < 7 || strcmp(name + len - 6, ".class") != 0) {
+            continue;
+        }
+        const char *slash = strrchr(name, '/');
+        size_t package_len = slash ? (size_t)(slash - name) : 0;
+        if (package_len >= sizeof(package)) {
+            continue;
+        }
+        memcpy(package, name, package_len);
+        package[package_len] = '\0';
+        classpath_index_add(cp->package_index, package, entry);
+    }
+}
+
+/*
+ * Whether the package index is there and covers every entry. The caller
+ * holds the cache lock.
+ */
+static bool classpath_package_index_ready(classpath_t *cp)
+{
+    return cp->package_index && cp->indexed_entry_count == cp->entry_count;
+}
+
+/*
+ * Build the package index, or rebuild it if entries have been added since.
+ * The caller holds the cache lock.
+ *
+ * A class can only be in an archive that has its package, and the central
+ * directory of every archive is already in memory. Without the index each
+ * lookup asked every entry in turn - ten JMODs and every JAR of the
+ * classpath, each computing its own hash of the member name - and semantic
+ * analysis makes a great many lookups for names that turn out not to exist
+ * (a simple name tried as a member of each implemented interface, a
+ * package prefix tried as a class). Directory entries are not indexed;
+ * they are searched in their place in the order (see
+ * classpath_dir_files()).
+ */
+static void classpath_build_package_index(classpath_t *cp)
+{
+    if (classpath_package_index_ready(cp)) {
+        return;
+    }
+
+    classpath_free_package_index(cp);
+    cp->package_index = hashtable_new_sized(2048);
+    cp->dir_entries = calloc(cp->entry_count > 0 ? (size_t)cp->entry_count : 1,
+                             sizeof(cp_entry_t *));
+    if (!cp->package_index || !cp->dir_entries) {
+        return;
+    }
+
+    int order = 0;
+    slist_t *lists[2];
+    lists[0] = cp->boot_entries;
+    lists[1] = cp->entries;
+    for (int n = 0; n < 2; n++) {
+        for (slist_t *node = lists[n]; node; node = node->next) {
+            cp_entry_t *entry = (cp_entry_t *)node->data;
+            entry->order = order++;
+            if (entry->type == CP_DIRECTORY) {
+                cp->dir_entries[cp->dir_entry_count++] = entry;
+            } else {
+                classpath_index_archive(cp, entry);
+            }
+        }
+    }
+    cp->indexed_entry_count = cp->entry_count;
+}
+
+/*
+ * The names of the files in the directory of `package` ("java/util", or ""
+ * for the unnamed package) under a directory entry, as a set. The directory
+ * is read once, on the first lookup in that package: finding out that a
+ * class is not there then costs a hash lookup rather than a failed open().
+ * (The output directory and "." are always on the classpath, and are asked
+ * for nearly every class the compilation refers to.)
+ *
+ * The listing is not refreshed. A class file written into the directory
+ * later in the same run - the compiler's own output - is not seen, which
+ * is as it should be: the classes of this compilation are resolved from
+ * their sources, not read back from disk while other threads are still
+ * writing them.
+ */
+static hashtable_t *classpath_dir_files(classpath_t *cp, cp_entry_t *entry, const char *package)
+{
+    pthread_mutex_t *lock = (pthread_mutex_t *)cp->cache_lock;
+
+    if (lock) {
+        pthread_mutex_lock(lock);
+    }
+    hashtable_t *files = entry->dir_packages ?
+        (hashtable_t *)hashtable_lookup(entry->dir_packages, package) : NULL;
+    if (lock) {
+        pthread_mutex_unlock(lock);
+    }
+    if (files) {
+        return files;
+    }
+
+    /* Read the directory without holding the lock */
+    char dir_path[1024];
+    int len = snprintf(dir_path, sizeof(dir_path), "%s%s%s", entry->path,
+                       *package ? "/" : "", package);
+    DIR *dir = (len > 0 && (size_t)len < sizeof(dir_path)) ? opendir(dir_path) : NULL;
+    if (dir) {
+        files = hashtable_new();
+        struct dirent *de;
+        while (files && (de = readdir(dir)) != NULL) {
+            hashtable_insert(files, de->d_name, (void *)1);
+        }
+        closedir(dir);
+    }
+    if (!files) {
+        files = cp->no_files;
+    }
+
+    if (lock) {
+        pthread_mutex_lock(lock);
+    }
+    if (!entry->dir_packages) {
+        entry->dir_packages = hashtable_new();
+    }
+    hashtable_t *existing = entry->dir_packages ?
+        (hashtable_t *)hashtable_lookup(entry->dir_packages, package) : NULL;
+    if (existing) {
+        /* Another thread read it meanwhile */
+        if (files != cp->no_files) {
+            hashtable_free(files);
+        }
+        files = existing;
+    } else if (entry->dir_packages) {
+        hashtable_insert(entry->dir_packages, package, files);
+    }
+    if (lock) {
+        pthread_mutex_unlock(lock);
+    }
+    return files;
+}
+
 classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
 {
-    pthread_mutex_t *mutex = (pthread_mutex_t *)cp->cache_mutex;
+    pthread_mutex_t *lock = (pthread_mutex_t *)cp->cache_lock;
+
+    /* The class file's path, split into package directory and file name:
+     * java.util.Map$Entry is java/util + Map$Entry.class */
+    char path_buf[512];
+    size_t name_len = strlen(classname);
+    char *path = name_len + 7 <= sizeof(path_buf) ? path_buf : malloc(name_len + 7);
+    if (!path) {
+        return NULL;
+    }
+    char *slash = NULL;
+    for (size_t i = 0; i < name_len; i++) {
+        if (classname[i] == '.') {
+            path[i] = '/';
+            slash = path + i;
+        } else {
+            path[i] = classname[i];
+        }
+    }
+    memcpy(path + name_len, ".class", 7);
+    const char *file = slash ? slash + 1 : path;
     
     /* Lock for cache access */
-    if (mutex) {
-        pthread_mutex_lock(mutex);
+    if (lock) {
+        pthread_mutex_lock(lock);
     }
     
     /* Check positive cache first */
     classfile_t *cached = (classfile_t *)hashtable_lookup(cp->cache, classname);
-    if (cached) {
-        cp->cache_hits++;
-        if (mutex) {
-            pthread_mutex_unlock(mutex);
+
+    /* Check negative cache - avoid repeated failed lookups */
+    bool known_missing = !cached && cp->negative_cache &&
+                         hashtable_lookup(cp->negative_cache, classname);
+
+    /* Find the archives that hold classes of the package */
+    cp_package_t *pkg = NULL;
+    bool index_ready = classpath_package_index_ready(cp);
+    if (!cached && !known_missing && index_ready) {
+        if (slash) {
+            *slash = '\0';
+        }
+        pkg = (cp_package_t *)hashtable_lookup(cp->package_index, slash ? path : "");
+        if (slash) {
+            *slash = '/';
+        }
+    }
+
+    if (lock) {
+        pthread_mutex_unlock(lock);
+    }
+
+    if (cached || known_missing) {
+        if (path != path_buf) {
+            free(path);
         }
         return cached;
     }
-    
-    /* Check negative cache - avoid repeated failed lookups */
-    if (cp->negative_cache && hashtable_lookup(cp->negative_cache, classname)) {
-        cp->negative_cache_hits++;
-        if (mutex) {
-            pthread_mutex_unlock(mutex);
-        }
-        return NULL;
-    }
-    
-    /* Unlock while doing I/O (which is slow) */
-    if (mutex) {
-        pthread_mutex_unlock(mutex);
-    }
 
-    char *path = classname_to_path(classname);
-    if (!path) {
-        return NULL;
+    if (!index_ready) {
+        /* First lookup: build the package index */
+        if (lock) {
+            pthread_mutex_lock(lock);
+        }
+        classpath_build_package_index(cp);
+        if (cp->package_index) {
+            if (slash) {
+                *slash = '\0';
+            }
+            pkg = (cp_package_t *)hashtable_lookup(cp->package_index, slash ? path : "");
+            if (slash) {
+                *slash = '/';
+            }
+        }
+        if (lock) {
+            pthread_mutex_unlock(lock);
+        }
     }
 
     classfile_t *cf = NULL;
+    bool package_exists = pkg != NULL;
 
-    /* Search boot classpath first (read-only, no lock needed) */
-    for (slist_t *node = cp->boot_entries; node && !cf; node = node->next) {
-        cf = load_from_entry((cp_entry_t *)node->data, path);
+    /* Search in classpath order - boot classpath first, then user
+     * classpath - visiting only the archives that have the package, and
+     * each directory entry in its turn. The I/O is done without the lock. */
+    int archive = 0;
+    int directory = 0;
+    while (!cf) {
+        cp_entry_t *a = (pkg && archive < pkg->count) ? pkg->entries[archive] : NULL;
+        cp_entry_t *d = directory < cp->dir_entry_count ? cp->dir_entries[directory] : NULL;
+        if (!a && !d) {
+            break;
+        }
+        if (a && (!d || a->order < d->order)) {
+            archive++;
+            cf = load_from_entry(a, path);
+        } else {
+            directory++;
+            if (slash) {
+                *slash = '\0';
+            }
+            hashtable_t *files = classpath_dir_files(cp, d, slash ? path : "");
+            if (slash) {
+                *slash = '/';
+            }
+            if (files != cp->no_files) {
+                package_exists = true;
+            }
+            if (hashtable_contains(files, file)) {
+                cf = load_from_entry(d, path);
+            }
+        }
     }
 
-    /* Then user classpath (read-only, no lock needed) */
-    for (slist_t *node = cp->entries; node && !cf; node = node->next) {
-        cf = load_from_entry((cp_entry_t *)node->data, path);
+    if (path != path_buf) {
+        free(path);
     }
 
-    free(path);
+    /* A name in a package that nothing on the classpath has: establishing
+     * that again costs a few hash lookups, less than remembering every
+     * such name would. They are by far the most numerous - a qualified
+     * name is retried with each of its dots in turn read as a nested-class
+     * boundary ("org.example.Outer$Inner" as class "example$Outer$Inner"
+     * of package "org", ...), and those packages hold no classes. */
+    if (!cf && !package_exists) {
+        return NULL;
+    }
 
     /* Lock for cache update */
-    if (mutex) {
-        pthread_mutex_lock(mutex);
+    if (lock) {
+        pthread_mutex_lock(lock);
     }
     
     /* Check cache again - another thread may have loaded it while we were doing I/O */
@@ -1147,9 +1474,8 @@ classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
         if (cf) {
             classfile_free(cf);
         }
-        cp->cache_hits++;
-        if (mutex) {
-            pthread_mutex_unlock(mutex);
+        if (lock) {
+            pthread_mutex_unlock(lock);
         }
         return existing;
     }
@@ -1161,10 +1487,13 @@ classfile_t *classpath_find_class(classpath_t *cp, const char *classname)
     } else if (cp->negative_cache) {
         /* Add to negative cache so we don't search again */
         hashtable_insert(cp->negative_cache, classname, (void *)1);
+        if (debug_getenv("GENESIS_DEBUG_CLASSPATH_MISS")) {
+            fprintf(stderr, "DEBUG classpath miss: %s\n", classname);
+        }
     }
     
-    if (mutex) {
-        pthread_mutex_unlock(mutex);
+    if (lock) {
+        pthread_mutex_unlock(lock);
     }
 
     return cf;

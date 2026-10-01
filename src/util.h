@@ -166,45 +166,40 @@ bool file_put_contents(const char *filename, const char *contents, size_t length
 unsigned int str_hash(const char *str);
 bool parse_boolean(const char *str, bool default_value);
 
+/**
+ * Debug tracing switches (the GENESIS_DEBUG_* environment variables) are
+ * tested on the hottest paths of the compiler. getenv() is a linear scan of
+ * the environment under a lock, so asking it on every call is measurable
+ * (several percent of a large build). debug_env_init() looks once, at
+ * startup, at whether any GENESIS_DEBUG_* variable is set at all; when none
+ * is, debug_getenv() answers without touching the environment.
+ */
+extern bool g_debug_env_enabled;
+void debug_env_init(void);
+#define debug_getenv(name) (g_debug_env_enabled ? getenv(name) : NULL)
+
+/* GENESIS_DEBUG_TIMING: report the wall-clock time of each compilation
+ * phase on stderr. GENESIS_DEBUG_PAUSE=<seconds>: wait that long before
+ * starting, so that a profiler attaching by process name sees the whole
+ * run. Neither enables debug_getenv(). */
+extern bool g_debug_timing;
+extern int g_debug_pause;
+
 /* ========================================================================
  * String Interning
  * ======================================================================== */
 
 /**
- * String intern table for O(1) string comparison.
- * All interned strings are stored in a single large buffer.
- * Interned strings can be compared with pointer equality (==).
- */
-typedef struct intern_table {
-    char *buffer;           /* Single buffer for all interned strings */
-    size_t buffer_size;     /* Allocated size of buffer */
-    size_t buffer_used;     /* Used size of buffer */
-    hashtable_t *index;     /* hash -> offset in buffer (stored as intptr_t) */
-} intern_table_t;
-
-intern_table_t *intern_table_new(void);
-void intern_table_free(intern_table_t *table);
-
-/**
- * Intern a string. Returns a pointer to the interned string.
- * The returned pointer is valid for the lifetime of the intern table.
- * Interned strings can be compared with pointer equality (==).
- */
-const char *intern_string(intern_table_t *table, const char *str);
-
-/**
- * Intern a string with known length (may not be null-terminated).
- */
-const char *intern_string_len(intern_table_t *table, const char *str, size_t len);
-
-/**
  * Global intern table for compiler-wide string interning.
+ * Interned strings can be compared with pointer equality (==), and a
+ * pointer returned by intern() stays valid until intern_cleanup().
  * Call intern_init() at startup and intern_cleanup() at shutdown.
  */
 void intern_init(void);
 void intern_cleanup(void);
 const char *intern(const char *str);
 const char *intern_len(const char *str, size_t len);
+void intern_set_concurrent(bool concurrent);
 
 /* ========================================================================
  * Memory Pool (Arena Allocator)

@@ -651,6 +651,11 @@ struct symbol
     /* Completer for lazy member population (javac-style) */
     symbol_completer_t completer;   /* Function to populate members */
     void *completer_context;        /* Context for completer (type_registry + classpath) */
+
+    /* For a class loaded from a class file and shared by every analyzer of
+     * the batch: its record in type_registry_t.external_classes (an
+     * external_class_t*). NULL for every other symbol. */
+    void *shared_record;
     
     /* Kind-specific data */
     union {
@@ -884,6 +889,9 @@ typedef struct semantic
     hashtable_t *sourcepath_misses; /* Qualified names for which no source
                                   * file exists on the sourcepath (see
                                   * load_class_from_source_impl). */
+    hashtable_t *nested_imports_done; /* Registry types whose nested types
+                                  * have already been entered in unit_types
+                                  * by simple name (load_external_class). */
     hashtable_t *loading_external_names; /* Qualified names currently mid-load
                                   * via load_external_class. Deliberately a
                                   * separate table from loading_names:
@@ -936,7 +944,43 @@ typedef struct type_registry {
     hashtable_t *ast_map;       /* qualified_name -> ast_node_t* (for deferred population) */
     void *mutex;                /* pthread_mutex_t* for thread safety */
     bool populated;             /* True after all symbols have been fully populated */
+    bool sealed;                /* Every type has been registered: `types` and
+                                 * `ast_map` are only read from now on, and
+                                 * lookups in them take no lock (see
+                                 * type_registry_seal()). */
+
+    /* Secondary indexes over `types`, built on first use and rebuilt if a
+     * type is registered afterwards (see type_registry_ensure_indexes()).
+     * Each value is an slist of hashtable_entry_t* - entries of `types` -
+     * in the order a walk over the buckets of `types` meets them. */
+    hashtable_t *nested_index;  /* outer qualified name -> its directly nested types */
+    hashtable_t *simple_index;  /* last name segment -> the types so named */
+    size_t indexed_count;       /* types->count when the indexes were built */
+
+    /* Qualified (dotted) names that load_external_class() has established
+     * do not name any class: not in this registry, not on the classpath,
+     * not on the sourcepath. Every file of a batch asks for many of the
+     * same nonexistent names (speculative Outer$Inner probes, package
+     * prefixes tried as class names), and each such miss is expensive. */
+    hashtable_t *missing_classes;
+
+    /* Symbols of classes loaded from class files (the JDK, the classpath),
+     * built once and used by every analyzer of the batch instead of each
+     * file's analyzer building its own copy of java.lang.String and
+     * everything it drags in. See symbol_from_classfile_shared(). */
+    hashtable_t *external_classes;  /* internal class name -> external_class_t* */
+    bool external_sharing_open;     /* New entries may be added: true only
+                                     * during serial semantic analysis.
+                                     * Parallel code generation reads the
+                                     * table but never adds to it. */
+    struct external_class *external_loading;   /* Classes under construction, innermost first */
+    struct external_class *external_completed; /* Built since the outermost load began */
+    bool external_tainted;          /* That outermost load must not be shared */
 } type_registry_t;
+
+/* Open/close the window during which symbols built from class files are
+ * entered in the registry for sharing (see external_sharing_open). */
+void type_registry_set_external_sharing(type_registry_t *reg, bool open);
 
 /* Type registry API */
 type_registry_t *type_registry_new(void);
@@ -944,6 +988,7 @@ void type_registry_free(type_registry_t *reg);
 void type_registry_register(type_registry_t *reg, const char *qname, symbol_t *sym, ast_node_t *ast);
 symbol_t *type_registry_lookup(type_registry_t *reg, const char *qname);
 ast_node_t *type_registry_get_ast(type_registry_t *reg, const char *qname);
+void type_registry_seal(type_registry_t *reg);
 
 /* Multi-phase compilation support (javac-style) */
 /* Phase 3: Member Entry - add method/field signatures with unresolved types */
@@ -979,6 +1024,7 @@ bool semantic_analyze(semantic_t *sem, ast_node_t *ast, source_file_t *source);
 void semantic_error(semantic_t *sem, int line, int col, const char *fmt, ...);
 void semantic_warning(semantic_t *sem, int line, int col, const char *fmt, ...);
 void semantic_print_diagnostics(semantic_t *sem);
+char *semantic_format_diagnostics(semantic_t *sem);
 
 /* Type resolution */
 type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node);
@@ -991,6 +1037,10 @@ struct classpath;  /* Forward declaration */
 void resolve_types_in_compilation_unit(ast_node_t *ast, struct classpath *classpath,
                                        slist_t *sourcepath_list,
                                        type_registry_t *registry);
+void resolve_types_in_compilation_unit_cached(ast_node_t *ast, struct classpath *classpath,
+                                              slist_t *sourcepath_list,
+                                              type_registry_t *registry,
+                                              hashtable_t *probes);
 
 /* Sourcepath parsing helpers (for use before semantic_t is created) */
 slist_t *sourcepath_parse(const char *sourcepath);

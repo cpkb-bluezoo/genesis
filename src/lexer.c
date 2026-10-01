@@ -325,8 +325,16 @@ static keyword_entry_t keywords[] = {
  */
 static token_type_t lookup_keyword(const char *name)
 {
+    /* Called for every identifier in the source. Every keyword starts with
+     * a lowercase letter, so most identifiers are dismissed on their first
+     * character, and the rest only reach strcmp() for the few keywords
+     * sharing it. */
+    char first = name[0];
+    if (first < 'a' || first > 'z') {
+        return TOK_IDENTIFIER;
+    }
     for (int i = 0; keywords[i].name != NULL; i++) {
-        if (strcmp(keywords[i].name, name) == 0) {
+        if (keywords[i].name[0] == first && strcmp(keywords[i].name, name) == 0) {
             return keywords[i].type;
         }
     }

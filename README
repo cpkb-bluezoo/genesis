@@ -54,12 +54,24 @@ a large real-world project (644 source files, 942 class files) shows:
 
 ## Performance
 
-Under review. Earlier figures here (644 source files, genesis ~2x faster
-than javac) predated the Java 25 parity work against gumdrop and are no
-longer current - a lot of correctness fixes landed since, some of which
-carry a real cost, and this section will be updated once a proper
-performance pass is done. Run `make bench` (see CONTRIBUTING) for current
-numbers on your own machine in the meantime.
+Compiling all of [gumdrop](https://github.com/cpkb-bluezoo/gumdrop) in one
+invocation (1408 source files, about 340,000 lines, 15 jars on the classpath,
+`--release 25 -g`, output to an empty directory), genesis against javac 25.0.4
+on an Apple M4 (4 performance and 6 efficiency cores), average of 10 runs:
+
+| Compiler | Wall clock | CPU time (user+sys) | Speedup vs javac |
+|----------|-----------:|--------------------:|-----------------:|
+| genesis (default, one job per processor) | 0.46 s | 2.99 s | 7.4x |
+| genesis `-j1` | 1.13 s | 1.12 s | 3.0x |
+| javac | 3.37 s | 13.74 s | 1.0x |
+
+By default genesis parses on all processors, then divides semantic analysis
+and code generation between worker processes, one per processor. `-j1` does
+everything in a single thread of one process and uses the least processor
+time in total; `-jN` limits the number of jobs to N. Batches of fewer than 32
+files, and JAR output, are analysed in the compiler process itself.
+
+Run `make bench` (see CONTRIBUTING) for numbers on your own machine.
 
 ## Building
 
@@ -124,7 +136,7 @@ genesis -version
 | `-g:none` | Do not generate debugging information |
 | `-nowarn` | Disable all warnings |
 | `-Werror` | Treat warnings as errors |
-| `-j[N]` | Use N threads (default: auto-detect, `-j1` for single-threaded) |
+| `-j[N]` | Run N jobs at once (default: one per processor; `-j1` compiles in a single thread of one process) |
 | `-verbose` | Print compilation progress |
 | `-version` | Display version information |
 | `-help` | Print usage information |

@@ -70,6 +70,7 @@ void const_pool_free(const_pool_t *cp)
     }
     
     free(cp->entries);
+    free(cp->class_by_name);
     hashtable_free(cp->utf8_cache);
     free(cp);
 }
@@ -274,17 +275,34 @@ uint16_t cp_add_class(const_pool_t *cp, const char *name)
     
     uint16_t name_index = cp_add_utf8(cp, name);
     
-    /* Search for existing CONST_CLASS with same name_index to avoid duplicates */
-    for (uint16_t i = 1; i < cp->count; i++) {
-        if (cp->entries[i].type == CONST_CLASS && 
-            cp->entries[i].data.class_index == name_index) {
-            return i;  /* Return existing entry */
+    /* Reuse the existing CONST_CLASS entry for this name, if there is one.
+     * Class entries are only ever created here, one per name, so a table
+     * from UTF8 index to class index finds it directly. (This function is
+     * called for every class reference in the code and every reference
+     * type pushed in a stack map frame; searching the whole pool each
+     * time was a noticeable part of code generation.) */
+    if ((size_t)name_index >= cp->class_by_name_size) {
+        size_t new_size = cp->class_by_name_size ? cp->class_by_name_size : 256;
+        while (new_size <= (size_t)name_index) {
+            new_size *= 2;
         }
+        uint16_t *table = realloc(cp->class_by_name, new_size * sizeof(uint16_t));
+        if (!table) {
+            return 0;
+        }
+        memset(table + cp->class_by_name_size, 0,
+               (new_size - cp->class_by_name_size) * sizeof(uint16_t));
+        cp->class_by_name = table;
+        cp->class_by_name_size = new_size;
+    }
+    if (cp->class_by_name[name_index]) {
+        return cp->class_by_name[name_index];  /* Return existing entry */
     }
     
     uint16_t index = cp_add_entry(cp);
     cp->entries[index].type = CONST_CLASS;
     cp->entries[index].data.class_index = name_index;
+    cp->class_by_name[name_index] = index;
     return index;
 }
 

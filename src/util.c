@@ -1054,222 +1054,291 @@ bool parse_boolean(const char *str, bool default_value)
     return default_value;
 }
 
+bool g_debug_env_enabled = false;
+bool g_debug_timing = false;
+int g_debug_pause = 0;
+
+extern char **environ;
+
+/**
+ * Note whether any GENESIS_DEBUG_* tracing variable is set (see
+ * debug_getenv()). GENESIS_DEBUG_TIMING and GENESIS_DEBUG_PAUSE are read
+ * here once and for all and do not count: they exist to measure the
+ * compiler, and must not themselves switch the hot paths over to calling
+ * getenv().
+ */
+void debug_env_init(void)
+{
+    static const char prefix[] = "GENESIS_DEBUG_";
+    static const char timing[] = "GENESIS_DEBUG_TIMING=";
+    static const char pause[] = "GENESIS_DEBUG_PAUSE=";
+
+    g_debug_env_enabled = false;
+    g_debug_timing = false;
+    g_debug_pause = 0;
+    if (!environ) {
+        return;
+    }
+    for (char **e = environ; *e; e++) {
+        if (strncmp(*e, prefix, sizeof(prefix) - 1) != 0) {
+            continue;
+        }
+        if (strncmp(*e, timing, sizeof(timing) - 1) == 0) {
+            g_debug_timing = true;
+        } else if (strncmp(*e, pause, sizeof(pause) - 1) == 0) {
+            g_debug_pause = atoi(*e + sizeof(pause) - 1);
+        } else {
+            g_debug_env_enabled = true;
+        }
+    }
+}
+
 /* ========================================================================
  * String Interning implementation
  * ======================================================================== */
 
-#define INTERN_INITIAL_BUFFER_SIZE (1024 * 1024)  /* 1MB initial buffer */
-#define INTERN_INITIAL_INDEX_SIZE 8192            /* Initial hashtable size */
-
-/**
- * Create a new intern table.
+/*
+ * The intern table is consulted for every identifier and literal the
+ * parser sees, from every parser thread at once, and again throughout
+ * semantic analysis and code generation. It is therefore split into
+ * independent shards, each with its own lock, table and string storage: a
+ * string's hash selects its shard, so two threads only ever wait for one
+ * another when they intern strings of the same shard at the same instant.
+ * (A single table behind a single mutex made the parallel parse phase no
+ * faster than the serial one - the threads spent their time queueing for
+ * the lock.)
+ *
+ * Interned strings are stored in fixed chunks that are never moved or
+ * freed before intern_cleanup(), so a pointer returned by intern() stays
+ * valid for the life of the compilation however large the table grows.
  */
-intern_table_t *intern_table_new(void)
+
+#define INTERN_SHARD_BITS 6
+#define INTERN_SHARDS (1 << INTERN_SHARD_BITS)
+#define INTERN_INITIAL_SLOTS 1024             /* Per shard; a power of two */
+#define INTERN_CHUNK_SIZE (64 * 1024)         /* String storage chunk */
+
+typedef struct intern_entry
 {
-    intern_table_t *table = malloc(sizeof(intern_table_t));
-    if (!table) {
-        return NULL;
+    const char *str;        /* NULL: empty slot */
+    unsigned int hash;
+    unsigned int len;
+} intern_entry_t;
+
+typedef struct intern_chunk
+{
+    struct intern_chunk *next;
+    size_t size;
+    size_t used;
+} intern_chunk_t;
+
+typedef struct intern_shard
+{
+    pthread_mutex_t mutex;
+    intern_entry_t *slots;  /* Open addressing, linear probing */
+    size_t capacity;        /* Number of slots; a power of two */
+    size_t count;
+    intern_chunk_t *chunks; /* Most recent first */
+} intern_shard_t;
+
+static intern_shard_t g_intern_shards[INTERN_SHARDS];
+static pthread_once_t g_intern_once = PTHREAD_ONCE_INIT;
+
+/* Cleared while only one thread at a time can be interning (see
+ * intern_set_concurrent()); the shard locks are then skipped. */
+static bool g_intern_locking = true;
+
+static void intern_shards_init(void)
+{
+    for (int i = 0; i < INTERN_SHARDS; i++) {
+        pthread_mutex_init(&g_intern_shards[i].mutex, NULL);
+        g_intern_shards[i].slots = NULL;
+        g_intern_shards[i].capacity = 0;
+        g_intern_shards[i].count = 0;
+        g_intern_shards[i].chunks = NULL;
     }
-    
-    table->buffer_size = INTERN_INITIAL_BUFFER_SIZE;
-    table->buffer_used = 0;
-    table->buffer = malloc(table->buffer_size);
-    if (!table->buffer) {
-        free(table);
-        return NULL;
+}
+
+/* FNV-1a */
+static unsigned int intern_hash(const char *str, size_t len)
+{
+    unsigned int hash = 2166136261u;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= (unsigned char)str[i];
+        hash *= 16777619u;
     }
-    
-    table->index = hashtable_new_sized(INTERN_INITIAL_INDEX_SIZE);
-    if (!table->index) {
-        free(table->buffer);
-        free(table);
-        return NULL;
-    }
-    
-    return table;
+    return hash;
 }
 
 /**
- * Free an intern table.
+ * Double the slot table of a shard (or create it).
  */
-void intern_table_free(intern_table_t *table)
+static bool intern_shard_grow(intern_shard_t *shard)
 {
-    if (!table) {
-        return;
-    }
-    
-    /* Note: we don't free individual strings - they're all in the buffer */
-    hashtable_free(table->index);
-    free(table->buffer);
-    free(table);
-}
-
-/**
- * Grow the intern table buffer.
- */
-static bool intern_table_grow(intern_table_t *table, size_t needed)
-{
-    size_t new_size = table->buffer_size;
-    while (new_size < table->buffer_used + needed) {
-        new_size *= 2;
-    }
-    
-    char *new_buffer = realloc(table->buffer, new_size);
-    if (!new_buffer) {
+    size_t new_capacity = shard->capacity ? shard->capacity * 2 : INTERN_INITIAL_SLOTS;
+    intern_entry_t *new_slots = calloc(new_capacity, sizeof(intern_entry_t));
+    if (!new_slots) {
         return false;
     }
-    
-    /* If buffer moved, we need to update all hashtable entries */
-    if (new_buffer != table->buffer) {
-        ptrdiff_t delta = new_buffer - table->buffer;
-        
-        /* Update all values in the hashtable (they are char* pointers) */
-        for (size_t i = 0; i < table->index->size; i++) {
-            hashtable_entry_t *entry = table->index->buckets[i];
-            while (entry) {
-                /* The value is a pointer into the old buffer - adjust it */
-                char *old_ptr = (char *)entry->value;
-                entry->value = old_ptr + delta;
-                entry = entry->next;
-            }
+    for (size_t i = 0; i < shard->capacity; i++) {
+        intern_entry_t *e = &shard->slots[i];
+        if (!e->str) {
+            continue;
         }
+        size_t idx = e->hash & (new_capacity - 1);
+        while (new_slots[idx].str) {
+            idx = (idx + 1) & (new_capacity - 1);
+        }
+        new_slots[idx] = *e;
     }
-    
-    table->buffer = new_buffer;
-    table->buffer_size = new_size;
+    free(shard->slots);
+    shard->slots = new_slots;
+    shard->capacity = new_capacity;
     return true;
 }
 
 /**
- * Intern a string with known length.
+ * Copy a string into the shard's storage, null-terminated.
  */
-const char *intern_string_len(intern_table_t *table, const char *str, size_t len)
+static char *intern_shard_store(intern_shard_t *shard, const char *str, size_t len)
 {
-    if (!table || !str) {
-        return NULL;
-    }
-    
-    /* Create a temporary null-terminated copy for lookup */
-    char temp_key[256];
-    char *lookup_key;
-    bool free_key = false;
-    
-    if (len < sizeof(temp_key)) {
-        memcpy(temp_key, str, len);
-        temp_key[len] = '\0';
-        lookup_key = temp_key;
-    } else {
-        lookup_key = malloc(len + 1);
-        if (!lookup_key) {
+    size_t needed = len + 1;
+    intern_chunk_t *chunk = shard->chunks;
+    if (!chunk || chunk->size - chunk->used < needed) {
+        /* A string too large for a standard chunk gets one of its own */
+        size_t size = needed > INTERN_CHUNK_SIZE ? needed : INTERN_CHUNK_SIZE;
+        chunk = malloc(sizeof(intern_chunk_t) + size);
+        if (!chunk) {
             return NULL;
         }
-        memcpy(lookup_key, str, len);
-        lookup_key[len] = '\0';
-        free_key = true;
+        chunk->size = size;
+        chunk->used = 0;
+        chunk->next = shard->chunks;
+        shard->chunks = chunk;
     }
-    
-    /* Check if already interned */
-    const char *existing = (const char *)hashtable_lookup(table->index, lookup_key);
-    if (existing) {
-        if (free_key) {
-            free(lookup_key);
-        }
-        return existing;
-    }
-    
-    /* Need to add to buffer */
-    size_t needed = len + 1;  /* +1 for null terminator */
-    
-    if (table->buffer_used + needed > table->buffer_size) {
-        if (!intern_table_grow(table, needed)) {
-            if (free_key) {
-                free(lookup_key);
-            }
-            return NULL;
-        }
-    }
-    
-    /* Copy string to buffer */
-    char *interned = table->buffer + table->buffer_used;
-    memcpy(interned, str, len);
-    interned[len] = '\0';
-    table->buffer_used += needed;
-    
-    /* Add to index - the key is the interned string itself (saves a copy) */
-    hashtable_insert(table->index, interned, interned);
-    
-    if (free_key) {
-        free(lookup_key);
-    }
-    return interned;
+    char *stored = (char *)(chunk + 1) + chunk->used;
+    memcpy(stored, str, len);
+    stored[len] = '\0';
+    chunk->used += needed;
+    return stored;
 }
-
-/**
- * Intern a null-terminated string.
- */
-const char *intern_string(intern_table_t *table, const char *str)
-{
-    if (!str) {
-        return NULL;
-    }
-    return intern_string_len(table, str, strlen(str));
-}
-
-/* Global intern table */
-static intern_table_t *g_intern_table = NULL;
-static pthread_mutex_t g_intern_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /**
  * Initialize the global intern table.
  */
 void intern_init(void)
 {
-    pthread_mutex_lock(&g_intern_mutex);
-    if (!g_intern_table) {
-        g_intern_table = intern_table_new();
-    }
-    pthread_mutex_unlock(&g_intern_mutex);
+    pthread_once(&g_intern_once, intern_shards_init);
 }
 
 /**
- * Clean up the global intern table.
+ * Clean up the global intern table. Every pointer intern() has returned
+ * becomes invalid.
  */
 void intern_cleanup(void)
 {
-    pthread_mutex_lock(&g_intern_mutex);
-    if (g_intern_table) {
-        intern_table_free(g_intern_table);
-        g_intern_table = NULL;
+    pthread_once(&g_intern_once, intern_shards_init);
+    for (int i = 0; i < INTERN_SHARDS; i++) {
+        intern_shard_t *shard = &g_intern_shards[i];
+        pthread_mutex_lock(&shard->mutex);
+        intern_chunk_t *chunk = shard->chunks;
+        while (chunk) {
+            intern_chunk_t *next = chunk->next;
+            free(chunk);
+            chunk = next;
+        }
+        free(shard->slots);
+        shard->slots = NULL;
+        shard->capacity = 0;
+        shard->count = 0;
+        shard->chunks = NULL;
+        pthread_mutex_unlock(&shard->mutex);
     }
-    pthread_mutex_unlock(&g_intern_mutex);
 }
 
 /**
- * Intern a string using the global table (thread-safe).
+ * Say whether more than one thread may be interning strings from now on.
+ * Must only be called while no other thread is running. The table is
+ * locked by default; a single-threaded compilation turns the locking off
+ * for the millions of lock/unlock pairs it would otherwise pay for.
  */
-const char *intern(const char *str)
+void intern_set_concurrent(bool concurrent)
 {
-    pthread_mutex_lock(&g_intern_mutex);
-    if (!g_intern_table) {
-        g_intern_table = intern_table_new();
-    }
-    const char *result = intern_string(g_intern_table, str);
-    pthread_mutex_unlock(&g_intern_mutex);
-    return result;
+    g_intern_locking = concurrent;
 }
 
 /**
- * Intern a string with known length using the global table (thread-safe).
+ * Intern a string with known length (thread-safe). The string need not be
+ * null-terminated; the interned copy is.
  */
 const char *intern_len(const char *str, size_t len)
 {
-    pthread_mutex_lock(&g_intern_mutex);
-    if (!g_intern_table) {
-        g_intern_table = intern_table_new();
+    if (!str) {
+        return NULL;
     }
-    const char *result = intern_string_len(g_intern_table, str, len);
-    pthread_mutex_unlock(&g_intern_mutex);
+    pthread_once(&g_intern_once, intern_shards_init);
+
+    unsigned int hash = intern_hash(str, len);
+    intern_shard_t *shard = &g_intern_shards[hash >> (32 - INTERN_SHARD_BITS)];
+    bool locking = g_intern_locking;
+    const char *result = NULL;
+
+    if (locking) {
+        pthread_mutex_lock(&shard->mutex);
+    }
+
+    if (shard->capacity) {
+        size_t idx = hash & (shard->capacity - 1);
+        for (;;) {
+            intern_entry_t *e = &shard->slots[idx];
+            if (!e->str) {
+                break;
+            }
+            if (e->hash == hash && e->len == len && memcmp(e->str, str, len) == 0) {
+                result = e->str;
+                break;
+            }
+            idx = (idx + 1) & (shard->capacity - 1);
+        }
+    }
+
+    if (!result) {
+        /* Keep the table at most half full */
+        if ((shard->count + 1) * 2 > shard->capacity && !intern_shard_grow(shard)) {
+            if (locking) {
+                pthread_mutex_unlock(&shard->mutex);
+            }
+            return NULL;
+        }
+        char *stored = intern_shard_store(shard, str, len);
+        if (stored) {
+            size_t idx = hash & (shard->capacity - 1);
+            while (shard->slots[idx].str) {
+                idx = (idx + 1) & (shard->capacity - 1);
+            }
+            shard->slots[idx].str = stored;
+            shard->slots[idx].hash = hash;
+            shard->slots[idx].len = (unsigned int)len;
+            shard->count++;
+            result = stored;
+        }
+    }
+
+    if (locking) {
+        pthread_mutex_unlock(&shard->mutex);
+    }
     return result;
+}
+
+/**
+ * Intern a null-terminated string (thread-safe).
+ */
+const char *intern(const char *str)
+{
+    if (!str) {
+        return NULL;
+    }
+    return intern_len(str, strlen(str));
 }
 
 /* ========================================================================
