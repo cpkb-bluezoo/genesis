@@ -423,6 +423,132 @@ else
     failed=$((failed + 1))
 fi
 
+# The annotation type is compiled first (same reason as annotest/ and
+# nestedannotest/ above - a same-compilation-unit annotation type's own
+# RUNTIME retention isn't reliably resolved, a separate, pre-existing gap
+# not exercised or fixed here); the actual bug under test is the class
+# literal VALUE's own descriptor for a NESTED type ("Outer.Nested.class"),
+# declared inside the client class itself.
+printf "%-30s ... " "NestedClassLiteralAnnotationTest"
+ncl_lib="$TEST_BUILD/classlitlib-lib"
+ncl_out="$TEST_BUILD/classlitlib-out"
+rm -rf "$ncl_lib" "$ncl_out"
+mkdir -p "$ncl_lib" "$ncl_out"
+if "$GENESIS" -d "$ncl_lib" "$TEST_SRC"/external/classlitlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ncl_lib" -d "$ncl_out" \
+       "$TEST_SRC/external/NestedClassLiteralAnnotationTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ncl_out:$ncl_lib" NestedClassLiteralAnnotationTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The generic superclass is deliberately compiled with REAL javac (see
+# BoundedBase.java's own comment for why genesis compiling it itself
+# doesn't reproduce the bug), so the client's "super(...)" call must
+# resolve the bounded type variable constructor parameter from a real
+# classfile, exactly like javax.tools.ForwardingJavaFileManager.
+printf "%-30s ... " "BoundedSuperConstructorTest"
+bsc_lib="$TEST_BUILD/boundedctorlib-lib"
+bsc_out="$TEST_BUILD/boundedctorlib-out"
+rm -rf "$bsc_lib" "$bsc_out"
+mkdir -p "$bsc_lib" "$bsc_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$bsc_lib" "$TEST_SRC"/external/boundedctorlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$bsc_lib" -d "$bsc_out" \
+       "$TEST_SRC/external/BoundedSuperConstructorTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$bsc_out:$bsc_lib" BoundedSuperConstructorTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The interface is deliberately compiled with REAL javac (see
+# ExternalStringConstants.java's own comment), so the client's String
+# switch case labels must resolve a classfile-loaded String constant's
+# own ConstantValue attribute, exactly like jakarta.servlet's
+# HttpServletRequest.DIGEST_AUTH/BASIC_AUTH.
+printf "%-30s ... " "StringSwitchExternalConstantTest"
+sse_lib="$TEST_BUILD/strswitchlib-lib"
+sse_out="$TEST_BUILD/strswitchlib-out"
+rm -rf "$sse_lib" "$sse_out"
+mkdir -p "$sse_lib" "$sse_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$sse_lib" "$TEST_SRC"/external/strswitchlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$sse_lib" -d "$sse_out" \
+       "$TEST_SRC/external/StringSwitchExternalConstantTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$sse_out:$sse_lib" StringSwitchExternalConstantTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The library is compiled with genesis itself, into a separate classfile
+# (see protectedclasslib/Base.java's own comment) - the bug is in the
+# nested class's own access_flags, produced by genesis's codegen
+# regardless of same-batch vs. separate-invocation compilation.
+printf "%-30s ... " "ProtectedNestedClassAccessTest"
+pnc_lib="$TEST_BUILD/protectedclasslib-lib"
+pnc_out="$TEST_BUILD/protectedclasslib-out"
+rm -rf "$pnc_lib" "$pnc_out"
+mkdir -p "$pnc_lib" "$pnc_out"
+if "$GENESIS" -d "$pnc_lib" "$TEST_SRC"/external/protectedclasslib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$pnc_lib" -d "$pnc_out" \
+       "$TEST_SRC/external/ProtectedNestedClassAccessTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$pnc_out:$pnc_lib" ProtectedNestedClassAccessTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The library is compiled with genesis itself, into a separate classfile
+# (see protectedfieldlib/Base.java's own comment) - the bug is in codegen's
+# own decision of which class hosts the field access, independent of
+# same-batch vs. separate-invocation compilation.
+printf "%-30s ... " "ProtectedFieldViaNestedClassTest"
+pfl_lib="$TEST_BUILD/protectedfieldlib-lib"
+pfl_out="$TEST_BUILD/protectedfieldlib-out"
+rm -rf "$pfl_lib" "$pfl_out"
+mkdir -p "$pfl_lib" "$pfl_out"
+if "$GENESIS" -d "$pfl_lib" "$TEST_SRC"/external/protectedfieldlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$pfl_lib" -d "$pfl_out" \
+       "$TEST_SRC/external/ProtectedFieldViaNestedClassTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$pfl_out:$pfl_lib" ProtectedFieldViaNestedClassTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The library is compiled with genesis itself, into a separate classfile
+# (see protectedmethodreceiverlib/Base.java's own comment) - the bug is in
+# semantic.c's own receiver resolution, independent of same-batch vs.
+# separate-invocation compilation.
+printf "%-30s ... " "ProtectedMethodReceiverViaNestedClassTest"
+pmr_lib="$TEST_BUILD/protectedmethodreceiverlib-lib"
+pmr_out="$TEST_BUILD/protectedmethodreceiverlib-out"
+rm -rf "$pmr_lib" "$pmr_out"
+mkdir -p "$pmr_lib" "$pmr_out"
+if "$GENESIS" -d "$pmr_lib" "$TEST_SRC"/external/protectedmethodreceiverlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$pmr_lib" -d "$pmr_out" \
+       "$TEST_SRC/external/ProtectedMethodReceiverViaNestedClassTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$pmr_out:$pmr_lib" ProtectedMethodReceiverViaNestedClassTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "--- Class file version (-source/-target/-release) ---"
 # With no -target the version is computed from the features used (floor 52,
@@ -693,6 +819,21 @@ if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
        "$TEST_SRC/src/java8/switchqualifiedconst/SwitchQualifiedConstantCaseLabelVerifyTest.java" \
        >/dev/null 2>&1 && \
    "$JAVA" -cp "$TEST_BUILD" switchqualifiedconst.SwitchQualifiedConstantCaseLabelVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Named String constant (bare or qualified) as a switch case label ---"
+printf "%-30s ... " "StringSwitchQualifiedConstantCaseLabel"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/stringswitchconst/StringConstants.java" \
+       "$TEST_SRC/src/java8/stringswitchconst/StringSwitchQualifiedConstantCaseLabelVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" stringswitchconst.StringSwitchQualifiedConstantCaseLabelVerifyTest >/dev/null 2>&1; then
     echo PASS
     passed=$((passed + 1))
 else

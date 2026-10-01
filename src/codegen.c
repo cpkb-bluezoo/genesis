@@ -1820,6 +1820,37 @@ char *ast_type_to_descriptor(ast_node_t *type_node)
         
         case AST_FIELD_ACCESS:
             {
+                /* Prefer the resolved type from semantic analysis, exactly
+                 * like the AST_CLASS_TYPE/AST_IDENTIFIER cases above -
+                 * "Outer.Nested.class" parses its type portion as this
+                 * AST_FIELD_ACCESS chain (IDENTIFIER "Outer" -> FIELD_ACCESS
+                 * "Nested"), not AST_CLASS_TYPE, so without this check the
+                 * code below unconditionally rebuilt the descriptor from
+                 * the raw chain instead, joining EVERY segment with '/' -
+                 * both dropping the type's real package entirely (the
+                 * chain only ever has the segments actually written in
+                 * source, never a package prefix) and using '/' where a
+                 * nested class needs '$' - "Outer.Nested.class" (Nested a
+                 * static nested class of a DIFFERENT top-level class
+                 * Outer, itself in package "pkg") produced
+                 * "LOuter/Nested;", naming a class that doesn't exist,
+                 * instead of "Lpkg/Outer$Nested;" - java.lang.
+                 * TypeNotPresentException at reflection time despite
+                 * type_node->sem_type already holding the correct,
+                 * resolved type by the time this runs. Confirmed against
+                 * gumdrop's own MessageIndexTest, whose
+                 * "@Test(expected = MessageIndex.CorruptIndexException.class)"
+                 * depends on exactly this. */
+                if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS &&
+                    type_node->sem_type->data.class_type.name) {
+                    char *internal = class_to_internal_name(type_node->sem_type->data.class_type.name);
+                    size_t len = strlen(internal) + 3;
+                    char *desc = malloc(len);
+                    snprintf(desc, len, "L%s;", internal);
+                    free(internal);
+                    return desc;
+                }
+
                 /* Qualified type name like java.lang.String */
                 /* Build the full qualified name from the field access chain */
                 string_t *name = string_new(NULL);
@@ -2072,6 +2103,33 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
             effective_mods |= MOD_PUBLIC | MOD_STATIC;
         }
         cg->access_flags = mods_to_access_flags(effective_mods) & ~ACC_STATIC;
+
+        /* JVMS Table 4.1-A: a class file's own access_flags may only
+         * encode PUBLIC visibility (or none, for package-private) -
+         * there is no PROTECTED/PRIVATE bit for a class itself, only
+         * for its members (Table 4.5-A/4.6-A). A protected or private
+         * NESTED type's true visibility belongs solely in the
+         * enclosing class's InnerClasses attribute (already emitted
+         * correctly elsewhere), which is informational, read only by
+         * reflection - not consulted by the JVM's own class-access
+         * check at link time. Leaving ACC_PROTECTED set directly here
+         * produced a malformed access_flags value that made the JVM
+         * reject access to the class from any other package, even from
+         * a legitimate subclass (JLS 6.6.2 allows that). Promote
+         * PROTECTED to PUBLIC instead (matching real javac, confirmed
+         * by disassembly) so the type stays loadable/accessible
+         * outside the package - the "protected" restriction itself is
+         * enforced by the compiler at compile time, not by the
+         * classfile. PRIVATE has no equivalent at this level either, so
+         * it drops to package-private. Confirmed against gumdrop's own
+         * HttpClientProtocolHandler.ParseState (protected nested enum)
+         * accessed via WebSocketClientProtocolHandler, a subclass in a
+         * different package. */
+        if (cg->access_flags & ACC_PROTECTED) {
+            cg->access_flags = (cg->access_flags & ~(ACC_PROTECTED | ACC_PRIVATE)) | ACC_PUBLIC;
+        } else {
+            cg->access_flags &= ~ACC_PRIVATE;
+        }
 
         /* Check if this is an interface or annotation */
         bool is_interface = (class_sym->kind == SYM_INTERFACE);
@@ -4384,27 +4442,31 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
              * "Map<String,Object> readAttributes(Path, String,
              * LinkOption...)" - both 3 parameters, both named
              * readAttributes). Per JLS, overriding (unlike overloading)
-             * requires each PARAMETER's type to match the superclass
-             * method's own erased parameter type EXACTLY - only the
-             * RETURN type may be covariant - so compare erased parameter
-             * descriptors, not just count, or this could pick the WRONG
-             * overload as the bridge's own call target and generate a
-             * bridge invoking it with completely incompatible argument
-             * types (confirmed: this exact collision produced a real
-             * VerifyError - "Type java/lang/Class ... not assignable to
-             * java/lang/String" - against gumdrop's own
-             * MemoryFileSystemProvider). */
+             * requires each NON-type-variable parameter to match the
+             * superclass method's own erased type EXACTLY, so those
+             * positions are compared that way to disambiguate; a
+             * type-variable position, by definition, is exactly where a
+             * real override's parameter type legitimately DIFFERS from
+             * the superclass method's own erasure - e.g.
+             * SimpleFileVisitor<T>.visitFile(T, BasicFileAttributes)
+             * overridden as visitFile(Path, BasicFileAttributes) - so it
+             * matches ANY candidate parameter there rather than requiring
+             * equality. An earlier version of this compared the
+             * superclass method's own fully-erased descriptor
+             * ("Ljava/lang/Object;...") against the candidate's own
+             * fully-concrete descriptor ("Ljava/nio/file/Path;...")
+             * as flat strings - which, for a type-variable parameter,
+             * could never match ANY real override at all (that's the
+             * entire reason a bridge is needed here), so impl_method was
+             * never found and no bridge was ever generated for a
+             * genuinely covariant override: confirmed against gumdrop's
+             * own MemoryFileSystemTest, whose anonymous
+             * "new SimpleFileVisitor<Path>() { visitFile(Path, ...) }"
+             * was silently never invoked by Files.walkFileTree (real JDK
+             * code calls the ERASED visitFile(Object, ...), which
+             * without a bridge dispatches to SimpleFileVisitor's own
+             * inherited no-op instead). */
             symbol_t *impl_method = NULL;
-            string_t *super_param_desc = string_new("");
-            for (slist_t *sp = super_params; sp; sp = sp->next) {
-                symbol_t *sparam = (symbol_t *)sp->data;
-                if (sparam && sparam->type) {
-                    char *pdesc = type_to_descriptor(sparam->type);
-                    string_append(super_param_desc, pdesc);
-                    free(pdesc);
-                }
-            }
-
             for (size_t j = 0; j < class_methods->size && !impl_method; j++) {
                 hashtable_entry_t *class_entry = class_methods->buckets[j];
                 while (class_entry && !impl_method) {
@@ -4413,24 +4475,38 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
                         class_method->name && method->name &&
                         strcmp(class_method->name, method->name) == 0 &&
                         !(class_method->modifiers & MOD_STATIC)) {
-                        string_t *cand_param_desc = string_new("");
-                        for (slist_t *cp = class_method->data.method_data.parameters; cp; cp = cp->next) {
+                        slist_t *cparams = class_method->data.method_data.parameters;
+                        int super_count = 0, cand_count = 0;
+                        for (slist_t *t = super_params; t; t = t->next) super_count++;
+                        for (slist_t *t = cparams; t; t = t->next) cand_count++;
+
+                        bool positions_match = (super_count == cand_count);
+                        slist_t *sp = super_params;
+                        slist_t *cp = cparams;
+                        while (positions_match && sp && cp) {
+                            symbol_t *sparam = (symbol_t *)sp->data;
                             symbol_t *cparam = (symbol_t *)cp->data;
-                            if (cparam && cparam->type) {
-                                char *pdesc = type_to_descriptor(cparam->type);
-                                string_append(cand_param_desc, pdesc);
-                                free(pdesc);
+                            if (sparam && sparam->type && sparam->type->kind != TYPE_TYPEVAR) {
+                                char *sdesc = type_to_descriptor(sparam->type);
+                                char *cdesc = (cparam && cparam->type) ?
+                                    type_to_descriptor(cparam->type) : NULL;
+                                if (!cdesc || strcmp(sdesc, cdesc) != 0) {
+                                    positions_match = false;
+                                }
+                                free(sdesc);
+                                free(cdesc);
                             }
+                            sp = sp->next;
+                            cp = cp->next;
                         }
-                        if (strcmp(cand_param_desc->str, super_param_desc->str) == 0) {
+
+                        if (positions_match) {
                             impl_method = class_method;
                         }
-                        string_free(cand_param_desc, true);
                     }
                     class_entry = class_entry->next;
                 }
             }
-            string_free(super_param_desc, true);
 
             /* Not overridden at all - that's generate_superclass_bridges()'s
              * own job (invokespecial forwarding to super), not ours. */
@@ -4656,6 +4732,73 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
 
             entry = entry->next;
         }
+    }
+}
+
+/**
+ * Emit the synthetic static accessor methods this class was found (by
+ * get_or_create_field_accessor() in codegen_expr.c) to need for one of its
+ * own nested classes to read an inherited protected field declared in a
+ * superclass in a different runtime package - see pending_field_accessor_t's
+ * own comment (genesis.h) for the full JVMS 5.4.4 rationale. Mirrors real
+ * javac's own access$NNN bridge methods:
+ *   static <FieldType> access$N(<ThisClass> outer) { return outer.field; }
+ */
+void generate_pending_field_accessors(class_gen_t *cg)
+{
+    if (!cg || !cg->class_sym) {
+        return;
+    }
+
+    for (slist_t *p = cg->class_sym->data.class_data.pending_field_accessors; p; p = p->next) {
+        pending_field_accessor_t *acc = (pending_field_accessor_t *)p->data;
+        if (!acc || !acc->field || !acc->field_owner || !acc->accessor_name) {
+            continue;
+        }
+
+        char *field_owner_internal = class_to_internal_name(acc->field_owner->qualified_name);
+        char *field_desc = type_to_descriptor(acc->field->type);
+        size_t desc_len = strlen(cg->internal_name) + strlen(field_desc) + 5;
+        char *descriptor = malloc(desc_len);
+        snprintf(descriptor, desc_len, "(L%s;)%s", cg->internal_name, field_desc);
+
+        method_info_gen_t *mi = calloc(1, sizeof(method_info_gen_t));
+        mi->access_flags = ACC_STATIC | ACC_SYNTHETIC;
+        mi->name_index = cp_add_utf8(cg->cp, acc->accessor_name);
+        mi->descriptor_index = cp_add_utf8(cg->cp, descriptor);
+
+        bytecode_t *code = bytecode_new();
+        bc_emit(code, OP_ALOAD_0);
+        uint16_t fieldref = cp_add_fieldref(cg->cp, field_owner_internal,
+                                             acc->field->name, field_desc);
+        bc_emit(code, OP_GETFIELD);
+        bc_emit_u2(code, fieldref);
+
+        int max_stack = 1;
+        switch (acc->field->type ? acc->field->type->kind : TYPE_CLASS) {
+            case TYPE_LONG:   bc_emit(code, OP_LRETURN); max_stack = 2; break;
+            case TYPE_DOUBLE: bc_emit(code, OP_DRETURN); max_stack = 2; break;
+            case TYPE_FLOAT:  bc_emit(code, OP_FRETURN); break;
+            case TYPE_BOOLEAN:
+            case TYPE_BYTE:
+            case TYPE_CHAR:
+            case TYPE_SHORT:
+            case TYPE_INT:    bc_emit(code, OP_IRETURN); break;
+            default:          bc_emit(code, OP_ARETURN); break;
+        }
+        code->max_stack = max_stack;
+        code->max_locals = 1;
+        mi->code = code;
+
+        if (!cg->methods) {
+            cg->methods = slist_new(mi);
+        } else {
+            slist_append(cg->methods, mi);
+        }
+
+        free(field_owner_internal);
+        free(field_desc);
+        free(descriptor);
     }
 }
 
@@ -5153,6 +5296,13 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
     if (!is_interface && !is_annotation) {
         generate_covariant_override_bridges(cg);
     }
+
+    /* Emit any synthetic field-accessor methods a nested class of this one
+     * needed (discovered either during this class's own real codegen just
+     * above, if the nested class was itself compiled inline, or - the usual
+     * case - by the pre-scan in collect_nest_members_recursive(), which
+     * runs before this class is generated for real). */
+    generate_pending_field_accessors(cg);
 
     /* Generate bridge methods for generic interface implementations.
      * When C implements Comparator<X>, it needs compare(Object, Object) -> compare(X, X). */

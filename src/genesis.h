@@ -617,6 +617,25 @@ typedef struct completer_context {
 } completer_context_t;
 
 /**
+ * A synthetic static accessor method a class must emit so one of its own
+ * nested classes can read a `protected` field the class itself inherits
+ * from a superclass in a DIFFERENT runtime package. JVMS 5.4.4's protected-
+ * access check requires the class containing the getfield instruction to
+ * itself be a subclass of the field's declaring class when the two are in
+ * different packages - a nested class of the subclass does not qualify
+ * (it isn't itself a subclass), so it cannot read the field directly, only
+ * through a bridge defined in the subclass. Real javac handles this the
+ * same way (its own access$NNN methods). See codegen_expr.c (creates these
+ * on demand) and codegen.c's generate_pending_field_accessors() (emits
+ * them as real methods once the owning class is generated).
+ */
+typedef struct pending_field_accessor {
+    symbol_t *field;             /* the inherited field this accessor reads */
+    symbol_t *field_owner;       /* superclass that actually declares it */
+    char *accessor_name;         /* synthetic method name, e.g. "access$0" */
+} pending_field_accessor_t;
+
+/**
  * Represents a declared symbol (class, method, variable, etc.)
  */
 struct symbol
@@ -670,6 +689,9 @@ struct symbol
                                          * class declared earlier in the same file needs
                                          * it first, e.g. for @Override checking against
                                          * a not-yet-visited superclass). */
+            slist_t *pending_field_accessors; /* list of pending_field_accessor_t*
+                                         * this class must emit as synthetic methods -
+                                         * see pending_field_accessor_t's own comment. */
         } class_data;
         
         /* SYM_METHOD, SYM_CONSTRUCTOR */
@@ -711,6 +733,18 @@ struct symbol
                                           * instead (sym->ast), which a classfile-
                                           * loaded field has none of. */
             long long const_value;      /* The resolved constant, when has_const_value */
+            char *const_str_value;      /* A classfile-loaded "static final String"
+                                          * field's own ConstantValue attribute (JVMS
+                                          * 4.7.2), e.g. an external/JDK class's
+                                          * "public static final String DIGEST_AUTH =
+                                          * \"Digest\";" - has_const_value/const_value
+                                          * above are int/long-only, so a String-typed
+                                          * ConstantValue needs this separate field.
+                                          * NULL when the field isn't String-typed or
+                                          * has no ConstantValue attribute. Owned by
+                                          * this symbol; never freed (symbols live for
+                                          * the process lifetime, like every other
+                                          * heap field on this struct). */
         } var_data;
     } data;
     

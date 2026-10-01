@@ -665,6 +665,7 @@ void class_gen_set_target_version(class_gen_t *cg, int major_version);
 /* Generate bytecode for a class */
 bool codegen_class(class_gen_t *cg, ast_node_t *class_decl);
 bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym);
+void generate_pending_field_accessors(class_gen_t *cg);
 
 /* Generate module-info.class from module declaration */
 uint8_t *codegen_module(ast_node_t *module_decl, size_t *size_out);

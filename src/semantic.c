@@ -5161,6 +5161,15 @@ symbol_t *symbol_from_classfile(semantic_t *sem, classfile_t *cf)
                 field_sym->data.var_data.has_const_value = true;
                 field_sym->data.var_data.const_value = const_value;
             }
+            /* Same idea, for a String-typed field - needed for a String
+             * switch's case label referencing this classfile-loaded
+             * constant (e.g. an inherited "case HttpServletRequest.
+             * DIGEST_AUTH:" from an external servlet-api jar). See
+             * const_str_value's own doc comment in genesis.h. */
+            char *const_str_value = NULL;
+            if (classfile_get_attribute_constant_value_string(cf, fi->attributes, fi->attributes_count, &const_str_value)) {
+                field_sym->data.var_data.const_str_value = const_str_value;
+            }
 
             /* Try to get generic signature first - this has the real generic types
              * (e.g., List<String> instead of just List) */
@@ -9501,8 +9510,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
         case AST_CLASS_TYPE:
             {
                 const char *name = type_node->data.node.name;
-                
-                
+
                 /* Check if the name matches the current class (self-reference) */
                 if (sem->current_class && sem->current_class->name &&
                     strcmp(name, sem->current_class->name) == 0) {
@@ -13851,7 +13859,47 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     search_class = search_class->data.class_data.superclass;
                                 }
                             }
-                            
+
+                            /* Same check, but for each ENCLOSING class's own
+                             * superclass chain - e.g. a protected field
+                             * inherited into the enclosing (outer) class from
+                             * ITS superclass, read by simple name from a
+                             * nested class of that outer class via the
+                             * implicit this$0 chain. Without this, the
+                             * receiver's type here never gets resolved at
+                             * all (get_expression_type() below is never even
+                             * called), and the method call falls back to
+                             * guessing an "int" return type from the
+                             * argument list alone - confirmed against
+                             * gumdrop's own WebSocketClientProtocolHandler$
+                             * ClientWebSocketTransport.sendFrame(), whose
+                             * "endpoint.send(frameData)" (endpoint inherited
+                             * from HttpClientProtocolHandler into the
+                             * enclosing WebSocketClientProtocolHandler)
+                             * produced "NoSuchMethodError: 'int
+                             * Endpoint.send(ByteBuffer)'" despite
+                             * Endpoint.send() returning void. Mirrors
+                             * codegen_expr.c's own equivalent field-read
+                             * lookup, which already walks this same chain. */
+                            if (!sym) {
+                                symbol_t *enc = sem->current_class ?
+                                    sem->current_class->data.class_data.enclosing_class : NULL;
+                                while (enc && !sym) {
+                                    symbol_t *search_enc = enc;
+                                    while (search_enc && !sym) {
+                                        if (search_enc->data.class_data.members) {
+                                            sym = scope_lookup_local(
+                                                search_enc->data.class_data.members, recv_name);
+                                            if (sym && sym->kind != SYM_FIELD) {
+                                                sym = NULL;  /* Only look for fields */
+                                            }
+                                        }
+                                        search_enc = search_enc->data.class_data.superclass;
+                                    }
+                                    enc = enc->data.class_data.enclosing_class;
+                                }
+                            }
+
                             if (sym && (sym->kind == SYM_LOCAL_VAR || sym->kind == SYM_PARAMETER ||
                                         sym->kind == SYM_FIELD)) {
                                 if (getenv("GENESIS_DEBUG_SAM") && method_name && 
@@ -14058,6 +14106,41 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         }
                     } else if (first->type == AST_THIS_EXPR) {
                         target_class = sem->current_class;
+                    } else if (first->type == AST_SUPER_EXPR) {
+                        /* super.method() - must resolve starting from the
+                         * SUPERCLASS, not sem->current_class: with no case
+                         * for AST_SUPER_EXPR here at all, this fell through
+                         * to whatever the default/fallback resolution
+                         * further below does, which (like the AST_THIS_EXPR
+                         * case just above, but wrongly for `super`) ends up
+                         * searching sem->current_class's own member scope -
+                         * finding OUR OWN override of the method instead of
+                         * the real declaration `super` actually names. For
+                         * a covariant-return override two or more levels
+                         * deep (B extends A; C extends B, not overriding
+                         * some method f(); D extends C, overriding f() with
+                         * a covariant return, calling "super.f()") this set
+                         * expr->sem_symbol to D's OWN f(), which codegen
+                         * then preferred over its own (already-correct)
+                         * super-call resolution logic (codegen_expr.c's
+                         * AST_SUPER_EXPR case in codegen_method_call(),
+                         * which correctly starts from mg->class_gen->
+                         * superclass - but only runs when semantic analysis
+                         * didn't already resolve a symbol): the invokespecial
+                         * was emitted against the immediate superclass (C)
+                         * but with D's OWN return-type descriptor instead of
+                         * the real inherited method's, so the fabricated
+                         * method simply doesn't exist on C -
+                         * NoSuchMethodError at runtime, despite genesis
+                         * itself compiling without complaint. Confirmed
+                         * against gumdrop's own Http2Listener/MqttListener,
+                         * whose "super.bindWildcard()" (each overriding
+                         * Listener.bindWildcard() with its own covariant
+                         * return type, through the non-overriding
+                         * intermediate TcpListener) depends on this exact
+                         * resolution. */
+                        target_class = sem->current_class ?
+                            sem->current_class->data.class_data.superclass : NULL;
                     } else if (first->type == AST_FIELD_ACCESS) {
                         type_t *recv_type = get_expression_type(sem, first);
                         if (recv_type && recv_type->kind == TYPE_ARRAY) {
@@ -19814,6 +19897,95 @@ static bool resolve_qualified_constant_case_value(semantic_t *sem, ast_node_t *f
     return false;
 }
 
+/**
+ * Like resolve_qualified_constant_case_value() above, but for a String
+ * switch's qualified case label (e.g. "case HttpServletRequest.
+ * DIGEST_AUTH:") - resolves to the constant's own STRING value instead of
+ * an int. Mirrors that function's own symbol lookup exactly (same reasons,
+ * same doc comments there apply here); only the final "extract the value"
+ * step differs by type. *out_value is a malloc'd copy the caller must
+ * free(); untouched on a false return.
+ */
+static bool resolve_qualified_constant_case_string_value(semantic_t *sem, ast_node_t *field_access,
+                                                            char **out_value)
+{
+    if (!field_access || field_access->type != AST_FIELD_ACCESS || !out_value) {
+        return false;
+    }
+
+    slist_t *fa_children = field_access->data.node.children;
+    ast_node_t *receiver = fa_children ? (ast_node_t *)fa_children->data : NULL;
+    const char *field_name = field_access->data.node.name;
+    symbol_t *sym = NULL;
+
+    if (receiver && field_name) {
+        type_t *recv_type = semantic_resolve_type(sem, receiver);
+        if (recv_type && recv_type->kind == TYPE_CLASS) {
+            symbol_t *type_sym = recv_type->data.class_type.symbol;
+            if (!type_sym && recv_type->data.class_type.name) {
+                type_sym = load_external_class(sem, recv_type->data.class_type.name);
+                if (type_sym) {
+                    recv_type->data.class_type.symbol = type_sym;
+                }
+            }
+
+            if (type_sym && type_sym->data.class_data.members) {
+                sym = scope_lookup_local(type_sym->data.class_data.members, field_name);
+            }
+
+            if (!sym && type_sym) {
+                slist_t *ifaces = type_sym->data.class_data.interfaces;
+                for (slist_t *i = ifaces; i && !sym; i = i->next) {
+                    symbol_t *iface = (symbol_t *)i->data;
+                    if (iface && iface->data.class_data.members) {
+                        sym = scope_lookup_local(iface->data.class_data.members, field_name);
+                    }
+                }
+            }
+        }
+    }
+
+    if (!sym || sym->kind != SYM_FIELD) {
+        return false;
+    }
+
+    if (sym->data.var_data.const_str_value) {
+        *out_value = strdup(sym->data.var_data.const_str_value);
+        return true;
+    }
+
+    if (!sym->ast) {
+        return false;
+    }
+
+    ast_node_t *declarator = NULL;
+    if (sym->ast->type == AST_VAR_DECLARATOR) {
+        declarator = sym->ast;
+    } else if (sym->ast->type == AST_FIELD_DECL) {
+        for (slist_t *dc = sym->ast->data.node.children; dc; dc = dc->next) {
+            ast_node_t *cand = (ast_node_t *)dc->data;
+            if (cand && cand->type == AST_VAR_DECLARATOR &&
+                cand->data.node.name && strcmp(cand->data.node.name, field_name) == 0) {
+                declarator = cand;
+                break;
+            }
+        }
+    }
+
+    if (!declarator || !declarator->data.node.children) {
+        return false;
+    }
+
+    ast_node_t *init_expr = (ast_node_t *)declarator->data.node.children->data;
+    if (init_expr && init_expr->type == AST_LITERAL &&
+        init_expr->data.leaf.token_type == TOK_STRING_LITERAL &&
+        init_expr->data.leaf.value.str_val) {
+        *out_value = strdup(init_expr->data.leaf.value.str_val);
+        return true;
+    }
+    return false;
+}
+
 static bool resolve_named_int_constant(semantic_t *sem, const char *name, int32_t *out_value);
 
 /**
@@ -20037,6 +20209,76 @@ static bool resolve_named_int_constant(semantic_t *sem, const char *name, int32_
     }
     ast_node_t *init_expr = (ast_node_t *)declarator->data.node.children->data;
     return eval_case_constant_operand(sem, init_expr, out_value);
+}
+
+/**
+ * Like resolve_named_int_constant() above, but for a String switch's bare
+ * case label (e.g. "case DIGEST_AUTH:", DIGEST_AUTH a same-class, inherited,
+ * or statically-imported String constant) - resolves to the constant's own
+ * STRING value instead of an int. Mirrors that function's own symbol
+ * lookup exactly (same reasons, same doc comments there apply here); only
+ * the final "extract the value" step differs by type. *out_value is a
+ * malloc'd copy the caller must free(); untouched on a false return.
+ */
+static bool resolve_named_string_constant(semantic_t *sem, const char *name, char **out_value)
+{
+    if (!sem || !name || !out_value) {
+        return false;
+    }
+    symbol_t *sym = scope_lookup(sem->current_scope, name);
+    if (!sym && sem->current_class && sem->current_class->data.class_data.members) {
+        sym = scope_lookup_local(sem->current_class->data.class_data.members, name);
+    }
+    for (symbol_t *cls = sem->current_class; cls && !sym; cls = cls->data.class_data.superclass) {
+        symbol_complete(cls);
+        slist_t *ifaces = cls->data.class_data.interfaces;
+        for (slist_t *i = ifaces; i && !sym; i = i->next) {
+            symbol_t *iface = (symbol_t *)i->data;
+            if (iface && iface->data.class_data.members) {
+                sym = scope_lookup_local(iface->data.class_data.members, name);
+            }
+        }
+        if (!sym && cls != sem->current_class && cls->data.class_data.members) {
+            sym = scope_lookup_local(cls->data.class_data.members, name);
+        }
+    }
+    if (!sym) {
+        symbol_t *field_sym = NULL;
+        if (resolve_static_import_field(sem, name, &field_sym) && field_sym) {
+            sym = field_sym;
+        }
+    }
+    if (!sym || sym->kind != SYM_FIELD) {
+        return false;
+    }
+    if (sym->data.var_data.const_str_value) {
+        *out_value = strdup(sym->data.var_data.const_str_value);
+        return true;
+    }
+    ast_node_t *declarator = NULL;
+    if (sym->ast && sym->ast->type == AST_VAR_DECLARATOR) {
+        declarator = sym->ast;
+    } else if (sym->ast && sym->ast->type == AST_FIELD_DECL) {
+        for (slist_t *dc = sym->ast->data.node.children; dc; dc = dc->next) {
+            ast_node_t *cand = (ast_node_t *)dc->data;
+            if (cand && cand->type == AST_VAR_DECLARATOR &&
+                cand->data.node.name && strcmp(cand->data.node.name, name) == 0) {
+                declarator = cand;
+                break;
+            }
+        }
+    }
+    if (!declarator || !declarator->data.node.children) {
+        return false;
+    }
+    ast_node_t *init_expr = (ast_node_t *)declarator->data.node.children->data;
+    if (init_expr && init_expr->type == AST_LITERAL &&
+        init_expr->data.leaf.token_type == TOK_STRING_LITERAL &&
+        init_expr->data.leaf.value.str_val) {
+        *out_value = strdup(init_expr->data.leaf.value.str_val);
+        return true;
+    }
+    return false;
 }
 
 /**
@@ -21824,6 +22066,29 @@ define_local_var:
                                     sel_type->data.class_type.symbol &&
                                     sel_type->data.class_type.symbol->kind == SYM_ENUM);
 
+                                /* A String switch's named-constant case
+                                 * labels (bare or qualified) need their
+                                 * own resolution: a literal case label
+                                 * ("case \"basic\":") already works, but
+                                 * nothing resolved a CONSTANT REFERENCE
+                                 * ("case BASIC:"/"case Foo.BASIC:") to its
+                                 * own String value at all before this -
+                                 * every branch below this point assumed
+                                 * int, silently leaving such a case label
+                                 * unresolved (never matching anything at
+                                 * runtime, with no compile error for a
+                                 * same-batch constant, or a "Cannot
+                                 * resolve type" error for a classfile-
+                                 * loaded one once the unresolved node fell
+                                 * through to a later, unrelated pass).
+                                 * Confirmed against gumdrop's own
+                                 * HttpAuthenticationProvider.generateChallenge()'s
+                                 * "switch (authMethod) { case
+                                 * HttpServletRequest.DIGEST_AUTH: ... }". */
+                                bool is_string_switch = (sel_type && sel_type->kind == TYPE_CLASS &&
+                                    sel_type->data.class_type.name &&
+                                    strcmp(sel_type->data.class_type.name, "java.lang.String") == 0);
+
                                 if (sel_type && sel_type->kind == TYPE_CLASS &&
                                     sel_type->data.class_type.symbol &&
                                     sel_type->data.class_type.symbol->kind == SYM_ENUM) {
@@ -21953,6 +22218,31 @@ define_local_var:
                                                  * colliding with SOCKS5_METHOD_NEGOTIATION/
                                                  * SOCKS4_REQUEST: VerifyError/ClassFormatError "Bad
                                                  * lookupswitch instruction". */
+                                                if (is_string_switch) {
+                                                    /* See is_string_switch's own doc comment
+                                                     * above for why this needs a completely
+                                                     * separate resolution from the int-only
+                                                     * logic below. Set BOTH .name (interned -
+                                                     * codegen_string_switch()'s own case-value
+                                                     * extraction reads ONLY this field, not
+                                                     * value.str_val) and value.str_val/str_len
+                                                     * (what a genuinely-parsed string literal
+                                                     * ALSO always carries - see
+                                                     * ast_new_literal_from_lexer()'s identical
+                                                     * dual assignment for TOK_STRING_LITERAL),
+                                                     * so this transformed node is
+                                                     * indistinguishable from a real one to every
+                                                     * consumer, not just codegen's. */
+                                                    char *resolved_str = NULL;
+                                                    if (resolve_named_string_constant(sem, case_expr->data.leaf.name, &resolved_str)) {
+                                                        case_expr->type = AST_LITERAL;
+                                                        case_expr->data.leaf.name = (char *)intern(resolved_str);
+                                                        case_expr->data.leaf.token_type = TOK_STRING_LITERAL;
+                                                        case_expr->data.leaf.value.str_val = resolved_str;
+                                                        case_expr->data.leaf.str_len = strlen(resolved_str);
+                                                    }
+                                                    continue;
+                                                }
                                                 const char *name = case_expr->data.leaf.name;
                                                 symbol_t *sym = scope_lookup(sem->current_scope, name);
 
@@ -22114,6 +22404,23 @@ define_local_var:
                                                  * expression is never consulted again for
                                                  * anything but its value once semantic
                                                  * analysis is done with it. */
+                                                if (is_string_switch) {
+                                                    /* See is_string_switch's own comment
+                                                     * above, and the bare-identifier
+                                                     * branch's own comment (just above
+                                                     * in this same function) for why
+                                                     * BOTH .name and value.str_val/
+                                                     * str_len are set. */
+                                                    char *resolved_str = NULL;
+                                                    if (resolve_qualified_constant_case_string_value(sem, case_expr, &resolved_str)) {
+                                                        case_expr->type = AST_LITERAL;
+                                                        case_expr->data.leaf.name = (char *)intern(resolved_str);
+                                                        case_expr->data.leaf.token_type = TOK_STRING_LITERAL;
+                                                        case_expr->data.leaf.value.str_val = resolved_str;
+                                                        case_expr->data.leaf.str_len = strlen(resolved_str);
+                                                    }
+                                                    continue;
+                                                }
                                                 long long resolved_value = 0;
                                                 if (resolve_qualified_constant_case_value(sem, case_expr, &resolved_value)) {
                                                     case_expr->type = AST_LITERAL;

@@ -846,15 +846,32 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
                 mg_pop_typed(mg, 1);
             }
         } else {
-            /* Declaration form */
+            /* Declaration form. Only ALLOCATE the slot and pre-initialize
+             * it to null here, before the protected region starts (see
+             * "Record start of protected region" below) - the resource's
+             * own initializer expression is generated LATER, in the
+             * second pass right after that point, so that an exception
+             * thrown while evaluating it is still covered by this try
+             * statement's own catch clauses (JLS 14.20.3.1: a resource's
+             * initializer is part of the try statement, not something
+             * that runs before it). Pre-nulling first also means the
+             * local is always validly assigned (to null, if its own
+             * initializer never completed) by the time any exception
+             * handler - the synthetic close-with-suppression handler or
+             * a user catch clause - might need to read it, exactly like
+             * real javac's own try-with-resources desugaring. Confirmed
+             * against gumdrop's own SharedLockStore.createRecord(), whose
+             * "try (OutputStream out = Files.newOutputStream(record,
+             * CREATE_NEW)) { ... } catch (FileAlreadyExistsException e)
+             * { ... }" needs exactly this - the exception is thrown BY
+             * newOutputStream() itself, before out is ever assigned. */
             if (!res_children->next) {
                 continue;  /* Malformed: missing initializer */
             }
-            
+
             ast_node_t *type_node = (ast_node_t *)res_children->data;
-            ast_node_t *init_expr = (ast_node_t *)res_children->next->data;
             const char *var_name = res->data.node.name;
-            
+
             /* Resolve resource type - prefer sem_type set during semantic analysis
              * to ensure we get the fully qualified name with symbol reference */
             type_t *res_type = type_node->sem_type;
@@ -862,21 +879,14 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
                 res_type = semantic_resolve_type(mg->class_gen->sem, type_node);
             }
             resource_types[idx] = res_type;
-            
-            /* Generate initializer */
-            if (!codegen_expression(mg, init_expr)) {
-                free(resource_slots);
-                free(resource_types);
-                slist_free(resources);
-                slist_free(catch_clauses);
-                return false;
-            }
-            
+
             /* Allocate local variable for resource */
             uint16_t slot = mg_allocate_local(mg, var_name, res_type);
             resource_slots[idx] = slot;
-            
-            /* Store resource in local variable */
+
+            /* Pre-initialize to null */
+            bc_emit(mg->code, OP_ACONST_NULL);
+            mg_push(mg, 1);
             if (slot <= 3) {
                 bc_emit(mg->code, OP_ASTORE_0 + slot);
             } else {
@@ -886,7 +896,7 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
             mg_pop_typed(mg, 1);
         }
     }
-    
+
     /* Allocate slot for primary exception (used for suppressed exception handling) */
     type_t *throwable_type = type_new_class("java/lang/Throwable");
     uint16_t primary_exc_slot = mg_allocate_local(mg, "__primary_exc", throwable_type);
@@ -911,7 +921,45 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
     if (mg->stackmap) {
         try_entry_state = stackmap_save_state(mg->stackmap);
     }
-    
+
+    /* Second pass: now that the protected region has started (and every
+     * declaration-form resource's local is validly pre-nulled - see the
+     * first pass above), actually evaluate each declaration-form
+     * resource's own initializer expression and store it into its
+     * already-allocated slot. Reference-form resources (an existing
+     * variable/field, Java 9+) were already fully handled in the first
+     * pass - nothing more to do for them here. */
+    idx = 0;
+    for (slist_t *node = resources; node; node = node->next, idx++) {
+        ast_node_t *res = (ast_node_t *)node->data;
+        slist_t *res_children = res->data.node.children;
+        bool is_reference = (res->data.node.flags & 2) != 0;
+
+        if (is_reference || !res_children || !res_children->next) {
+            continue;
+        }
+
+        ast_node_t *init_expr = (ast_node_t *)res_children->next->data;
+        uint16_t slot = resource_slots[idx];
+
+        if (!codegen_expression(mg, init_expr)) {
+            stackmap_state_free(try_entry_state);
+            free(resource_slots);
+            free(resource_types);
+            slist_free(resources);
+            slist_free(catch_clauses);
+            return false;
+        }
+
+        if (slot <= 3) {
+            bc_emit(mg->code, OP_ASTORE_0 + slot);
+        } else {
+            bc_emit(mg->code, OP_ASTORE);
+            bc_emit_u1(mg->code, (uint8_t)slot);
+        }
+        mg_pop_typed(mg, 1);
+    }
+
     /* Generate try block body */
     if (try_block && !codegen_statement(mg, try_block)) {
         stackmap_state_free(try_entry_state);

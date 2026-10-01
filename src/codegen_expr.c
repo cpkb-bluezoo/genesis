@@ -153,6 +153,41 @@ static char *build_array_descriptor(type_kind_t base_kind, const char *base_clas
 static void codegen_load_enclosing_this(method_gen_t *mg, const_pool_t *cp, symbol_t *target_owner);
 
 /**
+ * Find (or register) the synthetic static accessor 'enclosing' must emit so
+ * a nested class can read 'field' (declared in the superclass
+ * 'field_owner') without a direct getfield - see pending_field_accessor_t's
+ * own comment (genesis.h) for why this is needed at all. Idempotent: the
+ * discovery pass and the real codegen pass both call this for the same
+ * access, and must agree on the same name, so a repeat lookup for the same
+ * field just returns the already-assigned one.
+ */
+static const char *get_or_create_field_accessor(symbol_t *enclosing, symbol_t *field_owner,
+                                                 symbol_t *field)
+{
+    int index = 0;
+    for (slist_t *p = enclosing->data.class_data.pending_field_accessors; p; p = p->next, index++) {
+        pending_field_accessor_t *acc = (pending_field_accessor_t *)p->data;
+        if (acc->field == field) {
+            return acc->accessor_name;
+        }
+    }
+
+    pending_field_accessor_t *acc = calloc(1, sizeof(pending_field_accessor_t));
+    acc->field = field;
+    acc->field_owner = field_owner;
+    char name_buf[32];
+    snprintf(name_buf, sizeof(name_buf), "access$%d", index);
+    acc->accessor_name = strdup(name_buf);
+
+    if (!enclosing->data.class_data.pending_field_accessors) {
+        enclosing->data.class_data.pending_field_accessors = slist_new(acc);
+    } else {
+        slist_append(enclosing->data.class_data.pending_field_accessors, acc);
+    }
+    return acc->accessor_name;
+}
+
+/**
  * Emit ++/-- on an instance field of the current object (this.field).
  * field_owner_internal is the class that declares the field (may be a superclass).
  */
@@ -1543,11 +1578,59 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
                             mg_pop_typed(mg, 1);
                             mg_push_object(mg, outer_internal);
 
-                            /* Get the field using the declaring superclass as owner */
-                            uint16_t fieldref = cp_add_fieldref(mg->cp, field_owner_internal,
-                                                                 name, field_desc);
-                            bc_emit(mg->code, OP_GETFIELD);
-                            bc_emit_u2(mg->code, fieldref);
+                            /* JVMS 5.4.4: a protected field declared in a
+                             * superclass in a DIFFERENT runtime package can only
+                             * be read directly by a getfield whose own
+                             * containing class is itself a subclass of the
+                             * declaring class - true of 'enclosing' but NOT of
+                             * the class actually emitting this instruction
+                             * (mg->class_gen, a nested class OF 'enclosing',
+                             * never itself a subclass of the far-away
+                             * superclass). Emitting the getfield directly threw
+                             * "IllegalAccessError: failed to access class ..."
+                             * at runtime despite this being perfectly legal
+                             * Java (JLS 6.6.2). Route through a synthetic
+                             * accessor defined on 'enclosing' instead, exactly
+                             * like real javac's own access$NNN bridge methods -
+                             * confirmed against gumdrop's own
+                             * WebSocketClientProtocolHandler$ClientWebSocketTransport
+                             * reading the inherited "protected Endpoint
+                             * endpoint" field declared on
+                             * HttpClientProtocolHandler (a different package). */
+                            bool needs_bridge = false;
+                            if ((outer_field->modifiers & MOD_PROTECTED) &&
+                                !(outer_field->modifiers & MOD_PUBLIC)) {
+                                char *acc_pkg = get_package_name(class_sym->qualified_name);
+                                char *owner_pkg = get_package_name(search->qualified_name);
+                                bool same_package = acc_pkg && owner_pkg &&
+                                    strcmp(acc_pkg, owner_pkg) == 0;
+                                free(acc_pkg);
+                                free(owner_pkg);
+                                bool current_is_subtype = false;
+                                for (symbol_t *s = class_sym; s; s = s->data.class_data.superclass) {
+                                    if (s == search) { current_is_subtype = true; break; }
+                                }
+                                needs_bridge = !same_package && !current_is_subtype;
+                            }
+
+                            if (needs_bridge) {
+                                const char *accessor_name =
+                                    get_or_create_field_accessor(enclosing, search, outer_field);
+                                size_t adesc_len = strlen(outer_internal) + strlen(field_desc) + 5;
+                                char *accessor_desc = malloc(adesc_len);
+                                snprintf(accessor_desc, adesc_len, "(L%s;)%s", outer_internal, field_desc);
+                                uint16_t methodref = cp_add_methodref(mg->cp, outer_internal,
+                                                                       accessor_name, accessor_desc);
+                                bc_emit(mg->code, OP_INVOKESTATIC);
+                                bc_emit_u2(mg->code, methodref);
+                                free(accessor_desc);
+                            } else {
+                                /* Get the field using the declaring superclass as owner */
+                                uint16_t fieldref = cp_add_fieldref(mg->cp, field_owner_internal,
+                                                                     name, field_desc);
+                                bc_emit(mg->code, OP_GETFIELD);
+                                bc_emit_u2(mg->code, fieldref);
+                            }
                             mg_pop_typed(mg, 1);
                             switch (field_desc[0]) {
                                 case 'J': mg_push_long(mg); break;
@@ -2070,10 +2153,26 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                     break;
                 }
                 
-                /* Load the next this$N field */
-                char this_field[32];
-                snprintf(this_field, sizeof(this_field), "this$%d", depth);
-                
+                /* Load the next hop's synthetic outer-instance field. Real
+                 * javac (and genesis's own field-creation code, e.g.
+                 * class_gen_new()'s "this0->name = strdup(\"this$0\")")
+                 * always names this field "this$0" on EVERY class that has
+                 * one - there is no "this$1"/"this$2" convention; reaching
+                 * an ancestor two levels up means chaining TWO separate
+                 * "this$0" getfields, one per class, each named "this$0"
+                 * on its own class. Using "this$%d" with an incrementing
+                 * depth here instead produced a getfield naming a
+                 * NON-EXISTENT field ("this$1") the moment this loop ran a
+                 * second iteration: NoSuchFieldError at runtime, for any
+                 * anonymous/inner class nested two or more lexical levels
+                 * deep referring to a non-immediate enclosing instance
+                 * (e.g. "Outer.this" from inside an anonymous class nested
+                 * inside another anonymous class). Confirmed against
+                 * gumdrop's own ServletWebConnection, whose constructor
+                 * nests exactly this shape. */
+                (void)depth;
+                const char *this_field = "this$0";
+
                 char *current_internal = class_to_internal_name(
                     current_class->qualified_name ? current_class->qualified_name : current_class->name);
                 char *enclosing_internal = class_to_internal_name(
@@ -6780,7 +6879,36 @@ static bool codegen_explicit_ctor_call(method_gen_t *mg, ast_node_t *expr, const
      * argument-inferred descriptor only if semantic analysis didn't
      * resolve a target constructor (should not normally happen). */
     char *descriptor = NULL;
-    if (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR) {
+    if (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR &&
+        !is_enum_this_call && !expr->sem_symbol->ast &&
+        expr->sem_symbol->data.method_data.descriptor) {
+        /* Classfile-loaded target constructor (no source AST - see
+         * create_type_stub()'s own "the symbol is just a type stub"
+         * comment for this convention) - use its own exact, already-
+         * erased descriptor directly rather than reconstructing one
+         * param-by-param below. A constructor parameter typed as a
+         * BOUNDED class-level type variable (e.g. "M" in
+         * "ForwardingJavaFileManager<M extends JavaFileManager>(M
+         * fileManager)") erases to its bound (JavaFileManager), not
+         * Object - but the type_t for a classfile-loaded parameter
+         * symbol doesn't reliably carry that bound (reading it would
+         * need the class's own generic Signature attribute, which
+         * genesis's classfile loader doesn't parse for method
+         * parameters), so reconstructing the descriptor from param->type
+         * one type_to_descriptor() call at a time silently fell back to
+         * Object for exactly this case - a "(Ljava/lang/Object;)V"
+         * invokespecial where the real, compiled constructor is
+         * "(Ljavax/tools/JavaFileManager;)V": NoSuchMethodError at
+         * runtime, despite genesis itself compiling without complaint.
+         * The classfile's own descriptor has no such gap - javac already
+         * baked the correct erasure into it when IT compiled the
+         * superclass. Confirmed against gumdrop's own
+         * InMemoryJavaCompiler$InMemoryFileManager, whose
+         * "super(fileManager)" (extending javax.tools.
+         * ForwardingJavaFileManager<StandardJavaFileManager>) depends on
+         * this exact resolution. */
+        descriptor = strdup(expr->sem_symbol->data.method_data.descriptor);
+    } else if (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR) {
         /* Build "(<param descriptors>)V" directly from the resolved
          * constructor's own parameters - not via method_to_descriptor(),
          * which also appends method->type's own descriptor as the return
@@ -7715,18 +7843,36 @@ static bool codegen_array_init(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             store_op = get_array_store_opcode(elem_kind);
         }
         bc_emit(mg->code, store_op);
-        
+
         /* Stack: arrayref, index, value -> (net effect: -3) */
         mg_pop_typed(mg, 3);
-        if (elem_kind == TYPE_LONG || elem_kind == TYPE_DOUBLE) {
-            mg_pop_typed(mg, 1);  /* Wide types */
+        /* elem_kind is the array's ultimate LEAF scalar type, not what
+         * THIS dimension's own store opcode operates on (see the
+         * dims>1/store_elem_kind comment above, in the sibling ASSIGNMENT
+         * codegen, for the identical distinction). At any outer dimension
+         * (arr_dims > 1) the value just stored is a SUB-ARRAY REFERENCE
+         * via AASTORE - one word, like any other reference - regardless
+         * of whether the leaf type is long/double; the extra word only
+         * exists at the leaf dimension's own LASTORE/DASTORE. Popping it
+         * here too undercounted mg->stack_depth by one word for every
+         * outer-dimension element of a long[][]/double[][] (or deeper)
+         * literal, which - for such a literal used directly as a method
+         * argument - eventually went negative in AST_EXPR_STMT's unsigned
+         * "slots to pop" computation, wrapping to 65535 and emitting a
+         * spurious POP2 after the call: VerifyError "Operand stack
+         * overflow"/"underflow" despite the actual array-construction
+         * bytecode being correct throughout. Confirmed against gumdrop's
+         * own LossDetectorTest, whose "new long[][] { { 0, 0 } }" method
+         * argument hits exactly this shape. */
+        if (arr_dims == 1 && (elem_kind == TYPE_LONG || elem_kind == TYPE_DOUBLE)) {
+            mg_pop_typed(mg, 1);  /* Wide types, leaf dimension only */
         }
-        
+
         index++;
     }
-    
+
     free(array_type_desc);
-    
+
     /* Array reference is still on stack */
     return true;
 }
@@ -10363,16 +10509,46 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 const char *field_desc = "I";  /* Default to int */
                                 type_kind_t field_kind = TYPE_INT;
 
-                                if (receiver->sem_type && receiver->sem_type->kind == TYPE_CLASS) {
-                                    if (receiver->sem_type->data.class_type.name) {
-                                        char *internal = class_to_internal_name(receiver->sem_type->data.class_type.name);
+                                /* An explicit "this.field++" receiver is AST_THIS_EXPR,
+                                 * whose own sem_type is never cached onto the node itself -
+                                 * get_expression_type()'s AST_THIS_EXPR case (semantic.c)
+                                 * computes and returns sem->current_class->type on demand
+                                 * but never assigns it to expr->sem_type, unlike an
+                                 * AST_IDENTIFIER receiver (e.g. "obj.field++"), which does
+                                 * get sem_type populated during normal expression type-
+                                 * checking. Calling get_expression_type() here as a generic
+                                 * fallback doesn't work either: it's a codegen-time call
+                                 * into semantic.c, and by then sem->current_class is stale
+                                 * (it only tracks "current position" during semantic
+                                 * analysis's own, already-finished AST walk) - so use
+                                 * mg->class_gen->class_sym->type directly instead, the
+                                 * codegen-time equivalent. Without this, the whole block
+                                 * below was skipped, leaving the java.lang.Object/int
+                                 * placeholders above to reach the classfile as a real
+                                 * fieldref: NoSuchFieldError at runtime for ANY
+                                 * "this.field++"/"this.field--", widening or not. Confirmed
+                                 * against gumdrop's own Quota.incrementMessageCount()'s
+                                 * "this.messageCount++". */
+                                type_t *receiver_type = receiver->sem_type;
+                                if ((!receiver_type || receiver_type->kind != TYPE_CLASS) &&
+                                    receiver->type == AST_THIS_EXPR &&
+                                    mg->class_gen && mg->class_gen->class_sym) {
+                                    receiver_type = mg->class_gen->class_sym->type;
+                                } else if ((!receiver_type || receiver_type->kind != TYPE_CLASS) &&
+                                           mg->class_gen && mg->class_gen->sem) {
+                                    receiver_type = get_expression_type(mg->class_gen->sem, receiver);
+                                }
+
+                                if (receiver_type && receiver_type->kind == TYPE_CLASS) {
+                                    if (receiver_type->data.class_type.name) {
+                                        char *internal = class_to_internal_name(receiver_type->data.class_type.name);
                                         obj_class = internal;
                                     }
 
                                     /* Look up the field in the class to get its type -
                                      * walking the superclass chain too, since the field
                                      * may be inherited (see lookup_field_with_superclass()). */
-                                    symbol_t *class_sym = receiver->sem_type->data.class_type.symbol;
+                                    symbol_t *class_sym = receiver_type->data.class_type.symbol;
                                     if (class_sym) {
                                         symbol_t *field_sym = lookup_field_with_superclass(class_sym, field_name);
                                         if (field_sym && field_sym->type) {

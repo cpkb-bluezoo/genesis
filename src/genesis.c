@@ -1004,6 +1004,13 @@ static int compile_file(source_file_t *src, compiler_options_t *opts)
                         collect_nest_members_recursive(sem, cg, cg->cp, &cg->nest_members, target_major);
                     }
 
+                    /* A descendant discovered during that same recursive scan
+                     * may have registered a synthetic field-accessor need on
+                     * THIS class (see pending_field_accessor_t's own comment,
+                     * genesis.h) - after codegen_class() already returned, so
+                     * emit it now, before this class's bytes are finalized. */
+                    generate_pending_field_accessors(cg);
+
                     /* Output the class */
                     const char *qname = class_sym->qualified_name ?
                                         class_sym->qualified_name : class_name;
@@ -1590,6 +1597,13 @@ static void *codegen_phase_worker(void *arg)
                 if (cg->nest_host == 0) {
                     collect_nest_members_recursive(sem, cg, cg->cp, &cg->nest_members, target_major);
                 }
+
+                /* A descendant discovered during that same recursive scan may
+                 * have registered a synthetic field-accessor need on THIS
+                 * class (see pending_field_accessor_t's own comment,
+                 * genesis.h) - after codegen_class() already returned, so
+                 * emit it now, before this class's bytes are finalized. */
+                generate_pending_field_accessors(cg);
 
                 /* Write class file */
                 const char *qname = class_sym ? class_sym->qualified_name : class_name;

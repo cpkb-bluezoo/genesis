@@ -1179,6 +1179,40 @@ bool classfile_get_attribute_constant_value(classfile_t *cf, attribute_info_t *a
     return false;
 }
 
+bool classfile_get_attribute_constant_value_string(classfile_t *cf, attribute_info_t *attrs,
+                                                     uint16_t attr_count, char **out_value)
+{
+    if (!cf || !out_value) {
+        return false;
+    }
+    for (uint16_t i = 0; i < attr_count; i++) {
+        char *name = classfile_get_utf8(cf, attrs[i].attribute_name_index);
+        bool is_const_value = name && strcmp(name, "ConstantValue") == 0;
+        free(name);
+        if (!is_const_value) {
+            continue;
+        }
+        if (attrs[i].attribute_length < 2 || !attrs[i].info) {
+            return false;
+        }
+        uint16_t const_index = ((uint16_t)attrs[i].info[0] << 8) | attrs[i].info[1];
+        if (const_index == 0 || const_index >= cf->constant_pool_count) {
+            return false;
+        }
+        cp_info_t *cp = &cf->constant_pool[const_index];
+        if (cp->tag != CONSTANT_String) {
+            return false;  /* Integer/Long/Float/Double: never a valid String case-label type */
+        }
+        char *str = classfile_get_utf8(cf, cp->info.class_info.name_index);
+        if (!str) {
+            return false;
+        }
+        *out_value = str;
+        return true;
+    }
+    return false;
+}
+
 /* Forward declarations for signature parsing */
 static generic_type_t *parse_type_signature(const char **sig);
 static generic_type_t *parse_class_type_signature(const char **sig);

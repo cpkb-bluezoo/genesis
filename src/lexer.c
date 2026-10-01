@@ -718,9 +718,29 @@ static void lexer_scan_number(lexer_t *lexer)
         lexer->text_buf[j] = '\0';
         
         if (is_hex) {
-            lexer->token.value.int_value = strtoll(lexer->text_buf, NULL, 16);
+            /* Per JLS 3.10.1, a hex/octal/binary integer literal names a
+             * bit pattern directly (the full unsigned range of its type
+             * is allowed), unlike a decimal literal (whose allowed range
+             * is the signed type's own range, plus the single special
+             * case of Long/Integer.MIN_VALUE via a preceding unary
+             * minus). strtoll() (SIGNED parse) saturates to LLONG_MAX
+             * whenever the hex digits name a bit pattern with the sign
+             * bit set - "0xc000000000000000L" (a perfectly legal literal
+             * naming a negative long) silently became
+             * 0x7fffffffffffffffL (Long.MAX_VALUE) instead, with no
+             * parse error of any kind. strtoull() (unsigned parse)
+             * correctly returns the exact bit pattern requested; the
+             * implicit conversion to the signed int_value field below
+             * then reinterprets it exactly as two's-complement (as every
+             * mainstream platform this runs on already does), matching
+             * what the bit pattern means as a signed value. Confirmed
+             * against gumdrop's own VarInt.encode()'s "value |
+             * 0xc000000000000000L" (RFC 9000's varint length-prefix
+             * mask for the 8-byte encoding), which silently corrupted
+             * every value requiring that encoding. */
+            lexer->token.value.int_value = (long long)strtoull(lexer->text_buf, NULL, 16);
         } else if (is_binary) {
-            lexer->token.value.int_value = strtoll(lexer->text_buf + 2, NULL, 2);  /* Skip 0b */
+            lexer->token.value.int_value = (long long)strtoull(lexer->text_buf + 2, NULL, 2);  /* Skip 0b */
         } else {
             lexer->token.value.int_value = strtoll(lexer->text_buf, NULL, 10);
         }

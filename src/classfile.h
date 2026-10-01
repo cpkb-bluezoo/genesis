@@ -383,12 +383,29 @@ char *classfile_get_attribute_signature(classfile_t *cf, attribute_info_t *attrs
  * external/JDK class's "public static final int PAGE_SCOPE = 1;". Reads
  * the u2 constant pool index the attribute stores and resolves it to the
  * actual int/long value. Returns true and sets *out_value only for a
- * CONSTANT_Integer or CONSTANT_Long pool entry (the only kinds a switch
- * case label's own constant can ever need); false if no ConstantValue
- * attribute is present or it names some other constant kind (String,
- * Float, Double - never valid as a case label's type to begin with). */
+ * CONSTANT_Integer or CONSTANT_Long pool entry (the only kinds an
+ * int-family switch case label's own constant can ever need - see the
+ * sibling classfile_get_attribute_constant_value_string() just below for
+ * a String-typed field's own ConstantValue, needed for a String switch's
+ * case label instead); false if no ConstantValue attribute is present or
+ * it names some other constant kind (String, Float, Double - never valid
+ * as an int-family case label's type to begin with). */
 bool classfile_get_attribute_constant_value(classfile_t *cf, attribute_info_t *attrs,
                                             uint16_t attr_count, long long *out_value);
+
+/* Like classfile_get_attribute_constant_value() above, but for a
+ * String-typed "static final" field's own ConstantValue attribute (a
+ * CONSTANT_String pool entry, whose own name_index actually names a
+ * CONSTANT_Utf8 entry holding the real string, despite the shared
+ * cp_info_t layout also used for CONSTANT_Class). Needed for a String
+ * switch's case label referencing a classfile-loaded constant (e.g. an
+ * inherited "case HttpServletRequest.DIGEST_AUTH:" from an external
+ * servlet-api jar) - the int/long-only sibling function above always
+ * returns false for a String-typed field. Returns a malloc'd copy the
+ * caller must free(); false (with *out_value left untouched) if no
+ * ConstantValue attribute is present or it names a non-String constant. */
+bool classfile_get_attribute_constant_value_string(classfile_t *cf, attribute_info_t *attrs,
+                                                     uint16_t attr_count, char **out_value);
 
 /* Parse a generic type from a signature string */
 generic_type_t *signature_parse_type(const char **sig);
