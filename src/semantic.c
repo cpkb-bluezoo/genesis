@@ -17042,6 +17042,16 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     return type_new_primitive(TYPE_INT);
                 }
                 
+                /* The type of a field loaded from a class file is made from
+                 * its descriptor and names its class without carrying the
+                 * class's symbol. When the object is such a field reached
+                 * by its simple name - one this class inherits from a
+                 * class-file superclass, "kind.extension" - nothing has
+                 * attached the symbol yet, and without it the field could
+                 * not be looked up: the expression had no type at all (a
+                 * string concatenation then compiled it as an int). */
+                ensure_type_symbol_loaded(sem, object_type);
+
                 /* Look up the field in the object's type, including superclasses */
                 if (object_type && object_type->kind == TYPE_CLASS && 
                     object_type->data.class_type.symbol) {

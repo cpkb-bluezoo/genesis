@@ -2661,6 +2661,44 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                 }
                 return true;
             }
+
+            /* Not declared by this class: a field it inherits (field_map
+             * only holds the class's own fields). Reached for the receiver
+             * of a chained access, "this.kind.extension" with kind declared
+             * by a superclass - the single-level "this.kind" is handled
+             * before it gets here. The field is named through this class,
+             * as the assignment path does for "this.field = ..."; the JVM
+             * resolves it up the superclass chain. */
+            symbol_t *inherited = mg->class_gen->class_sym ?
+                lookup_field_with_superclass(mg->class_gen->class_sym, field_name) : NULL;
+            char *inherited_desc = (inherited && inherited->type) ?
+                type_to_descriptor(inherited->type) : NULL;
+            if (inherited_desc) {
+                uint16_t fieldref = cp_add_fieldref(cp, mg->class_gen->internal_name,
+                                                     field_name, inherited_desc);
+                if (inherited->modifiers & MOD_STATIC) {
+                    /* A static field reached through "this": the reference
+                     * is not used */
+                    bc_emit(mg->code, OP_POP);
+                    mg_pop_typed(mg, 1);
+                    bc_emit(mg->code, OP_GETSTATIC);
+                    bc_emit_u2(mg->code, fieldref);
+                } else {
+                    bc_emit(mg->code, OP_GETFIELD);
+                    bc_emit_u2(mg->code, fieldref);
+                    mg_pop_typed(mg, 1);  /* Pop the object reference */
+                }
+                switch (inherited_desc[0]) {
+                    case 'J': mg_push_long(mg); break;
+                    case 'D': mg_push_double(mg); break;
+                    case 'F': mg_push_float(mg); break;
+                    case 'L':
+                    case '[': mg_push_object_from_descriptor(mg, inherited_desc); break;
+                    default:  mg_push_int(mg); break;
+                }
+                free(inherited_desc);
+                return true;
+            }
         }
         
         fprintf(stderr, "codegen: cannot resolve field: this.%s\n", field_name);

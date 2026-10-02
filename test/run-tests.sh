@@ -1177,5 +1177,26 @@ else
 fi
 
 echo
+echo "--- Field of a field inherited from a class-file superclass ---"
+# The library is compiled first, on its own, so that the test inherits
+# "kind" and "holder" from a class file. Own freshly emptied -d directory
+# and working directory, same reason as InheritedMemberType above.
+printf "%-30s ... " "InheritedFieldChain"
+ifc_lib="$TEST_BUILD/inherited-field-chain-lib"
+ifc_out="$TEST_BUILD/inherited-field-chain-out"
+rm -rf "$ifc_lib" "$ifc_out"
+mkdir -p "$ifc_lib" "$ifc_out"
+if "$GENESIS" -d "$ifc_lib" "$TEST_SRC"/external/fieldchain/lib/*.java >/dev/null 2>&1 &&
+   (cd "$ifc_out" && "$GENESIS" -cp "$ifc_lib" -d "$ifc_out" \
+       "$TEST_SRC/external/InheritedFieldChainTest.java" >/dev/null 2>&1) &&
+   "$JAVA" -cp "$ifc_out:$ifc_lib" InheritedFieldChainTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]
