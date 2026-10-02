@@ -4119,11 +4119,19 @@ static void generate_interface_bridges(class_gen_t *cg)
                  * sites in semantic.c - the return-type AST node lives in a
                  * method declaration's own .data.node.extra), same as
                  * several earlier fixes this session forcing a lazily-
-                 * unresolved type on first genuine use. */
-                if (!iface_method->type && iface_method->ast &&
+                 * unresolved type on first genuine use.
+                 *
+                 * The resolved type is used here and not stored in the
+                 * method symbol: an interface of this compilation is
+                 * shared by every file that implements it, and their code
+                 * is generated on several threads at once - one thread
+                 * writing the symbol's type while another reads it is a
+                 * data race. */
+                type_t *iface_return_type = iface_method->type;
+                if (!iface_return_type && iface_method->ast &&
                     iface_method->ast->type == AST_METHOD_DECL &&
                     iface_method->ast->data.node.extra && cg->sem) {
-                    iface_method->type = semantic_resolve_type(cg->sem,
+                    iface_return_type = semantic_resolve_type(cg->sem,
                         (ast_node_t *)iface_method->ast->data.node.extra);
                 }
 
@@ -4143,8 +4151,8 @@ static void generate_interface_bridges(class_gen_t *cg)
                     }
                 }
                 string_append(erased_desc, ")");
-                if (iface_method->type) {
-                    char *rdesc = type_to_descriptor(iface_method->type);
+                if (iface_return_type) {
+                    char *rdesc = type_to_descriptor(iface_return_type);
                     string_append(erased_desc, rdesc);
                     free(rdesc);
                 } else {

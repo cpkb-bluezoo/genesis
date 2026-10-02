@@ -8188,10 +8188,21 @@ static symbol_t *load_external_class_impl(semantic_t *sem, const char *name)
             bool registry_has_more = registry_sym && 
                 (registry_sym->data.class_data.members || registry_sym->data.class_data.interfaces);
             if (registry_has_more) {
-                /* Update the thread-local cached type to point to the registry symbol.
-                 * This is safe because cached is thread-local.
-                 * DO NOT modify registry_sym - it's shared read-only state! */
-                cached->data.class_type.symbol = registry_sym;
+                /* Point the cached type at the registry symbol.
+                 * DO NOT modify registry_sym - it's shared read-only state!
+                 *
+                 * The cached type is very often the registry symbol's own
+                 * type, which already points at it (any class that
+                 * implements no interface gets here on every lookup): that
+                 * type is shared by every analyzer, and this runs on the
+                 * code generation threads too, so it is only written when
+                 * there is something to change. Storing the pointer it
+                 * already holds was a data race with every thread reading
+                 * it. What does get switched is an analyzer's own type for
+                 * one of its file's classes. */
+                if (cached->data.class_type.symbol != registry_sym) {
+                    cached->data.class_type.symbol = registry_sym;
+                }
                 if (debug_getenv("GENESIS_DEBUG_LOAD")) {
                     fprintf(stderr, "DEBUG load_external_class: switched to registry symbol for '%s' (members=%p, interfaces=%p)\n",
                             name, (void*)registry_sym->data.class_data.members, 
