@@ -18,7 +18,7 @@ features.
 
 ## Current Status
 
-**Version 1.0.0** : Full Java 25 support
+**Version 1.0.1** : Full Java 25 support
 
 Genesis supports Java language features through Java 25:
 

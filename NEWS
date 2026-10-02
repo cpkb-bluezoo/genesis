@@ -1,5 +1,83 @@
 GNU Genesis NEWS -- history of user-visible changes.
 
+* Noteworthy changes in release 1.0.1 (2026-10-02) [stable]
+
+** Compatibility
+
+  Genesis now compiles all of gumdrop (github.com/cpkb-bluezoo/gumdrop, 1408
+  source files and 552 JUnit test sources) without an error, and gumdrop's
+  JUnit suite (519 suites, 6496 tests) passes when compiled entirely by
+  genesis.  Getting there fixed a large number of bugs; see "Bugs fixed".
+
+** Performance
+
+  Symbols for classes loaded from class files are built once per
+  compilation, not once per source file; lookups of classes that turn out
+  not to exist are remembered; the classpath is indexed by package; and the
+  phases that run on several threads no longer queue for a single lock.
+
+  With more than one job (the default is one per processor), semantic
+  analysis and code generation of a batch of 32 or more files written to a
+  directory are divided between worker processes.  -j1 compiles in a single
+  thread of one process.  JAR output and smaller batches are analysed in the
+  compiler process itself, with code generation on threads as before.
+
+** Changes in behavior
+
+  Source files found through -sourcepath are compiled as part of the same
+  batch as the files named on the command line, through the same pipeline.
+
+  A semantic error is no longer reported once for every overload candidate
+  it was evaluated against, so some compilations with errors print fewer
+  copies of the same message and a lower error count.
+
+  README is now README.md.
+
+** Bugs fixed
+
+  Code generation: stack map frames after try/finally, try-with-resources,
+  switch fall-through, synchronized blocks, loops and conditional
+  assignments; boxing and unboxing in conditional expressions, comparisons,
+  array initializers and varargs calls; long shifts and bitwise complement;
+  casts between primitive types and from references to primitives; enum
+  switch labels, including qualified and statically imported constants;
+  string switch on constants loaded from class files; compound assignment
+  to long and double fields; return inside try/finally; monitors not
+  released on early exit from a synchronized block.
+
+  Classes: enum constants with a class body, and annotation types nested in
+  another class, were silently not written.  An enum constructor is always
+  private.  A nested class is no longer written with an invalid protected
+  access flag.  NestMembers lists nested, local and anonymous classes at
+  every depth.  A protected field inherited from another package is read
+  from a nested class through a synthetic accessor.  Anonymous classes
+  nested in anonymous classes, created in static initializers, or passing
+  arguments to a superclass constructor.
+
+  Types and overload resolution: generic method return types inferred from
+  the target type and from the receiver's type arguments; method type
+  parameters; parameterized interface inheritance; overloads no longer
+  chosen by the wrong boxing or widening conversion, nor from inaccessible
+  or synthetic bridge methods of classes loaded from class files; varargs
+  parameters across files; wildcard imports of types from other files of
+  the same compilation; single-type imports take precedence over same-
+  package types; captured local variables in block-bodied lambdas and in
+  nested local and anonymous classes.
+
+  Class files: a nested type loaded from a class file is now the same
+  whichever of it and its outer type is loaded first, and keeps its
+  supertype when it extends its own outer type.  A field read through a
+  field inherited from a class-file superclass (kind.extension) has its
+  type.  Retention of annotations defined in class files and in other files
+  of the same compilation is honoured.
+
+  Source text: \uXXXX escapes and characters outside the Basic Multilingual
+  Plane in string literals; "final" on a catch parameter.
+
+  Two data races in code generation on threads, and unsynchronised reads of
+  the same JAR from several threads, are fixed.  Interned strings no longer
+  move when the intern table grows.
+
 * Noteworthy changes in release 1.0.0 (2026-09-27) [stable]
 
 This is the first release.  Genesis is a Java compiler written in C99 that

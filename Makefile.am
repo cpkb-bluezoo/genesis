@@ -10,7 +10,7 @@ SUBDIRS = src
 ## Only user-facing documentation is distributed.  Everything under test/
 ## (regression tests, jtreg glue) is development-only and is
 ## intentionally absent from EXTRA_DIST.
-EXTRA_DIST = CONTRIBUTING TODO README bench/compare-compilers.sh bench/gumdrop-ant-test.sh
+EXTRA_DIST = CONTRIBUTING TODO README.md bench/compare-compilers.sh bench/gumdrop-ant-test.sh
 
 if HAVE_TESTS
 

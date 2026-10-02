@@ -1,3 +1,96 @@
+2026-10-02  Chris Burdess  <dog@gnu.org>
+
+	Release 1.0.1.
+
+	Parity with javac on gumdrop (1408 sources, 552 JUnit test sources):
+	everything compiles and the JUnit suite passes.  The individual fixes
+	are recorded in the git history between v1.0.0 and this release.
+	* src/semantic.c: Generic method return inference, method type
+	parameters, parameterized interface inheritance, overload resolution
+	(boxing and widening priorities, inaccessible and bridge methods of
+	class-file classes), varargs across files, imports (wildcard, single-
+	type before same-package, nested types), annotation retention,
+	captures in lambdas and nested local classes, -sourcepath loading.
+	* src/codegen.c, src/codegen_expr.c, src/codegen_stmt.c,
+	src/stackmap.c: Stack map frames for try/finally, try-with-resources,
+	switch, synchronized and loops; boxing and unboxing; primitive casts;
+	enum and string switch labels; enum constant bodies, nested annotation
+	types, anonymous class constructors, synthetic accessors for inherited
+	protected fields, NestMembers at every depth.
+	* src/classwriter.c, src/lexer.c, src/parser.c: Unicode escapes and
+	supplementary characters in string literals; "final" catch parameters;
+	nested class access flags.
+	* src/genesis.c (compile_parallel, compile_batch): Restart the batch
+	with the source files loaded through -sourcepath added to it.
+	* bench/compare-compilers.sh, bench/gumdrop-ant-test.sh: New.  "make
+	bench" and "make gumdrop-smoke".
+
+	Performance.
+	* src/semantic.c (symbol_from_classfile_shared, external_class_import)
+	(symbol_from_classfile_impl): New.  Build the symbol of a class file
+	once per batch and replay its effect on each analyzer's type cache.
+	(semantic_prebuild_external_classes): New.  Build them before the
+	worker processes are forked.
+	(type_registry_ensure_indexes, type_registry_nested_entries)
+	(type_registry_entries_by_simple_name): New.  Index the registry by
+	outer type and by simple name.
+	(registry_lookup_nested_members, load_external_class_impl): Use the
+	indexes in place of walks over every registered type.
+	(load_external_class): Remember qualified names that do not exist.
+	(type_registry_seal, type_registry_lookup): No lock once registration
+	is over.
+	(resolve_type_name_with_imports, resolve_types_in_compilation_unit_cached):
+	Resolve each simple name once per file; remember classpath and
+	sourcepath probes per thread.
+	(resolve_unresolved_type): Remember qualified names per class while
+	its members are entered.
+	(find_best_method_by_types): Type each argument once, not once per
+	candidate.
+	* src/classpath.c (classpath_build_package_index, classpath_dir_files):
+	New.  Go straight to the archives holding a package; list a package
+	directory once.
+	(classpath_find_class): Use them.  Do not remember names in packages
+	that do not exist.
+	(jar_read_entry): Positioned reads; safe for concurrent readers.
+	(classpath_loaded_class_names): New.
+	* src/genesis.c (compile_with_worker_processes, worker_process_run):
+	New.  Semantic analysis and code generation in worker processes.
+	(qualify_phase_worker): New.  Qualify type names on threads.
+	(analyze_file, generate_file_code): New, from compile_batch and
+	codegen_phase_worker.
+	(output_class): No global lock for directory output; plain open, write
+	and close; create directories only when missing.
+	(timing_mark): New.  GENESIS_DEBUG_TIMING, GENESIS_DEBUG_PAUSE.
+	* src/util.c (intern_len, intern, intern_init, intern_cleanup): Sharded
+	table with storage that never moves.
+	(intern_set_concurrent): New.
+	(debug_env_init): New.
+	* src/util.h (debug_getenv): New.  All GENESIS_DEBUG_* tests use it.
+	* src/lexer.c (lookup_keyword): Dismiss non-keywords on the first
+	character.
+	* src/constpool.c (cp_add_class): Find the class entry by name index.
+
+	Class files loaded in any order.
+	* src/semantic.c (load_member_class_file): New.  Load a member class by
+	way of its outer class.
+	(load_external_class): Answer a load of a class that is still loading
+	its nested types from the type cache.
+	(symbol_from_classfile_impl): Give a nested class cached before its
+	outer class its simple name and enclosing class.
+	(get_expression_type): Load the symbol of a field's type before
+	looking a further field up in it.
+	* src/codegen_expr.c (codegen_field_access): Resolve an inherited field
+	as the receiver in this.field.other.
+
+	Data races in code generation on threads.
+	* src/semantic.c (load_external_class_impl): Do not store a registry
+	type's symbol pointer when it already has that value.
+	* src/codegen.c (generate_interface_bridges): Do not store the resolved
+	return type in the shared interface method symbol.
+
+	* Makefile.am (EXTRA_DIST): README is now README.md.
+	* README.md, CONTRIBUTING, NEWS: Updated.
+
 2026-09-27  Chris Burdess  <dog@gnu.org>
 
 	Release 1.0.0.
