@@ -1504,6 +1504,44 @@ classfile_t *classpath_load_class(classpath_t *cp, const char *classname)
     return classpath_find_class(cp, classname);
 }
 
+static int compare_class_names(const void *a, const void *b)
+{
+    return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+char **classpath_loaded_class_names(classpath_t *cp, int *count_out)
+{
+    pthread_mutex_t *lock = (pthread_mutex_t *)cp->cache_lock;
+    char **names = NULL;
+    int count = 0;
+
+    if (lock) {
+        pthread_mutex_lock(lock);
+    }
+    names = malloc((cp->cache->count > 0 ? cp->cache->count : 1) * sizeof(char *));
+    if (names) {
+        for (size_t i = 0; i < cp->cache->size; i++) {
+            for (hashtable_entry_t *e = cp->cache->buckets[i]; e; e = e->next) {
+                char *copy = strdup(e->key);
+                if (copy) {
+                    names[count++] = copy;
+                }
+            }
+        }
+    }
+    if (lock) {
+        pthread_mutex_unlock(lock);
+    }
+
+    if (names) {
+        qsort(names, (size_t)count, sizeof(char *), compare_class_names);
+    }
+    if (count_out) {
+        *count_out = count;
+    }
+    return names;
+}
+
 bool classpath_class_exists(classpath_t *cp, const char *classname)
 {
     /* For now, just try to load it */

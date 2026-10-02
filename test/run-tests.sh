@@ -1133,5 +1133,49 @@ else
 fi
 
 echo
+echo "--- Class-file nested type extending its own outer type ---"
+# The library is compiled first, on its own, so that the test sees Shape,
+# Shape$Circle, Registration and Registration$Dynamic as class files. The
+# test names each outer type before its nested type; the nested type must
+# still inherit the outer type's members.
+printf "%-30s ... " "NestedExtendsOuter"
+neo_lib="$TEST_BUILD/nested-extends-outer-lib"
+neo_out="$TEST_BUILD/nested-extends-outer-out"
+rm -rf "$neo_lib" "$neo_out"
+mkdir -p "$neo_lib" "$neo_out"
+if "$GENESIS" -d "$neo_lib" "$TEST_SRC"/external/nestedouter/lib/*.java >/dev/null 2>&1 &&
+   (cd "$neo_out" && "$GENESIS" -cp "$neo_lib" -d "$neo_out" \
+       "$TEST_SRC/external/NestedExtendsOuterTest.java" >/dev/null 2>&1) &&
+   "$JAVA" -cp "$neo_out:$neo_lib" NestedExtendsOuterTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Class-file nested type met before its outer type ---"
+# Two files in one batch, in this order: the first names only the nested
+# type FileObject.Kind (so it is loaded on its own), the second then needs
+# it as a member of FileObject, inherited through a class file superclass.
+# The symbols of class-file classes are shared by the files of a batch, so
+# what the first file's analysis loaded is what the second one sees.
+printf "%-30s ... " "NestedBeforeOuter"
+nbo_out="$TEST_BUILD/nested-before-outer-out"
+rm -rf "$nbo_out"
+mkdir -p "$nbo_out"
+if (cd "$nbo_out" && "$GENESIS" -j1 -cp "$neo_lib" -d "$nbo_out" \
+       "$TEST_SRC/external/nestedouter/use/KindUser.java" \
+       "$TEST_SRC/external/nestedouter/use/NestedBeforeOuterTest.java" >/dev/null 2>&1) &&
+   "$JAVA" -cp "$nbo_out:$neo_lib" nestedouter.use.NestedBeforeOuterTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

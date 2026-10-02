@@ -154,6 +154,10 @@ classfile_t *classpath_load_class(classpath_t *cp, const char *classname);
 /* Check if a class exists without fully loading it */
 bool classpath_class_exists(classpath_t *cp, const char *classname);
 
+/* The names of the classes loaded so far, sorted, as a newly allocated
+ * array of newly allocated strings (*count_out receives their number) */
+char **classpath_loaded_class_names(classpath_t *cp, int *count_out);
+
 /*
  * Load module-info for a named module and return exported package names
  * (binary form). Caller frees each string and the array. Returns NULL on failure.

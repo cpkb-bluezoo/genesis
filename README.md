@@ -39,12 +39,18 @@ See [TODO](TODO) for detailed feature tracking.
 
 ## Compatibility
 
-Genesis produces functionally equivalent class files to `javac`. Testing against
-a large real-world project (644 source files, 942 class files) shows:
+Genesis produces class files that are functionally equivalent to `javac`'s.
+It is tested against [gumdrop](https://github.com/cpkb-bluezoo/gumdrop), a
+large real-world project (1408 source files, about 340,000 lines, plus 552
+JUnit test sources):
 
 - **0 compilation errors** : identical to javac
-- **Identical method signatures** : including generics, throws clauses, and bridge methods
-- **Bytecode verification passes** : all generated classes are valid
+- **The same classes** : javac writes 2767 class files for the main sources and
+  genesis 2726; the 41 it leaves out are javac's synthetic enum-switch holders
+  (see below)
+- **The test suite passes** : gumdrop's JUnit suite (519 suites, 6496 tests),
+  compiled entirely by genesis and run on the JVM with bytecode verification,
+  passes without a failure (`make gumdrop-smoke`)
 
 **Minor differences** (all functionally equivalent):
 - Genesis lowers enum `switch` with `ordinal()` and `lookupswitch` instead of emitting
@@ -61,9 +67,9 @@ on an Apple M4 (4 performance and 6 efficiency cores), average of 10 runs:
 
 | Compiler | Wall clock | CPU time (user+sys) | Speedup vs javac |
 |----------|-----------:|--------------------:|-----------------:|
-| genesis (default, one job per processor) | 0.46 s | 2.99 s | 7.4x |
-| genesis `-j1` | 1.13 s | 1.12 s | 3.0x |
-| javac | 3.37 s | 13.74 s | 1.0x |
+| genesis (default, one job per processor) | 0.41 s | 2.64 s | 6.8x |
+| genesis `-j1` | 1.05 s | 1.03 s | 2.7x |
+| javac | 2.79 s | 11.74 s | 1.0x |
 
 By default genesis parses on all processors, then divides semantic analysis
 and code generation between worker processes, one per processor. `-j1` does

@@ -6261,6 +6261,22 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
                     if (rec) {
                         external_class_note_dep(sem, rec, nested_sym);
                     }
+                    /* A nested class that was loaded on its own before its
+                     * outer class (see load_member_class_file()) does not
+                     * know its outer class and still goes by its binary
+                     * name ("Outer$Inner"): entered like that it could not
+                     * be found among the outer class's members by its
+                     * simple name. Give it what it would have had, had the
+                     * outer class loaded it. */
+                    if (!nested_sym->ast && nested_sym->qualified_name &&
+                        strcmp(nested_sym->qualified_name, ic->inner_class_name) == 0) {
+                        if (!nested_sym->data.class_data.enclosing_class) {
+                            nested_sym->data.class_data.enclosing_class = sym;
+                        }
+                        if (nested_sym->name && strcmp(nested_sym->name, ic->inner_name) != 0) {
+                            nested_sym->name = (char *)intern(ic->inner_name);
+                        }
+                    }
                 } else if (sem->classpath) {
                     /* Load from classfile */
                     classfile_t *nested_cf = classpath_load_class(sem->classpath, ic->inner_class_name);
@@ -8043,6 +8059,21 @@ symbol_t *load_external_class(semantic_t *sem, const char *name)
         sem->loading_external_names = hashtable_new();
     }
     if (hashtable_contains(sem->loading_external_names, name)) {
+        /* The class is being loaded further up the stack. If its symbol
+         * is already in the type cache, that symbol is the answer: this is
+         * a class file's nested type naming its own outer type as its
+         * superclass or superinterface ("class Shape { static class Circle
+         * extends Shape }", jakarta.servlet.ServletRegistration.Dynamic),
+         * reached while the outer type is loading its nested types - by
+         * which time the outer type has its members, its supertypes and
+         * its place in the cache. Answering NULL here left the nested type
+         * without that supertype, and every member it inherits through it
+         * unresolvable, whenever the outer type happened to be loaded
+         * before the nested one. */
+        type_t *loading = hashtable_lookup(sem->types, name);
+        if (loading && loading->kind == TYPE_CLASS && loading->data.class_type.symbol) {
+            return loading->data.class_type.symbol;
+        }
         return NULL;
     }
 
@@ -8072,6 +8103,62 @@ symbol_t *load_external_class(semantic_t *sem, const char *name)
         type_registry_note_missing(sem->shared_registry, name);
     }
     return result;
+}
+
+/**
+ * Build (or fetch) the symbol for a class file found on the classpath under
+ * the name `name`.
+ *
+ * A member class - one nested in another class - is built by way of its
+ * outer class whenever that is possible: the outer class is loaded first,
+ * and loads its nested classes in turn. A class should look the same
+ * however it came to be loaded, and it is as a nested class of its outer
+ * class that it gets its simple name, its enclosing class and its place
+ * among the outer class's members. Loaded on its own first, it had none of
+ * those, and what a later lookup made of it ("Kind.SOURCE" for
+ * javax.tools.JavaFileObject.Kind, say) depended on which of the two
+ * classes a file happened to mention first.
+ */
+static symbol_t *load_member_class_file(semantic_t *sem, classfile_t *cf, const char *name)
+{
+    type_registry_t *reg = sem->shared_registry;
+    bool already_shared = reg && reg->external_classes && cf->this_class_name &&
+                          hashtable_lookup(reg->external_classes, cf->this_class_name);
+
+    if (!already_shared && strchr(name, '$') && cf->this_class_name) {
+        char *binary_name = classname_to_binary(cf->this_class_name);
+        char *outer_name = NULL;
+        inner_class_info_t *inner_classes = binary_name ? classfile_get_inner_classes(cf) : NULL;
+        for (inner_class_info_t *ic = inner_classes; ic; ic = ic->next) {
+            if (ic->inner_class_name && strcmp(ic->inner_class_name, binary_name) == 0) {
+                if (ic->outer_class_name && ic->inner_name) {
+                    outer_name = strdup(ic->outer_class_name);
+                }
+                break;
+            }
+        }
+        inner_class_info_free(inner_classes);
+
+        symbol_t *built = NULL;
+        if (outer_name) {
+            if (!hashtable_lookup(sem->types, outer_name)) {
+                /* (NULL, harmlessly, if the outer class is itself in the
+                 * middle of loading) */
+                load_external_class(sem, outer_name);
+            }
+            type_t *mine = hashtable_lookup(sem->types, binary_name);
+            if (mine && mine->kind == TYPE_CLASS && mine->data.class_type.symbol) {
+                built = mine->data.class_type.symbol;
+            }
+        }
+        free(outer_name);
+        free(binary_name);
+        if (built) {
+            return built;
+        }
+    }
+
+    return symbol_from_classfile_shared(sem, cf, NULL);
 }
 
 static symbol_t *load_external_class_impl(semantic_t *sem, const char *name)
@@ -8236,7 +8323,7 @@ static symbol_t *load_external_class_impl(semantic_t *sem, const char *name)
             if (debug_getenv("GENESIS_DEBUG_LOAD")) {
                 fprintf(stderr, "DEBUG load_external_class: loaded '%s' from classpath\n", name);
             }
-            return symbol_from_classfile_shared(sem, cf, NULL);
+            return load_member_class_file(sem, cf, name);
         }
     }
     
@@ -8306,7 +8393,7 @@ static symbol_t *load_external_class_impl(semantic_t *sem, const char *name)
             if (sem->classpath) {
                 classfile_t *cf = classpath_load_class(sem->classpath, candidate);
                 if (cf) {
-                    symbol_t *result = symbol_from_classfile_shared(sem, cf, NULL);
+                    symbol_t *result = load_member_class_file(sem, cf, candidate);
                     if (result && result->type) {
                         /* Also cache under the original name for future lookups */
                         hashtable_insert(sem->types, strdup(name), result->type);
@@ -8334,6 +8421,54 @@ static symbol_t *load_external_class_impl(semantic_t *sem, const char *name)
     
     free(candidate);
     return NULL;
+}
+
+/**
+ * Build, ahead of any analysis, the shared symbols of every class the
+ * classpath has loaded so far - by this point, every class file the sources
+ * of the batch refer to by name (the type name qualification pass looked
+ * each of them up) - and of the classes those depend on.
+ *
+ * For the worker processes. Each of them would otherwise build its own
+ * copy of the same symbols as its files came to need them: the same work
+ * done once per processor, at a time when every processor is busy. Built
+ * here, before the workers are forked, the symbols are simply part of what
+ * each worker inherits.
+ *
+ * The classes are taken in the order of their names, so that what is built
+ * (and how: an outer class before the classes nested in it) does not depend
+ * on the order in which earlier phases happened to load them.
+ */
+void semantic_prebuild_external_classes(classpath_t *cp, type_registry_t *registry,
+                                        const char *sourcepath)
+{
+    if (!cp || !registry) {
+        return;
+    }
+
+    bool was_open = registry->external_sharing_open;
+    registry->external_sharing_open = true;
+
+    semantic_t *sem = semantic_new_with_registry(cp, registry);
+    if (sem) {
+        if (sourcepath) {
+            semantic_set_sourcepath(sem, sourcepath);
+        }
+        int count = 0;
+        char **names = classpath_loaded_class_names(cp, &count);
+        for (int i = 0; names && i < count; i++) {
+            /* A class of this compilation shadows a class file of the
+             * same name; there is nothing to build for it */
+            if (!type_registry_lookup(registry, names[i])) {
+                load_external_class(sem, names[i]);
+            }
+            free(names[i]);
+        }
+        free(names);
+        semantic_free(sem);
+    }
+
+    registry->external_sharing_open = was_open;
 }
 
 /**

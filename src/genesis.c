@@ -1824,8 +1824,15 @@ static bool analyze_file(compiler_options_t *opts, type_registry_t *registry,
  * diagnostics of every file (printed by the compiler process in the order
  * of the files, once it is known that the batch stands), source files
  * loaded through -sourcepath (which make the batch start over, as in the
- * single-process path), and error counts. Code generation only starts when
- * the compiler process says so, after every file has been analysed.
+ * single-process path), and error counts.
+ *
+ * A worker generates the code of each file as soon as it has analysed it.
+ * Analysis is bound by the processors and writing class files by the file
+ * system (which takes only so many new files a second, however many
+ * processes create them): done one after the other, each phase leaves the
+ * other resource idle. Only with a -sourcepath, where the batch may yet have
+ * to start over, does code generation wait until every file has been
+ * analysed and the compiler process says that the batch stands.
  */
 
 /* A batch smaller than this is compiled in this process: forking and
@@ -1931,6 +1938,7 @@ static void worker_process_run(compiler_options_t *opts, type_registry_t *regist
 
     int *claimed = malloc((size_t)(file_count > 0 ? file_count : 1) * sizeof(int));
     int claimed_count = 0;
+    int errors = 0;
     if (!claimed) {
         _exit(3);
     }
@@ -1981,6 +1989,15 @@ static void worker_process_run(compiler_options_t *opts, type_registry_t *regist
             _exit(3);
         }
         free(text);
+
+        /* Without a -sourcepath the batch cannot be called off: generate
+         * this file's code now (symbols first needed during code
+         * generation are private to the file, as in the other paths) */
+        if (!report_dependencies) {
+            type_registry_set_external_sharing(registry, false);
+            errors += generate_file_code(pr, opts, NULL);
+            type_registry_set_external_sharing(registry, true);
+        }
     }
     type_registry_set_external_sharing(registry, false);
     close(queue_fd);
@@ -1989,6 +2006,13 @@ static void worker_process_run(compiler_options_t *opts, type_registry_t *regist
     fflush(stderr);
     if (!worker_send(report_fd, WORKER_MSG_ANALYZED, 0, 0, 0, NULL)) {
         _exit(3);
+    }
+    if (!report_dependencies) {
+        if (!worker_send(report_fd, WORKER_MSG_GENERATED, 0, 0, errors, NULL)) {
+            _exit(3);
+        }
+        /* (The compiler process's verdict is still read, so that it never
+         * finds this end of the control pipe closed.) */
     }
 
     /* Code generation, if the compiler process says the batch stands */
@@ -2003,11 +2027,10 @@ static void worker_process_run(compiler_options_t *opts, type_registry_t *regist
         }
         break;
     }
-    if (command != WORKER_CMD_GENERATE) {
+    if (command != WORKER_CMD_GENERATE || !report_dependencies) {
         _exit(0);
     }
 
-    int errors = 0;
     for (int i = 0; i < claimed_count; i++) {
         errors += generate_file_code(&results[claimed[i]], opts, NULL);
     }
@@ -2218,6 +2241,7 @@ static int compile_with_worker_processes(compiler_options_t *opts, int worker_co
         started++;
     }
     close(queue_pipe[0]);
+    timing_mark("start workers");
 
     if (start_failed) {
         /* Nothing has been handed out yet: call the workers off and let
@@ -2418,8 +2442,10 @@ static int compile_with_worker_processes(compiler_options_t *opts, int worker_co
                 }
                 if (opts->verbose) {
                     printf("Phase 5a complete: %d semantic errors\n", *sem_errors);
-                    printf("Phase 5b: Code generation in %d worker processes...\n",
-                           worker_count);
+                    if (dependencies_out) {
+                        printf("Phase 5b: Code generation in %d worker processes...\n",
+                               worker_count);
+                    }
                 }
                 fflush(stdout);
             }
@@ -2756,6 +2782,10 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
      * whichever worker generates them; a JAR is a single stream, written
      * by this process.) */
     if (thread_count > 1 && !g_jar_writer && file_count >= WORKER_MIN_FILES) {
+        /* What every worker would otherwise build for itself */
+        semantic_prebuild_external_classes(g_classpath, registry, opts->sourcepath);
+        timing_mark("prebuild class symbols");
+
         int worker_sem_errors = 0;
         int worker_codegen_errors = 0;
         int outcome = compile_with_worker_processes(opts, thread_count, parse_results,

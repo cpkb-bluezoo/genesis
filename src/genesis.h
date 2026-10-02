@@ -982,6 +982,11 @@ typedef struct type_registry {
  * entered in the registry for sharing (see external_sharing_open). */
 void type_registry_set_external_sharing(type_registry_t *reg, bool open);
 
+/* Build the shared symbols of the classes the classpath has loaded so far
+ * (defined in semantic.c; see there) */
+void semantic_prebuild_external_classes(struct classpath *cp, type_registry_t *registry,
+                                        const char *sourcepath);
+
 /* Type registry API */
 type_registry_t *type_registry_new(void);
 void type_registry_free(type_registry_t *reg);
