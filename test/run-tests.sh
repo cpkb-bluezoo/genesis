@@ -1342,5 +1342,37 @@ else
 fi
 
 echo
+echo "--- Narrowing an int constant from a class file (byte/short/char) ---"
+printf "%-30s ... " "NarrowingConstantClassfile"
+nc_lib="$TEST_BUILD/narrowconstlib-lib"
+nc_out="$TEST_BUILD/narrowconstlib-out"
+rm -rf "$nc_lib" "$nc_out"
+mkdir -p "$nc_lib" "$nc_out"
+if "$GENESIS" -d "$nc_lib" "$TEST_SRC"/external/narrowconstlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$nc_lib" -d "$nc_out" \
+       "$TEST_SRC/external/NarrowingConstantFromClassfileTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$nc_out:$nc_lib" NarrowingConstantFromClassfileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Narrowing a non-constant or an out-of-range constant must fail to compile ---"
+printf "%-30s ... " "NarrowingRejected"
+nr_out="$TEST_BUILD/narrowingrejected-out"
+rm -rf "$nr_out"
+mkdir -p "$nr_out"
+if ! "$GENESIS" -d "$nr_out" "$TEST_SRC/external/narrowingrejected/NarrowingRejected.java" >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

@@ -1189,9 +1189,20 @@ static bool codegen_literal(method_gen_t *mg, ast_node_t *lit, const_pool_t *cp)
                 } else if (val <= 127) {
                     bc_emit(mg->code, OP_BIPUSH);
                     bc_emit_s1(mg->code, (int8_t)val);
-                } else {
+                } else if (val <= 32767) {
                     bc_emit(mg->code, OP_SIPUSH);
                     bc_emit_s2(mg->code, (int16_t)val);
+                } else {
+                    /* sipush takes a SIGNED 16-bit value: 0x8000-0xFFFF
+                     * (e.g. '\uFF11') would arrive negative. */
+                    uint16_t idx = cp_add_integer(cp, val);
+                    if (idx <= 255) {
+                        bc_emit(mg->code, OP_LDC);
+                        bc_emit(mg->code, (uint8_t)idx);
+                    } else {
+                        bc_emit(mg->code, OP_LDC_W);
+                        bc_emit_u2(mg->code, idx);
+                    }
                 }
                 mg_push_int(mg);
                 return true;
@@ -5225,7 +5236,11 @@ bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_
                  * element type), when a resolved type_t for it
                  * is available. See arg_elem_type_full's own
                  * comment above for why this is needed at all. */
-                if (!compatible && arg_elem_type_full) {
+                if (!compatible && arg_elem_type_full &&
+                    (arg_elem_type_full->kind == TYPE_CLASS || arg_elem_type_full->kind == TYPE_ARRAY ||
+                     arg_elem_type_full->kind == TYPE_TYPEVAR)) {
+                    /* Reference element types only: type_assignable() would say yes
+                     * for a primitive (it boxes), but a byte[] is not an Object[]. */
                     compatible = type_assignable(elem_type, arg_elem_type_full);
                 }
             } else if (elem_type->kind == TYPE_ARRAY) {
@@ -7920,6 +7935,32 @@ static uint8_t get_array_store_opcode(type_kind_t kind)
  * Generate code for a standalone array initializer: {1, 2, 3} or {{1,2}, {3,4}}
  * Uses sem_type to determine the target array type.
  */
+/**
+ * True if an expression's VALUE is an array. get_expr_type_kind() reports an
+ * array's ELEMENT kind (so "new byte[16]" reads as a byte), which must never
+ * be mistaken for a primitive needing boxing.
+ */
+static bool expr_is_array_valued(method_gen_t *mg, ast_node_t *e)
+{
+    if (!e) {
+        return false;
+    }
+    if (e->sem_type && e->sem_type->kind == TYPE_ARRAY) {
+        return true;
+    }
+    if (e->type == AST_NEW_ARRAY || e->type == AST_ARRAY_INIT) {
+        return true;
+    }
+    if (e->type == AST_IDENTIFIER && e->data.leaf.name && mg_local_is_array(mg, e->data.leaf.name)) {
+        return true;
+    }
+    if (mg->class_gen && mg->class_gen->sem) {
+        type_t *t = get_expression_type(mg->class_gen->sem, e);
+        return t && t->kind == TYPE_ARRAY;
+    }
+    return false;
+}
+
 static bool codegen_array_init(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 {
     if (!expr || expr->type != AST_ARRAY_INIT) {
@@ -8139,7 +8180,8 @@ static bool codegen_array_init(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     mg_pop_typed(mg, 1);  /* Pop int */
                     mg_push_double(mg);   /* Push double (2 slots) */
                 } else if (elem_kind == TYPE_CLASS &&
-                           !(elem_expr->sem_type && elem_expr->sem_type->kind == TYPE_CLASS)) {
+                           !(elem_expr->sem_type && elem_expr->sem_type->kind == TYPE_CLASS) &&
+                           !expr_is_array_valued(mg, elem_expr)) {
                     /* int/short/byte/char element of a reference-typed array
                      * ("new Object[] { delay, attempt }"): box it, as the
                      * long/boolean/... case below already does - see there
@@ -8156,7 +8198,8 @@ static bool codegen_array_init(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                 bc_emit(mg->code, OP_F2D);
                 mg_push(mg, 1);  /* float -> double gains a slot */
             } else if (elem_kind == TYPE_CLASS && expr_kind >= TYPE_BOOLEAN && expr_kind <= TYPE_DOUBLE &&
-                       !(elem_expr->sem_type && elem_expr->sem_type->kind == TYPE_CLASS)) {
+                       !(elem_expr->sem_type && elem_expr->sem_type->kind == TYPE_CLASS) &&
+                       !expr_is_array_valued(mg, elem_expr)) {
                 /* Array element type is a reference (e.g. "Object[] pair =
                  * { someLongExpr, someEnum };") but this particular
                  * element's own expression is primitive - box it before

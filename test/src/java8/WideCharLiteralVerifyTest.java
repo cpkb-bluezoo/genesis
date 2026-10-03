@@ -54,6 +54,16 @@ public class WideCharLiteralVerifyTest {
         if (sum != 3) {
             throw new RuntimeException("loop " + sum);
         }
+        /* Above 0x7FFF: sipush holds a SIGNED 16-bit value, so these need ldc. */
+        StringBuilder sb = new StringBuilder();
+        sb.append('\uFF11').append('\uffff').append('\u8000');
+        if (sb.length() != 3 || sb.charAt(0) != 0xFF11 || sb.charAt(1) != 0xFFFF || sb.charAt(2) != 0x8000) {
+            throw new RuntimeException("high chars: " + (int) sb.charAt(0));
+        }
+        char high = '\uFF11';
+        if (high != 65297 || (int) '\uffff' != 65535) {
+            throw new RuntimeException("high compare");
+        }
         System.out.println("WideCharLiteralVerifyTest passed!");
     }
 }

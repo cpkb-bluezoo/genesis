@@ -2837,7 +2837,44 @@ static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_n
  * @param init_type   The type of the initializer (should be int or smaller)
  * @return true if narrowing conversion is allowed, false otherwise
  */
-static bool narrowing_constant_allowed(type_t *target_type, ast_node_t *init_expr, type_t *init_type)
+static bool eval_case_constant_operand(semantic_t *sem, ast_node_t *expr, int32_t *out);
+static symbol_t *lookup_named_constant_field(semantic_t *sem, const char *name);
+
+/**
+ * True if every NAMED operand of a constant expression is a final field (or a
+ * class-file constant): a mutable field is not a constant (JLS 15.29), so
+ * "static int x = 3; byte b = x;" must stay an error.
+ */
+static bool constant_names_are_final(semantic_t *sem, ast_node_t *expr)
+{
+    if (!expr) {
+        return false;
+    }
+    switch (expr->type) {
+        case AST_LITERAL:
+            return true;
+        case AST_PARENTHESIZED:
+        case AST_UNARY_EXPR:
+        case AST_BINARY_EXPR:
+            for (slist_t *c = expr->data.node.children; c; c = c->next) {
+                if (!constant_names_are_final(sem, (ast_node_t *)c->data)) {
+                    return false;
+                }
+            }
+            return true;
+        case AST_IDENTIFIER: {
+            symbol_t *sym = lookup_named_constant_field(sem, expr->data.leaf.name);
+            return sym && ((sym->modifiers & MOD_FINAL) || sym->data.var_data.has_const_value);
+        }
+        case AST_FIELD_ACCESS:
+            /* A qualified constant: accepted when the folder can resolve it to a value. */
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool narrowing_constant_allowed(semantic_t *sem, type_t *target_type, ast_node_t *init_expr, type_t *init_type)
 {
     if (!target_type || !init_expr || !init_type) {
         return false;
@@ -2872,7 +2909,20 @@ static bool narrowing_constant_allowed(type_t *target_type, ast_node_t *init_exp
     }
     
     if (literal_expr->type != AST_LITERAL) {
-        return false;
+        /* Not a bare literal: a constant expression - a named constant (of this
+         * class, or of another loaded from a class file), possibly combined
+         * with operators - narrows when its value fits (JLS 5.2). */
+        int32_t folded;
+        if (!sem || !constant_names_are_final(sem, init_expr) ||
+            !eval_case_constant_operand(sem, init_expr, &folded)) {
+            return false;
+        }
+        switch (target_type->kind) {
+            case TYPE_BYTE:  return folded >= -128 && folded <= 127;
+            case TYPE_SHORT: return folded >= -32768 && folded <= 32767;
+            case TYPE_CHAR:  return folded >= 0 && folded <= 65535;
+            default:         return false;
+        }
     }
     
     /* Check if this is an integer or char literal (not float, string, etc.) */
@@ -18117,6 +18167,28 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         }
                     }
 
+                    /* One branch primitive, the other an unrelated reference
+                     * ("c == null ? "none" : arr.length"): the primitive is boxed
+                     * and the result is the lub of its wrapper and the other
+                     * type - Object for these purposes, never the reference
+                     * branch's own type (whose frame the boxed value would not
+                     * fit: "Integer is not assignable to String"). */
+                    if (then_type && else_type) {
+                        bool then_prim = then_type->kind >= TYPE_BOOLEAN && then_type->kind <= TYPE_DOUBLE;
+                        bool else_prim = else_type->kind >= TYPE_BOOLEAN && else_type->kind <= TYPE_DOUBLE;
+                        if (then_prim != else_prim) {
+                            type_t *ref = then_prim ? else_type : then_type;
+                            if (ref->kind == TYPE_CLASS && ref->data.class_type.name &&
+                                get_primitive_for_wrapper(ref->data.class_type.name) == TYPE_UNKNOWN &&
+                                strcmp(ref->data.class_type.name, "java.lang.Object") != 0 &&
+                                strcmp(ref->data.class_type.name, "java.lang.Number") != 0 &&
+                                strcmp(ref->data.class_type.name, "java.lang.Comparable") != 0 &&
+                                strcmp(ref->data.class_type.name, "java.io.Serializable") != 0) {
+                                return type_object();
+                            }
+                        }
+                    }
+
                     /* Reference conditional (JLS 15.25): prefer whichever
                      * branch's type is the wider one, when one is simply a
                      * subtype of the other (e.g. "cond ? this : someMethod()"
@@ -21794,10 +21866,15 @@ static bool eval_case_constant_operand(semantic_t *sem, ast_node_t *expr, int32_
  * is itself a compound expression (not just a plain literal) still
  * resolves correctly when referenced as an operand elsewhere.
  */
-static bool resolve_named_int_constant(semantic_t *sem, const char *name, int32_t *out_value)
+/**
+ * The field a bare constant name refers to: in scope, a member of the current
+ * class, a member of an implemented interface or superclass, or a static
+ * import. NULL if it names no field.
+ */
+static symbol_t *lookup_named_constant_field(semantic_t *sem, const char *name)
 {
-    if (!sem || !name || !out_value) {
-        return false;
+    if (!sem || !name) {
+        return NULL;
     }
     symbol_t *sym = scope_lookup(sem->current_scope, name);
     if (!sym && sem->current_class && sem->current_class->data.class_data.members) {
@@ -21851,7 +21928,16 @@ static bool resolve_named_int_constant(semantic_t *sem, const char *name, int32_
             sym = field_sym;
         }
     }
-    if (!sym || sym->kind != SYM_FIELD) {
+    return (sym && sym->kind == SYM_FIELD) ? sym : NULL;
+}
+
+static bool resolve_named_int_constant(semantic_t *sem, const char *name, int32_t *out_value)
+{
+    if (!sem || !name || !out_value) {
+        return false;
+    }
+    symbol_t *sym = lookup_named_constant_field(sem, name);
+    if (!sym) {
         return false;
     }
     /* A classfile-loaded field (e.g. an inherited "public static final
@@ -22256,7 +22342,7 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                     }
                                     
                                     if (field_type && init_type && !type_assignable(field_type, init_type) &&
-                                        !narrowing_constant_allowed(field_type, init_expr, init_type)) {
+                                        !narrowing_constant_allowed(sem, field_type, init_expr, init_type)) {
                                         char *expected = type_to_string(field_type);
                                         char *actual = type_to_string(init_type);
                                         semantic_error(sem, decl->line, decl->column,
@@ -22642,7 +22728,7 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                         /* Ensure symbols loaded for proper subtype checking */
                                         ensure_type_symbol_loaded(sem, init_type);
                                         if (actual_type && !type_assignable(actual_type, init_type) &&
-                                            !narrowing_constant_allowed(actual_type, init_expr, init_type)) {
+                                            !narrowing_constant_allowed(sem, actual_type, init_expr, init_type)) {
                                             char *expected = type_to_string(actual_type);
                                             char *actual = type_to_string(init_type);
                                             semantic_error(sem, decl->line, decl->column,
@@ -22789,7 +22875,7 @@ define_local_var:
                                         semantic_error(sem, node->line, node->column,
                                             "cannot return a value from method whose result type is void");
                                     } else if (expected && !type_assignable(expected, actual) &&
-                                               !narrowing_constant_allowed(expected, ret_expr, actual)) {
+                                               !narrowing_constant_allowed(sem, expected, ret_expr, actual)) {
                                         /* Before reporting error, ensure actual type's interfaces are populated.
                                          * This handles cases where the return type is a source class that
                                          * hasn't been fully processed yet. */
@@ -23291,7 +23377,7 @@ define_local_var:
                                 
                                 if (!is_compound &&
                                     !type_assignable(left_type, right_type) &&
-                                    !narrowing_constant_allowed(left_type, right, right_type)) {
+                                    !narrowing_constant_allowed(sem, left_type, right, right_type)) {
                                     char *left_str = type_to_string(left_type);
                                     char *right_str = type_to_string(right_type);
                                     semantic_error(sem, node->line, node->column,
