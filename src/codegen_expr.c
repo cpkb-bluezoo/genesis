@@ -1183,7 +1183,7 @@ static bool codegen_literal(method_gen_t *mg, ast_node_t *lit, const_pool_t *cp)
             {
                 /* Char is stored as str_val, get first char value */
                 const char *str = lit->data.leaf.value.str_val;
-                int val = str && str[0] ? (unsigned char)str[0] : 0;
+                int val = (int)char_literal_value(str);
                 if (val >= 0 && val <= 5) {
                     bc_emit(mg->code, OP_ICONST_0 + val);
                 } else if (val <= 127) {
@@ -5536,6 +5536,52 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         }
     }
     
+    /* The other java.lang.Object methods on an array receiver: an array's
+     * only own method is clone() (above); getClass/hashCode/equals/toString
+     * are Object's, so the owner is java/lang/Object - never the array's
+     * element class, and never absent for a primitive array. */
+    if (has_explicit_receiver && children &&
+        (strcmp(method_name, "getClass") == 0 || strcmp(method_name, "hashCode") == 0 ||
+         strcmp(method_name, "toString") == 0 || strcmp(method_name, "equals") == 0)) {
+        ast_node_t *first = (ast_node_t *)children->data;
+        type_t *recv_type = first->sem_type;
+        if (!recv_type) {
+            recv_type = get_expression_type(mg->class_gen->sem, first);
+        }
+        bool is_equals = strcmp(method_name, "equals") == 0;
+        if (recv_type && recv_type->kind == TYPE_ARRAY &&
+            (is_equals ? (children->next && !children->next->next) : !children->next)) {
+            if (!codegen_expr(mg, first, cp)) {
+                return false;
+            }
+            const char *desc;
+            if (is_equals) {
+                if (!codegen_expr(mg, (ast_node_t *)children->next->data, cp)) {
+                    return false;
+                }
+                desc = "(Ljava/lang/Object;)Z";
+            } else if (strcmp(method_name, "getClass") == 0) {
+                desc = "()Ljava/lang/Class;";
+            } else if (strcmp(method_name, "hashCode") == 0) {
+                desc = "()I";
+            } else {
+                desc = "()Ljava/lang/String;";
+            }
+            uint16_t methodref = cp_add_methodref(cp, "java/lang/Object", method_name, desc);
+            bc_emit(mg->code, OP_INVOKEVIRTUAL);
+            bc_emit_u2(mg->code, methodref);
+            mg_pop_typed(mg, is_equals ? 2 : 1);
+            if (strcmp(method_name, "getClass") == 0) {
+                mg_push_object(mg, "java/lang/Class");
+            } else if (strcmp(method_name, "toString") == 0) {
+                mg_push_object(mg, "java/lang/String");
+            } else {
+                mg_push_int(mg);
+            }
+            return true;
+        }
+    }
+
     /* FIRST: Check if first child is a field access (e.g., System.out.println) 
      * Only do this if there's an explicit receiver - otherwise first child is just an argument */
     if (has_explicit_receiver && children) {
@@ -7042,11 +7088,55 @@ static bool codegen_explicit_ctor_call(method_gen_t *mg, ast_node_t *expr, const
         mg_push_int(mg);
     }
 
-    /* Generate constructor arguments */
-    int arg_count = is_enum_this_call ? 2 : 0;
+    /* A member inner class's constructors take the enclosing instance as a
+     * leading parameter (slot 1), which a user-written this(...) between two
+     * of its own constructors never spells out. */
+    bool forward_outer = is_this_call && mg->class_gen && mg->class_gen->is_inner_class &&
+        !mg->class_gen->is_local_class && !mg->class_gen->is_anonymous_class &&
+        mg->class_gen->outer_class_internal;
+    /* The same for super(...) when the superclass is a sibling inner class,
+     * a member of the very class that encloses this one: the enclosing
+     * instance this class received is the one its superclass needs. */
+    bool super_outer_in_descriptor = false;
+    if (!is_this_call && !forward_outer && mg->class_gen && mg->class_gen->is_inner_class &&
+        !mg->class_gen->is_local_class && !mg->class_gen->is_anonymous_class &&
+        mg->class_gen->outer_class_internal && mg->class_gen->class_sym) {
+        symbol_t *super_sym = mg->class_gen->class_sym->data.class_data.superclass;
+        symbol_t *super_outer = super_sym ? super_sym->data.class_data.enclosing_class : NULL;
+        if (super_sym && super_outer && super_outer->qualified_name &&
+            !(super_sym->modifiers & MOD_STATIC) &&
+            super_sym->kind == SYM_CLASS) {
+            char *so = class_to_internal_name(super_outer->qualified_name);
+            if (so && strcmp(so, mg->class_gen->outer_class_internal) == 0) {
+                forward_outer = true;
+                /* A class-file superclass's stored descriptor already starts
+                 * with the enclosing instance. */
+                super_outer_in_descriptor = expr->sem_symbol &&
+                    expr->sem_symbol->kind == SYM_CONSTRUCTOR && !expr->sem_symbol->ast &&
+                    expr->sem_symbol->data.method_data.descriptor;
+            }
+            free(so);
+        }
+    }
+    if (forward_outer) {
+        bc_emit(mg->code, OP_ALOAD_1);
+        mg_push_object(mg, mg->class_gen->outer_class_internal);
+    }
+
+    /* Generate constructor arguments, each converted to the resolved target
+     * constructor's declared parameter type (widening int to long/double,
+     * boxing, unboxing) - the descriptor below names those types. */
+    int arg_count = (is_enum_this_call ? 2 : 0) + (forward_outer ? 1 : 0);
+    slist_t *ctor_param_node = (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR) ?
+        expr->sem_symbol->data.method_data.parameters : NULL;
     for (slist_t *node = expr->data.node.children; node; node = node->next) {
-        if (!codegen_expr(mg, (ast_node_t *)node->data, cp)) {
+        ast_node_t *arg = (ast_node_t *)node->data;
+        if (!codegen_expr(mg, arg, cp)) {
             return false;
+        }
+        if (ctor_param_node) {
+            coerce_arg_to_param(mg, cp, arg, (symbol_t *)ctor_param_node->data, false);
+            ctor_param_node = ctor_param_node->next;
         }
         arg_count++;
     }
@@ -7142,6 +7232,14 @@ static bool codegen_explicit_ctor_call(method_gen_t *mg, ast_node_t *expr, const
         }
     }
     
+    if (forward_outer && !super_outer_in_descriptor && descriptor && descriptor[0] == '(') {
+        size_t dl = strlen(descriptor) + strlen(mg->class_gen->outer_class_internal) + 4;
+        char *with_outer = malloc(dl);
+        snprintf(with_outer, dl, "(L%s;%s", mg->class_gen->outer_class_internal, descriptor + 1);
+        free(descriptor);
+        descriptor = with_outer;
+    }
+
     /* Emit: invokespecial <init> */
     uint16_t init_ref = cp_add_methodref(cp, target_class, "<init>", descriptor);
     bc_emit(mg->code, OP_INVOKESPECIAL);
@@ -7622,16 +7720,24 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
      * otherwise fall back to inferring from argument expressions */
     symbol_t *ctor_sym = expr->sem_symbol;
     if (ctor_sym && ctor_sym->kind == SYM_CONSTRUCTOR &&
-        ctor_sym->data.method_data.descriptor && !is_inner_class && !is_local_class) {
+        ctor_sym->data.method_data.descriptor && !is_local_class) {
         /* Constructor loaded from a class file: its own descriptor is exact,
          * whereas one rebuilt from generic parameter types would erase a type
-         * variable to Object instead of to its bound. Inner and local classes
-         * are excluded as their descriptor is assembled with synthetic params. */
+         * variable to Object instead of to its bound. A local class is
+         * excluded as its descriptor is assembled with synthetic params. A
+         * member INNER class's stored descriptor starts with the enclosing
+         * instance, already appended above, so that first parameter is
+         * skipped. */
         char *stored = strdup(ctor_sym->data.method_data.descriptor);
         char *close = stored ? strchr(stored, ')') : NULL;
         if (close) {
             *close = '\0';
-            string_append(desc, stored + 1);  /* skip the leading '(' */
+            char *params = stored + 1;  /* skip the leading '(' */
+            if (is_inner_class && *params == 'L') {
+                char *semi = strchr(params, ';');
+                params = semi ? semi + 1 : params;
+            }
+            string_append(desc, params);
         }
         free(stored);
     } else if (ctor_sym && ctor_sym->kind == SYM_CONSTRUCTOR && ctor_sym->data.method_data.parameters) {
@@ -7654,8 +7760,34 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                 break;
             }
             
-            const char *arg_desc = infer_arg_descriptor(arg);
-            string_append(desc, arg_desc);
+            /* An anonymous class's own constructor takes each argument at
+             * its static type (codegen_anonymous_class() builds it the same
+             * way) - infer_arg_descriptor() alone says Object for "this". */
+            type_t *anon_arg_type = NULL;
+            if (is_anonymous_class && arg->type == AST_THIS_EXPR && mg->class_gen &&
+                mg->class_gen->internal_name) {
+                /* Unqualified "this": the class being generated. Evaluating it
+                 * through semantic state here would use whatever class the
+                 * analysis left current. */
+                string_append(desc, "L");
+                string_append(desc, mg->class_gen->internal_name);
+                string_append(desc, ";");
+                continue;
+            }
+            if (is_anonymous_class) {
+                anon_arg_type = arg->sem_type;
+                if (!anon_arg_type && mg->class_gen && mg->class_gen->sem) {
+                    anon_arg_type = get_expression_type(mg->class_gen->sem, arg);
+                }
+            }
+            if (anon_arg_type) {
+                char *anon_arg_desc = type_to_descriptor(anon_arg_type);
+                string_append(desc, anon_arg_desc);
+                free(anon_arg_desc);
+            } else {
+                const char *arg_desc = infer_arg_descriptor(arg);
+                string_append(desc, arg_desc);
+            }
         }
     }
     
@@ -8006,6 +8138,13 @@ static bool codegen_array_init(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     bc_emit(mg->code, OP_I2D);
                     mg_pop_typed(mg, 1);  /* Pop int */
                     mg_push_double(mg);   /* Push double (2 slots) */
+                } else if (elem_kind == TYPE_CLASS &&
+                           !(elem_expr->sem_type && elem_expr->sem_type->kind == TYPE_CLASS)) {
+                    /* int/short/byte/char element of a reference-typed array
+                     * ("new Object[] { delay, attempt }"): box it, as the
+                     * long/boolean/... case below already does - see there
+                     * for why an already-boxed wrapper is excluded. */
+                    emit_boxing(mg, cp, expr_kind);
                 }
             } else if (expr_kind == TYPE_LONG && elem_kind == TYPE_DOUBLE) {
                 bc_emit(mg->code, OP_L2D);
@@ -8802,7 +8941,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     if (compound) {
                         /* Duplicate 'this' for getfield, then load current value */
                         bc_emit(mg->code, OP_DUP);
-                        mg_push(mg, 1);
+                        mg_dup(mg);
                         
                         uint16_t fieldref = cp_add_fieldref(mg->cp, mg->class_gen->internal_name,
                                                              field->name, field->descriptor);
@@ -8928,7 +9067,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     if (compound) {
                         /* Duplicate 'this' for getfield, then load current value */
                         bc_emit(mg->code, OP_DUP);
-                        mg_push(mg, 1);
+                        mg_dup(mg);
                         
                         uint16_t fieldref = cp_add_fieldref(mg->cp, class_internal,
                                                              name, field_desc);
@@ -9071,7 +9210,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                             if (compound) {
                                 /* Duplicate outer instance for getfield */
                                 bc_emit(mg->code, OP_DUP);
-                                mg_push(mg, 1);
+                                mg_dup(mg);
                                 
                                 uint16_t fieldref = cp_add_fieldref(mg->cp, outer_internal,
                                                                      name, field_desc);
@@ -9371,7 +9510,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
              * value, generate the RHS, apply the operator and narrow back
              * to field_desc's type (JLS 15.26.2). */
             bc_emit(mg->code, OP_DUP);
-            mg_push(mg, 1);
+            mg_dup(mg);
             uint16_t getref = cp_add_fieldref(cp, recv_class, field_name, field_desc);
             bc_emit(mg->code, OP_GETFIELD);
             bc_emit_u2(mg->code, getref);
@@ -11158,6 +11297,18 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         elem_kind = elem_type->kind;
                         if (elem_kind == TYPE_CLASS) {
                             elem_class = elem_type->data.class_type.name;
+                        } else if (elem_kind != TYPE_BOOLEAN && elem_kind != TYPE_BYTE &&
+                                   elem_kind != TYPE_CHAR && elem_kind != TYPE_SHORT &&
+                                   elem_kind != TYPE_INT && elem_kind != TYPE_LONG &&
+                                   elem_kind != TYPE_FLOAT && elem_kind != TYPE_DOUBLE &&
+                                   elem_kind != TYPE_ARRAY) {
+                            /* A type variable or wildcard element (the T[] a generic
+                             * method returns): a reference, erased to its bound or
+                             * Object - never the int the default would load. */
+                            type_t *bound = (elem_kind == TYPE_TYPEVAR) ? elem_type->data.type_var.bound : NULL;
+                            elem_kind = TYPE_CLASS;
+                            elem_class = (bound && bound->kind == TYPE_CLASS) ?
+                                bound->data.class_type.name : NULL;
                         }
                     }
                     /* Check if this is a multi-dim array with more dimensions */

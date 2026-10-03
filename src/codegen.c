@@ -361,6 +361,19 @@ uint16_t inner_class_access_flags(uint16_t mods, symbol_kind_t kind)
     return acc;
 }
 
+/**
+ * Source modifiers of a member type for its InnerClasses entry: a type
+ * declared in an interface or annotation is implicitly public and static
+ * (JLS 9.5), whatever the source says.
+ */
+static uint16_t member_type_modifiers(uint16_t mods, symbol_t *enclosing)
+{
+    if (enclosing && (enclosing->kind == SYM_INTERFACE || enclosing->kind == SYM_ANNOTATION)) {
+        mods |= MOD_PUBLIC | MOD_STATIC;
+    }
+    return mods;
+}
+
 /* ========================================================================
  * Method Generation Implementation
  * ======================================================================== */
@@ -1071,6 +1084,14 @@ void mg_pop_typed(method_gen_t *mg, int slots)
  * mg->stack_depth (via mg_push) and reorder mg->stackmap's own tracked
  * types to match, rather than leaving the stackmap's type array stale
  * (see stackmap_dup_x1()/stackmap_dup2_x1() for why this matters). */
+void mg_dup(method_gen_t *mg)
+{
+    mg_push(mg, 1);
+    if (mg->stackmap) {
+        stackmap_dup(mg->stackmap);
+    }
+}
+
 void mg_dup_x1(method_gen_t *mg)
 {
     mg_push(mg, 1);
@@ -2153,7 +2174,8 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
          * doesn't matter here - implicit public/static applies
          * regardless of who's calling). */
         bool is_interface_member_type = class_sym->data.class_data.enclosing_class &&
-            class_sym->data.class_data.enclosing_class->kind == SYM_INTERFACE;
+            (class_sym->data.class_data.enclosing_class->kind == SYM_INTERFACE ||
+             class_sym->data.class_data.enclosing_class->kind == SYM_ANNOTATION);
         uint16_t effective_mods = class_sym->modifiers;
         if (is_interface_member_type) {
             effective_mods |= MOD_PUBLIC | MOD_STATIC;
@@ -2398,7 +2420,8 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
                     cg->outer_class_internal : class_to_internal_name(enclosing->qualified_name));
             }
             entry->inner_name = cp_add_utf8(cg->cp, class_sym->name);
-            entry->access_flags = inner_class_access_flags(class_sym->modifiers, class_sym->kind);
+            entry->access_flags = inner_class_access_flags(
+                member_type_modifiers(class_sym->modifiers, enclosing), class_sym->kind);
             
             cg->inner_class_entries = slist_new(entry);
             
@@ -3961,6 +3984,67 @@ static bool interface_impl_params_match(slist_t *iface_params, slist_t *candidat
 }
 
 /**
+ * Collect every interface reachable from `iface` (itself first, then each of
+ * its super-interfaces, transitively) into `*out`, once each by qualified
+ * name. A class that implements "interface Specific extends Provider<Conn>"
+ * owes a bridge for Provider's erased methods too, not just Specific's own.
+ */
+static void collect_interface_closure(semantic_t *sem, symbol_t *iface, slist_t **out)
+{
+    if (!iface) {
+        return;
+    }
+    /* The same interface can exist as more than one symbol (a registry stub,
+     * a class-file stub, the one built from its own source); only some of
+     * them know what the interface extends. Prefer one that does. */
+    if (!iface->data.class_data.interfaces && sem && iface->qualified_name) {
+        symbol_t *richer = NULL;
+        type_t *known = hashtable_lookup(sem->types, iface->qualified_name);
+        if (known && known->kind == TYPE_CLASS && known->data.class_type.symbol) {
+            richer = known->data.class_type.symbol;
+        }
+        if ((!richer || !richer->data.class_data.interfaces) && sem->shared_registry) {
+            symbol_t *reg = type_registry_lookup(sem->shared_registry, iface->qualified_name);
+            if (reg) {
+                symbol_complete(reg);
+                if (reg->data.class_data.interfaces) {
+                    richer = reg;
+                }
+            }
+        }
+        if (richer && richer->data.class_data.interfaces) {
+            iface = richer;
+        }
+    }
+    /* A hollow stub (no members at all) cannot be bridged against: load the
+     * real interface by name. */
+    symbol_complete(iface);
+    if (!iface->data.class_data.members && sem && iface->qualified_name) {
+        symbol_t *loaded = load_external_class(sem, iface->qualified_name);
+        if (loaded && loaded->data.class_data.members) {
+            iface = loaded;
+        }
+    }
+    for (slist_t *n = *out; n; n = n->next) {
+        symbol_t *seen = (symbol_t *)n->data;
+        if (seen == iface ||
+            (seen->qualified_name && iface->qualified_name &&
+             strcmp(seen->qualified_name, iface->qualified_name) == 0)) {
+            return;
+        }
+    }
+    if (!*out) {
+        *out = slist_new(iface);
+    } else {
+        slist_append(*out, iface);
+    }
+    symbol_complete(iface);
+    for (slist_t *n = iface->data.class_data.interfaces; n; n = n->next) {
+        collect_interface_closure(sem, (symbol_t *)n->data, out);
+    }
+}
+
+/**
  * Generate bridge methods for generic interface implementations.
  * When a class implements Comparator<WebFragment> with compare(WebFragment, WebFragment),
  * we need a bridge method compare(Object, Object) that casts and delegates.
@@ -3980,8 +4064,12 @@ static void generate_interface_bridges(class_gen_t *cg)
         return;
     }
     
-    /* Process all implemented interfaces */
-    for (slist_t *iface_node = class_sym->data.class_data.interfaces; 
+    /* Process all implemented interfaces, and everything they extend */
+    slist_t *all_ifaces = NULL;
+    for (slist_t *direct = class_sym->data.class_data.interfaces; direct; direct = direct->next) {
+        collect_interface_closure(cg->sem, (symbol_t *)direct->data, &all_ifaces);
+    }
+    for (slist_t *iface_node = all_ifaces; 
          iface_node; iface_node = iface_node->next) {
         symbol_t *iface_sym = (symbol_t *)iface_node->data;
         if (!iface_sym || !iface_sym->data.class_data.members) {
@@ -4446,7 +4534,7 @@ static void generate_interface_bridges(class_gen_t *cg)
                 entry = entry->next;
             }
         }
-    }
+    }    slist_free(all_ifaces);
 }
 
 /**
@@ -5358,8 +5446,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                             member->type == AST_ENUM_DECL ? SYM_ENUM :
                             member->type == AST_RECORD_DECL ? SYM_RECORD :
                             member->type == AST_ANNOTATION_DECL ? SYM_ANNOTATION : SYM_CLASS;
-                        entry->access_flags = inner_class_access_flags(member->data.node.flags,
-                                                                       nested_kind);
+                        entry->access_flags = inner_class_access_flags(
+                            member_type_modifiers(member->data.node.flags, cg->class_sym),
+                            nested_kind);
                         
                         if (!cg->inner_class_entries) {
                             cg->inner_class_entries = slist_new(entry);
@@ -7802,11 +7891,21 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
     slist_t *static_initializers = NULL;
     slist_t *static_field_inits = NULL;
     
-    /* Process members in the anonymous class body */
-    slist_t *children = body->data.node.children;
+    /* Process members in the anonymous class body. Two passes: every field
+     * first, then everything else, since a method body may name a field
+     * declared LATER in the body (JLS 6.3) and codegen_identifier() looks
+     * fields up in field_map, which a field only enters once handled here. */
+    slist_t *children = NULL;
     
+    for (int member_pass = 0; member_pass < 2; member_pass++) {
+    children = body->data.node.children;
     while (children) {
         ast_node_t *member = (ast_node_t *)children->data;
+        
+        if ((member->type == AST_FIELD_DECL) != (member_pass == 0)) {
+            children = children->next;
+            continue;
+        }
         
         switch (member->type) {
             case AST_FIELD_DECL:
@@ -7920,6 +8019,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         }
         
         children = children->next;
+    }
     }
     
     /* Bridge methods, as for a named class: new Function<Integer, Integer>() {
@@ -8052,6 +8152,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 resolved_super_ctor->data.method_data.descriptor : NULL;
             const char *super_ctor_close_paren = super_ctor_full_desc ?
                 strrchr(super_ctor_full_desc, ')') : NULL;
+            bool super_params_known = false;
             if (super_ctor_full_desc && super_ctor_full_desc[0] == '(' && super_ctor_close_paren) {
                 size_t param_len = (size_t)(super_ctor_close_paren - (super_ctor_full_desc + 1));
                 char *params_only = malloc(param_len + 1);
@@ -8059,6 +8160,28 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 params_only[param_len] = '\0';
                 string_append(super_desc, params_only);
                 free(params_only);
+                super_params_known = true;
+            } else if (resolved_super_ctor && resolved_super_ctor->data.method_data.parameters) {
+                /* A SOURCE-declared super constructor has no stored descriptor
+                 * string, but its parameter symbols carry the same declared
+                 * types: invokespecial needs those (Base), not the argument's
+                 * own narrower type (a Factory passed as "this"). */
+                bool all_typed = true;
+                for (slist_t *pn = resolved_super_ctor->data.method_data.parameters; pn; pn = pn->next) {
+                    symbol_t *ps = (symbol_t *)pn->data;
+                    if (!ps || !ps->type) {
+                        all_typed = false;
+                        break;
+                    }
+                }
+                if (all_typed) {
+                    for (slist_t *pn = resolved_super_ctor->data.method_data.parameters; pn; pn = pn->next) {
+                        char *pd = type_to_descriptor(((symbol_t *)pn->data)->type);
+                        string_append(super_desc, pd);
+                        free(pd);
+                    }
+                    super_params_known = true;
+                }
             }
 
             for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
@@ -8071,7 +8194,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 if (arg_type) {
                     char *arg_desc = type_to_descriptor(arg_type);
                     string_append(desc, arg_desc);
-                    if (!super_ctor_full_desc) {
+                    if (!super_params_known) {
                         /* No resolved descriptor to fall back on - use the
                          * argument's own type, as before (correct whenever
                          * it exactly matches the declared parameter type,

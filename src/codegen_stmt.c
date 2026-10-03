@@ -133,7 +133,7 @@ static bool eval_int_constant_expr(ast_node_t *expr, int32_t *out)
     if (expr->type == AST_LITERAL) {
         if (expr->data.leaf.token_type == TOK_CHAR_LITERAL) {
             const char *sv = expr->data.leaf.value.str_val;
-            *out = sv ? (int32_t)(unsigned char)sv[0] : 0;
+            *out = (int32_t)char_literal_value(sv);
             return true;
         }
         if (expr->data.leaf.token_type == TOK_INTEGER_LITERAL) {
@@ -1605,8 +1605,37 @@ static void emit_pending_finally_blocks(method_gen_t *mg, size_t stop_depth)
          node = node->next, depth--) {
         ast_node_t *finally_block = (ast_node_t *)node->data;
         uint16_t saved_slot = mg->next_slot;
+
+        /* This copy is generated in the MIDDLE of the enclosing body, which
+         * goes on to use its own locals afterwards. A local the finally
+         * block declares under the same name as one of them ("ByteBuffer in"
+         * in both) would overwrite the name->slot mapping, so every later
+         * use in the enclosing body resolved to the finally copy's slot
+         * (VerifyError: Bad local variable type). Put the mapping back. */
+        size_t saved_count = 0;
+        char **saved_names = NULL;
+        void **saved_infos = NULL;
+        if (mg->locals) {
+            saved_names = malloc(sizeof(char *) * (mg->locals->count + 1));
+            saved_infos = malloc(sizeof(void *) * (mg->locals->count + 1));
+            for (size_t b = 0; saved_names && saved_infos && b < mg->locals->size; b++) {
+                for (hashtable_entry_t *e = mg->locals->buckets[b]; e; e = e->next) {
+                    saved_names[saved_count] = strdup(e->key);
+                    saved_infos[saved_count] = e->value;
+                    saved_count++;
+                }
+            }
+        }
+
         codegen_statement(mg, finally_block);
         mg->next_slot = saved_slot;
+
+        for (size_t i = 0; i < saved_count; i++) {
+            hashtable_insert(mg->locals, saved_names[i], saved_infos[i]);
+            free(saved_names[i]);
+        }
+        free(saved_names);
+        free(saved_infos);
     }
 }
 
@@ -1927,8 +1956,18 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             case OP_ARETURN: tmp_kind = TYPE_CLASS; break;
                             default: tmp_kind = TYPE_INT; break;
                         }
-                        type_t *tmp_type = (tmp_kind == TYPE_CLASS) ?
-                            type_new_class("java/lang/Object") : type_new_primitive(tmp_kind);
+                        /* The temp must carry the method's real reference return
+                         * type, not Object: the stack-map frame recorded at the
+                         * finally's join records the local's DECLARED type, and
+                         * the reload then reaches the areturn as that type. */
+                        type_t *tmp_type;
+                        if (tmp_kind == TYPE_CLASS) {
+                            type_t *mret = (mg->method && mg->method->type) ? mg->method->type : NULL;
+                            tmp_type = (mret && (mret->kind == TYPE_CLASS || mret->kind == TYPE_ARRAY)) ?
+                                mret : type_new_class("java/lang/Object");
+                        } else {
+                            tmp_type = type_new_primitive(tmp_kind);
+                        }
                         uint16_t saved_slot_for_tmp = mg->next_slot;
                         uint16_t tmp_slot = mg_allocate_local(mg, "__pending_return", tmp_type);
                         mg_emit_store_local(mg, tmp_slot, tmp_kind);
@@ -4189,7 +4228,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                      * '\u0000') never matched any of them. */
                                     if (case_expr->data.leaf.token_type == TOK_CHAR_LITERAL) {
                                         const char *sv = case_expr->data.leaf.value.str_val;
-                                        case_values[case_idx] = sv ? (int32_t)(unsigned char)sv[0] : 0;
+                                        case_values[case_idx] = (int32_t)char_literal_value(sv);
                                     } else {
                                         case_values[case_idx] = (int32_t)case_expr->data.leaf.value.int_val;
                                     }

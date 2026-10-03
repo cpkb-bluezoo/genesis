@@ -151,6 +151,8 @@ void stackmap_clear_stack(stack_map_table_t *smt);
  * chained/reused assignment expression") - without a matching stackmap
  * update, the reordering it performs on the *real* JVM stack silently
  * desyncs from what mg->stackmap tracks, corrupting later frames. */
+/* Mirror OP_DUP: the top entry is repeated. */
+void stackmap_dup(stack_map_table_t *smt);
 void stackmap_dup_x1(stack_map_table_t *smt);
 
 /* Reorder the tracked stack to match OP_DUP2_X1's form 2: duplicate the

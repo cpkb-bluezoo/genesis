@@ -1483,3 +1483,22 @@ void *pool_alloc(memory_pool_t *pool, size_t size)
 {
     return pool_alloc_aligned(pool, size, POOL_ALIGNMENT);
 }
+
+
+unsigned int char_literal_value(const char *text)
+{
+    const unsigned char *u = (const unsigned char *)text;
+    if (!u || !u[0]) {
+        return 0;
+    }
+    if (u[0] < 0x80) {
+        return u[0];
+    }
+    if ((u[0] & 0xE0) == 0xC0 && (u[1] & 0xC0) == 0x80) {
+        return ((unsigned int)(u[0] & 0x1F) << 6) | (u[1] & 0x3F);
+    }
+    if ((u[0] & 0xF0) == 0xE0 && (u[1] & 0xC0) == 0x80 && (u[2] & 0xC0) == 0x80) {
+        return ((unsigned int)(u[0] & 0x0F) << 12) | ((unsigned int)(u[1] & 0x3F) << 6) | (u[2] & 0x3F);
+    }
+    return u[0];
+}

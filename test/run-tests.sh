@@ -1198,5 +1198,149 @@ else
 fi
 
 echo
+echo "--- Wildcard-imported type vs nested type of an unrelated single-type import ---"
+printf "%-30s ... " "NestedVsWildcardImport"
+nvw_out="$TEST_BUILD/nestedshadow-out"
+rm -rf "$nvw_out"
+mkdir -p "$nvw_out"
+if (cd "$nvw_out" && "$GENESIS" -source 8 -d "$nvw_out" \
+       "$TEST_SRC/src/java8/nestedshadow/lib/Filter.java" \
+       "$TEST_SRC/src/java8/nestedshadow/main/NestedVsWildcardImportVerifyTest.java" \
+       >/dev/null 2>&1) && \
+   "$JAVA" -cp "$nvw_out" nestedshadow.main.NestedVsWildcardImportVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Nested class implementing a member type its enclosing class inherits ---"
+printf "%-30s ... " "NestedImplementsInherited"
+nii_out="$TEST_BUILD/nestedimplinherited-out"
+rm -rf "$nii_out"
+mkdir -p "$nii_out"
+if (cd "$nii_out" && "$GENESIS" -source 8 -d "$nii_out" \
+       "$TEST_SRC/src/java8/nestedimplinherited/p/Transport.java" \
+       "$TEST_SRC/src/java8/nestedimplinherited/p/NestedImplementsInheritedMemberTypeVerifyTest.java" \
+       >/dev/null 2>&1) && \
+   "$JAVA" -cp "$nii_out" nestedimplinherited.p.NestedImplementsInheritedMemberTypeVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Class declared in an interface, used from its class file ---"
+printf "%-30s ... " "InterfaceMemberClassFromClassfile"
+imc_lib="$TEST_BUILD/ifacememberlib-lib"
+imc_out="$TEST_BUILD/ifacememberlib-out"
+rm -rf "$imc_lib" "$imc_out"
+mkdir -p "$imc_lib" "$imc_out"
+if "$GENESIS" -d "$imc_lib" "$TEST_SRC"/external/ifacememberlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$imc_lib" -d "$imc_out" \
+       "$TEST_SRC/external/InterfaceMemberClassFromClassfileTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$imc_out:$imc_lib" InterfaceMemberClassFromClassfileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Bridge for a generic parent interface loaded from a class file ---"
+printf "%-30s ... " "IndirectGenericBridgeClassfile"
+igb_lib="$TEST_BUILD/indirectbridgelib-lib"
+igb_out="$TEST_BUILD/indirectbridgelib-out"
+rm -rf "$igb_lib" "$igb_out"
+mkdir -p "$igb_lib" "$igb_out"
+if "$GENESIS" -d "$igb_lib" "$TEST_SRC"/external/indirectbridgelib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$igb_lib" -d "$igb_out" \
+       "$TEST_SRC/external/IndirectGenericBridgeFromClassfileTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$igb_out:$igb_lib" IndirectGenericBridgeFromClassfileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Generic method with a bounded type variable, called from another file ---"
+printf "%-30s ... " "BoundedMethodTypeVarCrossFile"
+bmt_out="$TEST_BUILD/boundedmethodtypevar-out"
+rm -rf "$bmt_out"
+mkdir -p "$bmt_out"
+if (cd "$bmt_out" && "$GENESIS" -source 8 -d "$bmt_out" \
+       "$TEST_SRC/src/java8/boundedmethodtypevar/Maker.java" \
+       "$TEST_SRC/src/java8/boundedmethodtypevar/BoundedMethodTypeVarCrossFileVerifyTest.java" \
+       >/dev/null 2>&1) && \
+   "$JAVA" -cp "$bmt_out" boundedmethodtypevar.BoundedMethodTypeVarCrossFileVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- outer.new Inner(...) where Inner comes from a class file ---"
+printf "%-30s ... " "InnerCtorFromClassfile"
+ic_lib="$TEST_BUILD/innerctorlib-lib"
+ic_out="$TEST_BUILD/innerctorlib-out"
+rm -rf "$ic_lib" "$ic_out"
+mkdir -p "$ic_lib" "$ic_out"
+if "$GENESIS" -d "$ic_lib" "$TEST_SRC"/external/innerctorlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ic_lib" -d "$ic_out" \
+       "$TEST_SRC/external/InnerCtorFromClassfileTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ic_out:$ic_lib" InnerCtorFromClassfileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Every annotation element value kind, in uses and in defaults ---"
+printf "%-30s ... " "AnnotationElementKinds"
+aek_lib="$TEST_BUILD/annoelementslib-lib"
+aek_out="$TEST_BUILD/annoelementslib-out"
+rm -rf "$aek_lib" "$aek_out"
+mkdir -p "$aek_lib" "$aek_out"
+if "$GENESIS" -d "$aek_lib" "$TEST_SRC"/external/annoelementslib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$aek_lib" -d "$aek_out" \
+       "$TEST_SRC/external/AnnotationElementKindsTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$aek_out:$aek_lib" AnnotationElementKindsTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Switch case labels that are constants defined through another class's constant ---"
+printf "%-30s ... " "StringConstantChainSwitch"
+scc_lib="$TEST_BUILD/stringconstchainlib-lib"
+scc_out="$TEST_BUILD/stringconstchainlib-out"
+rm -rf "$scc_lib" "$scc_out"
+mkdir -p "$scc_lib" "$scc_out"
+if "$GENESIS" -d "$scc_lib" "$TEST_SRC"/external/stringconstchainlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$scc_lib" -d "$scc_out" \
+       "$TEST_SRC/external/StringConstantChainSwitchTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$scc_out:$scc_lib" StringConstantChainSwitchTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

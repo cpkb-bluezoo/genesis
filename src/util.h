@@ -108,6 +108,11 @@ hashtable_t *hashtable_new_sized(size_t expected_items);
 void hashtable_free(hashtable_t *ht);
 void hashtable_free_full(hashtable_t *ht, void (*free_func)(void *));
 void hashtable_insert(hashtable_t *ht, const char *key, void *value);
+
+/* The UTF-16 code unit a char literal's token text stands for. The lexer stores
+ * the literal as the UTF-8 encoding of that unit (one to three bytes); a
+ * missing or empty string is 0. */
+unsigned int char_literal_value(const char *text);
 void *hashtable_lookup(hashtable_t *ht, const char *key);
 void *hashtable_remove(hashtable_t *ht, const char *key);
 bool hashtable_contains(hashtable_t *ht, const char *key);

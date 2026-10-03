@@ -4009,57 +4009,40 @@ ast_node_t *parse_array_initializer(parser_t *parser)
  * ======================================================================== */
 
 /**
- * Parse one annotation element value and attach it as a child of pair.
- * Handles string/number/boolean literals, nested annotations, and
- * array initializers {@code { "a", "b" }}.
+ * Parse one annotation element value (JLS 9.7.1): a nested annotation, a
+ * brace-enclosed array of element values, or any expression (a literal,
+ * possibly negated; a constant or enum constant, qualified or not; a class
+ * literal). An array is an AST_ARRAY_INIT whose children are the element
+ * values; the result is attached as the child of pair.
  */
 static void parse_annotation_element_value(parser_t *parser, ast_node_t *pair)
 {
-    if (parser_check(parser, TOK_STRING_LITERAL)) {
-        ast_node_t *val = ast_new_literal_from_lexer(parser->lexer);
-        ast_add_child(pair, val);
-        parser_advance(parser);
-    } else if (parser_check(parser, TOK_INTEGER_LITERAL) ||
-               parser_check(parser, TOK_TRUE) ||
-               parser_check(parser, TOK_FALSE)) {
-        ast_node_t *val = ast_new_literal_from_lexer(parser->lexer);
-        ast_add_child(pair, val);
-        parser_advance(parser);
-    } else if (parser_check(parser, TOK_AT)) {
+    if (parser_check(parser, TOK_AT)) {
         ast_node_t *nested = parse_annotation(parser);
         if (nested) {
             ast_add_child(pair, nested);
         }
     } else if (parser_check(parser, TOK_LBRACE)) {
+        ast_node_t *array = ast_new(AST_ARRAY_INIT, parser_current_line(parser),
+                                    parser_current_column(parser));
         parser_advance(parser);  /* { */
         while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
-            if (parser_check(parser, TOK_STRING_LITERAL) ||
-                parser_check(parser, TOK_INTEGER_LITERAL) ||
-                parser_check(parser, TOK_TRUE) ||
-                parser_check(parser, TOK_FALSE) ||
-                parser_check(parser, TOK_AT) ||
-                parser_check(parser, TOK_IDENTIFIER)) {
-                ast_node_t *elem = ast_new(AST_ANNOTATION_VALUE,
-                                           parser_current_line(parser),
-                                           parser_current_column(parser));
-                elem->data.node.name = (char *)intern("value");
-                if (parser_check(parser, TOK_IDENTIFIER)) {
-                    const char *id = (char *)intern(parser_current_text(parser));
-                    int el = parser_current_line(parser);
-                    int ec = parser_current_column(parser);
-                    parser_advance(parser);
-                    ast_node_t *val = ast_new_leaf(AST_IDENTIFIER, id, el, ec);
-                    ast_add_child(elem, val);
-                } else {
-                    parse_annotation_element_value(parser, elem);
-                }
-                ast_add_child(pair, elem);
+            /* An element is itself an element value: wrap it in a scratch
+             * node so the same routine parses it, then move it across. */
+            ast_node_t *holder = ast_new(AST_ANNOTATION_VALUE, parser_current_line(parser),
+                                         parser_current_column(parser));
+            parse_annotation_element_value(parser, holder);
+            if (holder->data.node.children) {
+                ast_add_child(array, (ast_node_t *)holder->data.node.children->data);
             } else {
-                parser_advance(parser);
+                parser_advance(parser);  /* unparseable: make progress */
             }
-            parser_match(parser, TOK_COMMA);
+            if (!parser_match(parser, TOK_COMMA)) {
+                break;
+            }
         }
         parser_expect(parser, TOK_RBRACE);
+        ast_add_child(pair, array);
     } else {
         ast_node_t *val = parse_expression(parser);
         if (val) {

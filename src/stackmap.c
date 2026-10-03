@@ -343,6 +343,18 @@ void stackmap_pop(stack_map_table_t *smt, uint16_t count)
     }
 }
 
+void stackmap_dup(stack_map_table_t *smt)
+{
+    if (!smt || smt->current_stack_size < 1) {
+        return;
+    }
+
+    ensure_stack_capacity(smt, smt->current_stack_size);
+    smt->current_stack[smt->current_stack_size] =
+        smt->current_stack[smt->current_stack_size - 1];
+    smt->current_stack_size++;
+}
+
 void stackmap_dup_x1(stack_map_table_t *smt)
 {
     if (!smt || smt->current_stack_size < 2) {

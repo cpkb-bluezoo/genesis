@@ -773,6 +773,16 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
                     tv->kind = TYPE_TYPEVAR;
                     tv->data.type_var.name = strdup(ch->data.node.name);
                     tp_sym->type = tv;
+                    /* "<A extends Annotation> A f(...)" erases to the BOUND in
+                     * the method's descriptor; a bound left unset here makes a
+                     * caller in another file say Object. */
+                    if (ch->data.node.children && ch->data.node.children->data) {
+                        unresolved_type_t *but = unresolved_type_from_ast(
+                            (ast_node_t *)ch->data.node.children->data);
+                        if (but) {
+                            tv->data.type_var.bound = resolve_unresolved_type_full(but, reg, cp, sym);
+                        }
+                    }
                 }
                 if (!method_sym->data.method_data.type_params) {
                     method_sym->data.method_data.type_params = slist_new(tp_sym);
@@ -2798,6 +2808,8 @@ static int check_symbol_population(symbol_t *sym, const char *context)
 static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type_t *target_type);
 static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, type_t *target_type);
 static type_t *substitute_from_receiver(type_t *type, type_t *recv_type);
+static type_t *infer_array_return_from_args(semantic_t *sem, type_t *return_type,
+                                            symbol_t *method, slist_t *args);
 static type_t *interface_extends_type_for_subst(semantic_t *sem, symbol_t *iface_sym);
 static type_t *enrich_recv_type_for_subst(semantic_t *sem, type_t *recv_type);
 static void bind_array_init_elements(semantic_t *sem, ast_node_t *init, type_t *array_type);
@@ -2874,7 +2886,7 @@ static bool narrowing_constant_allowed(type_t *target_type, ast_node_t *init_exp
     if (tok_type == TOK_CHAR_LITERAL) {
         /* Char literals store the character as a string in str_val */
         const char *str = literal_expr->data.leaf.value.str_val;
-        value = (str && str[0]) ? (unsigned char)str[0] : 0;
+        value = (str && str[0]) ? char_literal_value(str) : 0;
     } else {
         value = literal_expr->data.leaf.value.int_val;
     }
@@ -5751,10 +5763,23 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
      * invokespecial, since "this" of the unrelated enclosing method got
      * pushed where no such parameter exists at all. */
     inner_class_info_t *self_inner_classes = classfile_get_inner_classes(cf);
+    /* A non-static MEMBER class's constructors take the enclosing instance as
+     * a synthetic first parameter in their descriptors; the source-level
+     * parameter list (what overload resolution matches arguments against)
+     * does not have it. Remember its internal name to drop it below. */
+    char *inner_ctor_outer = NULL;
     for (inner_class_info_t *ic = self_inner_classes; ic; ic = ic->next) {
         if (ic->inner_class_name && strcmp(ic->inner_class_name, binary_name) == 0) {
             if (ic->access_flags & ACC_STATIC) {
                 mods |= MOD_STATIC;
+            } else if (ic->outer_class_name && ic->inner_name &&
+                       !(ic->access_flags & (ACC_INTERFACE | ACC_ENUM))) {
+                inner_ctor_outer = strdup(ic->outer_class_name);
+                for (char *c = inner_ctor_outer; inner_ctor_outer && *c; c++) {
+                    if (*c == '.') {
+                        *c = '/';
+                    }
+                }
             }
             break;
         }
@@ -6120,6 +6145,25 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
                 }
             }
             
+            /* Drop the synthetic enclosing-instance parameter (see above), but
+             * only when this list was built from the full descriptor: a
+             * generic Signature attribute never includes it. */
+            if (inner_ctor_outer && method_kind == SYM_CONSTRUCTOR && mi->descriptor &&
+                method_sym->data.method_data.parameters) {
+                size_t olen = strlen(inner_ctor_outer);
+                bool lead_is_outer = mi->descriptor[0] == '(' && mi->descriptor[1] == 'L' &&
+                    strncmp(mi->descriptor + 2, inner_ctor_outer, olen) == 0 &&
+                    mi->descriptor[2 + olen] == ';';
+                method_descriptor_t *dmd = lead_is_outer ? descriptor_parse_method(mi->descriptor) : NULL;
+                if (dmd) {
+                    if ((int)slist_length(method_sym->data.method_data.parameters) == dmd->param_count) {
+                        method_sym->data.method_data.parameters =
+                            method_sym->data.method_data.parameters->next;
+                    }
+                    method_descriptor_free(dmd);
+                }
+            }
+
             /* Mark method and last parameter as varargs if method has ACC_VARARGS flag */
             if (mi->access_flags & ACC_VARARGS) {
                 method_sym->modifiers |= MOD_VARARGS;
@@ -6144,6 +6188,7 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
         }
         free(method_key);
     }
+    free(inner_ctor_outer);
     
     /* Load superclass if present */
     if (cf->super_class_name && strlen(cf->super_class_name) > 0) {
@@ -8660,6 +8705,30 @@ static symbol_t *lookup_superclass_nested_type(semantic_t *sem, symbol_t *start_
 }
 
 /**
+ * A type named in a class's own extends/implements clause, where that name is
+ * a member type the ENCLOSING class inherits (JLS 8.5): in
+ * "class Mock implements Transport { static class L implements Listener {} }"
+ * Listener is Transport.Listener, reachable only through Mock's own interface
+ * list. The clause is scoped to the enclosing class, never to the declaring
+ * class itself.
+ */
+static symbol_t *lookup_clause_type_via_enclosing(semantic_t *sem, symbol_t *decl,
+                                                  const char *name)
+{
+    if (!sem || !decl || !name || strchr(name, '.') != NULL) {
+        return NULL;
+    }
+    symbol_t *outer = decl->data.class_data.enclosing_class;
+    if (!outer && sem->current_class != decl) {
+        outer = sem->current_class;
+    }
+    if (!outer) {
+        return NULL;
+    }
+    return lookup_superclass_nested_type(sem, outer, name);
+}
+
+/**
  * Resolve a simple class name to a fully qualified name using imports.
  * Returns a newly allocated string or NULL if not found.
  * 
@@ -8772,6 +8841,70 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         }
     }
     
+    /* Check on-demand imports */
+    for (slist_t *node = sem->imports; node; node = node->next) {
+        ast_node_t *import = (ast_node_t *)node->data;
+        if (!import || import->type != AST_IMPORT_DECL) {
+            continue;
+        }
+        
+        const char *import_name = import->data.node.name;
+        if (!import_name) {
+            continue;
+        }
+        
+        /* Check if it's a wildcard import (ends with .*) */
+        size_t len = strlen(import_name);
+        if (len > 2 && import_name[len-1] == '*' && import_name[len-2] == '.') {
+            /* Try package.SimpleName */
+            char qualified[512];
+            snprintf(qualified, sizeof(qualified), "%.*s%s", 
+                     (int)(len - 1), import_name, simple_name);
+            
+            /* Try shared registry first (for parallel compilation) */
+            if (sem->shared_registry) {
+                symbol_t *reg_sym = type_registry_lookup(sem->shared_registry, qualified);
+                if (reg_sym) {
+                    hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(qualified));
+                    sem->resolve_import_depth--;
+                    return strdup(qualified);
+                }
+            }
+            
+            /* Try to find the class in classpath */
+            if (sem->classpath) {
+                classfile_t *cf = classpath_load_class(sem->classpath, qualified);
+                if (cf) {
+                    /* Don't free cf - it's owned by the classpath cache */
+                    /* Cache and return */
+                    hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(qualified));
+                    sem->resolve_import_depth--;
+                    return strdup(qualified);
+                }
+            }
+        }
+    }
+    
+    /* Try java.lang.* (implicit import) */
+    char java_lang[256];
+    snprintf(java_lang, sizeof(java_lang), "java.lang.%s", simple_name);
+    if (sem->classpath) {
+        classfile_t *cf = classpath_load_class(sem->classpath, java_lang);
+        if (cf) {
+            /* Don't free cf - it's owned by the classpath cache */
+            /* Cache and return */
+            hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(java_lang));
+            sem->resolve_import_depth--;
+            return strdup(java_lang);
+        }
+    }
+
+    /* Lenient (not JLS) fallback: a member type of a single-type-imported
+     * class, by simple name. Deliberately tried only after on-demand imports
+     * and java.lang, so it can never shadow a type those legitimately
+     * provide: "import java.nio.file.DirectoryStream; import
+     * jakarta.servlet.*;" must leave "Filter" meaning jakarta.servlet.Filter,
+     * not DirectoryStream.Filter. */
     /* Check if simple_name is a nested type in any single-type-imported class
      * e.g., "import javax.tools.JavaFileManager;" allows using "Location" 
      * to refer to JavaFileManager.Location 
@@ -8846,64 +8979,6 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
                 simple_name, sem->resolve_import_depth);
     }
     
-    /* Check on-demand imports */
-    for (slist_t *node = sem->imports; node; node = node->next) {
-        ast_node_t *import = (ast_node_t *)node->data;
-        if (!import || import->type != AST_IMPORT_DECL) {
-            continue;
-        }
-        
-        const char *import_name = import->data.node.name;
-        if (!import_name) {
-            continue;
-        }
-        
-        /* Check if it's a wildcard import (ends with .*) */
-        size_t len = strlen(import_name);
-        if (len > 2 && import_name[len-1] == '*' && import_name[len-2] == '.') {
-            /* Try package.SimpleName */
-            char qualified[512];
-            snprintf(qualified, sizeof(qualified), "%.*s%s", 
-                     (int)(len - 1), import_name, simple_name);
-            
-            /* Try shared registry first (for parallel compilation) */
-            if (sem->shared_registry) {
-                symbol_t *reg_sym = type_registry_lookup(sem->shared_registry, qualified);
-                if (reg_sym) {
-                    hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(qualified));
-                    sem->resolve_import_depth--;
-                    return strdup(qualified);
-                }
-            }
-            
-            /* Try to find the class in classpath */
-            if (sem->classpath) {
-                classfile_t *cf = classpath_load_class(sem->classpath, qualified);
-                if (cf) {
-                    /* Don't free cf - it's owned by the classpath cache */
-                    /* Cache and return */
-                    hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(qualified));
-                    sem->resolve_import_depth--;
-                    return strdup(qualified);
-                }
-            }
-        }
-    }
-    
-    /* Try java.lang.* (implicit import) */
-    char java_lang[256];
-    snprintf(java_lang, sizeof(java_lang), "java.lang.%s", simple_name);
-    if (sem->classpath) {
-        classfile_t *cf = classpath_load_class(sem->classpath, java_lang);
-        if (cf) {
-            /* Don't free cf - it's owned by the classpath cache */
-            /* Cache and return */
-            hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(java_lang));
-            sem->resolve_import_depth--;
-            return strdup(java_lang);
-        }
-    }
-
     /* Last resort: a nested type of the class CURRENTLY BEING COMPILED (or
      * one of its own enclosing classes, or any of those classes' own
      * superclasses) - a plain member-type reference needs no import at
@@ -9516,56 +9591,6 @@ static char *resolve_type_name_uncached(const char *simple_name,
         }
     }
     
-    /* Check if simple_name is a nested type in any single-type-imported class
-     * e.g., "import javax.tools.JavaFileManager;" allows using "Location" 
-     * to refer to JavaFileManager.Location */
-    for (slist_t *node = imports; node; node = node->next) {
-        ast_node_t *import = (ast_node_t *)node->data;
-        if (!import || import->type != AST_IMPORT_DECL) {
-            continue;
-        }
-        
-        /* Skip static imports */
-        if (import->data.node.flags & MOD_STATIC) {
-            continue;
-        }
-        
-        const char *import_name = import->data.node.name;
-        if (!import_name) {
-            continue;
-        }
-        
-        /* Skip wildcard imports */
-        size_t len = strlen(import_name);
-        if (len > 2 && import_name[len-1] == '*' && import_name[len-2] == '.') {
-            continue;
-        }
-        
-        if (strncmp(import_name, "java.", 5) == 0 && package) {
-            char same_pkg[512];
-            snprintf(same_pkg, sizeof(same_pkg), "%s.%s", package, simple_name);
-            if ((registry && type_registry_lookup(registry, same_pkg)) ||
-                qualify_on_classpath(cache, classpath, same_pkg)) {
-                continue;
-            }
-        }
-        
-        /* Try loading the imported class and check for a nested type */
-        if (classpath) {
-            /* Try to load the imported class from classpath */
-            if (qualify_on_classpath(cache, classpath, import_name)) {
-                /* Check if it has an InnerClasses entry for our simple_name */
-                char nested_class_name[512];
-                snprintf(nested_class_name, sizeof(nested_class_name), "%s$%s",
-                         import_name, simple_name);
-                /* Try to load the nested class directly */
-                if (qualify_on_classpath(cache, classpath, nested_class_name)) {
-                    return strdup(nested_class_name);
-                }
-            }
-        }
-    }
-    
     /* Check on-demand (wildcard) imports */
     for (slist_t *node = imports; node; node = node->next) {
         ast_node_t *import = (ast_node_t *)node->data;
@@ -9639,6 +9664,60 @@ static char *resolve_type_name_uncached(const char *simple_name,
         return strdup(java_lang);
     }
     /* java.lang classes won't be on sourcepath, no need to check */
+
+    /* Lenient (not JLS) fallback, tried last so it can never shadow a type
+     * an on-demand import or java.lang legitimately provides - see the same
+     * ordering note in resolve_import(). */
+    /* Check if simple_name is a nested type in any single-type-imported class
+     * e.g., "import javax.tools.JavaFileManager;" allows using "Location" 
+     * to refer to JavaFileManager.Location */
+    for (slist_t *node = imports; node; node = node->next) {
+        ast_node_t *import = (ast_node_t *)node->data;
+        if (!import || import->type != AST_IMPORT_DECL) {
+            continue;
+        }
+        
+        /* Skip static imports */
+        if (import->data.node.flags & MOD_STATIC) {
+            continue;
+        }
+        
+        const char *import_name = import->data.node.name;
+        if (!import_name) {
+            continue;
+        }
+        
+        /* Skip wildcard imports */
+        size_t len = strlen(import_name);
+        if (len > 2 && import_name[len-1] == '*' && import_name[len-2] == '.') {
+            continue;
+        }
+        
+        if (strncmp(import_name, "java.", 5) == 0 && package) {
+            char same_pkg[512];
+            snprintf(same_pkg, sizeof(same_pkg), "%s.%s", package, simple_name);
+            if ((registry && type_registry_lookup(registry, same_pkg)) ||
+                qualify_on_classpath(cache, classpath, same_pkg)) {
+                continue;
+            }
+        }
+        
+        /* Try loading the imported class and check for a nested type */
+        if (classpath) {
+            /* Try to load the imported class from classpath */
+            if (qualify_on_classpath(cache, classpath, import_name)) {
+                /* Check if it has an InnerClasses entry for our simple_name */
+                char nested_class_name[512];
+                snprintf(nested_class_name, sizeof(nested_class_name), "%s$%s",
+                         import_name, simple_name);
+                /* Try to load the nested class directly */
+                if (qualify_on_classpath(cache, classpath, nested_class_name)) {
+                    return strdup(nested_class_name);
+                }
+            }
+        }
+    }
+    
     
     /* Could not resolve - return NULL (caller should keep original name) */
     return NULL;
@@ -12446,6 +12525,9 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                         if (!iface_sym) {
                                             iface_sym = load_external_class(sem, iface_name);
                                         }
+                                        if (!iface_sym) {
+                                            iface_sym = lookup_clause_type_via_enclosing(sem, sym, iface_name);
+                                        }
                                     }
                                     /* Store on AST node for the main pass to use */
                                     if (iface_sym && !child->sem_symbol) {
@@ -12753,6 +12835,9 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                             if (!iface_sym) {
                                                 /* Try unqualified name directly */
                                                 iface_sym = load_external_class(sem, iface_name);
+                                            }
+                                            if (!iface_sym) {
+                                                iface_sym = lookup_clause_type_via_enclosing(sem, sym, iface_name);
                                             }
                                             if (!iface_sym) {
                                                 /* Try java.lang prefix for standard interfaces */
@@ -14433,12 +14518,14 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         (sym->kind == SYM_LOCAL_VAR || sym->kind == SYM_PARAMETER) &&
                         !declared_inside_current_class(sem, sym, name)) {
                         symbol_t *enclosing = sem->current_class->data.class_data.enclosing_method;
-                        /* If we're in a method inside the local class (current_method != enclosing),
-                         * and the variable is a local/param, it must be captured */
+                        /* A local/param of the enclosing method, reached from inside
+                         * the local/anonymous class, is a capture - from one of its
+                         * methods, or from a field initializer / initializer block,
+                         * where current_method is still the ENCLOSING method (the
+                         * class body does not reset it). */
                         if (enclosing && 
                             (enclosing->kind == SYM_METHOD || enclosing->kind == SYM_CONSTRUCTOR) &&
-                            sem->current_method && 
-                            sem->current_method != enclosing) {
+                            sem->current_method) {
                             /* Add to captured_vars if not already there */
                             slist_t *captured = sem->current_class->data.class_data.captured_vars;
                             bool already_captured = false;
@@ -16318,7 +16405,13 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                         }
                         
-                        return_type = substitute_from_receiver(return_type, subst_recv);
+                        type_t *from_args = infer_array_return_from_args(sem, return_type,
+                                                                         found_method, children ? children->next : NULL);
+                        if (from_args) {
+                            return_type = from_args;
+                        } else {
+                            return_type = substitute_from_receiver(return_type, subst_recv);
+                        }
                         /* Ensure the substituted type has its symbol loaded */
                         ensure_type_symbol_loaded(sem, return_type);
                     }
@@ -19190,6 +19283,44 @@ static type_t *enrich_recv_type_for_subst(semantic_t *sem, type_t *recv_type)
 }
 
 /**
+ * "<T> T[] toArray(T[] a)": a method type variable that appears as BOTH the
+ * element of the return array and the element of one of the parameters is
+ * fixed by that ARGUMENT (JLS 18.5), not by the receiver's own type
+ * arguments - "List<Integer>.toArray(new Number[0])" is a Number[]. Returns
+ * the matching argument's array type, or NULL when the shape doesn't apply.
+ */
+static type_t *infer_array_return_from_args(semantic_t *sem, type_t *return_type,
+                                            symbol_t *method, slist_t *args)
+{
+    if (!return_type || return_type->kind != TYPE_ARRAY || !method || !args) {
+        return NULL;
+    }
+    type_t *elem = return_type->data.array_type.element_type;
+    if (!elem || elem->kind != TYPE_TYPEVAR || !elem->data.type_var.name) {
+        return NULL;
+    }
+    slist_t *param = method->data.method_data.parameters;
+    slist_t *arg = args;
+    for (; param && arg; param = param->next, arg = arg->next) {
+        symbol_t *ps = (symbol_t *)param->data;
+        if (!ps || !ps->type || ps->type->kind != TYPE_ARRAY) {
+            continue;
+        }
+        type_t *pelem = ps->type->data.array_type.element_type;
+        if (!pelem || pelem->kind != TYPE_TYPEVAR || !pelem->data.type_var.name ||
+            strcmp(pelem->data.type_var.name, elem->data.type_var.name) != 0) {
+            continue;
+        }
+        type_t *at = get_expression_type(sem, (ast_node_t *)arg->data);
+        if (at && at->kind == TYPE_ARRAY && at->data.array_type.element_type &&
+            at->data.array_type.element_type->kind == TYPE_CLASS) {
+            return at;
+        }
+    }
+    return NULL;
+}
+
+/**
  * Substitute type variables in a parameterized type with the receiver's type arguments.
  * This is used for method parameter types where the method's parameter type may reference
  * type parameters of the receiver class (e.g., Stream.map takes Function<? super T, R>
@@ -20067,6 +20198,12 @@ static void bind_array_init_elements(semantic_t *sem, ast_node_t *init, type_t *
             /* Nested array initializer for multi-dimensional arrays */
             elem->sem_type = immediate_elem_type;
             bind_array_init_elements(sem, elem, immediate_elem_type);
+        } else if (elem->type == AST_CLASS_LITERAL) {
+            /* Nothing else types an initializer element on its own, and a
+             * class literal's resolved type (what codegen reads for the
+             * qualified, '$'-joined name of a nested class) is attached
+             * only when it is typed. */
+            get_expression_type(sem, elem);
         }
     }
 }
@@ -21386,10 +21523,72 @@ static bool resolve_qualified_constant_case_value(semantic_t *sem, ast_node_t *f
         /* A char literal's value is the character stored as a string in
          * str_val, not int_val. */
         const char *str = init_expr->data.leaf.value.str_val;
-        *out_value = (str && str[0]) ? (unsigned char)str[0] : 0;
+        *out_value = (str && str[0]) ? char_literal_value(str) : 0;
         return true;
     }
     return false;
+}
+
+static bool resolve_named_string_constant(semantic_t *sem, const char *name, char **out_value);
+static bool resolve_qualified_constant_case_string_value(semantic_t *sem, ast_node_t *field_access,
+                                                         char **out_value);
+
+/**
+ * The value of a compile-time String constant expression (JLS 15.29): a
+ * string literal, a named or qualified constant (itself initialized by
+ * another constant expression - "BASIC_AUTH = HttpServletRequest.BASIC_AUTH"),
+ * a parenthesized one, or a "+" concatenation of those. *out is malloc'd.
+ * Bounded depth, so a (illegal) circular definition cannot loop.
+ */
+static bool eval_string_constant_expr(semantic_t *sem, ast_node_t *expr, char **out)
+{
+    static __thread int depth = 0;
+    if (!expr || !out || depth > 16) {
+        return false;
+    }
+    depth++;
+    bool ok = false;
+    switch (expr->type) {
+        case AST_PARENTHESIZED:
+            if (expr->data.node.children) {
+                ok = eval_string_constant_expr(sem, (ast_node_t *)expr->data.node.children->data, out);
+            }
+            break;
+        case AST_LITERAL:
+            if (expr->data.leaf.token_type == TOK_STRING_LITERAL && expr->data.leaf.value.str_val) {
+                *out = strdup(expr->data.leaf.value.str_val);
+                ok = *out != NULL;
+            }
+            break;
+        case AST_IDENTIFIER:
+            ok = expr->data.leaf.name && resolve_named_string_constant(sem, expr->data.leaf.name, out);
+            break;
+        case AST_FIELD_ACCESS:
+            ok = resolve_qualified_constant_case_string_value(sem, expr, out);
+            break;
+        case AST_BINARY_EXPR:
+            if (expr->data.node.op_token == TOK_PLUS && expr->data.node.children &&
+                expr->data.node.children->next) {
+                char *l = NULL;
+                char *r = NULL;
+                if (eval_string_constant_expr(sem, (ast_node_t *)expr->data.node.children->data, &l) &&
+                    eval_string_constant_expr(sem, (ast_node_t *)expr->data.node.children->next->data, &r)) {
+                    *out = malloc(strlen(l) + strlen(r) + 1);
+                    if (*out) {
+                        strcpy(*out, l);
+                        strcat(*out, r);
+                        ok = true;
+                    }
+                }
+                free(l);
+                free(r);
+            }
+            break;
+        default:
+            break;
+    }
+    depth--;
+    return ok;
 }
 
 /**
@@ -21472,13 +21671,7 @@ static bool resolve_qualified_constant_case_string_value(semantic_t *sem, ast_no
     }
 
     ast_node_t *init_expr = (ast_node_t *)declarator->data.node.children->data;
-    if (init_expr && init_expr->type == AST_LITERAL &&
-        init_expr->data.leaf.token_type == TOK_STRING_LITERAL &&
-        init_expr->data.leaf.value.str_val) {
-        *out_value = strdup(init_expr->data.leaf.value.str_val);
-        return true;
-    }
-    return false;
+    return eval_string_constant_expr(sem, init_expr, out_value);
 }
 
 static bool resolve_named_int_constant(semantic_t *sem, const char *name, int32_t *out_value);
@@ -21516,7 +21709,7 @@ static bool eval_case_constant_operand(semantic_t *sem, ast_node_t *expr, int32_
         }
         if (expr->data.leaf.token_type == TOK_CHAR_LITERAL) {
             const char *str = expr->data.leaf.value.str_val;
-            *out = (str && str[0]) ? (unsigned char)str[0] : 0;
+            *out = (str && str[0]) ? char_literal_value(str) : 0;
             return true;
         }
         return false;
@@ -21767,13 +21960,7 @@ static bool resolve_named_string_constant(semantic_t *sem, const char *name, cha
         return false;
     }
     ast_node_t *init_expr = (ast_node_t *)declarator->data.node.children->data;
-    if (init_expr && init_expr->type == AST_LITERAL &&
-        init_expr->data.leaf.token_type == TOK_STRING_LITERAL &&
-        init_expr->data.leaf.value.str_val) {
-        *out_value = strdup(init_expr->data.leaf.value.str_val);
-        return true;
-    }
-    return false;
+    return eval_string_constant_expr(sem, init_expr, out_value);
 }
 
 /**
@@ -22203,8 +22390,14 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                         } else {
                                             symbol_t *common = find_common_ancestor_symbol(
                                                 exc_type->data.class_type.symbol, this_type->data.class_type.symbol);
-                                            exc_type = (common && common->qualified_name) ?
-                                                type_new_class(common->qualified_name) : type_object();
+                                            if (common && common->qualified_name) {
+                                                /* Keep the symbol on the folded type: the
+                                                 * next alternative's pairwise LUB needs it. */
+                                                exc_type = type_new_class(common->qualified_name);
+                                                exc_type->data.class_type.symbol = common;
+                                            } else {
+                                                exc_type = type_object();
+                                            }
                                         }
                                     }
                                 }
@@ -23923,6 +24116,22 @@ define_local_var:
                                                     case_expr->data.leaf.token_type = TOK_INTEGER_LITERAL;
                                                     case_expr->data.leaf.value.int_val = resolved_value;
                                                 }
+                                            } else if (is_string_switch && case_expr &&
+                                                       (case_expr->type == AST_BINARY_EXPR ||
+                                                        case_expr->type == AST_PARENTHESIZED)) {
+                                                /* A constant String expression as the label
+                                                 * itself ("case PREFIX + "x":"). Rewritten
+                                                 * to its literal value exactly like the
+                                                 * identifier/qualified-name labels above. */
+                                                char *resolved_str = NULL;
+                                                if (eval_string_constant_expr(sem, case_expr, &resolved_str)) {
+                                                    case_expr->type = AST_LITERAL;
+                                                    case_expr->data.leaf.name = (char *)intern(resolved_str);
+                                                    case_expr->data.leaf.token_type = TOK_STRING_LITERAL;
+                                                    case_expr->data.leaf.value.str_val = resolved_str;
+                                                    case_expr->data.leaf.str_len = strlen(resolved_str);
+                                                }
+                                                continue;
                                             } else if (case_expr && case_expr->type == AST_CAST_EXPR) {
                                                 /* A qualified (or, in principle, bare) constant
                                                  * narrowed by an explicit cast, e.g.

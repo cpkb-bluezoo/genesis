@@ -1230,7 +1230,7 @@ static void lexer_scan_char(lexer_t *lexer)
 {
     int start_line = lexer->line;
     int start_column = lexer->column;
-    char ch;
+    unsigned int cp = 0;  /* the UTF-16 code unit the literal stands for */
     
     lexer_advance_char(lexer);  /* Skip opening quote */
     
@@ -1238,65 +1238,91 @@ static void lexer_scan_char(lexer_t *lexer)
         lexer_advance_char(lexer);
         char c = lexer_peek(lexer);
         switch (c) {
-            case 'n':  ch = '\n'; lexer_advance_char(lexer); break;
-            case 't':  ch = '\t'; lexer_advance_char(lexer); break;
-            case 'r':  ch = '\r'; lexer_advance_char(lexer); break;
-            case 'b':  ch = '\b'; lexer_advance_char(lexer); break;
-            case 'f':  ch = '\f'; lexer_advance_char(lexer); break;
-            case '\\': ch = '\\'; lexer_advance_char(lexer); break;
-            case '"':  ch = '"'; lexer_advance_char(lexer); break;
-            case '\'': ch = '\''; lexer_advance_char(lexer); break;
+            case 'n':  cp = '\n'; lexer_advance_char(lexer); break;
+            case 't':  cp = '\t'; lexer_advance_char(lexer); break;
+            case 'r':  cp = '\r'; lexer_advance_char(lexer); break;
+            case 'b':  cp = '\b'; lexer_advance_char(lexer); break;
+            case 'f':  cp = '\f'; lexer_advance_char(lexer); break;
+            case 's':  cp = ' ';  lexer_advance_char(lexer); break;
+            case '\\': cp = '\\'; lexer_advance_char(lexer); break;
+            case '"':  cp = '"'; lexer_advance_char(lexer); break;
+            case '\'': cp = '\''; lexer_advance_char(lexer); break;
             case 'u':
-                /* Unicode escape \uXXXX */
-                lexer_advance_char(lexer);  /* Skip 'u' */
+                /* Unicode escape: one or more 'u', then four hex digits (JLS 3.3) */
+                while (lexer_peek(lexer) == 'u') {
+                    lexer_advance_char(lexer);
+                }
                 {
-                    int value = 0;
+                    unsigned int value = 0;
+                    bool valid = true;
                     for (int i = 0; i < 4; i++) {
                         int digit = hex_digit_value(lexer_peek(lexer));
                         if (digit < 0) {
-                            /* Invalid hex digit */
-                            ch = '?';
+                            valid = false;
                             break;
                         }
-                        value = (value << 4) | digit;
+                        value = (value << 4) | (unsigned int)digit;
                         lexer_advance_char(lexer);
                     }
-                    /* For now, only handle BMP characters that fit in a char */
-                    ch = (char)(value & 0xFF);
+                    cp = valid ? value : '?';
                 }
                 break;
             case '0': case '1': case '2': case '3':
             case '4': case '5': case '6': case '7':
                 /* Octal escape */
                 {
-                    int value = c - '0';
+                    unsigned int value = (unsigned int)(c - '0');
                     lexer_advance_char(lexer);
                     if (lexer_peek(lexer) >= '0' && lexer_peek(lexer) <= '7') {
-                        value = value * 8 + (lexer_peek(lexer) - '0');
+                        value = value * 8 + (unsigned int)(lexer_peek(lexer) - '0');
                         lexer_advance_char(lexer);
                         if (c <= '3' && lexer_peek(lexer) >= '0' && lexer_peek(lexer) <= '7') {
-                            value = value * 8 + (lexer_peek(lexer) - '0');
+                            value = value * 8 + (unsigned int)(lexer_peek(lexer) - '0');
                             lexer_advance_char(lexer);
                         }
                     }
-                    ch = (char)value;
+                    cp = value;
                 }
                 break;
-            default:   ch = c; lexer_advance_char(lexer); break;
+            default:   cp = (unsigned char)c; lexer_advance_char(lexer); break;
         }
     } else {
-        ch = lexer_peek(lexer);
+        /* A raw character: decode the UTF-8 sequence the source holds. */
+        unsigned char b = (unsigned char)lexer_peek(lexer);
+        int extra = (b & 0xE0) == 0xC0 ? 1 : (b & 0xF0) == 0xE0 ? 2 : (b & 0xF8) == 0xF0 ? 3 : 0;
+        cp = extra == 0 ? b : extra == 1 ? (b & 0x1Fu) : extra == 2 ? (b & 0x0Fu) : (b & 0x07u);
         lexer_advance_char(lexer);
+        for (int i = 0; i < extra; i++) {
+            unsigned char cb = (unsigned char)lexer_peek(lexer);
+            if ((cb & 0xC0) != 0x80) {
+                break;
+            }
+            cp = (cp << 6) | (cb & 0x3Fu);
+            lexer_advance_char(lexer);
+        }
     }
     
     if (lexer_peek(lexer) == '\'') {
         lexer_advance_char(lexer);  /* Skip closing quote */
     }
     
-    /* Store single character in buffer */
-    lexer->text_buf[0] = ch;
-    lexer->text_buf[1] = '\0';
-    lexer_set_token_buf(lexer, TOK_CHAR_LITERAL, lexer->text_buf, 1,
+    /* Store the code unit as UTF-8 in the token buffer; see char_literal_value(). */
+    size_t len;
+    if (cp < 0x80) {
+        lexer->text_buf[0] = (char)cp;
+        len = 1;
+    } else if (cp < 0x800) {
+        lexer->text_buf[0] = (char)(0xC0 | (cp >> 6));
+        lexer->text_buf[1] = (char)(0x80 | (cp & 0x3F));
+        len = 2;
+    } else {
+        lexer->text_buf[0] = (char)(0xE0 | ((cp >> 12) & 0x0F));
+        lexer->text_buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        lexer->text_buf[2] = (char)(0x80 | (cp & 0x3F));
+        len = 3;
+    }
+    lexer->text_buf[len] = '\0';
+    lexer_set_token_buf(lexer, TOK_CHAR_LITERAL, lexer->text_buf, len,
                        start_line, start_column);
 }
 
