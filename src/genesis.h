@@ -21,6 +21,7 @@
 #ifndef GENESIS_H
 #define GENESIS_H
 
+#include <stdint.h>
 #include "util.h"
 #include "type.h"
 

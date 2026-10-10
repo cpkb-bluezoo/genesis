@@ -5985,12 +5985,12 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         if (nested->kind == SYM_ENUM) {
                             if (strcmp(method_name, "values") == 0) {
                                 /* values() returns EnumType[] */
-                                char desc[256];
+                                char desc[512];
                                 snprintf(desc, sizeof(desc), "()[L%s;", nested_internal);
                                 custom_descriptor = strdup(desc);
                             } else if (strcmp(method_name, "valueOf") == 0) {
                                 /* valueOf(String) returns EnumType */
-                                char desc[256];
+                                char desc[512];
                                 snprintf(desc, sizeof(desc), "(Ljava/lang/String;)L%s;", nested_internal);
                                 custom_descriptor = strdup(desc);
                             }
@@ -13279,7 +13279,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                              "lambda$%s$%d", enclosing_name, cg->lambda_counter++);
                     
                     /* Build synthetic method descriptor: (I)[<ElementType> */
-                    char synth_desc[256];
+                    char synth_desc[512];
                     snprintf(synth_desc, sizeof(synth_desc), "(I)%s", array_desc);
                     
                     /* Generate the synthetic array factory method */

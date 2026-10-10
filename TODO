@@ -153,6 +153,16 @@ KNOWN BUGS
     boolean element, it is right. Fix: read the declared type from the
     annotation's AST when there is no class file.
 
+15. A JDK with no jmods directory (JDK 24+ builds such as Eclipse Temurin 25,
+    JEP 493) cannot be used: jdk_detect_from_path() in classpath.c accepts
+    lib/modules as the module source, but nothing reads it (it is a jimage
+    file, not a directory of .jmod archives), so every java.* type is
+    unresolved. Needs a jimage reader (header, redirect/offset tables,
+    location attributes, and /packages and /modules entries to map a
+    package to its module), or a fallback to jrt-fs.jar / the java launcher.
+    Until then the README states the requirement, and CI uses a JDK that
+    ships jmods.
+
 ================================================================================
 OPTIONAL IMPROVEMENTS
 ================================================================================

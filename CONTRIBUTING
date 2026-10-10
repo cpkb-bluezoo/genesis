@@ -131,6 +131,11 @@ Testing
    so the numbers do not depend on what else a developer machine is doing.
    Start it from the Actions tab; the results table is in the job summary.
 
+   The CI workflow (.github/workflows/ci.yml) builds genesis with GCC and
+   clang on Linux for every push and fails on any compiler warning, so
+   problems the macOS build hides (a missing include, a GCC-only warning)
+   show up early.
+
    Example:
        GUMDROP_DIR=~/gumdrop JAVA_HOME=/path/to/jdk-25 make gumdrop-smoke
        GUMDROP_DIR=~/gumdrop JAVA_HOME=/path/to/jdk-25 make bench

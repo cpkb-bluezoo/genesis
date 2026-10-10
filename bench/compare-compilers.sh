@@ -49,7 +49,11 @@ BENCH_WARMUP=${BENCH_WARMUP:-1}
 
 TIME=${TIME:-/usr/bin/time}
 if [ ! -x "$TIME" ]; then
-    TIME=time
+    TIME=$(command -v time 2>/dev/null || true)
+    if [ -z "$TIME" ] || [ ! -x "$TIME" ]; then
+        echo "error: /usr/bin/time not found (install the 'time' package or set TIME)" >&2
+        exit 1
+    fi
 fi
 
 usage() {

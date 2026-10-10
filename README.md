@@ -102,6 +102,15 @@ autoreconf -fi
 make
 ```
 
+Genesis reads the Java platform classes it compiles against from a JDK
+(`JAVA_HOME`, or a standard location for your platform). That JDK must ship
+its `jmods` directory: genesis does not read the `lib/modules` runtime image
+by itself. Most JDKs include `jmods`, but JDK 24 and later let vendors leave
+it out (JEP 493) and some do: Eclipse Temurin 25 on Linux has none, for
+example, and genesis then reports every `java.*` type as unresolved. Check
+for `$JAVA_HOME/jmods`; Oracle JDK, Azul Zulu and the macOS and Linux
+distribution packages that include it work.
+
 Regression tests (`make check`) and the jtreg integration live in `test/`,
 which is only present in a git checkout, not in the release tarball. They
 need a Java 21+ runtime: set `JAVA` or `JAVA_HOME`.
@@ -160,6 +169,10 @@ genesis -version
   UTF-32 (with BOM for UTF-16/32). Unlike `javac`, genesis does not attempt to
   guess or fall back to platform-default encodings. Invalid UTF-8 sequences
   are rejected with an error. Use Unicode escapes (`\uXXXX`) for non-UTF-8 sources.
+
+- **JDK without `jmods`**: see Building. A JDK that has only the `lib/modules`
+  runtime image (such as Eclipse Temurin 25) cannot be used to compile against,
+  because genesis has no reader for that image format yet.
 
 ## Contributing
 

@@ -4285,7 +4285,7 @@ symbol_t *scope_lookup_method_with_types_and_recv(struct semantic *sem, scope_t 
             if (m->data.method_data.parameters) {
                 symbol_t *p = (symbol_t*)m->data.method_data.parameters->data;
                 fprintf(stderr, "DEBUG     param[0] type=%p (kind=%d, name=%s)\n",
-                        (void*)p->type, p->type ? p->type->kind : -1,
+                        (void*)p->type, p->type ? (int)p->type->kind : -1,
                         (p->type && p->type->kind == TYPE_CLASS && p->type->data.class_type.name) ?
                             p->type->data.class_type.name : "<null>");
             }
@@ -6552,7 +6552,7 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
                                                                                 method_sym->type = semantic_resolve_type(sem, ret_type_node);
                                                                                 if (debug_getenv("GENESIS_DEBUG_LOAD")) {
                                                                                     fprintf(stderr, "DEBUG: resolved return type for '%s' -> %p (kind=%d)\n",
-                                                                                        mname, (void*)method_sym->type, method_sym->type ? method_sym->type->kind : -1);
+                                                                                        mname, (void*)method_sym->type, method_sym->type ? (int)method_sym->type->kind : -1);
                                                                                 }
                                                                             }
                                                                             
@@ -7204,7 +7204,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
             symbol_t *nested = scope_lookup(outer->data.class_data.members, immediate_name);
             if (debug_getenv("GENESIS_DEBUG_LOAD")) {
                 fprintf(stderr, "DEBUG load: scope_lookup returned %p (kind=%d)\n",
-                    (void*)nested, nested ? nested->kind : -1);
+                    (void*)nested, nested ? (int)nested->kind : -1);
             }
             if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
                            nested->kind == SYM_ENUM || nested->kind == SYM_RECORD ||
@@ -7566,7 +7566,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                                 fprintf(stderr, "  - extends type_arg: %s (kind=%d)\n",
                                                     arg && arg->kind == TYPE_CLASS && arg->data.class_type.name ? arg->data.class_type.name :
                                                     arg && arg->kind == TYPE_TYPEVAR && arg->data.type_var.name ? arg->data.type_var.name : "(unknown)",
-                                                    arg ? arg->kind : -1);
+                                                    arg ? (int)arg->kind : -1);
                                             }
                                         }
                                     }
@@ -9031,7 +9031,7 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
             symbol_t *nested = scope_lookup_local(imported_sym->data.class_data.members, simple_name);
                 if (debug_getenv("GENESIS_DEBUG_OVERRIDE") && strcmp(simple_name, "ListWriter") == 0) {
                     fprintf(stderr, "DEBUG resolve_import: nested lookup '%s' in '%s' -> %p kind=%d\n",
-                            simple_name, import_name, (void*)nested, nested ? nested->kind : -1);
+                            simple_name, import_name, (void*)nested, nested ? (int)nested->kind : -1);
                 }
             if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
                            nested->kind == SYM_ENUM || nested->kind == SYM_RECORD ||
@@ -10905,8 +10905,7 @@ static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, c
             
             /* Extract primary class name from filename */
             char primary_class[256];
-            strncpy(primary_class, entry->d_name, len - 5);
-            primary_class[len - 5] = '\0';
+            snprintf(primary_class, sizeof(primary_class), "%.*s", (int)(len - 5), entry->d_name);
             
             /* Build qualified name for the primary class */
             char qualified[512];
@@ -11195,7 +11194,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                 if (debug_getenv("GENESIS_DEBUG_IFACE_NESTED")) {
                                     fprintf(stderr, "DEBUG iface_nested:   checking interface '%s' (kind=%d, members=%p)\n",
                                         iface_sym ? (iface_sym->name ? iface_sym->name : "(unnamed)") : "(null)",
-                                        iface_sym ? iface_sym->kind : -1,
+                                        iface_sym ? (int)iface_sym->kind : -1,
                                         iface_sym ? (void*)iface_sym->data.class_data.members : NULL);
                                 }
                                 /* Only check valid interface symbols */
@@ -11205,7 +11204,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                     if (debug_getenv("GENESIS_DEBUG_IFACE_NESTED")) {
                                         fprintf(stderr, "DEBUG iface_nested:   looked up '%s' in '%s' -> %p (kind=%d, type=%p)\n",
                                             name, iface_sym->name ? iface_sym->name : "(null)",
-                                            (void*)nested, nested ? nested->kind : -1, nested ? (void*)nested->type : NULL);
+                                            (void*)nested, nested ? (int)nested->kind : -1, nested ? (void*)nested->type : NULL);
                                     }
                                     if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
                                                    nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
@@ -12406,8 +12405,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                             char expected[256];
                                             size_t namelen = baselen - 5;
                                             if (namelen < sizeof(expected)) {
-                                                strncpy(expected, basename, namelen);
-                                                expected[namelen] = '\0';
+                                                snprintf(expected, sizeof(expected), "%.*s", (int)namelen, basename);
                                                 if (strcmp(expected, name) != 0) {
                                                     semantic_error(sem, node->line, node->column,
                                                         "class %s is public, should be declared in a file named %s.java",
@@ -12612,7 +12610,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                     /* Also add to interfaces list now so nested types are accessible */
                                     if (debug_getenv("GENESIS_DEBUG_OVERRIDE")) {
                                         fprintf(stderr, "DEBUG implements: resolved '%s' to iface_sym=%p kind=%d\n",
-                                                iface_name, (void*)iface_sym, iface_sym ? iface_sym->kind : -1);
+                                                iface_name, (void*)iface_sym, iface_sym ? (int)iface_sym->kind : -1);
                                     }
                                     if (iface_sym && (iface_sym->kind == SYM_INTERFACE ||
                                                       iface_sym->kind == SYM_CLASS)) {
@@ -12945,7 +12943,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                         }
                                         if (debug_getenv("GENESIS_DEBUG_IFACE")) {
                                             fprintf(stderr, "DEBUG iface: resolved '%s' -> %p (kind=%d)\n",
-                                                iface_name, (void*)iface_sym, iface_sym ? iface_sym->kind : -1);
+                                                iface_name, (void*)iface_sym, iface_sym ? (int)iface_sym->kind : -1);
                                         }
                                         if (iface_sym) {
                                             /* Check that we're implementing an interface, not a class */
@@ -15411,7 +15409,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 strcmp(method_name, "setNormalizer") == 0) {
                                 fprintf(stderr, "DEBUG: setNormalizer checking variable '%s' -> sym=%p kind=%d\n",
                                         recv_name ? recv_name : "<null>",
-                                        (void*)sym, sym ? sym->kind : -1);
+                                        (void*)sym, sym ? (int)sym->kind : -1);
                             }
                             
                             /* Check inherited fields from superclass chain */
@@ -15474,7 +15472,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 if (debug_getenv("GENESIS_DEBUG_SAM") && method_name && 
                                     strcmp(method_name, "setNormalizer") == 0) {
                                     fprintf(stderr, "DEBUG: setNormalizer sym->type=%p (kind=%d, name=%s)\n",
-                                            (void*)sym->type, sym->type ? sym->type->kind : -1,
+                                            (void*)sym->type, sym->type ? (int)sym->type->kind : -1,
                                             (sym->type && sym->type->kind == TYPE_CLASS && sym->type->data.class_type.name) ?
                                                 sym->type->data.class_type.name : "<null>");
                                 }
@@ -15522,7 +15520,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                                 fprintf(stderr, "  - type_arg: %s (kind=%d)\n",
                                                     arg && arg->kind == TYPE_CLASS && arg->data.class_type.name ? arg->data.class_type.name :
                                                     arg && arg->kind == TYPE_TYPEVAR && arg->data.type_var.name ? arg->data.type_var.name : "(unknown)",
-                                                    arg ? arg->kind : -1);
+                                                    arg ? (int)arg->kind : -1);
                                             }
                                         }
                                     }
@@ -15616,7 +15614,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                         if (method && method->data.method_data.parameters) {
                                             symbol_t *p = (symbol_t*)method->data.method_data.parameters->data;
                                             fprintf(stderr, "DEBUG:   param type=%p (kind=%d, name=%s)\n",
-                                                    (void*)p->type, p->type ? p->type->kind : -1,
+                                                    (void*)p->type, p->type ? (int)p->type->kind : -1,
                                                     (p->type && p->type->kind == TYPE_CLASS && p->type->data.class_type.name) ?
                                                         p->type->data.class_type.name : "<null>");
                                         }
@@ -16202,7 +16200,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             fprintf(stderr, "DEBUG:   param[0] name='%s' type=%p (kind=%d, name=%s)\n",
                                     p->name ? p->name : "<null>",
                                     (void*)p->type,
-                                    p->type ? p->type->kind : -1,
+                                    p->type ? (int)p->type->kind : -1,
                                     (p->type && p->type->kind == TYPE_CLASS && p->type->data.class_type.name) ?
                                         p->type->data.class_type.name : "<null>");
                         }
@@ -16288,7 +16286,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         if (debug_getenv("GENESIS_DEBUG_SAM") && unwrapped_arg->type == AST_LAMBDA_EXPR) {
                             fprintf(stderr, "DEBUG: lambda arg at line %d, bind_type_for_lambda=%p (kind=%d, name=%s)\n",
                                     unwrapped_arg->line, (void*)bind_type_for_lambda,
-                                    bind_type_for_lambda ? bind_type_for_lambda->kind : -1,
+                                    bind_type_for_lambda ? (int)bind_type_for_lambda->kind : -1,
                                     bind_type_for_lambda && bind_type_for_lambda->kind == TYPE_CLASS ? 
                                         (bind_type_for_lambda->data.class_type.name ? bind_type_for_lambda->data.class_type.name : "<null>") : "N/A");
                         }
@@ -16960,7 +16958,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             first_sym = load_external_class(sem, qualified_first);
                             if (debug_getenv("GENESIS_DEBUG_LOAD")) {
                                 fprintf(stderr, "DEBUG get_expr_type: load_external_class('%s') returned %p (kind=%d)\n",
-                                    qualified_first, (void*)first_sym, first_sym ? first_sym->kind : -1);
+                                    qualified_first, (void*)first_sym, first_sym ? (int)first_sym->kind : -1);
                             }
                             free(qualified_first);
                             }
@@ -16997,7 +16995,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 
                                 if (debug_getenv("GENESIS_DEBUG_LOAD")) {
                                     fprintf(stderr, "DEBUG get_expr_type: looked up '%s' in '%s', found=%p kind=%d\n",
-                                        nested_name, resolved_class->name, (void*)nested, nested ? nested->kind : -1);
+                                        nested_name, resolved_class->name, (void*)nested, nested ? (int)nested->kind : -1);
                                 }
                                 
                                 /* If not found in members, try loading directly using $ convention.
@@ -17105,7 +17103,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     
                                     if (debug_getenv("GENESIS_DEBUG_LOAD")) {
                                         fprintf(stderr, "DEBUG get_expr_type: field lookup returned %p (kind=%d, type=%p)\n",
-                                            (void*)field_sym, field_sym ? field_sym->kind : -1,
+                                            (void*)field_sym, field_sym ? (int)field_sym->kind : -1,
                                             field_sym ? (void*)field_sym->type : NULL);
                                     }
                                     
@@ -17251,7 +17249,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 if (debug_getenv("GENESIS_DEBUG_LOAD")) {
                     fprintf(stderr, "DEBUG get_expr_type: field access '%s', object_type kind=%d, name='%s', symbol=%p\n",
                         field_name,
-                        object_type ? object_type->kind : -1,
+                        object_type ? (int)object_type->kind : -1,
                         (object_type && object_type->kind == TYPE_CLASS) ? 
                             object_type->data.class_type.name : "(n/a)",
                         (object_type && object_type->kind == TYPE_CLASS) ? 
@@ -17394,7 +17392,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 if (debug_getenv("GENESIS_DEBUG_LOAD")) {
                                     fprintf(stderr, "DEBUG get_expr_type: found field '%s' kind=%d type=%p (type_kind=%d) modifiers=0x%x\n",
                                         field_name, field->kind, (void*)field->type,
-                                        field->type ? field->type->kind : -1, field->modifiers);
+                                        field->type ? (int)field->type->kind : -1, field->modifiers);
                                 }
                             /* Check access control - use search_class (where field was found), not class_sym */
                             if (!check_access(field->modifiers, search_class, sem->current_class)) {
