@@ -60,16 +60,18 @@ JUnit test sources):
 
 ## Performance
 
-Compiling all of [gumdrop](https://github.com/cpkb-bluezoo/gumdrop) in one
-invocation (1408 source files, about 340,000 lines, 15 jars on the classpath,
-`--release 25 -g`, output to an empty directory), genesis against javac 25.0.4
-on an Apple M4 (4 performance and 6 efficiency cores), average of 10 runs:
+Compiling all of [gumdrop](https://github.com/cpkb-bluezoo/gumdrop) 3.0.0 in
+one invocation (1457 source files, about 364,000 lines, 15 jars on the
+classpath, `--release 25 -g`, output to an empty directory), genesis against
+javac 25.0.4 (Oracle JDK) on a GitHub-hosted Ubuntu runner (4 vCPUs), average
+of 10 runs. The numbers come from the Benchmark workflow, so anyone can
+reproduce them:
 
 | Compiler | Wall clock | CPU time (user+sys) | Speedup vs javac |
 |----------|-----------:|--------------------:|-----------------:|
-| genesis (default, one job per processor) | 0.41 s | 2.64 s | 6.8x |
-| genesis `-j1` | 1.05 s | 1.03 s | 2.7x |
-| javac | 2.79 s | 11.74 s | 1.0x |
+| genesis (default, one job per processor) | 1.11 s | 3.72 s | 8.8x |
+| genesis `-j1` | 2.19 s | 2.18 s | 4.4x |
+| javac | 9.72 s | 31.62 s | 1.0x |
 
 By default genesis parses on all processors, then divides semantic analysis
 and code generation between worker processes, one per processor. `-j1` does
@@ -77,7 +79,7 @@ everything in a single thread of one process and uses the least processor
 time in total; `-jN` limits the number of jobs to N. Batches of fewer than 32
 files, and JAR output, are analysed in the compiler process itself.
 
-Run `make bench` (see CONTRIBUTING) for numbers on your own machine. The
+Run `make bench` (see CONTRIBUTING) for numbers on your own machine; the
 Benchmark workflow in `.github/workflows` runs the same comparison on a clean
 GitHub-hosted runner against a gumdrop release tag.
 
