@@ -126,6 +126,11 @@ Testing
                                        variables (BENCH_ITERATIONS,
                                        BENCH_WARMUP, etc).
 
+   The Benchmark workflow (.github/workflows/benchmark.yml) runs make bench
+   on a clean GitHub-hosted runner against a gumdrop tag (v3.0.0 by default),
+   so the numbers do not depend on what else a developer machine is doing.
+   Start it from the Actions tab; the results table is in the job summary.
+
    Example:
        GUMDROP_DIR=~/gumdrop JAVA_HOME=/path/to/jdk-25 make gumdrop-smoke
        GUMDROP_DIR=~/gumdrop JAVA_HOME=/path/to/jdk-25 make bench

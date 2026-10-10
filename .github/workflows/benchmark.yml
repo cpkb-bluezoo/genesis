@@ -1,0 +1,82 @@
+# Compiler benchmark: genesis against javac on gumdrop.
+#
+# Runs bench/compare-compilers.sh on a fresh GitHub-hosted runner, so the
+# numbers do not depend on what else a developer machine happens to be doing.
+# The result table goes to the job summary and the full log is kept as an
+# artifact. Run it from the Actions tab (Run workflow), or push a v* tag.
+
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      gumdrop_ref:
+        description: Tag, branch or commit of gumdrop to compile
+        default: v3.0.0
+      iterations:
+        description: Timed runs per compiler mode
+        default: "10"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      GUMDROP_REF: ${{ inputs.gumdrop_ref || 'v3.0.0' }}
+      BENCH_ITERATIONS: ${{ inputs.iterations || '10' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake zlib1g-dev ant
+
+      - name: Build genesis
+        run: |
+          autoreconf -fi
+          ./configure
+          make -j"$(nproc)"
+
+      - name: Run benchmark
+        env:
+          BENCH_GIT_REF: ${{ env.GUMDROP_REF }}
+        run: |
+          set -o pipefail
+          make bench 2>&1 | tee bench.log
+
+      - name: Publish results
+        if: always()
+        run: |
+          {
+            echo "## genesis vs javac on gumdrop ${GUMDROP_REF}"
+            echo
+            echo "Runner: $(nproc) processors, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+            echo "javac: $(javac -version 2>&1)"
+            echo "Timed runs per mode: ${BENCH_ITERATIONS}"
+            echo
+            echo '```'
+            sed -n '/^=== Results/,$p' bench.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-log
+          path: bench.log

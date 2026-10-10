@@ -77,7 +77,9 @@ everything in a single thread of one process and uses the least processor
 time in total; `-jN` limits the number of jobs to N. Batches of fewer than 32
 files, and JAR output, are analysed in the compiler process itself.
 
-Run `make bench` (see CONTRIBUTING) for numbers on your own machine.
+Run `make bench` (see CONTRIBUTING) for numbers on your own machine. The
+Benchmark workflow in `.github/workflows` runs the same comparison on a clean
+GitHub-hosted runner against a gumdrop release tag.
 
 ## Building
 
