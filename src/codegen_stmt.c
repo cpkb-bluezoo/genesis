@@ -2883,15 +2883,28 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     stackmap_restore_locals_only(mg->stackmap, loop_exit_state);
                 }
 
+                /* A "while (true)" with no break cannot complete normally
+                 * (JLS 14.22): nothing after it is reachable, which a
+                 * surrounding try must know (it would otherwise emit a jump
+                 * past its handlers to the end of the code). Its end is not
+                 * a branch target either, so it gets no frame: a frame
+                 * there would shadow that of an exception handler starting
+                 * at the same offset. */
+                bool loop_never_exits = condition_always_true && mg->loop_stack &&
+                    !((loop_context_t *)mg->loop_stack->data)->break_offsets;
+
                 /* Record frame at loop end (break target) */
-                mg_record_frame(mg);
+                if (!loop_never_exits) {
+                    mg_record_frame(mg);
+                }
                 stackmap_state_free(loop_exit_state);
 
                 /* Pop loop context and patch breaks */
                 mg_pop_loop(mg, loop_end);
 
-                /* Reset last_opcode - loop bodies don't guarantee method termination */
-                mg->last_opcode = 0;
+                /* Reset last_opcode - loop bodies don't guarantee method
+                 * termination, unless the loop never exits. */
+                mg->last_opcode = loop_never_exits ? OP_ATHROW : 0;
 
                 return true;
             }
@@ -3220,10 +3233,19 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * an implicit trailing return, or more enclosing
                  * statements, will end up following this exact
                  * position). */
+                /* "for (;;)" with no break cannot complete normally (see the
+                 * while-loop case above), and its end is no branch target,
+                 * so it gets no frame (which would shadow an exception
+                 * handler's own at the same offset). */
+                bool for_never_exits = !(condition && condition->type != AST_EMPTY_STMT) &&
+                    mg->loop_stack &&
+                    !((loop_context_t *)mg->loop_stack->data)->break_offsets;
                 if (loop_entry_state && mg->stackmap) {
                     stackmap_restore_state(mg->stackmap, loop_entry_state);
                 }
-                mg_record_frame(mg);
+                if (!for_never_exits) {
+                    mg_record_frame(mg);
+                }
                 stackmap_state_free(loop_entry_state);
 
                 /* Patch forward branch if we have a condition.
@@ -3246,8 +3268,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* Pop loop context and patch breaks */
                 mg_pop_loop(mg, loop_end);
                 
-                /* Reset last_opcode - loop bodies don't guarantee method termination */
-                mg->last_opcode = 0;
+                /* Reset last_opcode - loop bodies don't guarantee method
+                 * termination, unless the loop never exits. */
+                mg->last_opcode = for_never_exits ? OP_ATHROW : 0;
                 
                 return true;
             }

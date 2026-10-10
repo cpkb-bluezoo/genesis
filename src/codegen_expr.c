@@ -193,6 +193,17 @@ static const char *get_or_create_field_accessor(symbol_t *enclosing, symbol_t *f
     return acc->accessor_name;
 }
 
+/** Tracks the constant 1 pushed for ++/-- as its own type, not as untyped depth. */
+static void push_incdec_one(method_gen_t *mg, type_kind_t kind)
+{
+    switch (kind) {
+        case TYPE_LONG:   mg_push_long(mg); break;
+        case TYPE_DOUBLE: mg_push_double(mg); break;
+        case TYPE_FLOAT:  mg_push_float(mg); break;
+        default:          mg_push_int(mg); break;
+    }
+}
+
 /**
  * Emit ++/-- on an instance field of the current object (this.field).
  * field_owner_internal is the class that declares the field (may be a superclass).
@@ -234,26 +245,26 @@ static bool codegen_this_instance_field_incdec(method_gen_t *mg, const_pool_t *c
     bc_emit(mg->code, OP_ALOAD_0);
     mg_push_object(mg, mg->class_gen->internal_name);
 
+    type_kind_t value_kind = field_desc[0] == 'J' ? TYPE_LONG :
+                             field_desc[0] == 'D' ? TYPE_DOUBLE :
+                             field_desc[0] == 'F' ? TYPE_FLOAT : TYPE_INT;
+
     if (is_post) {
         bc_emit(mg->code, OP_DUP);
         mg_push_object(mg, mg->class_gen->internal_name);
         bc_emit(mg->code, OP_GETFIELD);
         bc_emit_u2(mg->code, fieldref);
         mg_pop_typed(mg, 1);
-        if (is_wide) {
-            mg_push_long(mg);
-        } else {
-            mg_push_int(mg);
-        }
+        push_incdec_one(mg, value_kind);
         if (is_wide) {
             bc_emit(mg->code, OP_DUP2_X1);
-            mg_push(mg, 2);
+            mg_dup2_x1(mg);
         } else {
             bc_emit(mg->code, OP_DUP_X1);
-            mg_push_int(mg);
+            mg_dup_x1(mg);
         }
         bc_emit(mg->code, const1_op);
-        mg_push(mg, is_wide ? 2 : 1);
+        push_incdec_one(mg, value_kind);
         bc_emit(mg->code, is_inc ? add_op : sub_op);
         mg_pop_typed(mg, is_wide ? 2 : 1);
         bc_emit(mg->code, OP_PUTFIELD);
@@ -265,21 +276,17 @@ static bool codegen_this_instance_field_incdec(method_gen_t *mg, const_pool_t *c
         bc_emit(mg->code, OP_GETFIELD);
         bc_emit_u2(mg->code, fieldref);
         mg_pop_typed(mg, 1);
-        if (is_wide) {
-            mg_push_long(mg);
-        } else {
-            mg_push_int(mg);
-        }
+        push_incdec_one(mg, value_kind);
         bc_emit(mg->code, const1_op);
-        mg_push(mg, is_wide ? 2 : 1);
+        push_incdec_one(mg, value_kind);
         bc_emit(mg->code, is_inc ? add_op : sub_op);
         mg_pop_typed(mg, is_wide ? 2 : 1);
         if (is_wide) {
             bc_emit(mg->code, OP_DUP2_X1);
-            mg_push(mg, 2);
+            mg_dup2_x1(mg);
         } else {
             bc_emit(mg->code, OP_DUP_X1);
-            mg_push_int(mg);
+            mg_dup_x1(mg);
         }
         bc_emit(mg->code, OP_PUTFIELD);
         bc_emit_u2(mg->code, fieldref);
@@ -1907,6 +1914,18 @@ static const char *get_known_static_field_type_class(const char *class_name, con
 }
 
 /**
+ * The type whose members a receiver of type t has: a type variable ("T
+ * extends Handler") has those of its bound.
+ */
+static type_t *receiver_member_type(type_t *t)
+{
+    for (int hops = 0; hops < 8 && t && t->kind == TYPE_TYPEVAR && t->data.type_var.bound; hops++) {
+        t = t->data.type_var.bound;
+    }
+    return t;
+}
+
+/**
  * Look up a field by name in a class's own members, walking UP its
  * superclass chain if not found directly on `class_sym` itself.
  *
@@ -2471,17 +2490,19 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                 obj_class = local_class;
             }
             
-            /* Use semantic type info if available */
-            if (receiver->sem_type && receiver->sem_type->kind == TYPE_CLASS) {
-                if (receiver->sem_type->data.class_type.name) {
-                    char *internal = class_to_internal_name(receiver->sem_type->data.class_type.name);
+            /* Use semantic type info if available. A type variable
+             * ("T extends Handler") has the fields of its bound. */
+            type_t *recv_field_type = receiver_member_type(receiver->sem_type);
+            if (recv_field_type && recv_field_type->kind == TYPE_CLASS) {
+                if (recv_field_type->data.class_type.name) {
+                    char *internal = class_to_internal_name(recv_field_type->data.class_type.name);
                     obj_class = internal;
                     /* Note: we leak this memory, but it's small */
                 }
                 
                 /* Look up the field in the class to get its type - walking
                  * the superclass chain too, since it may be inherited. */
-                symbol_t *class_sym = receiver->sem_type->data.class_type.symbol;
+                symbol_t *class_sym = recv_field_type->data.class_type.symbol;
                 if (class_sym) {
                     symbol_t *field_sym = lookup_field_with_superclass(class_sym, field_name);
                     if (field_sym && field_sym->type) {
@@ -2592,9 +2613,10 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
         const char *field_desc = NULL;
         
         /* Try to get type info from semantic analysis */
-        if (receiver->sem_type && receiver->sem_type->kind == TYPE_CLASS) {
-            if (receiver->sem_type->data.class_type.name) {
-                recv_class = class_to_internal_name(receiver->sem_type->data.class_type.name);
+        type_t *chain_recv_type = receiver_member_type(receiver->sem_type);
+        if (chain_recv_type && chain_recv_type->kind == TYPE_CLASS) {
+            if (chain_recv_type->data.class_type.name) {
+                recv_class = class_to_internal_name(chain_recv_type->data.class_type.name);
             }
         }
         
@@ -6888,6 +6910,31 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
      * When a method returns a type parameter (e.g., T in Supplier<T>.get()),
      * the actual bytecode returns Object. If semantic analysis determined a
      * more specific type (e.g., String), we need to emit a checkcast. */
+    const char *typevar_cast_name = NULL;
+    if (!is_void_return && expr->sem_type && expr->sem_type->kind == TYPE_TYPEVAR &&
+        method_sym && method_sym->type && method_sym->type->kind == TYPE_TYPEVAR) {
+        /* A type variable of this class substituted for the callee's own one
+         * ("Mid<E extends Mid<E>> extends Base<E>", calling Base.self(),
+         * which erases to Base): the call site's erasure is narrower than
+         * the method's, so the value needs narrowing to this variable's
+         * bound. */
+        type_t *site_bound = expr->sem_type->data.type_var.bound;
+        type_t *decl_bound = method_sym->type->data.type_var.bound;
+        const char *site_name = (site_bound && site_bound->kind == TYPE_CLASS)
+            ? site_bound->data.class_type.name : NULL;
+        const char *decl_name = (decl_bound && decl_bound->kind == TYPE_CLASS &&
+                                 decl_bound->data.class_type.name)
+            ? decl_bound->data.class_type.name : "java.lang.Object";
+        if (site_name && strcmp(site_name, "java.lang.Object") != 0 &&
+            strcmp(site_name, decl_name) != 0) {
+            char *internal = class_to_internal_name(site_name);
+            uint16_t class_idx = cp_add_class(cp, internal);
+            free(internal);
+            bc_emit(mg->code, OP_CHECKCAST);
+            bc_emit_u2(mg->code, class_idx);
+            typevar_cast_name = site_name;
+        }
+    }
     if (!is_void_return && expr->sem_type && expr->sem_type->kind == TYPE_CLASS) {
         bool needs_checkcast = false;
         const char *cast_target = NULL;
@@ -6993,7 +7040,11 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                      * specific than a bare type variable; otherwise erase
                      * to Object, matching what the actual bytecode
                      * produces with no narrowing checkcast at all. */
-                    if (expr->sem_type && expr->sem_type->kind == TYPE_CLASS) {
+                    if (typevar_cast_name) {
+                        char *internal = class_to_internal_name(typevar_cast_name);
+                        mg_push_object(mg, internal);
+                        free(internal);
+                    } else if (expr->sem_type && expr->sem_type->kind == TYPE_CLASS) {
                         if (expr->sem_type->data.class_type.name) {
                             char *internal = class_to_internal_name(expr->sem_type->data.class_type.name);
                             mg_push_object(mg, internal);
@@ -9480,15 +9531,16 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         bool field_desc_owned = false;
 
         /* Try to get receiver class from semantic info */
-        if (receiver->sem_type && receiver->sem_type->kind == TYPE_CLASS) {
-            if (receiver->sem_type->data.class_type.name) {
-                recv_class = class_to_internal_name(receiver->sem_type->data.class_type.name);
+        type_t *recv_assign_type = receiver_member_type(receiver->sem_type);
+        if (recv_assign_type && recv_assign_type->kind == TYPE_CLASS) {
+            if (recv_assign_type->data.class_type.name) {
+                recv_class = class_to_internal_name(recv_assign_type->data.class_type.name);
             }
 
             /* Look up field descriptor from receiver's class symbol -
              * walking the superclass chain too, since the field may be
              * inherited (see lookup_field_with_superclass()). */
-            symbol_t *class_sym = receiver->sem_type->data.class_type.symbol;
+            symbol_t *class_sym = recv_assign_type->data.class_type.symbol;
             if (class_sym) {
                 symbol_t *field_sym = lookup_field_with_superclass(class_sym, field_name);
                 if (field_sym && field_sym->type) {
@@ -10385,7 +10437,7 @@ static void checkcast_generic_field(method_gen_t *mg, const_pool_t *cp, ast_node
     if ((!field || field->kind != SYM_FIELD) && expr->type == AST_FIELD_ACCESS &&
         expr->data.node.name && expr->data.node.children) {
         ast_node_t *receiver = (ast_node_t *)expr->data.node.children->data;
-        type_t *rt = receiver ? receiver->sem_type : NULL;
+        type_t *rt = receiver ? receiver_member_type(receiver->sem_type) : NULL;
         symbol_t *cls = (rt && rt->kind == TYPE_CLASS) ? rt->data.class_type.symbol : NULL;
         field = NULL;
         for (; cls && !field; cls = cls->data.class_data.superclass) {
@@ -10623,7 +10675,11 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 
                                         if (is_post) {
                                             bc_emit(mg->code, wide ? OP_DUP2 : OP_DUP);
-                                            mg_push(mg, wide ? 2 : 1);
+                                            if (wide) {
+                                                mg_dup2(mg);
+                                            } else {
+                                                mg_dup(mg);
+                                            }
                                         }
 
                                         switch (inc_kind) {
@@ -10649,7 +10705,11 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 
                                         if (!is_post) {
                                             bc_emit(mg->code, wide ? OP_DUP2 : OP_DUP);
-                                            mg_push(mg, wide ? 2 : 1);
+                                            if (wide) {
+                                                mg_dup2(mg);
+                                            } else {
+                                                mg_dup(mg);
+                                            }
                                         }
 
                                         mg_emit_store_local(mg, slot, inc_kind);
@@ -10683,7 +10743,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                             bc_emit(mg->code, OP_ILOAD);
                                             bc_emit_u1(mg->code, (uint8_t)slot);
                                         }
-                                        mg_push(mg, 1);
+                                        mg_push_int(mg);
                                         bc_emit(mg->code, OP_IINC);
                                         bc_emit_u1(mg->code, (uint8_t)slot);
                                         bc_emit_s1(mg->code, (int8_t)delta);
@@ -10699,7 +10759,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                             bc_emit(mg->code, OP_ILOAD);
                                             bc_emit_u1(mg->code, (uint8_t)slot);
                                         }
-                                        mg_push(mg, 1);
+                                        mg_push_int(mg);
                                     }
                                     return true;
                                 }
@@ -10874,7 +10934,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                                         mg_dup_x1(mg);   /* [old,outer,old] */
                                                     }
                                                     bc_emit(mg->code, const1_op);
-                                                    mg_push(mg, is_wide ? 2 : 1);  /* [old,outer,old,1] */
+                                                    push_incdec_one(mg, field_kind);  /* [old,outer,old,1] */
                                                     bc_emit(mg->code, is_inc ? add_op : sub_op);
                                                     mg_pop_typed(mg, is_wide ? 2 : 1);  /* [old,outer,new] */
                                                     bc_emit(mg->code, OP_PUTFIELD);
@@ -10895,7 +10955,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                                         default:          mg_push_int(mg); break;
                                                     }
                                                     bc_emit(mg->code, const1_op);
-                                                    mg_push(mg, is_wide ? 2 : 1);  /* [outer,old,1] */
+                                                    push_incdec_one(mg, field_kind);  /* [outer,old,1] */
                                                     bc_emit(mg->code, is_inc ? add_op : sub_op);
                                                     mg_pop_typed(mg, is_wide ? 2 : 1);  /* [outer,new] */
                                                     if (is_wide) {
@@ -10959,14 +11019,15 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                  * "this.field++"/"this.field--", widening or not. Confirmed
                                  * against gumdrop's own Quota.incrementMessageCount()'s
                                  * "this.messageCount++". */
-                                type_t *receiver_type = receiver->sem_type;
+                                type_t *receiver_type = receiver_member_type(receiver->sem_type);
                                 if ((!receiver_type || receiver_type->kind != TYPE_CLASS) &&
                                     receiver->type == AST_THIS_EXPR &&
                                     mg->class_gen && mg->class_gen->class_sym) {
                                     receiver_type = mg->class_gen->class_sym->type;
                                 } else if ((!receiver_type || receiver_type->kind != TYPE_CLASS) &&
                                            mg->class_gen && mg->class_gen->sem) {
-                                    receiver_type = get_expression_type(mg->class_gen->sem, receiver);
+                                    receiver_type = receiver_member_type(
+                                        get_expression_type(mg->class_gen->sem, receiver));
                                 }
 
                                 if (receiver_type && receiver_type->kind == TYPE_CLASS) {
@@ -11055,7 +11116,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                         mg_dup_x1(mg);   /* [old,obj,old] */
                                     }
                                     bc_emit(mg->code, const1_op);
-                                    mg_push(mg, is_wide ? 2 : 1);  /* [old,obj,old,1] */
+                                    push_incdec_one(mg, field_kind);  /* [old,obj,old,1] */
                                     bc_emit(mg->code, is_inc ? add_op : sub_op);
                                     mg_pop_typed(mg, is_wide ? 2 : 1);   /* [old,obj,new] */
                                     bc_emit(mg->code, OP_PUTFIELD);
@@ -11077,7 +11138,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                         default:          mg_push_int(mg); break;
                                     }
                                     bc_emit(mg->code, const1_op);
-                                    mg_push(mg, is_wide ? 2 : 1);  /* [obj,old,1] */
+                                    push_incdec_one(mg, field_kind);  /* [obj,old,1] */
                                     bc_emit(mg->code, is_inc ? add_op : sub_op);
                                     mg_pop_typed(mg, is_wide ? 2 : 1);   /* [obj,new] */
                                     if (is_wide) {
@@ -11191,7 +11252,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                      *        [old, arr, i, old] -> [old, arr, i, old, 1] ->
                                      *        [old, arr, i, new] -> [old] */
                                     bc_emit(mg->code, OP_DUP2);
-                                    mg_push(mg, 2);  /* [arr, i, arr, i] */
+                                    mg_dup2(mg);  /* [arr, i, arr, i] */
                                     bc_emit(mg->code, load_op);
                                     /* load_op consumes arr+i (2 words) and pushes
                                      * the element value - for a WIDE element
@@ -11209,16 +11270,17 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                      * DoubleHistogram.HistogramBuckets.record(),
                                      * whose "counts[bucket]++" on a long[]
                                      * hits exactly this path). */
-                                    mg_pop_typed(mg, is_wide ? 0 : 1);  /* [arr, i, old] - load consumes arr,i pushes value */
+                                    mg_pop_typed(mg, 2);  /* load consumes arr, i */
+                                    push_incdec_one(mg, elem_kind);  /* [arr, i, old] */
                                     if (is_wide) {
                                         bc_emit(mg->code, OP_DUP2_X2);
-                                        mg_push(mg, 2);  /* [old, arr, i, old] for long/double */
+                                        mg_dup2_x2(mg);  /* [old, arr, i, old] for long/double */
                                     } else {
                                         bc_emit(mg->code, OP_DUP_X2);
-                                        mg_push(mg, 1);  /* [old, arr, i, old] */
+                                        mg_dup_x2(mg);  /* [old, arr, i, old] */
                                     }
                                     bc_emit(mg->code, const1_op);
-                                    mg_push(mg, is_wide ? 2 : 1);  /* [old, arr, i, old, 1] */
+                                    push_incdec_one(mg, elem_kind);  /* [old, arr, i, old, 1] */
                                     bc_emit(mg->code, is_inc ? add_op : sub_op);
                                     mg_pop_typed(mg, is_wide ? 2 : 1);  /* [old, arr, i, new] */
                                     bc_emit(mg->code, store_op);
@@ -11229,22 +11291,23 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                      *        [arr, i, old, 1] -> [arr, i, new] ->
                                      *        [new, arr, i, new] -> [new] */
                                     bc_emit(mg->code, OP_DUP2);
-                                    mg_push(mg, 2);  /* [arr, i, arr, i] */
+                                    mg_dup2(mg);  /* [arr, i, arr, i] */
                                     bc_emit(mg->code, load_op);
                                     /* See the identical wide/narrow net-change
                                      * distinction (and its full reasoning) in
                                      * the post-increment branch above. */
-                                    mg_pop_typed(mg, is_wide ? 0 : 1);  /* [arr, i, old] */
+                                    mg_pop_typed(mg, 2);  /* load consumes arr, i */
+                                    push_incdec_one(mg, elem_kind);  /* [arr, i, old] */
                                     bc_emit(mg->code, const1_op);
-                                    mg_push(mg, is_wide ? 2 : 1);  /* [arr, i, old, 1] */
+                                    push_incdec_one(mg, elem_kind);  /* [arr, i, old, 1] */
                                     bc_emit(mg->code, is_inc ? add_op : sub_op);
                                     mg_pop_typed(mg, is_wide ? 2 : 1);  /* [arr, i, new] */
                                     if (is_wide) {
                                         bc_emit(mg->code, OP_DUP2_X2);
-                                        mg_push(mg, 2);  /* [new, arr, i, new] for long/double */
+                                        mg_dup2_x2(mg);  /* [new, arr, i, new] for long/double */
                                     } else {
                                         bc_emit(mg->code, OP_DUP_X2);
-                                        mg_push(mg, 1);  /* [new, arr, i, new] */
+                                        mg_dup_x2(mg);  /* [new, arr, i, new] */
                                     }
                                     bc_emit(mg->code, store_op);
                                     mg_pop_typed(mg, is_wide ? 4 : 3);  /* [new] */

@@ -1108,6 +1108,30 @@ void mg_dup2_x1(method_gen_t *mg)
     }
 }
 
+void mg_dup2(method_gen_t *mg)
+{
+    mg_push(mg, 2);
+    if (mg->stackmap) {
+        stackmap_dup2(mg->stackmap);
+    }
+}
+
+void mg_dup_x2(method_gen_t *mg)
+{
+    mg_push(mg, 1);
+    if (mg->stackmap) {
+        stackmap_dup_x2(mg->stackmap);
+    }
+}
+
+void mg_dup2_x2(method_gen_t *mg)
+{
+    mg_push(mg, 2);
+    if (mg->stackmap) {
+        stackmap_dup2_x2(mg->stackmap);
+    }
+}
+
 /* ========================================================================
  * Type Descriptor Generation
  * ======================================================================== */
@@ -2173,7 +2197,12 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
          * BasicFTPFileSystem (implements FtpFileSystem, but that
          * doesn't matter here - implicit public/static applies
          * regardless of who's calling). */
+        /* Only a MEMBER type: a local or anonymous class in an interface's
+         * default method is not one, and has the interface instance as its
+         * outer instance. */
         bool is_interface_member_type = class_sym->data.class_data.enclosing_class &&
+            !class_sym->data.class_data.is_local_class &&
+            !class_sym->data.class_data.is_anonymous_class &&
             (class_sym->data.class_data.enclosing_class->kind == SYM_INTERFACE ||
              class_sym->data.class_data.enclosing_class->kind == SYM_ANNOTATION);
         uint16_t effective_mods = class_sym->modifiers;
@@ -2281,13 +2310,17 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
             cg->is_inner_class = true;
             cg->outer_class_internal = class_to_internal_name(enclosing->qualified_name);
             
-            /* Check if superclass is a non-static inner class.
-             * If so, we don't need our own this$0 - the superclass will have it.
-             * We just pass the outer instance to the superclass constructor. */
+            /* Check if superclass is a non-static inner class of the SAME
+             * enclosing class. If so, we don't need our own this$0 - the
+             * superclass will have it (same type), and we just pass the outer
+             * instance to the superclass constructor. A superclass that is
+             * an inner class of some OTHER class (an anonymous class in
+             * Lookup extending Realm's inner Handler) holds an outer
+             * instance of a different type than ours, so we need our own. */
             bool super_is_inner = false;
             if (class_sym->data.class_data.superclass) {
                 symbol_t *super_sym = class_sym->data.class_data.superclass;
-                if (super_sym->data.class_data.enclosing_class &&
+                if (super_sym->data.class_data.enclosing_class == enclosing &&
                     !(super_sym->modifiers & MOD_STATIC)) {
                     super_is_inner = true;
                 }
@@ -3836,6 +3869,26 @@ static void generate_superclass_bridges(class_gen_t *cg)
                 mi->descriptor_index = cp_add_utf8(cg->cp, desc->str);
                 char *desc_str = strdup(desc->str);
                 string_free(desc, true);
+
+                /* A superclass scope can hold the same method under more than
+                 * one key, and the class may already carry this exact method:
+                 * never emit the same name and descriptor twice (a
+                 * ClassFormatError "Duplicate method"). */
+                bool already_present = false;
+                for (slist_t *m = cg->methods; m && !already_present; m = m->next) {
+                    method_info_gen_t *existing = (method_info_gen_t *)m->data;
+                    if (existing &&
+                        existing->name_index == mi->name_index &&
+                        existing->descriptor_index == mi->descriptor_index) {
+                        already_present = true;
+                    }
+                }
+                if (already_present) {
+                    free(desc_str);
+                    free(mi);
+                    entry = entry->next;
+                    continue;
+                }
                 
                 /* Generate bridge method body */
                 bytecode_t *code = bytecode_new();

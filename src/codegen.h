@@ -649,6 +649,9 @@ void mg_pop_typed(method_gen_t *mg, int slots);  /* Pop from both runtime and st
 void mg_dup(method_gen_t *mg);     /* Type-aware OP_DUP (see stackmap_dup) */
 void mg_dup_x1(method_gen_t *mg);   /* Type-aware OP_DUP_X1 (see stackmap_dup_x1) */
 void mg_dup2_x1(method_gen_t *mg);  /* Type-aware OP_DUP2_X1 form 2 (see stackmap_dup2_x1) */
+void mg_dup2(method_gen_t *mg);     /* Type-aware OP_DUP2 */
+void mg_dup_x2(method_gen_t *mg);   /* Type-aware OP_DUP_X2 (form 1) */
+void mg_dup2_x2(method_gen_t *mg);  /* Type-aware OP_DUP2_X2 (form 1) */
 
 /* Line number and local variable recording */
 void mg_record_line(method_gen_t *mg, int line);

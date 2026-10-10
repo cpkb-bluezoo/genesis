@@ -142,6 +142,17 @@ KNOWN BUGS
     Needs either auditing all the duplicate resolution paths individually,
     or consolidating them to all go through lookup_same_package_type().
 
+14. An annotation element of a type narrower or wider than its literal's own
+    (byte, short, char, float) is tagged by the literal ("I") when the
+    annotation type is declared in the same compilation batch, so reading it
+    reflectively fails with AnnotationTypeMismatchException ("@Opts(small =
+    12)" for "short small()"). The writer takes the element's declared type
+    from the annotation's class file (declared_element_type() in
+    classwriter.c), which a same-batch source annotation does not have yet.
+    With the annotation compiled first (-cp), or an int/long/double/String/
+    boolean element, it is right. Fix: read the declared type from the
+    annotation's AST when there is no class file.
+
 ================================================================================
 OPTIONAL IMPROVEMENTS
 ================================================================================

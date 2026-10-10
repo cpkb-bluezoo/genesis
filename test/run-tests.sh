@@ -1360,6 +1360,61 @@ else
 fi
 
 echo
+echo "--- Inner class calling a method its outer class inherits through a generic class-file chain ---"
+printf "%-30s ... " "InnerCallThroughGenericSuper"
+ig_lib="$TEST_BUILD/genericsuperlib-lib"
+ig_out="$TEST_BUILD/genericsuperlib-out"
+rm -rf "$ig_lib" "$ig_out"
+mkdir -p "$ig_lib" "$ig_out"
+if "$GENESIS" -d "$ig_lib" "$TEST_SRC"/external/genericsuperlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ig_lib" -d "$ig_out" \
+       "$TEST_SRC/external/InnerCallThroughGenericSuperTest.java" \
+       "$TEST_SRC"/external/genericsuperclient/*.java >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ig_out:$ig_lib" InnerCallThroughGenericSuperTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- A single-type import of a nested class beats another class's nested type of the same name ---"
+printf "%-30s ... " "ImportedNestedReceiver"
+in_out="$TEST_BUILD/importednested-out"
+rm -rf "$in_out"
+mkdir -p "$in_out"
+if (cd "$in_out" && "$GENESIS" -j1 -d "$in_out" \
+       "$TEST_SRC/external/importednested/p/G.java" \
+       "$TEST_SRC/external/importednested/p/F.java" \
+       "$TEST_SRC/external/importednested/p/ImportedNestedReceiverTest.java" >/dev/null 2>&1) &&
+   "$JAVA" -cp "$in_out" p.ImportedNestedReceiverTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Overloaded interface default method called on a new-expression receiver ---"
+printf "%-30s ... " "InterfaceOverloadNewReceiver"
+io_lib="$TEST_BUILD/ifaceoverloadlib-lib"
+io_out="$TEST_BUILD/ifaceoverloadlib-out"
+rm -rf "$io_lib" "$io_out"
+mkdir -p "$io_lib" "$io_out"
+if "$GENESIS" -d "$io_lib" "$TEST_SRC"/external/ifaceoverloadlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$io_lib" -d "$io_out" \
+       "$TEST_SRC/external/InterfaceOverloadOnNewReceiverTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$io_out:$io_lib" InterfaceOverloadOnNewReceiverTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "--- Narrowing a non-constant or an out-of-range constant must fail to compile ---"
 printf "%-30s ... " "NarrowingRejected"
 nr_out="$TEST_BUILD/narrowingrejected-out"

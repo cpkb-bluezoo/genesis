@@ -388,6 +388,35 @@ void stackmap_dup2_x1(stack_map_table_t *smt)
     smt->current_stack[smt->current_stack_size++] = b_hi;
 }
 
+/* Duplicates the top `ndup` entries and inserts the copy below the `nunder`
+ * entries beneath them: ndup 1/2 with nunder 0/1/2 is DUP, DUP_X1, DUP_X2,
+ * DUP2, DUP2_X1, DUP2_X2 (the stack holds one entry per slot, so a long or
+ * double is two entries). */
+static void stackmap_dup_below(stack_map_table_t *smt, uint16_t ndup, uint16_t nunder)
+{
+    if (!smt || smt->current_stack_size < (uint16_t)(ndup + nunder)) {
+        return;
+    }
+    ensure_stack_capacity(smt, smt->current_stack_size + ndup);
+    uint16_t top = smt->current_stack_size;
+    verification_type_t dup[2];
+    for (uint16_t i = 0; i < ndup; i++) {
+        dup[i] = smt->current_stack[top - ndup + i];
+    }
+    /* Shift the nunder + ndup entries up by ndup, then put the copy beneath. */
+    for (uint16_t i = 0; i < (uint16_t)(nunder + ndup); i++) {
+        smt->current_stack[top + ndup - 1 - i] = smt->current_stack[top - 1 - i];
+    }
+    for (uint16_t i = 0; i < ndup; i++) {
+        smt->current_stack[top - ndup - nunder + i] = dup[i];
+    }
+    smt->current_stack_size = top + ndup;
+}
+
+void stackmap_dup2(stack_map_table_t *smt)    { stackmap_dup_below(smt, 2, 0); }
+void stackmap_dup_x2(stack_map_table_t *smt)  { stackmap_dup_below(smt, 1, 2); }
+void stackmap_dup2_x2(stack_map_table_t *smt) { stackmap_dup_below(smt, 2, 2); }
+
 void stackmap_clear_stack(stack_map_table_t *smt)
 {
     if (!smt) {
@@ -464,6 +493,17 @@ void stackmap_record_frame(stack_map_table_t *smt, uint16_t offset)
              * We shrink if current_locals_count < existing locals.
              * Note: current_locals_count == 0 is valid for static methods
              * with no parameters, so we don't require > 0. */
+            /* A slot the two paths do not agree on (set on one, unset on
+             * the other: "top"; or of different kinds) is "top" at the join
+             * (JVMS 4.10.1.4). Two different classes in the same kind of
+             * slot keep the first, as there is no class merge here. */
+            uint16_t common = smt->current_locals_count < f->num_locals ?
+                              smt->current_locals_count : f->num_locals;
+            for (uint16_t i = 0; i < common && f->locals; i++) {
+                if (f->locals[i].tag != smt->current_locals[i].tag) {
+                    f->locals[i] = (verification_type_t){.tag = VT_TOP};
+                }
+            }
             if (smt->current_locals_count < f->num_locals) {
                 /* Shrink to minimum - locals declared in one path
                    but not another should not be in the frame */

@@ -162,6 +162,9 @@ void stackmap_dup_x1(stack_map_table_t *smt);
  * [..., B_lo, B_hi, A, B_lo, B_hi]. See stackmap_dup_x1() for why this
  * matters. */
 void stackmap_dup2_x1(stack_map_table_t *smt);
+void stackmap_dup2(stack_map_table_t *smt);
+void stackmap_dup_x2(stack_map_table_t *smt);
+void stackmap_dup2_x2(stack_map_table_t *smt);
 
 /* Get/set locals count for save/restore around scoped regions (e.g., catch blocks) */
 uint16_t stackmap_get_locals_count(stack_map_table_t *smt);

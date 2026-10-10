@@ -4791,8 +4791,9 @@ static void ensure_class_implements_prescanned(semantic_t *sem, symbol_t *sym)
  * Recursively look up a method in an interface hierarchy.
  * Checks the interface and all its super-interfaces.
  */
-static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sym,
-                                              const char *method_name)
+static symbol_t *lookup_method_in_interfaces_ex(semantic_t *sem, symbol_t *class_sym,
+                                                 const char *method_name,
+                                                 slist_t *args, bool typed)
 {
     ensure_class_implements_prescanned(sem, class_sym);
 
@@ -4858,7 +4859,8 @@ static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sy
         
         /* Check direct members of this interface */
         if (iface->data.class_data.members) {
-            symbol_t *method = scope_lookup_method(iface->data.class_data.members, method_name);
+            symbol_t *method = typed ? scope_lookup_method_with_types(sem, iface->data.class_data.members, method_name, args)
+                                : scope_lookup_method(iface->data.class_data.members, method_name);
             if (method && method->kind == SYM_METHOD) {
                 return method;
             }
@@ -4869,7 +4871,8 @@ static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sy
                 symbol_complete(loaded);
             }
             if (loaded && loaded->data.class_data.members) {
-                symbol_t *method = scope_lookup_method(loaded->data.class_data.members, method_name);
+                symbol_t *method = typed ? scope_lookup_method_with_types(sem, loaded->data.class_data.members, method_name, args)
+                                    : scope_lookup_method(loaded->data.class_data.members, method_name);
                 if (method && method->kind == SYM_METHOD) {
                     return method;
                 }
@@ -4877,7 +4880,7 @@ static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sy
         }
         
         /* Recursively check super-interfaces */
-        symbol_t *method = lookup_method_in_interfaces(sem, iface, method_name);
+        symbol_t *method = lookup_method_in_interfaces_ex(sem, iface, method_name, args, typed);
         if (method) {
             return method;
         }
@@ -4887,14 +4890,37 @@ static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sy
      * This is needed when a class extends another class that implements interfaces.
      * E.g., SNIKeyManager extends X509ExtendedKeyManager implements X509KeyManager */
     if (class_sym->data.class_data.superclass) {
-        symbol_t *method = lookup_method_in_interfaces(sem, 
-            class_sym->data.class_data.superclass, method_name);
+        symbol_t *method = lookup_method_in_interfaces_ex(sem,
+            class_sym->data.class_data.superclass, method_name, args, typed);
         if (method) {
             return method;
         }
     }
     
     return NULL;
+}
+
+static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sym,
+                                              const char *method_name)
+{
+    return lookup_method_in_interfaces_ex(sem, class_sym, method_name, NULL, false);
+}
+
+/**
+ * The method an interface of the class (or one of its super-interfaces) declares
+ * for these arguments: the overload that fits them, where the plain lookup above
+ * returns whichever method of that name it meets first ("getScramCredentials(u)"
+ * is not "getScramCredentials(u, callback)"). Falls back to that plain lookup if
+ * no overload fits.
+ */
+static symbol_t *lookup_method_in_interfaces_for_args(semantic_t *sem, symbol_t *class_sym,
+                                                       const char *method_name, slist_t *args)
+{
+    symbol_t *m = lookup_method_in_interfaces_ex(sem, class_sym, method_name, args, true);
+    if (m && m->kind == SYM_METHOD) {
+        return m;
+    }
+    return lookup_method_in_interfaces_ex(sem, class_sym, method_name, NULL, false);
 }
 
 /* ========================================================================
@@ -15182,6 +15208,24 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 sem->current_class->data.class_data.members, recv_name);
                         }
                         
+                        /* A single-type import names the type before any cached
+                         * simple name does: loading another class enters its
+                         * nested types in unit_types under their simple names,
+                         * and "import p.F.Fixture" must not lose to the
+                         * "Fixture" nested in an unrelated p.G (JLS 6.4.1). */
+                        if (!class_sym) {
+                            char *imported = resolve_import(sem, recv_name);
+                            if (imported) {
+                                type_t *itype = hashtable_lookup(sem->types, imported);
+                                if (itype && itype->kind == TYPE_CLASS && itype->data.class_type.symbol) {
+                                    class_sym = itype->data.class_type.symbol;
+                                } else {
+                                    class_sym = load_external_class(sem, imported);
+                                }
+                                free(imported);
+                            }
+                        }
+
                         /* Check the types cache as a fallback for nested types.
                          * Check per-compilation-unit scope first, then global cache. */
                         if (!class_sym) {
@@ -15600,7 +15644,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     
                                     /* Check interface hierarchy */
                                     if (!method || method->kind != SYM_METHOD) {
-                                        method = lookup_method_in_interfaces(sem, recv_class, method_name);
+                                        method = lookup_method_in_interfaces_for_args(sem, recv_class, method_name, args);
                                     }
                                     
                                     /* For enums, also check java.lang.Enum explicitly */
@@ -15828,7 +15872,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             if (recv_class && (!method || method->kind != SYM_METHOD)) {
                                 /* For interface methods, use the receiver's superclass_type if available 
                                  * and it has type arguments for substitution */
-                                method = lookup_method_in_interfaces(sem, recv_class, method_name);
+                                method = lookup_method_in_interfaces_for_args(sem, recv_class, method_name, args);
                                 if (method && method->kind == SYM_METHOD && 
                                     recv_class->data.class_data.superclass_type &&
                                     recv_class->data.class_data.superclass_type->kind == TYPE_CLASS &&
@@ -15983,7 +16027,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 }
                                 /* Also check superinterfaces recursively */
                                 if (!found_method && iface_sym) {
-                                    found_method = lookup_method_in_interfaces(sem, iface_sym, method_name);
+                                    found_method = lookup_method_in_interfaces_for_args(sem, iface_sym, method_name, method_args);
                                 }
                             }
                             check_class = check_class->data.class_data.superclass;
@@ -16012,15 +16056,39 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 enclosing->data.class_data.members, method_name, method_args);
                         }
                         
-                        /* Check superclass chain of enclosing class too */
+                        /* Check superclass chain of enclosing class too. A link
+                         * can be unset while the superclass is still known by
+                         * its parameterized type (a generic superclass loaded
+                         * lazily: "class Outer extends Mid<Outer>"); resolve it
+                         * the way the receiver-less lookup on the class itself
+                         * does. */
                         if (!found_method) {
                             symbol_t *super = enclosing->data.class_data.superclass;
+                            type_t *super_type = enclosing->data.class_data.superclass_type;
+                            if (!super && super_type && super_type->kind == TYPE_CLASS &&
+                                super_type->data.class_type.name) {
+                                super = load_external_class(sem, super_type->data.class_type.name);
+                            }
                             while (!found_method && super) {
+                                /* A stub with no members: reload it from the
+                                 * classpath, as the same-class walk does. */
+                                if (!super->data.class_data.members && super->qualified_name) {
+                                    symbol_t *loaded = load_external_class(sem, super->qualified_name);
+                                    if (loaded && loaded->data.class_data.members) {
+                                        super = loaded;
+                                    }
+                                }
                                 if (super->data.class_data.members) {
                                     found_method = scope_lookup_method_with_types(sem,
                                         super->data.class_data.members, method_name, method_args);
                                 }
-                                super = super->data.class_data.superclass;
+                                super_type = super->data.class_data.superclass_type;
+                                symbol_t *next_super = super->data.class_data.superclass;
+                                if (!next_super && super_type && super_type->kind == TYPE_CLASS &&
+                                    super_type->data.class_type.name) {
+                                    next_super = load_external_class(sem, super_type->data.class_type.name);
+                                }
+                                super = next_super;
                             }
                         }
                         
@@ -17195,6 +17263,13 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     strcmp(field_name, "length") == 0) {
                     return type_new_primitive(TYPE_INT);
                 }
+
+                /* A receiver whose type is a type variable ("T extends
+                 * Handler"): its fields are those of the bound. */
+                for (int hops = 0; hops < 8 && object_type &&
+                     object_type->kind == TYPE_TYPEVAR && object_type->data.type_var.bound; hops++) {
+                    object_type = object_type->data.type_var.bound;
+                }
                 
                 /* The type of a field loaded from a class file is made from
                  * its descriptor and names its class without carrying the
@@ -18162,6 +18237,31 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                             if (then_kind == TYPE_LONG || else_kind == TYPE_LONG) {
                                 return type_long();
+                            }
+                            /* byte with short is short. */
+                            if ((then_kind == TYPE_BYTE && else_kind == TYPE_SHORT) ||
+                                (then_kind == TYPE_SHORT && else_kind == TYPE_BYTE)) {
+                                return type_short();
+                            }
+                            /* T (byte, short, char) with an int constant that
+                             * fits in T is T, not int ("char b = c ? ch : 0"). */
+                            ast_node_t *then_expr = children->next->data;
+                            ast_node_t *else_expr = children->next->next->data;
+                            if (else_type->kind == TYPE_INT &&
+                                (then_kind == TYPE_BYTE || then_kind == TYPE_SHORT || then_kind == TYPE_CHAR)) {
+                                type_t *t = then_kind == TYPE_BYTE ? type_byte() :
+                                            then_kind == TYPE_SHORT ? type_short() : type_char();
+                                if (narrowing_constant_allowed(sem, t, else_expr, else_type)) {
+                                    return t;
+                                }
+                            }
+                            if (then_type->kind == TYPE_INT &&
+                                (else_kind == TYPE_BYTE || else_kind == TYPE_SHORT || else_kind == TYPE_CHAR)) {
+                                type_t *t = else_kind == TYPE_BYTE ? type_byte() :
+                                            else_kind == TYPE_SHORT ? type_short() : type_char();
+                                if (narrowing_constant_allowed(sem, t, then_expr, then_type)) {
+                                    return t;
+                                }
                             }
                             return type_int();
                         }
@@ -21462,6 +21562,10 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
     return true;
 }
 
+static symbol_t *lookup_qualified_constant_field(semantic_t *sem, ast_node_t *field_access);
+static bool resolve_constant_field_case_value_tail(semantic_t *sem, symbol_t *sym,
+                                                   const char *field_name, long long *out_value);
+
 /**
  * Resolve a qualified constant reference used as a switch case label's
  * value, e.g. the "AmqpMethod.CONNECTION_START" in
@@ -21490,6 +21594,25 @@ static bool resolve_qualified_constant_case_value(semantic_t *sem, ast_node_t *f
 {
     if (!field_access || field_access->type != AST_FIELD_ACCESS || !out_value) {
         return false;
+    }
+
+    const char *field_name = field_access->data.node.name;
+    symbol_t *sym = lookup_qualified_constant_field(sem, field_access);
+    if (!sym) {
+        return false;
+    }
+    return resolve_constant_field_case_value_tail(sem, sym, field_name, out_value);
+}
+
+/**
+ * The field a qualified constant reference ("Other.NAME", "pkg.Other.NAME")
+ * names: a member of the receiver type or of an interface it implements.
+ * NULL if it names no field.
+ */
+static symbol_t *lookup_qualified_constant_field(semantic_t *sem, ast_node_t *field_access)
+{
+    if (!field_access || field_access->type != AST_FIELD_ACCESS) {
+        return NULL;
     }
 
     slist_t *fa_children = field_access->data.node.children;
@@ -21527,9 +21650,13 @@ static bool resolve_qualified_constant_case_value(semantic_t *sem, ast_node_t *f
         }
     }
 
-    if (!sym || sym->kind != SYM_FIELD) {
-        return false;
-    }
+    return (sym && sym->kind == SYM_FIELD) ? sym : NULL;
+}
+
+static bool resolve_constant_field_case_value_tail(semantic_t *sem, symbol_t *sym,
+                                                   const char *field_name, long long *out_value)
+{
+    (void)sem;
 
     /* A classfile-loaded field (e.g. a cross-module "int
      * SETTINGS_HEADER_TABLE_SIZE = 0x1;" declared on an interface compiled
@@ -22084,8 +22211,15 @@ static void resolve_type_hierarchy(semantic_t *sem, ast_node_t *ast)
                 if (child->data.node.flags == 1 && 
                     (!sym->data.class_data.superclass || !sym->data.class_data.superclass_type)) {
                     /* extends - set superclass and/or superclass_type */
-                    /* Resolve the full parameterized type from this AST node */
+                    /* Resolve the full parameterized type from this AST node.
+                     * The class's own type parameters are in scope in its
+                     * extends clause ("class Sub<T> extends Box<T>"). */
+                    scope_t *saved_hier_scope = sem->current_scope;
+                    if (sym->data.class_data.members && sym->data.class_data.type_params) {
+                        sem->current_scope = sym->data.class_data.members;
+                    }
                     type_t *super_type = semantic_resolve_type(sem, child);
+                    sem->current_scope = saved_hier_scope;
                     
                     /* Get the base symbol from the type */
                     symbol_t *super_sym = NULL;
@@ -22134,6 +22268,336 @@ process_children:
     }
 }
 
+
+/* ========================================================================
+ * Named constants in annotation element values
+ * ======================================================================== */
+
+typedef enum { CV_NONE, CV_INT, CV_LONG, CV_DOUBLE, CV_STRING, CV_BOOL } cv_kind_t;
+
+typedef struct {
+    cv_kind_t kind;
+    long long i;        /* CV_INT, CV_LONG, CV_BOOL */
+    double d;           /* CV_DOUBLE */
+    char *s;            /* CV_STRING (malloc'd) */
+} cv_t;
+
+/** The initializer expression of a field symbol, or NULL. */
+static ast_node_t *field_symbol_initializer(symbol_t *sym)
+{
+    if (!sym || !sym->ast || !sym->name) {
+        return NULL;
+    }
+    ast_node_t *declarator = NULL;
+    if (sym->ast->type == AST_VAR_DECLARATOR) {
+        declarator = sym->ast;
+    } else if (sym->ast->type == AST_FIELD_DECL) {
+        for (slist_t *dc = sym->ast->data.node.children; dc; dc = dc->next) {
+            ast_node_t *cand = (ast_node_t *)dc->data;
+            if (cand && cand->type == AST_VAR_DECLARATOR &&
+                cand->data.node.name && strcmp(cand->data.node.name, sym->name) == 0) {
+                declarator = cand;
+                break;
+            }
+        }
+    }
+    if (!declarator || !declarator->data.node.children) {
+        return NULL;
+    }
+    return (ast_node_t *)declarator->data.node.children->data;
+}
+
+static bool cv_is_numeric(const cv_t *v)
+{
+    return v->kind == CV_INT || v->kind == CV_LONG || v->kind == CV_DOUBLE;
+}
+
+static double cv_as_double(const cv_t *v)
+{
+    return v->kind == CV_DOUBLE ? v->d : (double)v->i;
+}
+
+/** Converts a value to the declared type of the field it was read from. */
+static void cv_coerce_to_field_type(cv_t *v, type_t *t)
+{
+    if (!t || !cv_is_numeric(v)) {
+        return;
+    }
+    switch (t->kind) {
+        case TYPE_LONG:
+            if (v->kind == CV_INT) {
+                v->kind = CV_LONG;
+            }
+            break;
+        case TYPE_FLOAT:
+        case TYPE_DOUBLE:
+            if (v->kind != CV_DOUBLE) {
+                v->d = (double)v->i;
+                v->kind = CV_DOUBLE;
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+static bool eval_annotation_constant(semantic_t *sem, ast_node_t *e, cv_t *out, int depth)
+{
+    if (!e || !out || depth > 16) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    switch (e->type) {
+        case AST_LITERAL:
+            switch (e->data.leaf.token_type) {
+                case TOK_INTEGER_LITERAL:
+                    out->kind = CV_INT;
+                    out->i = e->data.leaf.value.int_val;
+                    return true;
+                case TOK_LONG_LITERAL:
+                    out->kind = CV_LONG;
+                    out->i = e->data.leaf.value.int_val;
+                    return true;
+                case TOK_FLOAT_LITERAL:
+                case TOK_DOUBLE_LITERAL:
+                    out->kind = CV_DOUBLE;
+                    out->d = e->data.leaf.value.float_val;
+                    return true;
+                case TOK_STRING_LITERAL:
+                    out->kind = CV_STRING;
+                    out->s = strdup(e->data.leaf.value.str_val ? e->data.leaf.value.str_val : "");
+                    return out->s != NULL;
+                case TOK_TRUE:
+                case TOK_FALSE:
+                    out->kind = CV_BOOL;
+                    out->i = e->data.leaf.token_type == TOK_TRUE ? 1 : 0;
+                    return true;
+                case TOK_CHAR_LITERAL: {
+                    const char *cs = e->data.leaf.value.str_val;
+                    out->kind = CV_INT;
+                    out->i = (cs && cs[0]) ? char_literal_value(cs) : 0;
+                    return true;
+                }
+                default:
+                    return false;
+            }
+        case AST_PARENTHESIZED:
+            return e->data.node.children &&
+                eval_annotation_constant(sem, (ast_node_t *)e->data.node.children->data, out, depth + 1);
+        case AST_UNARY_EXPR: {
+            if (!e->data.node.children ||
+                !eval_annotation_constant(sem, (ast_node_t *)e->data.node.children->data, out, depth + 1)) {
+                return false;
+            }
+            if (!cv_is_numeric(out)) {
+                free(out->s);
+                memset(out, 0, sizeof(*out));
+                return false;
+            }
+            switch (e->data.node.op_token) {
+                case TOK_MINUS:
+                    if (out->kind == CV_DOUBLE) {
+                        out->d = -out->d;
+                    } else {
+                        out->i = out->kind == CV_INT ? (long long)(int32_t)-out->i : -out->i;
+                    }
+                    return true;
+                case TOK_PLUS:
+                    return true;
+                case TOK_TILDE:
+                    if (out->kind == CV_DOUBLE) {
+                        return false;
+                    }
+                    out->i = ~out->i;
+                    if (out->kind == CV_INT) {
+                        out->i = (int32_t)out->i;
+                    }
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        case AST_BINARY_EXPR: {
+            slist_t *ch = e->data.node.children;
+            if (!ch || !ch->next) {
+                return false;
+            }
+            cv_t l, r;
+            if (!eval_annotation_constant(sem, (ast_node_t *)ch->data, &l, depth + 1)) {
+                return false;
+            }
+            if (!eval_annotation_constant(sem, (ast_node_t *)ch->next->data, &r, depth + 1)) {
+                free(l.s);
+                return false;
+            }
+            bool ok = false;
+            if (l.kind == CV_STRING && r.kind == CV_STRING && e->data.node.op_token == TOK_PLUS) {
+                size_t n = strlen(l.s) + strlen(r.s);
+                char *cat = malloc(n + 1);
+                if (cat) {
+                    strcpy(cat, l.s);
+                    strcat(cat, r.s);
+                    out->kind = CV_STRING;
+                    out->s = cat;
+                    ok = true;
+                }
+            } else if (cv_is_numeric(&l) && cv_is_numeric(&r)) {
+                token_type_t op = e->data.node.op_token;
+                if (l.kind == CV_DOUBLE || r.kind == CV_DOUBLE) {
+                    double a = cv_as_double(&l), b = cv_as_double(&r);
+                    out->kind = CV_DOUBLE;
+                    switch (op) {
+                        case TOK_PLUS:  out->d = a + b; ok = true; break;
+                        case TOK_MINUS: out->d = a - b; ok = true; break;
+                        case TOK_STAR:  out->d = a * b; ok = true; break;
+                        case TOK_SLASH: out->d = a / b; ok = true; break;
+                        default: break;
+                    }
+                } else {
+                    bool wide = l.kind == CV_LONG || r.kind == CV_LONG;
+                    long long a = l.i, b = r.i, v = 0;
+                    ok = true;
+                    switch (op) {
+                        case TOK_PLUS:    v = a + b; break;
+                        case TOK_MINUS:   v = a - b; break;
+                        case TOK_STAR:    v = a * b; break;
+                        case TOK_SLASH:   if (b == 0) { ok = false; } else { v = a / b; } break;
+                        case TOK_MOD: if (b == 0) { ok = false; } else { v = a % b; } break;
+                        case TOK_BITOR:   v = a | b; break;
+                        case TOK_BITAND:  v = a & b; break;
+                        case TOK_CARET:   v = a ^ b; break;
+                        case TOK_LSHIFT:  v = (l.kind == CV_LONG) ? (long long)((unsigned long long)a << (b & 63))
+                                                                  : (long long)(int32_t)((uint32_t)a << (b & 31));
+                                          wide = l.kind == CV_LONG; break;
+                        case TOK_RSHIFT:  v = (l.kind == CV_LONG) ? (a >> (b & 63)) : (long long)((int32_t)a >> (b & 31));
+                                          wide = l.kind == CV_LONG; break;
+                        default: ok = false; break;
+                    }
+                    if (ok) {
+                        out->kind = wide ? CV_LONG : CV_INT;
+                        out->i = wide ? v : (long long)(int32_t)v;
+                    }
+                }
+            }
+            free(l.s);
+            free(r.s);
+            return ok;
+        }
+        case AST_IDENTIFIER:
+        case AST_FIELD_ACCESS: {
+            symbol_t *sym = NULL;
+            if (e->type == AST_IDENTIFIER) {
+                sym = lookup_named_constant_field(sem, e->data.leaf.name);
+            } else if (e->data.node.children &&
+                       ((ast_node_t *)e->data.node.children->data)->type == AST_IDENTIFIER) {
+                sym = lookup_qualified_constant_field(sem, e);
+            }
+            if (!sym || sym->data.var_data.is_enum_constant) {
+                return false;
+            }
+            if (sym->data.var_data.const_str_value) {
+                out->kind = CV_STRING;
+                out->s = strdup(sym->data.var_data.const_str_value);
+                return out->s != NULL;
+            }
+            if (sym->data.var_data.has_const_value) {
+                out->kind = (sym->type && sym->type->kind == TYPE_LONG) ? CV_LONG :
+                            (sym->type && sym->type->kind == TYPE_BOOLEAN) ? CV_BOOL : CV_INT;
+                out->i = sym->data.var_data.const_value;
+                return true;
+            }
+            if (!(sym->modifiers & MOD_FINAL)) {
+                return false;
+            }
+            ast_node_t *init = field_symbol_initializer(sym);
+            if (!init || !eval_annotation_constant(sem, init, out, depth + 1)) {
+                return false;
+            }
+            cv_coerce_to_field_type(out, sym->type);
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+/**
+ * Replaces the named-constant or constant-expression node an annotation
+ * element value is with the literal of its value, so the class file writer
+ * emits it with the tag of its type instead of as the text of the name.
+ */
+static void fold_annotation_element(semantic_t *sem, ast_node_t *node)
+{
+    if (!node) {
+        return;
+    }
+    switch (node->type) {
+        case AST_ARRAY_INIT:
+            for (slist_t *c = node->data.node.children; c; c = c->next) {
+                fold_annotation_element(sem, (ast_node_t *)c->data);
+            }
+            return;
+        case AST_ANNOTATION:
+            for (slist_t *c = node->data.node.children; c; c = c->next) {
+                ast_node_t *pair = (ast_node_t *)c->data;
+                if (pair && pair->type == AST_ANNOTATION_VALUE && pair->data.node.children) {
+                    fold_annotation_element(sem, (ast_node_t *)pair->data.node.children->data);
+                }
+            }
+            return;
+        case AST_IDENTIFIER:
+        case AST_FIELD_ACCESS:
+        case AST_PARENTHESIZED:
+        case AST_UNARY_EXPR:
+        case AST_BINARY_EXPR:
+            break;
+        default:
+            return;
+    }
+    cv_t v;
+    if (!eval_annotation_constant(sem, node, &v, 0)) {
+        return;
+    }
+    token_type_t tok;
+    switch (v.kind) {
+        case CV_INT:    tok = TOK_INTEGER_LITERAL; break;
+        case CV_LONG:   tok = TOK_LONG_LITERAL; break;
+        case CV_DOUBLE: tok = TOK_DOUBLE_LITERAL; break;
+        case CV_STRING: tok = TOK_STRING_LITERAL; break;
+        case CV_BOOL:   tok = v.i ? TOK_TRUE : TOK_FALSE; break;
+        default:        free(v.s); return;
+    }
+    node->type = AST_LITERAL;
+    memset(&node->data, 0, sizeof(node->data));
+    node->data.leaf.token_type = tok;
+    switch (v.kind) {
+        case CV_DOUBLE:
+            node->data.leaf.value.float_val = v.d;
+            break;
+        case CV_STRING:
+            node->data.leaf.value.str_val = v.s;
+            node->data.leaf.str_len = strlen(v.s);
+            break;
+        default:
+            node->data.leaf.value.int_val = v.i;
+            break;
+    }
+}
+
+/** Folds the named constants in the element values of a declaration's annotations. */
+static void fold_annotation_constants(semantic_t *sem, ast_node_t *decl)
+{
+    if (!decl) {
+        return;
+    }
+    for (slist_t *a = decl->annotations; a; a = a->next) {
+        fold_annotation_element(sem, (ast_node_t *)a->data);
+    }
+    if (decl->annotation_default) {
+        fold_annotation_element(sem, decl->annotation_default);
+    }
+}
+
 static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
 {
     if (!ast) {
@@ -22163,6 +22627,9 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
         
         switch (frame->state) {
             case WALK_ENTER:
+                if (node->annotations || node->annotation_default) {
+                    fold_annotation_constants(sem, node);
+                }
                 switch (node->type) {
                     case AST_MODULE_DECL:
                     case AST_REQUIRES_DIRECTIVE:
