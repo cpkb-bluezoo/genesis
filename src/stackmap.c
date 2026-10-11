@@ -459,15 +459,29 @@ void stackmap_init_object(stack_map_table_t *smt, uint16_t new_offset,
             smt->current_locals[i].data.offset == new_offset) {
             smt->current_locals[i] = initialized;
         }
-        /* Also handle UninitializedThis for constructors */
-        if (smt->current_locals[i].tag == VT_UNINITIALIZED_THIS) {
-            smt->current_locals[i] = initialized;
-        }
     }
     
     for (uint16_t i = 0; i < smt->current_stack_size; i++) {
         if (smt->current_stack[i].tag == VT_UNINITIALIZED &&
             smt->current_stack[i].data.offset == new_offset) {
+            smt->current_stack[i] = initialized;
+        }
+    }
+}
+
+void stackmap_init_this(stack_map_table_t *smt, const_pool_t *cp, const char *class_name)
+{
+    if (!smt || !cp || !class_name) {
+        return;
+    }
+    verification_type_t initialized = vtype_object(cp, class_name);
+    for (uint16_t i = 0; i < smt->current_locals_count; i++) {
+        if (smt->current_locals[i].tag == VT_UNINITIALIZED_THIS) {
+            smt->current_locals[i] = initialized;
+        }
+    }
+    for (uint16_t i = 0; i < smt->current_stack_size; i++) {
+        if (smt->current_stack[i].tag == VT_UNINITIALIZED_THIS) {
             smt->current_stack[i] = initialized;
         }
     }

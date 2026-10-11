@@ -174,6 +174,12 @@ void stackmap_set_locals_count(stack_map_table_t *smt, uint16_t count);
 void stackmap_init_object(stack_map_table_t *smt, uint16_t new_offset, 
                           const_pool_t *cp, const char *class_name);
 
+/* After the invokespecial of the enclosing class's own constructor ("this()" or "super()"): the
+ * uninitializedThis of the locals and the stack is the class itself from here on. Distinct from
+ * stackmap_init_object(): a "new" of some other class inside the constructor's arguments does not
+ * initialize this. */
+void stackmap_init_this(stack_map_table_t *smt, const_pool_t *cp, const char *class_name);
+
 /* Record a frame at a branch target */
 void stackmap_record_frame(stack_map_table_t *smt, uint16_t offset);
 

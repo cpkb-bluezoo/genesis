@@ -59,6 +59,7 @@ void coerce_value_to_descriptor(method_gen_t *mg, const_pool_t *cp,
  * @param label           Optional label name (NULL for unlabeled loops)
  */
 void mg_push_loop(method_gen_t *mg, size_t continue_target, const char *label);
+void mg_push_break_scope(method_gen_t *mg, const char *label);
 
 /**
  * Pop a loop context from the loop stack and patch break statements.

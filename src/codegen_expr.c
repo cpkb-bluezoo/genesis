@@ -2704,6 +2704,22 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
         
         /* Try to get type info from semantic analysis */
         type_t *chain_recv_type = receiver_member_type(receiver->sem_type);
+        if (!chain_recv_type && receiver->data.node.name && strcmp(receiver->data.node.name, "this") == 0 &&
+            receiver->data.node.children && mg->class_gen) {
+            /* "Outer.this.field" under a bound method reference, which the analyzer does not walk:
+             * the class is the enclosing one of that name */
+            ast_node_t *qualifier = (ast_node_t *)receiver->data.node.children->data;
+            const char *qualifier_name = qualifier && qualifier->type == AST_IDENTIFIER ? qualifier->data.leaf.name : NULL;
+            for (symbol_t *c = mg->class_gen->class_sym; c && qualifier_name; c = c->data.class_data.enclosing_class) {
+                const char *simple = c->qualified_name ? strrchr(c->qualified_name, '.') : NULL;
+                simple = simple ? simple + 1 : c->name;
+                if ((c->name && strcmp(c->name, qualifier_name) == 0) ||
+                    (simple && strcmp(simple, qualifier_name) == 0)) {
+                    chain_recv_type = c->type;
+                    break;
+                }
+            }
+        }
         if (chain_recv_type && chain_recv_type->kind == TYPE_CLASS) {
             if (chain_recv_type->data.class_type.name) {
                 recv_class = class_to_internal_name(chain_recv_type->data.class_type.name);
@@ -2734,15 +2750,73 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
          * in the classfile and the verifier rejecting whatever used the
          * result as anything other than a plain reference. */
         char *owned_field_desc = NULL;
-        if (expr->sem_type) {
+        /* ...but the descriptor of a field is the one it is declared with: a field of a type
+         * variable ("A actual") is an Object in the class file, whatever it is here
+         * ("Outer.this.actual" a CharSequence) - the cast is made by the caller */
+        if (chain_recv_type && chain_recv_type->kind == TYPE_CLASS) {
+            symbol_t *chain_class = chain_recv_type->data.class_type.symbol;
+            if (!chain_class && chain_recv_type->data.class_type.name && mg->class_gen && mg->class_gen->sem) {
+                chain_class = load_external_class(mg->class_gen->sem, chain_recv_type->data.class_type.name);
+            }
+            symbol_t *declared = chain_class ? lookup_field_with_superclass(chain_class, field_name) : NULL;
+            if (declared && declared->type) {
+                owned_field_desc = type_to_descriptor(declared->type);
+            }
+        }
+        if (!owned_field_desc && expr->sem_type) {
             owned_field_desc = type_to_descriptor(expr->sem_type);
         }
         field_desc = owned_field_desc ? owned_field_desc : "Ljava/lang/Object;";
 
-        /* Emit getfield */
-        uint16_t fieldref = cp_add_fieldref(cp, recv_class, field_name, field_desc);
-        bc_emit(mg->code, OP_GETFIELD);
-        bc_emit_u2(mg->code, fieldref);
+        /* A protected field of a superclass in another package, read by a nested class of the
+         * subclass ("Outer.this.actual"): only the subclass itself may read it (JVMS 5.4.4), so
+         * its accessor method is called, as javac's access$NNN */
+        symbol_t *accessor_class = NULL;
+        symbol_t *accessor_field = NULL;
+        if (chain_recv_type && chain_recv_type->kind == TYPE_CLASS && mg->class_gen && mg->class_gen->class_sym) {
+            symbol_t *chain_class = chain_recv_type->data.class_type.symbol;
+            symbol_t *declared = chain_class ? lookup_field_with_superclass(chain_class, field_name) : NULL;
+            symbol_t *owner = (declared && declared->scope) ? declared->scope->owner : NULL;
+            symbol_t *current = mg->class_gen->class_sym;
+            if (declared && owner && owner != chain_class && (declared->modifiers & MOD_PROTECTED) &&
+                !(declared->modifiers & MOD_STATIC) && owner->qualified_name && current->qualified_name) {
+                char *current_pkg = get_package_name(current->qualified_name);
+                char *owner_pkg = get_package_name(owner->qualified_name);
+                bool same_package = current_pkg && owner_pkg && strcmp(current_pkg, owner_pkg) == 0;
+                free(current_pkg);
+                free(owner_pkg);
+                bool current_is_subclass = false;
+                for (symbol_t *c = current; c; c = c->data.class_data.superclass) {
+                    if (c == owner) {
+                        current_is_subclass = true;
+                        break;
+                    }
+                }
+                if (!same_package && !current_is_subclass) {
+                    accessor_class = chain_class;
+                    accessor_field = declared;
+                }
+            }
+        }
+
+        if (accessor_class) {
+            const char *accessor_name = get_or_create_field_accessor(accessor_class,
+                accessor_field->scope->owner, accessor_field);
+            char *accessor_internal = class_to_internal_name(accessor_class->qualified_name);
+            size_t adesc_len = strlen(accessor_internal) + strlen(field_desc) + 5;
+            char *accessor_desc = malloc(adesc_len);
+            snprintf(accessor_desc, adesc_len, "(L%s;)%s", accessor_internal, field_desc);
+            uint16_t methodref = cp_add_methodref(cp, accessor_internal, accessor_name, accessor_desc);
+            bc_emit(mg->code, OP_INVOKESTATIC);
+            bc_emit_u2(mg->code, methodref);
+            free(accessor_desc);
+            free(accessor_internal);
+        } else {
+            /* Emit getfield */
+            uint16_t fieldref = cp_add_fieldref(cp, recv_class, field_name, field_desc);
+            bc_emit(mg->code, OP_GETFIELD);
+            bc_emit_u2(mg->code, fieldref);
+        }
         /* getfield pops ref, pushes value with proper type tracking */
         mg_pop_typed(mg, 1);  /* Pop the object reference */
         switch (field_desc[0]) {
@@ -5584,6 +5658,10 @@ static bool array_passes_as_varargs(type_t *param_type, type_t *arg_type)
  *
  * Leaves exactly one array reference on the stack.
  */
+/* What a varargs parameter declared as "T..." is an array of, where the call infers T (the
+ * array "mock()" of "<T> T mock(T... reified)" creates is of the type assigned to). */
+static __thread type_t *g_varargs_inferred_element = NULL;
+
 bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_param,
                           slist_t *node, bool skip_trailing_block)
 {
@@ -5600,6 +5678,12 @@ bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_
 
     /* Get element type from varargs array type */
     type_t *elem_type = varargs_element_type(varargs_param->type);
+    if (g_varargs_inferred_element && varargs_param->type && varargs_param->type->kind == TYPE_ARRAY &&
+        varargs_param->type->data.array_type.dimensions <= 1 &&
+        varargs_param->type->data.array_type.element_type &&
+        varargs_param->type->data.array_type.element_type->kind == TYPE_TYPEVAR) {
+        elem_type = g_varargs_inferred_element;
+    }
 
     /* Check for array-to-varargs conversion:
      * If there's exactly one argument at the varargs position and it's
@@ -5997,6 +6081,45 @@ bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_
     return true;
 }
 
+
+/* The compiler-generated "valueOf(String)" of an enum, unless the call is of a "valueOf" the enum
+ * declares itself for another parameter ("HttpStatus.valueOf(int)") */
+extern slist_t *scope_find_all_methods(scope_t *scope, const char *name);
+
+static bool synthetic_valueof_applies(ast_node_t *call, symbol_t *enum_sym)
+{
+    if (!call || !enum_sym || !enum_sym->data.class_data.members) {
+        return true;
+    }
+    bool declares_other = false;
+    slist_t *all = scope_find_all_methods(enum_sym->data.class_data.members, "valueOf");
+    for (slist_t *m = all; m; m = m->next) {
+        symbol_t *method = (symbol_t *)m->data;
+        if (method && method->kind == SYM_METHOD && method->data.method_data.parameters) {
+            symbol_t *first = (symbol_t *)method->data.method_data.parameters->data;
+            if (first && first->type && !(first->type->kind == TYPE_CLASS && first->type->data.class_type.name &&
+                strcmp(first->type->data.class_type.name, "java.lang.String") == 0)) {
+                declares_other = true;
+            }
+        }
+    }
+    slist_free(all);
+    if (!declares_other) {
+        return true;
+    }
+    /* the enum has a valueOf of its own for another type: the argument says which is meant */
+    slist_t *children = call->data.node.children;
+    ast_node_t *arg = (children && (call->data.node.flags & AST_METHOD_CALL_EXPLICIT_RECEIVER)) ?
+                      (children->next ? (ast_node_t *)children->next->data : NULL) :
+                      (children ? (ast_node_t *)children->data : NULL);
+    if (arg && arg->type == AST_LITERAL && arg->data.leaf.token_type == TOK_STRING_LITERAL) {
+        return true;
+    }
+    type_t *arg_type = arg ? arg->sem_type : NULL;
+    return arg_type && arg_type->kind == TYPE_CLASS && arg_type->data.class_type.name &&
+           strcmp(arg_type->data.class_type.name, "java.lang.String") == 0;
+}
+
 static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 {
     if (!expr || expr->type != AST_METHOD_CALL) {
@@ -6289,7 +6412,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         char desc[256];
                         snprintf(desc, sizeof(desc), "()[L%s;", target_class);
                         custom_descriptor = strdup(desc);
-                    } else if (strcmp(method_name, "valueOf") == 0) {
+                    } else if (strcmp(method_name, "valueOf") == 0 && synthetic_valueof_applies(expr, class_sym)) {
                         /* valueOf(String) returns EnumType */
                         char desc[256];
                         snprintf(desc, sizeof(desc), "(Ljava/lang/String;)L%s;", target_class);
@@ -6448,7 +6571,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         char desc[256];
                         snprintf(desc, sizeof(desc), "()[L%s;", target_class);
                         custom_descriptor = strdup(desc);
-                    } else if (strcmp(method_name, "valueOf") == 0) {
+                    } else if (strcmp(method_name, "valueOf") == 0 && synthetic_valueof_applies(expr, class_sym)) {
                         /* valueOf(String) returns EnumType */
                         char desc[256];
                         snprintf(desc, sizeof(desc), "(Ljava/lang/String;)L%s;", target_class);
@@ -6494,7 +6617,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                                 char desc[512];
                                 snprintf(desc, sizeof(desc), "()[L%s;", nested_internal);
                                 custom_descriptor = strdup(desc);
-                            } else if (strcmp(method_name, "valueOf") == 0) {
+                            } else if (strcmp(method_name, "valueOf") == 0 && synthetic_valueof_applies(expr, nested)) {
                                 /* valueOf(String) returns EnumType */
                                 char desc[512];
                                 snprintf(desc, sizeof(desc), "(Ljava/lang/String;)L%s;", nested_internal);
@@ -6929,6 +7052,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 if (!recv_type && mg->class_gen && mg->class_gen->sem) {
                     recv_type = get_expression_type(mg->class_gen->sem, first);
                 }
+                bool recv_was_variable = recv_type && recv_type->kind == TYPE_TYPEVAR;
                 if (recv_type && recv_type->kind == TYPE_TYPEVAR &&
                     recv_type->data.type_var.bound) {
                     recv_type = recv_type->data.type_var.bound;
@@ -6938,6 +7062,15 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                     target_class = class_to_internal_name(recv_type->data.class_type.name);
                     symbol_t *recv_sym = recv_type->data.class_type.symbol;
                     is_interface_call = (recv_sym && (recv_sym->kind == SYM_INTERFACE || recv_sym->kind == SYM_ANNOTATION));
+                    /* "T extends Number & Comparable<T>": the method of the second bound is
+                     * called through that interface */
+                    symbol_t *owner = (recv_was_variable && method_sym && method_sym->scope) ?
+                        method_sym->scope->owner : NULL;
+                    if (owner && owner->kind == SYM_INTERFACE && owner->qualified_name && recv_sym &&
+                        recv_sym != owner && !class_inherits_from(recv_sym, owner, 0)) {
+                        target_class = class_to_internal_name(owner->qualified_name);
+                        is_interface_call = true;
+                    }
                 }
                 /* A variable the receiver's own bound does not name ("<T extends B> T m()", B
                  * bound by a class variable): the method that is called says whose it is */
@@ -6971,7 +7104,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 char desc[256];
                 snprintf(desc, sizeof(desc), "()[L%s;", mg->class_gen->internal_name);
                 custom_descriptor = strdup(desc);
-            } else if (strcmp(method_name, "valueOf") == 0) {
+            } else if (strcmp(method_name, "valueOf") == 0 && synthetic_valueof_applies(expr, class_sym)) {
                 /* valueOf(String) is a synthetic static method returning EnumType */
                 is_static = true;
                 target_class = mg->class_gen->internal_name;
@@ -7010,7 +7143,8 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                  * stack", the invoked method's owner type not assignable
                  * from the inner class pushed). */
                 if (!is_static && owner_class != class_sym) {
-                    bool is_inherited = class_inherits_from(class_sym, owner_class, 0);
+                    bool is_inherited = class_inherits_from(class_sym, owner_class, 0) ||
+                        strcmp(owner_class->qualified_name, "java.lang.Object") == 0;
                     if (!is_inherited) {
                         /* owner_class might not be a LEXICALLY enclosing
                          * class at all - it could be a superclass of one
@@ -7160,6 +7294,22 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         }
     }
     
+    /* "<T> T mock(T... reified)": T is what the call is typed as, so is what the array the
+     * argument is packed in holds */
+    g_varargs_inferred_element = NULL;
+    if (is_varargs_method && varargs_param && method_sym && method_sym->type &&
+        method_sym->type->kind == TYPE_TYPEVAR && method_sym->type->data.type_var.name && expr->sem_type &&
+        expr->sem_type->kind == TYPE_CLASS) {
+        type_t *declared_elem = (varargs_param->type && varargs_param->type->kind == TYPE_ARRAY) ?
+            varargs_param->type->data.array_type.element_type : NULL;
+        if (declared_elem && declared_elem->kind == TYPE_TYPEVAR && declared_elem->data.type_var.name &&
+            strcmp(declared_elem->data.type_var.name, method_sym->type->data.type_var.name) == 0 &&
+            erase_typevar_for_array(declared_elem)->kind == TYPE_CLASS &&
+            strcmp(erase_typevar_for_array(declared_elem)->data.class_type.name, "java.lang.Object") == 0) {
+            g_varargs_inferred_element = expr->sem_type;
+        }
+    }
+
     /* Generate arguments with autoboxing/unboxing */
     slist_t *param_node = method_sym ? method_sym->data.method_data.parameters : NULL;
     int arg_index = 0;
@@ -7290,6 +7440,14 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                 is_interface_call = (recv_sym && (recv_sym->kind == SYM_INTERFACE || recv_sym->kind == SYM_ANNOTATION));
             }
         }
+        /* A receiver the analyzer could not type from here ("this.properties" of another class
+         * than the one it last walked): the method it resolved says whose it is */
+        if (!target_class && !is_static && receiver && method_sym && method_sym->scope &&
+            method_sym->scope->owner && method_sym->scope->owner->qualified_name) {
+            symbol_t *owner = method_sym->scope->owner;
+            target_class = class_to_internal_name(owner->qualified_name);
+            is_interface_call = owner->kind == SYM_INTERFACE || owner->kind == SYM_ANNOTATION;
+        }
         if (!target_class) {
             target_class = mg->class_gen ? mg->class_gen->internal_name : "java/lang/Object";
         }
@@ -7302,7 +7460,10 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
     } else {
         methodref = cp_add_methodref(cp, target_class, method_name, descriptor);
     }
-    free(descriptor);
+    /* (custom_descriptor is read again below, for the argument slots: it is freed at the end) */
+    if (descriptor != custom_descriptor) {
+        free(descriptor);
+    }
     
     /* Slots the arguments occupy on the stack after conversion to the parameter
      * types; needed for invokeinterface's count operand and to update tracking. */
@@ -7577,6 +7738,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         }
     }
     
+    free(custom_descriptor);
     if (static_import_class) {
         free(static_import_class);
     }
@@ -7856,7 +8018,7 @@ static bool codegen_explicit_ctor_call(method_gen_t *mg, ast_node_t *expr, const
     
     /* Mark 'this' as initialized after explicit super()/this() (JEP 513) */
     if (mg->stackmap && mg->class_gen && mg->class_gen->internal_name) {
-        stackmap_init_object(mg->stackmap, 0, cp, mg->class_gen->internal_name);
+        stackmap_init_this(mg->stackmap, cp, mg->class_gen->internal_name);
     }
     
     return true;
@@ -9116,6 +9278,9 @@ static bool codegen_compound_rhs(method_gen_t *mg, const_pool_t *cp, ast_node_t 
 
         /* Stack: [lhs_string, sb] -> [sb, lhs_string] */
         bc_emit(mg->code, OP_SWAP);
+        mg_pop_typed(mg, 2);
+        mg_push_object(mg, "java/lang/StringBuilder");
+        mg_push_object(mg, "java/lang/String");
         uint16_t append_str = cp_add_methodref(cp, "java/lang/StringBuilder", "append",
                                                "(Ljava/lang/String;)Ljava/lang/StringBuilder;");
         bc_emit(mg->code, OP_INVOKEVIRTUAL);
@@ -12554,6 +12719,55 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         }
                     } else {
                         target_class = type_node->data.node.name;
+                        /* A type variable the node was never resolved as ("throw (E) e" in
+                         * "<E extends Throwable> void rethrow(..) throws E"): the declaring
+                         * method's or class's variable of that name, erased to its bound */
+                        const char *tv_name = type_node->data.node.name;
+                        if (tv_name && !strchr(tv_name, '.')) {
+                            type_t *tv = NULL;
+                            if (mg->method) {
+                                for (slist_t *tp = mg->method->data.method_data.type_params; tp && !tv; tp = tp->next) {
+                                    symbol_t *tps = (symbol_t *)tp->data;
+                                    if (tps && tps->name && strcmp(tps->name, tv_name) == 0) {
+                                        tv = tps->type;
+                                    }
+                                }
+                            }
+                            for (symbol_t *owner = mg->class_gen ? mg->class_gen->class_sym : NULL; owner && !tv;
+                                 owner = owner->data.class_data.enclosing_class) {
+                                for (slist_t *tp = owner->data.class_data.type_params; tp && !tv; tp = tp->next) {
+                                    symbol_t *tps = (symbol_t *)tp->data;
+                                    if (tps && tps->name && strcmp(tps->name, tv_name) == 0) {
+                                        tv = tps->type;
+                                    }
+                                }
+                            }
+                            if (tv && tv->kind == TYPE_TYPEVAR) {
+                                type_t *erased = tv;
+                                for (int hops = 0; erased && erased->kind == TYPE_TYPEVAR && hops < 8; hops++) {
+                                    erased = erased->data.type_var.bound;
+                                }
+                                target_class = (erased && erased->kind == TYPE_CLASS && erased->data.class_type.name) ?
+                                               erased->data.class_type.name : "java.lang.Object";
+                                /* (a variable whose bound was never filled in: the one written in
+                                 * the declaration) */
+                                if (strcmp(target_class, "java.lang.Object") == 0 && mg->method && mg->method->ast) {
+                                    for (slist_t *dc = mg->method->ast->data.node.children; dc; dc = dc->next) {
+                                        ast_node_t *tpn = (ast_node_t *)dc->data;
+                                        if (tpn && tpn->type == AST_TYPE_PARAMETER && tpn->data.node.name &&
+                                            strcmp(tpn->data.node.name, tv_name) == 0 && tpn->data.node.children) {
+                                            ast_node_t *bn = (ast_node_t *)tpn->data.node.children->data;
+                                            if (bn && bn->type == AST_CLASS_TYPE && bn->data.node.name) {
+                                                target_class = (bn->sem_type && bn->sem_type->kind == TYPE_CLASS &&
+                                                                bn->sem_type->data.class_type.name) ?
+                                                               bn->sem_type->data.class_type.name : bn->data.node.name;
+                                            }
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 } else if (type_node->type == AST_ARRAY_TYPE) {
                     target_kind = TYPE_ARRAY;
@@ -12616,6 +12830,14 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     }
                 }
                 
+                /* A primitive cast to a reference type ("(Long) value", "(Object) 1") is a boxing
+                 * conversion (JLS 5.5), not a reference cast */
+                if (target_kind == TYPE_CLASS && source_kind >= TYPE_BOOLEAN && source_kind <= TYPE_DOUBLE) {
+                    emit_boxing(mg, cp, source_kind);
+                    free(target_class_owned);
+                    return true;
+                }
+
                 /* Reference cast: use checkcast */
                 if (target_kind == TYPE_CLASS || target_kind == TYPE_ARRAY) {
                     if (target_class) {
@@ -12645,6 +12867,23 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                  * integer". Confirmed against gumdrop's own
                  * H3ClientStreamTest.testExtractStatusReturns200(): "int
                  * result = (int) m.invoke(null, ...);". */
+                /* ...but a wrapper cast to a primitive ("(long) anInteger") is that wrapper unboxed
+                 * and then widened */
+                if (source_kind == TYPE_CLASS) {
+                    type_t *operand_type = operand->sem_type;
+                    if (!operand_type && mg->class_gen && mg->class_gen->sem) {
+                        operand_type = get_expression_type(mg->class_gen->sem, operand);
+                    }
+                    const char *operand_class = (operand_type && operand_type->kind == TYPE_CLASS) ?
+                        operand_type->data.class_type.name : NULL;
+                    type_kind_t operand_prim = operand_class ? get_primitive_for_wrapper(operand_class) : TYPE_UNKNOWN;
+                    if (operand_prim != TYPE_UNKNOWN) {
+                        char *wrapper_internal = class_to_internal_name(operand_class);
+                        emit_unboxing(mg, cp, operand_prim, wrapper_internal);
+                        free(wrapper_internal);
+                        source_kind = operand_prim;
+                    }
+                }
                 if (source_kind == TYPE_CLASS) {
                     const char *wrapper_class;
                     switch (target_kind) {
@@ -13637,6 +13876,18 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 bc_emit_u1(lambda_mg->code, OP_ARETURN);
                                 mg_pop(lambda_mg, 1);
                             } else {
+                            /* A primitive result the functional interface returns as another
+                             * primitive ("(cache) -> cache.deletes()", a long, for a
+                             * ToDoubleFunction) is converted to it, or a boxed one unboxed */
+                            if (sam->type->kind >= TYPE_BOOLEAN && sam->type->kind <= TYPE_DOUBLE && body_type) {
+                                if (body_is_primitive && body_type->kind != sam->type->kind) {
+                                    coerce_stack_value(lambda_mg, cp, body_type->kind, NULL, sam->type->kind, NULL);
+                                } else if (body_type->kind == TYPE_CLASS && body_type->data.class_type.name &&
+                                           get_primitive_for_wrapper(body_type->data.class_type.name) != TYPE_UNKNOWN) {
+                                    coerce_stack_value(lambda_mg, cp, TYPE_CLASS, body_type->data.class_type.name,
+                                                       sam->type->kind, NULL);
+                                }
+                            }
                             switch (sam->type->kind) {
                                 case TYPE_VOID:
                                     bc_emit_u1(lambda_mg->code, OP_RETURN);
@@ -14075,7 +14326,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     bc_emit_u1(mg->code, 0);
                     bc_emit_u1(mg->code, 0);
                     
-                    mg_push(mg, 1);
+                    mg_push_object(mg, iface_internal);
                     
                     free(elem_desc);
                     free(iface_internal);
@@ -14461,10 +14712,12 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 /* Stack effect: for bound, we consumed receiver (-1), produce interface (+1) = 0
                  * For unbound/static/ctor, we just produce interface (+1) = +1 */
                 if (is_bound) {
-                    /* Already consumed receiver, just produced interface - net 0 but we pushed it earlier */
-                    /* mg_pop already done by consuming receiver; result already on stack */
+                    /* The receiver on the stack became the functional interface: the same slot, a
+                     * different type to the verifier */
+                    mg_pop_typed(mg, 1);
+                    mg_push_object(mg, iface_internal);
                 } else {
-                    mg_push(mg, 1);
+                    mg_push_object(mg, iface_internal);
                 }
                 
                 free(target_internal);

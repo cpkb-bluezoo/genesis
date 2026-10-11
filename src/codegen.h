@@ -343,6 +343,7 @@ typedef struct loop_context
                                       * mg_add_continue_to_context()/
                                       * mg_patch_continue_offsets(). */
     const char *label;              /* Optional label name */
+    bool is_loop;                   /* A loop, which continue can target - not a switch or a labeled block */
     size_t finally_depth;           /* Length of mg->finally_stack at the
                                       * point this loop was entered - a
                                       * break/continue targeting this loop

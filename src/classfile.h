@@ -464,6 +464,9 @@ char **classfile_get_module_exports(classfile_t *cf, int *count_out);
  */
 char *classfile_get_retention_policy_name(classfile_t *cf);
 
+/* The internal name of the container annotation type a repeatable one names, or NULL */
+char *classfile_get_repeatable_container(classfile_t *cf);
+
 /*
  * Find a no-argument method (e.g. an annotation interface's element, such
  * as "timeout" on org.junit.Test) by name and return its raw descriptor

@@ -29,6 +29,10 @@
 #include <dirent.h>
 #include <pthread.h>
 
+/* The descriptor of a type, for the element of an annotation type of this compilation */
+extern char *type_to_descriptor(type_t *type);
+static type_t *ensure_method_result_type(semantic_t *sem, symbol_t *method, symbol_t *from);
+
 /* Forward declarations for functions used in ensure_interfaces_resolved */
 static char *resolve_import(semantic_t *sem, const char *simple_name);
 symbol_t *load_external_class(semantic_t *sem, const char *name);
@@ -1528,6 +1532,23 @@ static type_t *resolve_unresolved_type_full_for_method(unresolved_type_t *ut,
         }
         return type_new_wildcard(ut->wildcard_kind == 3 ? -1 : (ut->wildcard_kind == 2 ? 1 : 0), bound);
     }
+    /* An array ("T[]", "List<T>[][]"): its element, as the method sees it, in as many dimensions */
+    {
+        size_t nlen = strlen(ut->name);
+        int dims = 0;
+        while (nlen >= 2 && ut->name[nlen - 2] == '[' && ut->name[nlen - 1] == ']') {
+            nlen -= 2;
+            dims++;
+        }
+        if (dims > 0 && nlen > 0) {
+            unresolved_type_t element = *ut;
+            char *stripped = strndup(ut->name, nlen);
+            element.name = stripped;
+            type_t *elem_type = resolve_unresolved_type_full_for_method(&element, reg, cp, class_ctx, method);
+            free(stripped);
+            return elem_type ? type_new_array(elem_type, dims) : NULL;
+        }
+    }
     if (!ut->type_args) {
         type_t *mtp = lookup_method_type_param(method, ut->name);
         if (mtp) {
@@ -2683,6 +2704,19 @@ void registry_resolve_types(type_registry_t *reg, classpath_t *cp)
                         }
                     }
                     
+                }
+
+                /* An enum is a java.lang.Enum, a record a java.lang.Record, though the source
+                 * never says so */
+                if ((sym->kind == SYM_ENUM || sym->kind == SYM_RECORD) && cp &&
+                    !sym->data.class_data.unresolved_superclass && !sym->data.class_data.superclass) {
+                    const char *implicit = sym->kind == SYM_ENUM ? "java.lang.Enum" : "java.lang.Record";
+                    classfile_t *cf = classpath_load_class(cp, implicit);
+                    symbol_t *super_sym = cf ? symbol_from_classfile_minimal(cf, cp) : NULL;
+                    if (super_sym) {
+                        sym->data.class_data.superclass = super_sym;
+                        changed = true;
+                    }
                 }
 
                 /* Resolve superclass_type with type arguments (for generic inheritance).
@@ -9469,6 +9503,25 @@ char *semantic_resolve_annotation_type_name(semantic_t *sem, const char *simple_
     if (!sem || !simple_name) {
         return NULL;
     }
+    /* "ComponentScan.Filter": the first segment is a type (imported or in this
+     * package) and the rest names its member types, unlike "org.junit.Test",
+     * whose first segment is a package */
+    const char *dot = strchr(simple_name, '.');
+    if (dot && simple_name[0] >= 'A' && simple_name[0] <= 'Z') {
+        char *first = strndup(simple_name, (size_t)(dot - simple_name));
+        char *resolved = first ? resolve_import(sem, first) : NULL;
+        free(first);
+        if (!resolved) {
+            return NULL;
+        }
+        size_t len = strlen(resolved) + strlen(dot) + 1;
+        char *full = malloc(len);
+        if (full) {
+            snprintf(full, len, "%s%s", resolved, dot);
+        }
+        free(resolved);
+        return full;
+    }
     return resolve_import(sem, simple_name);
 }
 
@@ -9541,6 +9594,35 @@ static classfile_t *classpath_load_class_with_nested_fallback(semantic_t *sem, c
 struct classfile *semantic_load_annotation_classfile(semantic_t *sem, const char *qualified_name)
 {
     return classpath_load_class_with_nested_fallback(sem, qualified_name);
+}
+
+/**
+ * Binary name ("pkg.Outer$Inner") of a source-defined type written with
+ * dots between its nesting levels ("pkg.Outer.Inner"), found by turning
+ * trailing dots into '$' until the shared registry knows the name. Returns
+ * a malloc'd string, or NULL if the registry has no such type.
+ */
+char *semantic_registry_binary_name(semantic_t *sem, const char *qualified_name)
+{
+    if (!sem || !sem->shared_registry || !qualified_name) {
+        return NULL;
+    }
+    char *name = strdup(qualified_name);
+    if (!name) {
+        return NULL;
+    }
+    for (;;) {
+        if (type_registry_lookup(sem->shared_registry, name)) {
+            return name;
+        }
+        char *dot = strrchr(name, '.');
+        if (!dot) {
+            break;
+        }
+        *dot = '$';
+    }
+    free(name);
+    return NULL;
 }
 
 /**
@@ -9652,8 +9734,18 @@ retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const 
      * (e.g. "import Outer; ... @Marker(...)", Marker nested in Outer) - a
      * case resolve_annotation_retention_same_batch() above doesn't cover,
      * since Outer is neither the current class nor one of its ancestors. */
-    char *qualified = strchr(annotation_name, '.') ?
-        strdup(annotation_name) : resolve_import(sem, annotation_name);
+    char *qualified = NULL;
+    if (strchr(annotation_name, '.') && annotation_name[0] >= 'A' && annotation_name[0] <= 'Z') {
+        qualified = semantic_resolve_annotation_type_name(sem, annotation_name);
+    }
+    if (!qualified) {
+        qualified = (strchr(annotation_name, '.') || strchr(annotation_name, '$')) ?
+            strdup(annotation_name) : resolve_import(sem, annotation_name);
+    }
+    if (!qualified) {
+        /* (a type of the default package) */
+        qualified = strdup(annotation_name);
+    }
     if (!qualified) {
         return RETENTION_CLASS;
     }
@@ -9726,21 +9818,58 @@ char *semantic_resolve_annotation_element_descriptor(semantic_t *sem,
                                                        const char *annotation_name,
                                                        const char *element_name)
 {
-    if (!sem || !annotation_name || !element_name || !sem->classpath) {
+    if (!sem || !annotation_name || !element_name) {
         return NULL;
     }
 
-    char *qualified = strchr(annotation_name, '.') ?
-        strdup(annotation_name) : resolve_import(sem, annotation_name);
+    char *qualified = NULL;
+    if (strchr(annotation_name, '.') && annotation_name[0] >= 'A' && annotation_name[0] <= 'Z') {
+        qualified = semantic_resolve_annotation_type_name(sem, annotation_name);
+    }
+    if (!qualified) {
+        qualified = (strchr(annotation_name, '.') || strchr(annotation_name, '$')) ?
+            strdup(annotation_name) : resolve_import(sem, annotation_name);
+    }
+    if (!qualified) {
+        /* (a type of the default package) */
+        qualified = strdup(annotation_name);
+    }
     if (!qualified) {
         return NULL;
     }
 
     classfile_t *cf = classpath_load_class_with_nested_fallback(sem, qualified);
-    free(qualified);
     if (!cf) {
-        return NULL;
+        /* An annotation type of this compilation has no class file yet: its element is the
+         * method its registered symbol has */
+        char *binary = semantic_registry_binary_name(sem, qualified);
+        free(qualified);
+        symbol_t *annotation = binary ? type_registry_lookup(sem->shared_registry, binary) : NULL;
+        free(binary);
+        if (!annotation) {
+            return NULL;
+        }
+        symbol_complete(annotation);
+        symbol_t *element = annotation->data.class_data.members ?
+            scope_lookup_method(annotation->data.class_data.members, element_name) : NULL;
+        if (element && element->kind == SYM_METHOD) {
+            ensure_method_result_type(sem, element, annotation);
+        }
+        if (!element || element->kind != SYM_METHOD || !element->type) {
+            return NULL;
+        }
+        char *ret = type_to_descriptor(element->type);
+        if (!ret) {
+            return NULL;
+        }
+        char *desc = malloc(strlen(ret) + 3);
+        if (desc) {
+            sprintf(desc, "()%s", ret);
+        }
+        free(ret);
+        return desc;
     }
+    free(qualified);
 
     return classfile_get_method_descriptor(cf, element_name);
 }
@@ -10768,6 +10897,16 @@ static type_t *typevar_receiver_bound(semantic_t *sem, type_t *tv)
             own->data.type_var.bound->kind == TYPE_CLASS) {
             return own->data.type_var.bound;
         }
+    }    /* the variable as the scopes around see it (a lambda inside "<T extends Number> m()" sees T
+     * though the method being analysed is the lambda's) */
+    if (sem->current_scope) {
+        symbol_t *scoped = scope_lookup(sem->current_scope, tv->data.type_var.name);
+        if (scoped && scoped->kind == SYM_TYPE_PARAM && scoped->type && scoped->type->kind == TYPE_TYPEVAR &&
+            scoped->type->data.type_var.bound && scoped->type->data.type_var.bound->kind == TYPE_CLASS &&
+            scoped->type->data.type_var.bound->data.class_type.name &&
+            strcmp(scoped->type->data.type_var.bound->data.class_type.name, "java.lang.Object") != 0) {
+            return scoped->type->data.type_var.bound;
+        }
     }
     for (symbol_t *owner = sem->current_class; owner; owner = owner->data.class_data.enclosing_class) {
         for (slist_t *tp = owner->data.class_data.type_params; tp; tp = tp->next) {
@@ -10782,6 +10921,105 @@ static type_t *typevar_receiver_bound(semantic_t *sem, type_t *tv)
         }
     }
     return NULL;
+}
+
+/** The class-type bound written second or later for a type variable ("Comparable<T>" of
+ * "T extends Number & Comparable<T>"), the methods of which the variable has as well. */
+static ast_node_t *find_type_parameter_ast(ast_node_t *decl, const char *name)
+{
+    if (!decl) {
+        return NULL;
+    }
+    for (slist_t *c = decl->data.node.children; c; c = c->next) {
+        ast_node_t *child = (ast_node_t *)c->data;
+        if (child && child->type == AST_TYPE_PARAMETER && child->data.node.name &&
+            strcmp(child->data.node.name, name) == 0) {
+            return child;
+        }
+    }
+    return NULL;
+}
+
+static bool type_declares_method_named(semantic_t *sem, type_t *type, const char *name, int depth)
+{
+    if (!type || type->kind != TYPE_CLASS || depth > 12) {
+        return false;
+    }
+    symbol_t *sym = type->data.class_type.symbol;
+    if (!sym && type->data.class_type.name) {
+        sym = load_external_class(sem, type->data.class_type.name);
+    }
+    for (symbol_t *c = sym; c && depth < 24; c = c->data.class_data.superclass, depth++) {
+        if (!c->data.class_data.members && c->qualified_name) {
+            symbol_t *loaded = load_external_class(sem, c->qualified_name);
+            if (loaded && loaded->data.class_data.members) {
+                c = loaded;
+            }
+        }
+        if (c->data.class_data.members) {
+            slist_t *found = scope_find_all_methods(c->data.class_data.members, name);
+            if (found) {
+                slist_free(found);
+                return true;
+            }
+        }
+        for (slist_t *i = c->data.class_data.interfaces; i; i = i->next) {
+            symbol_t *iface = (symbol_t *)i->data;
+            if (iface && iface->qualified_name) {
+                type_t it = {0};
+                it.kind = TYPE_CLASS;
+                it.data.class_type.name = iface->qualified_name;
+                it.data.class_type.symbol = iface;
+                if (type_declares_method_named(sem, &it, name, depth + 1)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * The bound of a type variable that has the method "name" when its first bound has not ("a.compareTo(b)"
+ * for "T extends Number & Comparable<T>"); NULL if the first bound has it or none does.
+ */
+static type_t *typevar_bound_declaring(semantic_t *sem, type_t *tv, type_t *first_bound, const char *name)
+{
+    if (!tv || tv->kind != TYPE_TYPEVAR || !tv->data.type_var.name || !name ||
+        type_declares_method_named(sem, first_bound, name, 0)) {
+        return NULL;
+    }
+    ast_node_t *param = NULL;
+    for (scope_t *sc = sem->current_scope; sc && !param; sc = sc->parent) {
+        if (sc->owner && sc->owner->kind == SYM_METHOD) {
+            param = find_type_parameter_ast(sc->owner->ast, tv->data.type_var.name);
+        }
+    }
+    if (!param && sem->current_method) {
+        param = find_type_parameter_ast(sem->current_method->ast, tv->data.type_var.name);
+    }
+    for (symbol_t *c = sem->current_class; c && !param; c = c->data.class_data.enclosing_class) {
+        param = find_type_parameter_ast(c->ast, tv->data.type_var.name);
+    }
+    if (!param) {
+        return NULL;
+    }
+    bool saved_quiet = sem->loading_dependency;
+    sem->loading_dependency = true;
+    type_t *found = NULL;
+    int index = 0;
+    for (slist_t *b = param->data.node.children; b && !found; b = b->next, index++) {
+        ast_node_t *bn = (ast_node_t *)b->data;
+        if (index == 0 || !bn || bn->type != AST_CLASS_TYPE) {
+            continue;
+        }
+        type_t *bt = semantic_resolve_type(sem, bn);
+        if (bt && bt->kind == TYPE_CLASS && type_declares_method_named(sem, bt, name, 0)) {
+            found = bt;
+        }
+    }
+    sem->loading_dependency = saved_quiet;
+    return found;
 }
 
 /**
@@ -11557,7 +11795,8 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                                  * not name java.lang.Enum / java.lang.Record as its superclass yet */
                                 symbol_t *gs = given->data.class_type.symbol;
                                 if (raw->data.class_type.symbol && gs &&
-                                    gs->kind != SYM_ENUM && gs->kind != SYM_RECORD &&
+                                    ((gs->kind != SYM_ENUM && gs->kind != SYM_RECORD) ||
+                                     gs->data.class_data.superclass) &&
                                     !type_assignable(raw, given)) {
                                     type_mismatch = true;
                                     break;
@@ -13650,6 +13889,15 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             /* Nested enums, interfaces, and records are implicitly static */
                             if (sem->current_class && 
                                 (kind == SYM_ENUM || kind == SYM_INTERFACE || kind == SYM_RECORD)) {
+                                sym->modifiers |= MOD_STATIC;
+                                node->data.node.flags |= MOD_STATIC;
+                            }
+                            
+                            /* ...and so is every member type of an interface (JLS 9.5), a class
+                             * among them */
+                            if (sem->current_class && !sem->current_method &&
+                                (sem->current_class->kind == SYM_INTERFACE ||
+                                 sem->current_class->kind == SYM_ANNOTATION)) {
                                 sym->modifiers |= MOD_STATIC;
                                 node->data.node.flags |= MOD_STATIC;
                             }
@@ -16095,12 +16343,13 @@ static scope_t *pattern_binding_scope_for_child(semantic_t *sem, ast_node_t *nod
 static type_t *conditional_result_type(semantic_t *sem, type_t *then_type, type_t *else_type,
                                        ast_node_t *then_expr, ast_node_t *else_expr)
 {
-    /* If one branch is null, use the type of the other branch */
+    /* If one branch is null, use the type of the other branch (boxed, when it is a primitive:
+     * "flag ? 1 : null" is an Integer) */
     if (then_type && then_type->kind == TYPE_NULL && else_type) {
-        return else_type;
+        return type_boxed(else_type);
     }
     if (else_type && else_type->kind == TYPE_NULL && then_type) {
-        return then_type;
+        return type_boxed(then_type);
     }
 
     /* Numeric binary promotion (JLS 15.25): if both branches are
@@ -17385,11 +17634,40 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 /* Set sem_type on the receiver node so later processing skips it */
                                 first->sem_type = recv_type;
                                 
+                                /* ...the bound the scopes around declare, when the variable's own is missing
+                                 * or is the Object a stub gave it */
+                                if (recv_type && recv_type->kind == TYPE_TYPEVAR) {
+                                    type_t *own_bound = recv_type->data.type_var.bound;
+                                    bool plain_object = !own_bound || (own_bound->kind == TYPE_CLASS &&
+                                        own_bound->data.class_type.name &&
+                                        strcmp(own_bound->data.class_type.name, "java.lang.Object") == 0);
+                                    if (plain_object) {
+                                        type_t *scoped_bound = typevar_receiver_bound(sem, recv_type);
+                                        if (scoped_bound) {
+                                            type_t *bounded = malloc(sizeof(type_t));
+                                            if (bounded) {
+                                                bounded->kind = TYPE_TYPEVAR;
+                                                bounded->data.type_var.name = strdup(recv_type->data.type_var.name);
+                                                bounded->data.type_var.bound = scoped_bound;
+                                                recv_type = bounded;
+                                            }
+                                        }
+                                    }
+                                }
                                 /* For type variables, use the bound type for method lookup */
                                 if (recv_type && recv_type->kind == TYPE_TYPEVAR && 
                                     recv_type->data.type_var.bound) {
                                     bool subst_was_variable = recv_type_for_subst == recv_type;
+                                    type_t *variable = recv_type;
                                     recv_type = recv_type->data.type_var.bound;
+                                    /* ...one of the other bounds of "T extends A & B", when the
+                                     * method is not A's */
+                                    type_t *other_bound = typevar_bound_declaring(sem, variable, recv_type, method_name);
+                                    if (other_bound) {
+                                        recv_type = other_bound;
+                                        subst_was_variable = false;
+                                        recv_type_for_subst = other_bound;
+                                    }
                                     /* ...and its arguments are what the receiver's own say
                                      * ("R extends Runner<R, C, A>": withBean() is an R) */
                                     if (subst_was_variable && recv_type->kind == TYPE_CLASS &&
@@ -18239,6 +18517,40 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             if (!inferred_types[tpi] &&
                                 strcmp(type_param_names[tpi], found_method->type->data.type_var.name) == 0) {
                                 inferred_types[tpi] = sem->target_type;
+                            }
+                        }
+                    }
+
+                    /* A lambda given before the arguments that fix the method's type variables
+                     * ("each((a, b) -> ..., first, second)") is typed by them: a plain variable or
+                     * literal argument says so before the lambda is bound */
+                    if (n_type_params > 0) {
+                        bool has_functional = false;
+                        for (slist_t *an = args; an && !has_functional; an = an->next) {
+                            ast_node_t *a = (ast_node_t *)an->data;
+                            while (a && a->type == AST_PARENTHESIZED && a->data.node.children) {
+                                a = (ast_node_t *)a->data.node.children->data;
+                            }
+                            has_functional = a && (a->type == AST_LAMBDA_EXPR || a->type == AST_METHOD_REF);
+                        }
+                        slist_t *pn = params;
+                        for (slist_t *an = has_functional ? args : NULL; an && pn; an = an->next, pn = pn->next) {
+                            symbol_t *ps = (symbol_t *)pn->data;
+                            ast_node_t *a = (ast_node_t *)an->data;
+                            if (!ps || !ps->type || (ps->modifiers & MOD_VARARGS) || !a ||
+                                (a->type != AST_IDENTIFIER && a->type != AST_LITERAL &&
+                                 a->type != AST_THIS_EXPR)) {
+                                continue;
+                            }
+                            type_t *at = get_expression_type(sem, a);
+                            if (!at || at->kind == TYPE_NULL || at->kind == TYPE_UNKNOWN) {
+                                continue;
+                            }
+                            for (int tpi = 0; tpi < n_type_params; tpi++) {
+                                if (!inferred_types[tpi]) {
+                                    inferred_types[tpi] = infer_type_arg_from_expression(
+                                        sem, ps->type, a, at, type_param_names[tpi]);
+                                }
                             }
                         }
                     }
@@ -21245,12 +21557,21 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             ast_node_t *arg = (ast_node_t *)arg_node->data;
                             
                             if (arg && param && param->type) {
+                                /* "super(Entry::new)" of "extends Registry<Contributor, Entry>": the
+                                 * parameter as that class sees it, its variables the arguments the
+                                 * extends clause gives them */
+                                type_t *bind_to = param->type;
+                                type_t *super_type = (!is_this_call && sem->current_class) ?
+                                    sem->current_class->data.class_data.superclass_type : NULL;
+                                if (super_type && super_type->kind == TYPE_CLASS && super_type->data.class_type.type_args) {
+                                    bind_to = substitute_from_receiver(param->type, super_type);
+                                }
                                 if (arg->type == AST_LAMBDA_EXPR) {
-                                    bind_lambda_to_target_type(sem, arg, param->type);
+                                    bind_lambda_to_target_type(sem, arg, bind_to);
                                 } else if (arg->type == AST_METHOD_REF) {
-                                    bind_method_ref_to_target_type(sem, arg, param->type);
+                                    bind_method_ref_to_target_type(sem, arg, bind_to);
                                 } else if (arg->type == AST_CONDITIONAL_EXPR || arg->type == AST_PARENTHESIZED) {
-                                    bind_poly_operands(sem, arg, param->type);
+                                    bind_poly_operands(sem, arg, bind_to);
                                 }
                             }
                             
@@ -21974,7 +22295,12 @@ static slist_t *class_implemented_types(semantic_t *sem, symbol_t *sym)
      * unparameterized one may have a parameterized one above it); a class's matter only
      * when parameterized */
     bool is_interface = sym->kind == SYM_INTERFACE;
-    if (sym->ast) {
+    ast_node_t *decl_ast = sym->ast;
+    if (!decl_ast && sem->shared_registry && sym->qualified_name) {
+        /* a type of the compilation declared in another file keeps its tree in the registry */
+        decl_ast = type_registry_get_ast(sem->shared_registry, sym->qualified_name);
+    }
+    if (decl_ast) {
         /* ...named as that class sees them: its own type variables are in scope ("Count<T>
          * implements Supplier<T>"), and what it cannot name is not the compilation's error */
         scope_t *saved_scope = sem->current_scope;
@@ -21985,7 +22311,7 @@ static slist_t *class_implemented_types(semantic_t *sem, symbol_t *sym)
         }
         sem->current_class = sym;
         sem->loading_dependency = true;
-        for (slist_t *c = sym->ast->data.node.children; c; c = c->next) {
+        for (slist_t *c = decl_ast->data.node.children; c; c = c->next) {
             ast_node_t *child = (ast_node_t *)c->data;
             if (child && child->type == AST_CLASS_TYPE && child->data.node.flags == (is_interface ? 1 : 2)) {
                 type_t *it = semantic_resolve_type(sem, child);
@@ -23012,7 +23338,11 @@ static void scan_lambda_body_for_this_capture(semantic_t *sem, ast_node_t *node,
             /* A local variable or parameter of the same name hides the field. */
             symbol_t *visible = sem->current_scope ? scope_lookup(sem->current_scope, name) : NULL;
             bool hidden = visible && (visible->kind == SYM_LOCAL_VAR || visible->kind == SYM_PARAMETER);
-            if (sym && sym->kind == SYM_FIELD && !(sym->modifiers & MOD_STATIC) && !hidden) {
+            /* (nothing in a static method or initializer is an instance field: the name is a
+             * local the lambda declares itself) */
+            bool static_context = (sem->current_method && (sem->current_method->modifiers & MOD_STATIC)) ||
+                                  sem->in_static_field_init;
+            if (sym && sym->kind == SYM_FIELD && !(sym->modifiers & MOD_STATIC) && !hidden && !static_context) {
                 /* Identifier refers to an instance field - need 'this' capture */
                 lambda->lambda_captures_this = true;
             }
@@ -23461,8 +23791,19 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                 param_type = unwrap_wildcard(param_type);
                         /* Ensure the type symbol is loaded for method lookups */
                         ensure_type_symbol_loaded(sem, param_type);
+                /* A type argument that is a variable of the code around the lambda ("Function<T,
+                 * Double>" inside "<T extends Number> m()") is that variable, with the bound the
+                 * scopes declare for it */
+                if (param_type->kind == TYPE_TYPEVAR && param_type != sam_param->type &&
+                    param_type->data.type_var.name && sem->current_scope) {
+                    symbol_t *declared = scope_lookup(sem->current_scope, param_type->data.type_var.name);
+                    if (declared && declared->kind == SYM_TYPE_PARAM && declared->type &&
+                        declared->type->kind == TYPE_TYPEVAR) {
+                        param_type = declared->type;
+                    }
+                }
                 /* If still a type variable (unsubstituted), fall back to Object */
-                if (param_type->kind == TYPE_TYPEVAR) {
+                if (param_type->kind == TYPE_TYPEVAR && param_type == sam_param->type) {
                     param_type = type_new_class("java.lang.Object");
                     symbol_t *obj = load_external_class(sem, "java.lang.Object");
                     if (obj) {
@@ -24430,9 +24771,13 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
             return false;
         }
         
-        /* Find the method in superclass */
+        /* Find the method in superclass: the overload the functional interface's parameters fit */
         if (target_class_sym->data.class_data.members) {
-            resolved_method = scope_lookup_method(target_class_sym->data.class_data.members, method_name);
+            resolved_method = mref_lookup_inherited(sem, target_class_sym, method_name,
+                                                    sam_pcount, sam_ptypes, sam_pcount, 0, 0);
+            if (!resolved_method) {
+                resolved_method = scope_lookup_method(target_class_sym->data.class_data.members, method_name);
+            }
         }
         if (!resolved_method || resolved_method->kind != SYM_METHOD) {
             semantic_error(sem, ref->line, ref->column,
@@ -24476,8 +24821,13 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
             return false;
         }
         
-        /* Find the method in current class and superclass chain */
+        /* Find the method in current class and superclass chain: the overload the functional
+         * interface's parameters fit */
         if (target_class_sym->data.class_data.members) {
+            resolved_method = mref_lookup_inherited(sem, target_class_sym, method_name,
+                                                    sam_pcount, sam_ptypes, sam_pcount, 0, 0);
+        }
+        if ((!resolved_method || resolved_method->kind != SYM_METHOD) && target_class_sym->data.class_data.members) {
             resolved_method = scope_lookup_method(target_class_sym->data.class_data.members, method_name);
         }
         if (!resolved_method || resolved_method->kind != SYM_METHOD) {
@@ -24670,7 +25020,48 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
                     sam_param_count++;
                 }
                 
-                if (target_class_sym->data.class_data.members) {
+                /* Several constructors of one arity ("Runner(Supplier)" and
+                 * "Runner(Configuration)"): the one whose parameters the
+                 * functional interface's own parameter types fit */
+                if (target_class_sym->data.class_data.members && sam_param_count > 0 &&
+                    sam_param_count <= sam_pcount) {
+                    const char *simple = strrchr(name, '.') ? strrchr(name, '.') + 1 : name;
+                    symbol_t *best_ctor = NULL;
+                    int best_score = -1;
+                    for (int round = 0; round < 2; round++) {
+                        slist_t *cands = scope_find_all_methods(target_class_sym->data.class_data.members,
+                                                                round == 0 ? "<init>" : simple);
+                        for (slist_t *c = cands; c; c = c->next) {
+                            symbol_t *ctor = (symbol_t *)c->data;
+                            if (!ctor || ctor->kind != SYM_CONSTRUCTOR) {
+                                continue;
+                            }
+                            int count = 0, score = 0, i = 0;
+                            for (slist_t *cp = ctor->data.method_data.parameters; cp; cp = cp->next, i++) {
+                                count++;
+                                symbol_t *ps = (symbol_t *)cp->data;
+                                if (i < sam_param_count) {
+                                    int one = mref_param_score(sem, ps ? ps->type : NULL, sam_ptypes[i]);
+                                    if (one < 0) {
+                                        score = -1;
+                                        break;
+                                    }
+                                    score += one;
+                                }
+                            }
+                            if (score >= 0 && count == sam_param_count && score > best_score) {
+                                best_score = score;
+                                best_ctor = ctor;
+                            }
+                        }
+                        slist_free(cands);
+                    }
+                    if (best_ctor) {
+                        resolved_method = best_ctor;
+                    }
+                }
+
+                if (target_class_sym->data.class_data.members && !resolved_method) {
                     /* For source-defined constructors, try key format name(N) */
                     char ctor_key[256];
                     const char *dot = strrchr(name, '.');
@@ -25032,6 +25423,21 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
                         snprintf(pname, sizeof(pname), "$mref%d", i);
                         ast_node_t *param = ast_new(AST_PARAMETER, line, column);
                         param->data.node.name = (char *)intern(pname);
+                        /* "Builder::name" where nothing but this reference says what the first
+                         * parameter is (the variable "T" of a generic method it was passed to) */
+                        const char *written_type = target_node->type == AST_CLASS_TYPE ? target_node->data.node.name :
+                            (target_node->type == AST_IDENTIFIER ? target_node->data.leaf.name : NULL);
+                        if (unbound && i == 0 && written_type) {
+                            type_t *first = sam_ptypes[0];
+                            bool unknown = !first || first->kind == TYPE_TYPEVAR ||
+                                (first->kind == TYPE_CLASS && first->data.class_type.name &&
+                                 strcmp(first->data.class_type.name, "java.lang.Object") == 0);
+                            if (unknown) {
+                                ast_node_t *typed = ast_new(AST_CLASS_TYPE, line, column);
+                                typed->data.node.name = (char *)intern(written_type);
+                                ast_add_child(param, typed);
+                            }
+                        }
                         ast_add_child(params, param);
                     }
                     if (unbound) {
@@ -26114,12 +26520,152 @@ static void fold_annotation_element(semantic_t *sem, ast_node_t *node)
     }
 }
 
+/**
+ * The container annotation type the annotation type called qualified names in its
+ * @Repeatable, as a dotted name; NULL if it is not repeatable (or not known).
+ */
+static char *annotation_container_name(semantic_t *sem, const char *qualified)
+{
+    if (!sem || !qualified) {
+        return NULL;
+    }
+    /* declared in this batch: its own annotations say */
+    if (sem->shared_registry) {
+        ast_node_t *reg_ast = type_registry_get_ast(sem->shared_registry, qualified);
+        if (reg_ast && reg_ast->type == AST_ANNOTATION_DECL) {
+            for (slist_t *a = reg_ast->annotations; a; a = a->next) {
+                ast_node_t *meta = (ast_node_t *)a->data;
+                if (!meta || meta->type != AST_ANNOTATION || !meta->data.node.name ||
+                    !(strcmp(meta->data.node.name, "Repeatable") == 0 ||
+                      strcmp(meta->data.node.name, "java.lang.annotation.Repeatable") == 0)) {
+                    continue;
+                }
+                for (slist_t *pc = meta->data.node.children; pc; pc = pc->next) {
+                    ast_node_t *pair = (ast_node_t *)pc->data;
+                    ast_node_t *value = pair && pair->type == AST_ANNOTATION_VALUE && pair->data.node.children ?
+                                        (ast_node_t *)pair->data.node.children->data : NULL;
+                    if (value && value->type == AST_CLASS_LITERAL && value->data.node.children) {
+                        ast_node_t *type_node = (ast_node_t *)value->data.node.children->data;
+                        const char *tname = type_node ? type_node->data.node.name : NULL;
+                        if (tname) {
+                            char *container = strchr(tname, '.') ? strdup(tname) : resolve_import(sem, tname);
+                            if (!container) {
+                                /* a type of the annotation's own package or nesting */
+                                const char *last = strrchr(qualified, '.');
+                                if (last) {
+                                    size_t n = (size_t)(last - qualified) + 1;
+                                    container = malloc(n + strlen(tname) + 1);
+                                    memcpy(container, qualified, n);
+                                    strcpy(container + n, tname);
+                                }
+                            }
+                            return container;
+                        }
+                    }
+                }
+            }
+            return NULL;
+        }
+    }
+    classfile_t *cf = classpath_load_class_with_nested_fallback(sem, qualified);
+    char *internal = cf ? classfile_get_repeatable_container(cf) : NULL;
+    if (!internal) {
+        return NULL;
+    }
+    for (char *c = internal; *c; c++) {
+        if (*c == '/' || *c == '$') {
+            *c = '.';
+        }
+    }
+    return internal;
+}
+
+/**
+ * An annotation written more than once on a declaration is, in the class file, one annotation of
+ * the container type its own type names in @Repeatable, holding them (JLS 9.7.5). Rewrites the
+ * annotations of decl so.
+ */
+static void wrap_repeated_annotations(semantic_t *sem, ast_node_t *decl)
+{
+    if (!decl || !decl->annotations || !decl->annotations->next) {
+        return;
+    }
+    int n = 0;
+    for (slist_t *a = decl->annotations; a; a = a->next) {
+        n++;
+    }
+    ast_node_t **items = malloc((size_t)n * sizeof(ast_node_t *));
+    char **names = calloc((size_t)n, sizeof(char *));
+    if (!items || !names) {
+        free(items);
+        free(names);
+        return;
+    }
+    int i = 0;
+    for (slist_t *a = decl->annotations; a; a = a->next, i++) {
+        items[i] = (ast_node_t *)a->data;
+        if (items[i] && items[i]->type == AST_ANNOTATION && items[i]->data.node.name) {
+            names[i] = strchr(items[i]->data.node.name, '.') ? strdup(items[i]->data.node.name) :
+                       resolve_import(sem, items[i]->data.node.name);
+        }
+    }
+    bool changed = false;
+    bool *taken = calloc((size_t)n, sizeof(bool));
+    slist_t *result = NULL;
+    for (i = 0; taken && i < n; i++) {
+        if (taken[i]) {
+            continue;
+        }
+        int same = 1;
+        for (int j = i + 1; names[i] && j < n; j++) {
+            if (!taken[j] && names[j] && strcmp(names[i], names[j]) == 0) {
+                same++;
+            }
+        }
+        char *container = same > 1 ? annotation_container_name(sem, names[i]) : NULL;
+        if (container) {
+            ast_node_t *wrapper = ast_new(AST_ANNOTATION, items[i]->line, items[i]->column);
+            wrapper->data.node.name = (char *)intern(container);
+            ast_node_t *pair = ast_new(AST_ANNOTATION_VALUE, items[i]->line, items[i]->column);
+            pair->data.node.name = (char *)intern("value");
+            ast_node_t *array = ast_new(AST_ARRAY_INIT, items[i]->line, items[i]->column);
+            for (int j = i; j < n; j++) {
+                if (!taken[j] && names[j] && strcmp(names[i], names[j]) == 0) {
+                    ast_add_child(array, items[j]);
+                    taken[j] = true;
+                }
+            }
+            ast_add_child(pair, array);
+            ast_add_child(wrapper, pair);
+            result = result ? (slist_append(result, wrapper), result) : slist_new(wrapper);
+            free(container);
+            changed = true;
+        } else {
+            taken[i] = true;
+            result = result ? (slist_append(result, items[i]), result) : slist_new(items[i]);
+        }
+    }
+    if (changed) {
+        slist_free(decl->annotations);
+        decl->annotations = result;
+    } else {
+        slist_free(result);
+    }
+    for (i = 0; i < n; i++) {
+        free(names[i]);
+    }
+    free(names);
+    free(items);
+    free(taken);
+}
+
 /** Folds the named constants in the element values of a declaration's annotations. */
 static void fold_annotation_constants(semantic_t *sem, ast_node_t *decl)
 {
     if (!decl) {
         return;
     }
+    wrap_repeated_annotations(sem, decl);
     for (slist_t *a = decl->annotations; a; a = a->next) {
         fold_annotation_element(sem, (ast_node_t *)a->data);
     }

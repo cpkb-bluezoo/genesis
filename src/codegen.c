@@ -459,6 +459,7 @@ static loop_context_t *loop_context_new(size_t continue_target, const char *labe
     ctx->break_offsets = NULL;
     ctx->continue_offsets = NULL;
     ctx->label = label;
+    ctx->is_loop = true;
     ctx->finally_depth = 0;
     return ctx;
 }
@@ -494,6 +495,15 @@ void mg_push_loop(method_gen_t *mg, size_t continue_target, const char *label)
     if (ctx) {
         ctx->finally_depth = slist_length(mg->finally_stack);
         mg->loop_stack = slist_prepend(mg->loop_stack, ctx);
+    }
+}
+
+/* A switch or a labeled block: break can leave it, continue passes through to the loop around */
+void mg_push_break_scope(method_gen_t *mg, const char *label)
+{
+    mg_push_loop(mg, 0, label);
+    if (mg->loop_stack) {
+        ((loop_context_t *)mg->loop_stack->data)->is_loop = false;
     }
 }
 
@@ -732,6 +742,21 @@ void mg_record_local_var(method_gen_t *mg, const char *name, const char *descrip
 uint16_t mg_allocate_local(method_gen_t *mg, const char *name, type_t *type)
 {
     uint16_t slot = mg->next_slot;
+
+    /* A type variable (or wildcard) is a reference of what its bound erases to */
+    if (type && (type->kind == TYPE_TYPEVAR || type->kind == TYPE_WILDCARD)) {
+        type_t *erased = type;
+        for (int hops = 0; erased && hops < 8; hops++) {
+            if (erased->kind == TYPE_TYPEVAR) {
+                erased = erased->data.type_var.bound;
+            } else if (erased->kind == TYPE_WILDCARD) {
+                erased = erased->data.wildcard.bound_kind == 1 ? erased->data.wildcard.bound : NULL;
+            } else {
+                break;
+            }
+        }
+        type = (erased && (erased->kind == TYPE_CLASS || erased->kind == TYPE_ARRAY)) ? erased : type_object();
+    }
     
     /* Long and double take 2 slots */
     int size = 1;
@@ -3108,7 +3133,9 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                 
                 /* Unnamed parameters (JEP 456) omit LocalVariableTable entries */
                 if (!is_unnamed_name(child->data.node.name)) {
-                    mg_record_local_var(mg, child->data.node.name, param_desc, slot, 0, param_type_node);
+                    /* (its type annotations are the method's, as formal parameter targets, not
+                     * a local variable's) */
+                    mg_record_local_var(mg, child->data.node.name, param_desc, slot, 0, NULL);
                 }
                 
                 /* Update StackMapTable for this parameter using the actual type descriptor */
@@ -3299,7 +3326,7 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                 
                 /* Mark 'this' as initialized in stackmap after super() */
                 if (mg->stackmap && cg->internal_name) {
-                    stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+                    stackmap_init_this(mg->stackmap, cg->cp, cg->internal_name);
                 }
             } else {
                 uint16_t init_ref = cp_add_methodref(cg->cp, cg->superclass, 
@@ -3311,7 +3338,7 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
             
             /* Mark 'this' as initialized in stackmap after super() */
             if (mg->stackmap && cg->internal_name) {
-                stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+                stackmap_init_this(mg->stackmap, cg->cp, cg->internal_name);
             }
         } else if (explicit_ctor_call) {
             /* Emit explicit this()/super() now (after prologue) */
@@ -4684,14 +4711,13 @@ static void generate_interface_bridges(class_gen_t *cg)
  * interface (which also needs parameter checkcasts, reused here for
  * symmetry even though the primary, confirmed bug is return-type-only).
  */
-static void generate_covariant_override_bridges(class_gen_t *cg)
+static void generate_covariant_override_bridges_for(class_gen_t *cg, symbol_t *super_sym)
 {
     if (!cg || !cg->class_sym) {
         return;
     }
 
     symbol_t *class_sym = cg->class_sym;
-    symbol_t *super_sym = class_sym->data.class_data.superclass;
 
     if (!super_sym || !super_sym->data.class_data.members) {
         return;
@@ -4737,7 +4763,12 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
             if (method->type && method->type->kind == TYPE_TYPEVAR) {
                 has_type_var = true;
             }
-            if (!has_type_var) {
+
+            /* Without a type variable the gap is a plain covariant return
+             * ("Object apply(Object)" overridden as "String apply(Object)"):
+             * the override still needs a bridge at the superclass's own
+             * descriptor, but only when both return types are known. */
+            if (!has_type_var && !method->type) {
                 entry = entry->next;
                 continue;
             }
@@ -4811,6 +4842,14 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
                                 }
                                 free(sdesc);
                                 free(cdesc);
+                            } else if (sparam && sparam->type && cparam && cparam->type &&
+                                       cparam->type->kind != TYPE_CLASS &&
+                                       cparam->type->kind != TYPE_ARRAY &&
+                                       cparam->type->kind != TYPE_TYPEVAR) {
+                                /* A type variable is only ever a reference type: a primitive
+                                 * parameter ("boolean" against "T defaultValue") is another
+                                 * overload */
+                                positions_match = false;
                             }
                             sp = sp->next;
                             cp = cp->next;
@@ -4826,7 +4865,7 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
 
             /* Not overridden at all - that's generate_superclass_bridges()'s
              * own job (invokespecial forwarding to super), not ours. */
-            if (!impl_method) {
+            if (!impl_method || (!has_type_var && !impl_method->type)) {
                 entry = entry->next;
                 continue;
             }
@@ -5069,6 +5108,20 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
 
             entry = entry->next;
         }
+    }
+}
+
+/* Bridge a covariant override at the erased descriptor of every
+ * superclass that declares the overridden method. */
+static void generate_covariant_override_bridges(class_gen_t *cg)
+{
+    if (!cg || !cg->class_sym) {
+        return;
+    }
+    int depth = 0;
+    for (symbol_t *super = cg->class_sym->data.class_data.superclass;
+         super && depth < 64; super = super->data.class_data.superclass, depth++) {
+        generate_covariant_override_bridges_for(cg, super);
     }
 }
 
@@ -5986,7 +6039,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             
             /* Mark 'this' as initialized in stackmap after super() */
             if (mg->stackmap && cg->internal_name) {
-                stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+                stackmap_init_this(mg->stackmap, cg->cp, cg->internal_name);
             }
         } else if (super_is_inner && super_enclosing && cg->is_inner_class) {
             /* Superclass is a non-static inner class - pass its enclosing instance.
@@ -6107,7 +6160,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             
             /* Mark 'this' as initialized in stackmap after super() */
             if (mg->stackmap && cg->internal_name) {
-                stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+                stackmap_init_this(mg->stackmap, cg->cp, cg->internal_name);
             }
         } else if (super_ctor_args) {
             /* Forward this anonymous class's own explicit super-
@@ -6170,7 +6223,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
 
             /* Mark 'this' as initialized in stackmap after super() */
             if (mg->stackmap && cg->internal_name) {
-                stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+                stackmap_init_this(mg->stackmap, cg->cp, cg->internal_name);
             }
         } else {
             uint16_t super_init = cp_add_methodref(cg->cp, cg->superclass, "<init>", "()V");
@@ -6180,7 +6233,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
 
             /* Mark 'this' as initialized in stackmap after super() */
             if (mg->stackmap && cg->internal_name) {
-                stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+                stackmap_init_this(mg->stackmap, cg->cp, cg->internal_name);
             }
         }
         
@@ -6597,6 +6650,14 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     }
                     if (!arg_type) {
                         arg_type = arg->sem_type ? arg->sem_type : get_expression_type(cg->sem, arg);
+                    } else {
+                        /* the argument as the parameter takes it: boxed for an Object or wrapper
+                         * ("A(4)" for "E(Object value)"), unboxed, or widened */
+                        type_kind_t from_kind;
+                        const char *from_class;
+                        value_kind_and_class(mg, arg, &from_kind, &from_class);
+                        coerce_stack_value(mg, cg->cp, from_kind, from_class, arg_type->kind,
+                                           arg_type->kind == TYPE_CLASS ? arg_type->data.class_type.name : NULL);
                     }
                     if (arg_type) {
                         char *arg_desc = type_to_descriptor(arg_type);
@@ -7961,7 +8022,7 @@ static void codegen_enum_constant_anon_constructor(class_gen_t *cg,
 
     /* Mark 'this' as initialized in stackmap after super() */
     if (mg->stackmap && cg->internal_name) {
-        stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+        stackmap_init_this(mg->stackmap, cg->cp, cg->internal_name);
     }
 
     string_free(desc, true);
@@ -8645,7 +8706,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         
         /* Mark 'this' as initialized in stackmap after super() */
         if (mg->stackmap && cg->internal_name) {
-            stackmap_init_object(mg->stackmap, 0, cg->cp, cg->internal_name);
+            stackmap_init_this(mg->stackmap, cg->cp, cg->internal_name);
         }
         
         string_free(super_desc, true);

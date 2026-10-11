@@ -376,6 +376,7 @@ typedef enum ast_node_type
     AST_CONTINUE_STMT,
     AST_TRY_STMT,
     AST_RESOURCE_SPEC,          /* Resource specification for try-with-resources */
+    AST_TWR_CLOSE,              /* Codegen-only: close a try-with-resources statement's resources on an early exit */
     AST_CATCH_CLAUSE,
     AST_FINALLY_CLAUSE,
     AST_SYNCHRONIZED_STMT,
@@ -944,6 +945,7 @@ char *semantic_resolve_annotation_element_descriptor(semantic_t *sem,
  * Returns NULL if unresolvable. Defined in semantic.c; used by
  * classwriter.c. */
 struct classfile *semantic_load_annotation_classfile(semantic_t *sem, const char *qualified_name);
+char *semantic_registry_binary_name(semantic_t *sem, const char *qualified_name);
 
 /*
  * Shared Type Registry for Parallel Compilation

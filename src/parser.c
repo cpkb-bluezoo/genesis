@@ -140,7 +140,8 @@ ast_node_t *ast_new_literal_from_lexer(lexer_t *lexer)
     const char *text = lexer_text(lexer);
     token_value_t value = lexer_value(lexer);
     
-    node->data.leaf.token_type = type;
+    /* A text block is a String literal like any other from here on (its text is already cooked) */
+    node->data.leaf.token_type = (type == TOK_TEXT_BLOCK) ? TOK_STRING_LITERAL : type;
     
     switch (type) {
         case TOK_INTEGER_LITERAL:

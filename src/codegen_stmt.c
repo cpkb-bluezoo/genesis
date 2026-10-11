@@ -501,7 +501,7 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
     slist_t *goto_patches = NULL;  /* List of goto positions to patch to switch end */
     
     /* Push switch context for break */
-    mg_push_loop(mg, 0, NULL);
+    mg_push_break_scope(mg, NULL);
     
     /* Generate hash comparison blocks */
     hash_idx = 0;
@@ -777,6 +777,43 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
 /* Forward declaration */
 bool codegen_statement(method_gen_t *mg, ast_node_t *stmt);
 
+/* The resources of a try-with-resources statement, for the code that closes them where the
+ * body is left early (return, break, continue). The ranges of the code it emits are kept: the
+ * statement's own handler for exceptions of the body must not cover them. */
+typedef struct {
+    uint16_t *slots;
+    int count;
+    slist_t *gaps;      /* uint16_t[2] {start, end} of each inlined close sequence */
+} twr_close_t;
+
+/* if (resource != null) resource.close(); for each resource, last first */
+static void emit_resource_closes(method_gen_t *mg, const uint16_t *slots, int count)
+{
+    for (int i = count - 1; i >= 0; i--) {
+        uint16_t slot = slots[i];
+        mg_emit_load_local(mg, slot, TYPE_CLASS);
+
+        size_t ifnull_pos = mg->code->length;
+        bc_emit(mg->code, OP_IFNULL);
+        bc_emit_u2(mg->code, 0);
+        mg_pop_typed(mg, 1);
+
+        mg_emit_load_local(mg, slot, TYPE_CLASS);
+        uint16_t close_ref = cp_add_interface_methodref(mg->cp, "java/lang/AutoCloseable", "close", "()V");
+        bc_emit(mg->code, OP_INVOKEINTERFACE);
+        bc_emit_u2(mg->code, close_ref);
+        bc_emit_u1(mg->code, 1);
+        bc_emit_u1(mg->code, 0);
+        mg_pop_typed(mg, 1);
+
+        uint16_t skip_close = (uint16_t)mg->code->length;
+        mg_record_frame(mg);
+        int16_t offset = (int16_t)(skip_close - ifnull_pos);
+        mg->code->code[ifnull_pos + 1] = (offset >> 8) & 0xFF;
+        mg->code->code[ifnull_pos + 2] = offset & 0xFF;
+    }
+}
+
 /**
  * Generate code for try-with-resources statement.
  *
@@ -1000,8 +1037,22 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
         mg_pop_typed(mg, 1);
     }
 
-    /* Generate try block body */
-    if (try_block && !codegen_statement(mg, try_block)) {
+    /* Generate try block body - with the closing of the resources pending, so a return, break
+     * or continue that leaves it closes them first (as a finally block would) */
+    twr_close_t close_ctx = { resource_slots, resource_count, NULL };
+    ast_node_t *pending_close = ast_new(AST_TWR_CLOSE, 0, 0);
+    pending_close->data.node.extra = (ast_node_t *)&close_ctx;
+    mg->finally_stack = slist_prepend(mg->finally_stack, pending_close);
+    bool body_ok = !try_block || codegen_statement(mg, try_block);
+    {
+        slist_t *old_finally = mg->finally_stack;
+        mg->finally_stack = mg->finally_stack->next;
+        free(old_finally);
+    }
+    pending_close->data.node.extra = NULL;
+    ast_free(pending_close);
+    if (!body_ok) {
+        slist_free_full(close_ctx.gaps, free);
         stackmap_state_free(try_entry_state);
         free(resource_slots);
         free(resource_types);
@@ -1009,13 +1060,15 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
         slist_free(catch_clauses);
         return false;
     }
+    uint16_t body_end = (uint16_t)mg->code->length;
     
     /* Check if try block ends with a terminating instruction */
     uint8_t try_last_op = mg->last_opcode;
     bool try_ends_with_return = (try_last_op == OP_RETURN || try_last_op == OP_ARETURN ||
                                  try_last_op == OP_IRETURN || try_last_op == OP_LRETURN ||
                                  try_last_op == OP_FRETURN || try_last_op == OP_DRETURN ||
-                                 try_last_op == OP_ATHROW);
+                                 try_last_op == OP_ATHROW ||
+                                 try_last_op == OP_GOTO);   /* a break or continue */
     
     /* Generate user's finally code if present (before resource cleanup) */
     if (finally_clause && finally_clause->data.node.children) {
@@ -1049,50 +1102,7 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
     uint16_t normal_exit_locals_count = 0;
 
     if (has_normal_exit) {
-        for (int i = resource_count - 1; i >= 0; i--) {
-            uint16_t slot = resource_slots[i];
-            
-            /* if (resource != null) resource.close(); */
-            /* Load resource */
-            if (slot <= 3) {
-                bc_emit(mg->code, OP_ALOAD_0 + slot);
-            } else {
-                bc_emit(mg->code, OP_ALOAD);
-                bc_emit_u1(mg->code, (uint8_t)slot);
-            }
-            mg_push(mg, 1);
-            
-            /* ifnull skip_close */
-            size_t ifnull_pos = mg->code->length;
-            bc_emit(mg->code, OP_IFNULL);
-            bc_emit_u2(mg->code, 0);  /* Placeholder */
-            mg_pop_typed(mg, 1);
-            
-            /* Load resource again for close() call */
-            if (slot <= 3) {
-                bc_emit(mg->code, OP_ALOAD_0 + slot);
-            } else {
-                bc_emit(mg->code, OP_ALOAD);
-                bc_emit_u1(mg->code, (uint8_t)slot);
-            }
-            mg_push(mg, 1);
-            
-            /* invokeinterface AutoCloseable.close()V */
-            uint16_t close_ref = cp_add_interface_methodref(mg->cp,
-                "java/lang/AutoCloseable", "close", "()V");
-            bc_emit(mg->code, OP_INVOKEINTERFACE);
-            bc_emit_u2(mg->code, close_ref);
-            bc_emit_u1(mg->code, 1);  /* count (1 for 'this') */
-            bc_emit_u1(mg->code, 0);  /* reserved */
-            mg_pop_typed(mg, 1);
-            
-            /* Patch ifnull - this is a branch target */
-            uint16_t skip_close = (uint16_t)mg->code->length;
-            mg_record_frame(mg);  /* Record frame at branch target */
-            int16_t offset = (int16_t)(skip_close - ifnull_pos);
-            mg->code->code[ifnull_pos + 1] = (offset >> 8) & 0xFF;
-            mg->code->code[ifnull_pos + 2] = offset & 0xFF;
-        }
+        emit_resource_closes(mg, resource_slots, resource_count);
         
         /* Jump past exception handlers */
         normal_exit_goto = mg->code->length;
@@ -1107,8 +1117,6 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
         }
     }
 
-    uint16_t try_end = (uint16_t)mg->code->length;
-    
     /* Exception handler: store exception, close resources with suppression */
     uint16_t exc_handler_pc = (uint16_t)mg->code->length;
     
@@ -1123,8 +1131,28 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
      * At exception handler, JVM clears stack and pushes exception. */
     mg_record_exception_handler_frame(mg, "java/lang/Throwable");
     
-    /* Add exception handler entry for any Throwable */
-    mg_add_exception_handler(mg, try_start, try_end, exc_handler_pc, 0);
+    /* Add exception handler entry for any Throwable: for the body, leaving out the code
+     * that closes the resources where it was left early */
+    {
+        uint16_t from = try_start;
+        slist_t *gaps = NULL;
+        for (slist_t *g = close_ctx.gaps; g; g = g->next) {
+            gaps = slist_prepend(gaps, g->data);   /* in code order */
+        }
+        for (slist_t *g = gaps; g; g = g->next) {
+            uint16_t *gap = (uint16_t *)g->data;
+            if (gap[0] > from) {
+                mg_add_exception_handler(mg, from, gap[0], exc_handler_pc, 0);
+            }
+            from = gap[1];
+        }
+        slist_free(gaps);
+        if (body_end > from) {
+            mg_add_exception_handler(mg, from, body_end, exc_handler_pc, 0);
+        }
+        slist_free_full(close_ctx.gaps, free);
+        close_ctx.gaps = NULL;
+    }
     
     /* Stack has exception (pushed by JVM) - store it */
     mg_push(mg, 1);
@@ -1551,7 +1579,13 @@ static bool codegen_try_with_resources(method_gen_t *mg, slist_t *resources,
     slist_free(catch_clauses);
     stackmap_state_free(try_entry_state);
     
-    mg->last_opcode = 0;
+    /* Where nothing reaches the end (the body always returns, the handler rethrows) the
+     * statement cannot complete normally */
+    if (needs_join_frame) {
+        mg->last_opcode = 0;
+    } else if (!has_user_catches) {
+        mg->last_opcode = OP_ATHROW;
+    }
     return true;
 }
 
@@ -1672,6 +1706,30 @@ static void emit_pending_finally_blocks(method_gen_t *mg, size_t stop_depth)
 /* ========================================================================
  * Statement Code Generation
  * ======================================================================== */
+
+/* The class a loop variable of a class (or type variable) type is cast to: the type's name, or for
+ * a type variable the class its bounds erase to; NULL when that is Object (nothing to cast to) */
+static const char *loop_var_class_name(ast_node_t *type_node)
+{
+    if (!type_node || type_node->type != AST_CLASS_TYPE) {
+        return NULL;
+    }
+    type_t *t = type_node->sem_type;
+    if (t && t->kind == TYPE_CLASS) {
+        return t->data.class_type.name;
+    }
+    if (t && t->kind == TYPE_TYPEVAR) {
+        for (int hops = 0; t && t->kind == TYPE_TYPEVAR && hops < 8; hops++) {
+            t = t->data.type_var.bound;
+        }
+        if (t && t->kind == TYPE_CLASS && t->data.class_type.name &&
+            strcmp(t->data.class_type.name, "java.lang.Object") != 0) {
+            return t->data.class_type.name;
+        }
+        return NULL;
+    }
+    return type_node->data.node.name;
+}
 
 bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
 {
@@ -2025,6 +2083,22 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 return true;
             }
         
+        case AST_TWR_CLOSE:
+            {
+                /* the closing of a try-with-resources statement's resources, where its body is
+                 * left early: the code stays out of the range its exception handler covers */
+                twr_close_t *close_ctx = (twr_close_t *)stmt->data.node.extra;
+                uint16_t from = (uint16_t)mg->code->length;
+                emit_resource_closes(mg, close_ctx->slots, close_ctx->count);
+                uint16_t *gap = malloc(2 * sizeof(uint16_t));
+                if (gap) {
+                    gap[0] = from;
+                    gap[1] = (uint16_t)mg->code->length;
+                    close_ctx->gaps = slist_prepend(close_ctx->gaps, gap);
+                }
+                return true;
+            }
+
         case AST_VAR_DECL:
             {
                 slist_t *children = stmt->data.node.children;
@@ -3588,10 +3662,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             mg_pop_typed(mg, 1);
                             /* Add checkcast for class types (aaload returns Object) */
                             if (var_kind == TYPE_CLASS && type_node && type_node->type == AST_CLASS_TYPE) {
-                                const char *type_name = type_node->data.node.name;
-                                if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS) {
-                                    type_name = type_node->sem_type->data.class_type.name;
-                                }
+                                const char *type_name = loop_var_class_name(type_node);
                                 if (type_name) {
                                     const char *internal = class_to_internal_name(type_name);
                                     uint16_t class_idx = cp_add_class(mg->cp, internal);
@@ -3688,12 +3759,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             case TYPE_CLASS:
                                 {
                                     /* Use the actual element type from the type node */
-                                    const char *type_name = "java/lang/Object";
-                                    if (type_node && type_node->sem_type &&
-                                        type_node->sem_type->kind == TYPE_CLASS) {
-                                        type_name = type_node->sem_type->data.class_type.name;
-                                    } else if (type_node && type_node->type == AST_CLASS_TYPE) {
-                                        type_name = type_node->data.node.name;
+                                    const char *type_name = loop_var_class_name(type_node);
+                                    if (!type_name) {
+                                        type_name = "java/lang/Object";
                                     }
                                     char *internal = class_to_internal_name(type_name);
                                     stackmap_set_local_object(mg->stackmap, var_slot, mg->cp, internal);
@@ -4008,12 +4076,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         } else {
                             /* For Iterable, a non-array, non-primitive loop
                              * variable is always reference type */
-                            const char *type_name = "java/lang/Object";
-                            if (type_node && type_node->sem_type &&
-                                type_node->sem_type->kind == TYPE_CLASS) {
-                                type_name = type_node->sem_type->data.class_type.name;
-                            } else if (type_node && type_node->type == AST_CLASS_TYPE) {
-                                type_name = type_node->data.node.name;
+                            const char *type_name = loop_var_class_name(type_node);
+                            if (!type_name) {
+                                type_name = "java/lang/Object";
                             }
                             char *internal = class_to_internal_name(type_name);
                             stackmap_set_local_object(mg->stackmap, var_slot, mg->cp, internal);
@@ -4112,13 +4177,22 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         return false;
                     }
                     /* Verify it's a loop (has a continue target) */
-                    if (target_ctx->continue_target == 0) {
+                    if (!target_ctx->is_loop) {
                         fprintf(stderr, "codegen: continue label '%s' does not refer to a loop\n", label);
                         return false;
                     }
                 } else {
-                    /* Unlabeled continue - use innermost loop */
-                    target_ctx = (loop_context_t *)mg->loop_stack->data;
+                    /* Unlabeled continue - use innermost loop (a switch around the continue
+                     * is passed through) */
+                    for (slist_t *n = mg->loop_stack; n && !target_ctx; n = n->next) {
+                        if (((loop_context_t *)n->data)->is_loop) {
+                            target_ctx = (loop_context_t *)n->data;
+                        }
+                    }
+                    if (!target_ctx) {
+                        fprintf(stderr, "codegen: continue outside of loop\n");
+                        return false;
+                    }
                 }
                 
                 /* Run any enclosing try statement's finally block(s)
@@ -4369,7 +4443,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 }
                 
                 /* Push switch context for break */
-                mg_push_loop(mg, 0, NULL);
+                mg_push_break_scope(mg, NULL);
                 
                 /* Build reverse mapping: ast_idx -> sorted_idx */
                 int *ast_to_sorted_idx = calloc(num_cases + 1, sizeof(int));
@@ -4419,7 +4493,6 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * genuinely unreachable trailing return with no stack map
                  * frame of its own right after the switch. */
                 bool has_default_case = false;
-                bool any_break = false;
                 bool last_case_had_code = false;
 
                 for (slist_t *node = children->next; node; node = node->next, ast_idx++) {
@@ -4555,7 +4628,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             last_op == OP_ATHROW);
 
                         /* Fold into the whole-switch termination tracking
-                         * (see has_default_case/any_break/
+                         * (see has_default_case/
                          * last_case_had_code's own comment above) - but
                          * only for a label that actually emitted bytecode
                          * of its own. An empty fall-through label (e.g.
@@ -4575,7 +4648,6 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                          * non-disqualifying switch fallthrough. */
                         if (mg->code->length > current_code_pos) {
                             if (last_op == OP_GOTO) {
-                                any_break = true;
                                 /* This case's `break` reaches the switch's
                                  * shared exit point directly - capture its
                                  * own local-variable state as one of the
@@ -4724,6 +4796,10 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     slist_free(switch_exit_states);
                 }
 
+                /* (a case ending in `continue` is a jump away too, but not one to the switch's end) */
+                bool has_real_break = mg->loop_stack &&
+                    ((loop_context_t *)mg->loop_stack->data)->break_offsets != NULL;
+
                 /* Pop switch context and patch breaks */
                 mg_pop_loop(mg, switch_end);
                 
@@ -4734,7 +4810,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * in that case, same as always before. But when there's
                  * no `break` anywhere, and the PHYSICALLY LAST case
                  * (default included) genuinely ends in return/throw (see
-                 * has_default_case/any_break/last_case_had_code's own
+                 * has_default_case/last_case_had_code's own
                  * comment above), the switch AS A WHOLE does
                  * unconditionally terminate - reflect that instead of
                  * unconditionally resetting, so enclosing code that
@@ -4753,8 +4829,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     (mg->last_opcode == OP_RETURN || mg->last_opcode == OP_IRETURN ||
                      mg->last_opcode == OP_LRETURN || mg->last_opcode == OP_FRETURN ||
                      mg->last_opcode == OP_DRETURN || mg->last_opcode == OP_ARETURN ||
-                     mg->last_opcode == OP_ATHROW);
-                bool switch_terminates = has_default_case && !any_break && last_case_terminates;
+                     mg->last_opcode == OP_ATHROW ||
+                     (mg->last_opcode == OP_GOTO && !has_real_break));
+                bool switch_terminates = has_default_case && !has_real_break && last_case_terminates;
                 mg->last_opcode = switch_terminates ? mg->last_opcode : 0;
 
                 stackmap_state_free(switch_entry_state);
@@ -6164,7 +6241,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     /* For non-loop statements (e.g., blocks), we still need to support
                      * labeled break. Push a "break-only" context with no continue target.
                      */
-                    mg_push_loop(mg, 0, label);  /* continue_target=0 means no continue */
+                    mg_push_break_scope(mg, label);  /* no continue target */
                     
                     bool result = codegen_statement(mg, inner_stmt);
                     

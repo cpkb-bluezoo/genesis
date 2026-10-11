@@ -1847,6 +1847,90 @@ else
     failed=$((failed + 1))
 fi
 
+for ap_order in "State ArrayTypeVariableParameterTest" "ArrayTypeVariableParameterTest State"; do
+    set -- $ap_order
+    printf "%-30s ... " "ArrayTypeVariableParameter ($1 first)"
+    ap_out="$TEST_BUILD/arrayparamstub-out"
+    rm -rf "$ap_out"
+    mkdir -p "$ap_out"
+    ap_files=""
+    for ap_name in "$@"; do
+        ap_files="$ap_files $TEST_SRC/external/arrayparamstub/p/$ap_name.java"
+    done
+    if (cd "$ap_out" && "$GENESIS" -j1 -d "$ap_out" $ap_files >/dev/null 2>&1) &&
+       "$JAVA" -Xverify:all -cp "$ap_out" p.ArrayTypeVariableParameterTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+printf "%-30s ... " "RepeatedAnnotationFromClassFile"
+ra_lib="$TEST_BUILD/repeatablelib-lib"
+ra_out="$TEST_BUILD/repeatablelib-out"
+rm -rf "$ra_lib" "$ra_out"
+mkdir -p "$ra_lib" "$ra_out"
+if "$GENESIS" -d "$ra_lib" "$TEST_SRC"/external/repeatablelib/repeatablelib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ra_lib" -d "$ra_out" \
+       "$TEST_SRC/external/RepeatedAnnotationFromClassFileTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ra_out:$ra_lib" RepeatedAnnotationFromClassFileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "NestedAnnotationNameFromClassFile"
+na_lib="$TEST_BUILD/nestedannolib-lib"
+na_out="$TEST_BUILD/nestedannolib-out"
+rm -rf "$na_lib" "$na_out"
+mkdir -p "$na_lib" "$na_out"
+if "$GENESIS" -d "$na_lib" "$TEST_SRC"/external/nestedannolib/nestedannolib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$na_lib" -d "$na_out" \
+       "$TEST_SRC/external/NestedAnnotationNameFromClassFileTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$na_out:$na_lib" NestedAnnotationNameFromClassFileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "BoundedEnumOverload"
+be_lib="$TEST_BUILD/boundedenumlib-lib"
+be_out="$TEST_BUILD/boundedenumlib-out"
+rm -rf "$be_lib" "$be_out"
+mkdir -p "$be_lib" "$be_out"
+if "$GENESIS" -d "$be_lib" "$TEST_SRC"/external/boundedenumlib/boundedenumlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$be_lib" -d "$be_out" \
+       "$TEST_SRC/external/BoundedEnumOverloadTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$be_out:$be_lib" BoundedEnumOverloadTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "QualifiedThisGenericField"
+qg_lib="$TEST_BUILD/qtgflib-lib"
+qg_out="$TEST_BUILD/qtgflib-out"
+rm -rf "$qg_lib" "$qg_out"
+mkdir -p "$qg_lib" "$qg_out"
+if "$GENESIS" -d "$qg_lib" "$TEST_SRC"/external/qualifiedthisgenericfield/qtgflib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$qg_lib" -d "$qg_out" \
+       "$TEST_SRC/external/QualifiedThisGenericFieldTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$qg_out:$qg_lib" QualifiedThisGenericFieldTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 for ci_order in "q/Limits p/Props r/Marker r/ImportedConstantInAnnotationTest" "r/ImportedConstantInAnnotationTest r/Marker p/Props q/Limits" "p/Props r/ImportedConstantInAnnotationTest q/Limits r/Marker"; do
     set -- $ci_order
     printf "%-30s ... " "ImportedConstantAnnotation ($1 first)"
@@ -1859,6 +1943,86 @@ for ci_order in "q/Limits p/Props r/Marker r/ImportedConstantInAnnotationTest" "
     done
     if (cd "$ci_out" && "$GENESIS" -j1 -d "$ci_out" $ci_files >/dev/null 2>&1) &&
        "$JAVA" -cp "$ci_out" r.ImportedConstantInAnnotationTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for it_order in "Mappings IterableOfNestedTypeTest" "IterableOfNestedTypeTest Mappings"; do
+    set -- $it_order
+    printf "%-30s ... " "IterableOfNestedType ($1 first)"
+    it_out="$TEST_BUILD/iterablestubs-out"
+    rm -rf "$it_out"
+    mkdir -p "$it_out"
+    it_files=""
+    for it_name in "$@"; do
+        it_files="$it_files $TEST_SRC/external/iterablestubs/p/$it_name.java"
+    done
+    if (cd "$it_out" && "$GENESIS" -j1 -d "$it_out" $it_files >/dev/null 2>&1) &&
+       "$JAVA" -Xverify:all -cp "$it_out" p.IterableOfNestedTypeTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for es_order in "Settings EnumStubOverloadTest" "EnumStubOverloadTest Settings"; do
+    set -- $es_order
+    printf "%-30s ... " "EnumStubOverload ($1 first)"
+    es_out="$TEST_BUILD/enumstubs-out"
+    rm -rf "$es_out"
+    mkdir -p "$es_out"
+    es_files=""
+    for es_name in "$@"; do
+        es_files="$es_files $TEST_SRC/external/enumstubs/p/$es_name.java"
+    done
+    if (cd "$es_out" && "$GENESIS" -j1 -d "$es_out" $es_files >/dev/null 2>&1) &&
+       "$JAVA" -Xverify:all -cp "$es_out" p.EnumStubOverloadTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for sc_order in "Registry SuperConstructorMethodRefTest" "SuperConstructorMethodRefTest Registry"; do
+    set -- $sc_order
+    printf "%-30s ... " "SuperConstructorMethodRef ($1 first)"
+    sc_out="$TEST_BUILD/superctorref-out"
+    rm -rf "$sc_out"
+    mkdir -p "$sc_out"
+    sc_files=""
+    for sc_name in "$@"; do
+        sc_files="$sc_files $TEST_SRC/external/superctorref/p/$sc_name.java"
+    done
+    if (cd "$sc_out" && "$GENESIS" -j1 -d "$sc_out" $sc_files >/dev/null 2>&1) &&
+       "$JAVA" -Xverify:all -cp "$sc_out" p.SuperConstructorMethodRefTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for ae_order in "Cond SingleValueForArrayElementTest" "SingleValueForArrayElementTest Cond"; do
+    set -- $ae_order
+    printf "%-30s ... " "SingleValueForArrayElement ($1 first)"
+    ae_out="$TEST_BUILD/arrayelementstubs-out"
+    rm -rf "$ae_out"
+    mkdir -p "$ae_out"
+    ae_files=""
+    for ae_name in "$@"; do
+        ae_files="$ae_files $TEST_SRC/external/arrayelementstubs/p/$ae_name.java"
+    done
+    if (cd "$ae_out" && "$GENESIS" -j1 -d "$ae_out" $ae_files >/dev/null 2>&1) &&
+       "$JAVA" -Xverify:all -cp "$ae_out" p.SingleValueForArrayElementTest >/dev/null 2>&1; then
         echo PASS
         passed=$((passed + 1))
     else

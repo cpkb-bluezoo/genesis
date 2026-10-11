@@ -1164,6 +1164,72 @@ char *classfile_get_retention_policy_name(classfile_t *cf)
     return NULL;
 }
 
+/**
+ * The container annotation type this annotation type's own @java.lang.annotation.Repeatable
+ * names, as an internal class name ("org/x/WithResources"); NULL if it is not repeatable.
+ * Caller must free() a non-NULL result.
+ */
+char *classfile_get_repeatable_container(classfile_t *cf)
+{
+    if (!cf) {
+        return NULL;
+    }
+    attribute_info_t *annots_attr = NULL;
+    for (uint16_t i = 0; i < cf->attributes_count; i++) {
+        char *aname = classfile_get_utf8(cf, cf->attributes[i].attribute_name_index);
+        bool match = aname && strcmp(aname, "RuntimeVisibleAnnotations") == 0;
+        free(aname);
+        if (match) {
+            annots_attr = &cf->attributes[i];
+            break;
+        }
+    }
+    if (!annots_attr || !annots_attr->info) {
+        return NULL;
+    }
+    const uint8_t *p = annots_attr->info;
+    const uint8_t *end = p + annots_attr->attribute_length;
+    uint16_t num_annotations;
+    if (!cf_read_u2(&p, end, &num_annotations)) {
+        return NULL;
+    }
+    for (uint16_t i = 0; i < num_annotations; i++) {
+        uint16_t type_index, num_pairs;
+        if (!cf_read_u2(&p, end, &type_index) || !cf_read_u2(&p, end, &num_pairs)) {
+            return NULL;
+        }
+        char *type_desc = classfile_get_utf8(cf, type_index);
+        bool is_repeatable = type_desc && strcmp(type_desc, "Ljava/lang/annotation/Repeatable;") == 0;
+        free(type_desc);
+        for (uint16_t j = 0; j < num_pairs; j++) {
+            uint16_t name_idx;
+            if (!cf_read_u2(&p, end, &name_idx)) {
+                return NULL;
+            }
+            if (is_repeatable && p < end && *p == 'c') {
+                uint8_t tag;
+                uint16_t class_idx;
+                if (!cf_read_u1(&p, end, &tag) || !cf_read_u2(&p, end, &class_idx)) {
+                    return NULL;
+                }
+                char *desc = classfile_get_utf8(cf, class_idx);
+                if (desc && desc[0] == 'L' && strlen(desc) > 2) {
+                    char *internal = strdup(desc + 1);
+                    internal[strlen(internal) - 1] = '\0';
+                    free(desc);
+                    return internal;
+                }
+                free(desc);
+                return NULL;
+            }
+            if (!skip_element_value(&p, end)) {
+                return NULL;
+            }
+        }
+    }
+    return NULL;
+}
+
 char *classfile_get_method_descriptor(classfile_t *cf, const char *method_name)
 {
     if (!cf || !method_name) {

@@ -189,7 +189,8 @@ static __thread semantic_t *g_classwriter_sem = NULL;
  */
 static const char *resolve_annotation_qualified_name(const char *name)
 {
-    if (!name || strchr(name, '.') != NULL || !g_classwriter_sem) {
+    if (!name || !g_classwriter_sem ||
+        (strchr(name, '.') != NULL && !(name[0] >= 'A' && name[0] <= 'Z'))) {
         return name;
     }
     char *qualified = semantic_resolve_annotation_type_name(g_classwriter_sem, name);
@@ -557,19 +558,12 @@ static int write_annotation_value(uint8_t **p, const_pool_t *cp, ast_node_t *val
 }
 
 /**
- * Write a single annotation to the buffer.
- * Returns the number of bytes written.
+ * Descriptor ("Lpkg/Outer$Inner;") of an annotation type, malloc'd. Shared
+ * by write_annotation() and preadd_annotation_cp_entries(), which must
+ * agree exactly.
  */
-static int write_annotation(uint8_t **p, const_pool_t *cp, ast_node_t *annot)
+static char *annotation_type_descriptor(const char *qualified_name)
 {
-    if (!annot || annot->type != AST_ANNOTATION) {
-        return 0;
-    }
-    
-    uint8_t *start = *p;
-
-    /* type_index - descriptor for annotation type */
-    const char *qualified_name = resolve_annotation_qualified_name(annot->data.node.name);
     char *type_desc = NULL;
 
     /* qualified_name's dots are ambiguous: most are package separators
@@ -599,14 +593,36 @@ static int write_annotation(uint8_t **p, const_pool_t *cp, ast_node_t *annot)
     if (!type_desc) {
         /* Best effort for a source-defined type not yet on the classpath,
          * or one that couldn't be resolved above. */
-        type_desc = calloc(strlen(qualified_name) + 4, 1);
-        sprintf(type_desc, "L%s;", qualified_name);
+        char *binary = g_classwriter_sem ?
+            semantic_registry_binary_name(g_classwriter_sem, qualified_name) : NULL;
+        const char *desc_name = binary ? binary : qualified_name;
+        type_desc = calloc(strlen(desc_name) + 4, 1);
+        sprintf(type_desc, "L%s;", desc_name);
+        free(binary);
         for (char *c = type_desc; *c; c++) {
             if (*c == '.') {
                 *c = '/';
             }
         }
     }
+    return type_desc;
+}
+
+/**
+ * Write a single annotation to the buffer.
+ * Returns the number of bytes written.
+ */
+static int write_annotation(uint8_t **p, const_pool_t *cp, ast_node_t *annot)
+{
+    if (!annot || annot->type != AST_ANNOTATION) {
+        return 0;
+    }
+    
+    uint8_t *start = *p;
+
+    /* type_index - descriptor for annotation type */
+    const char *qualified_name = resolve_annotation_qualified_name(annot->data.node.name);
+    char *type_desc = annotation_type_descriptor(qualified_name);
     uint16_t type_idx = cp_add_utf8(cp, type_desc);
     free(type_desc);
     write_be_u2(p, type_idx);
@@ -733,102 +749,163 @@ static int write_annotations_attribute(uint8_t **p, const_pool_t *cp,
 #define TARGET_TYPE_CAST                     0x47
 #define TARGET_TYPE_TYPE_ARGUMENT            0x48
 
+/* type_path kinds (JVMS 4.7.20.2) */
+#define TYPE_PATH_ARRAY          0
+#define TYPE_PATH_WILDCARD_BOUND 2
+#define TYPE_PATH_TYPE_ARGUMENT  3
+#define TYPE_PATH_MAX_STEPS      32
+
+typedef void (*type_annotation_visit_fn)(ast_node_t *annot, const uint8_t *path, int path_steps,
+                                         void *ctx);
+
+static void visit_annotation_list(slist_t *annotations, retention_policy_t retention,
+                                  const uint8_t *path, int steps, type_annotation_visit_fn fn, void *ctx)
+{
+    for (slist_t *n = annotations; n; n = n->next) {
+        ast_node_t *annot = (ast_node_t *)n->data;
+        if (annot && annot->type == AST_ANNOTATION && annot->data.node.name &&
+            get_annotation_retention(annot->data.node.name) == retention) {
+            fn(annot, path, steps, ctx);
+        }
+    }
+}
+
+/**
+ * Visit every type annotation of the right retention in a type, with the type_path
+ * to the part of the type it is on: a type argument is step (3, index), the bound of a
+ * wildcard (2, 0), the component of an array (0, 0).
+ */
+static void visit_type_annotations(ast_node_t *type_node, retention_policy_t retention,
+                                   const uint8_t *path, int steps, type_annotation_visit_fn fn,
+                                   void *ctx)
+{
+    if (!type_node || steps >= TYPE_PATH_MAX_STEPS - 2) {
+        return;
+    }
+
+    if (type_node->type == AST_ARRAY_TYPE) {
+        /* "String @A [] @B []" is nested the other way round than it reads: the
+         * outermost node is the innermost component */
+        int dims = 0;
+        ast_node_t *element = type_node;
+        while (element && element->type == AST_ARRAY_TYPE && element->data.node.children) {
+            dims++;
+            element = (ast_node_t *)element->data.node.children->data;
+        }
+        uint8_t local[TYPE_PATH_MAX_STEPS * 2];
+        memcpy(local, path, (size_t)steps * 2);
+        int base = steps;
+        if (base + dims >= TYPE_PATH_MAX_STEPS) {
+            return;
+        }
+        for (int d = 0; d < dims; d++) {
+            local[(base + d) * 2] = TYPE_PATH_ARRAY;
+            local[(base + d) * 2 + 1] = 0;
+        }
+        ast_node_t *node = type_node;
+        for (int k = 0; k < dims; k++) {
+            /* components beneath the array this node stands for */
+            visit_annotation_list(node->annotations, retention, local, base + (dims - 1 - k), fn, ctx);
+            node = (ast_node_t *)node->data.node.children->data;
+        }
+        visit_type_annotations(element, retention, local, base + dims, fn, ctx);
+        return;
+    }
+
+    visit_annotation_list(type_node->annotations, retention, path, steps, fn, ctx);
+
+    if (type_node->type == AST_CLASS_TYPE) {
+        int index = 0;
+        for (slist_t *n = type_node->data.node.children; n; n = n->next, index++) {
+            uint8_t local[TYPE_PATH_MAX_STEPS * 2];
+            memcpy(local, path, (size_t)steps * 2);
+            local[steps * 2] = TYPE_PATH_TYPE_ARGUMENT;
+            local[steps * 2 + 1] = (uint8_t)index;
+            visit_type_annotations((ast_node_t *)n->data, retention, local, steps + 1, fn, ctx);
+        }
+    } else if (type_node->type == AST_WILDCARD_TYPE) {
+        for (slist_t *n = type_node->data.node.children; n; n = n->next) {
+            uint8_t local[TYPE_PATH_MAX_STEPS * 2];
+            memcpy(local, path, (size_t)steps * 2);
+            local[steps * 2] = TYPE_PATH_WILDCARD_BOUND;
+            local[steps * 2 + 1] = 0;
+            visit_type_annotations((ast_node_t *)n->data, retention, local, steps + 1, fn, ctx);
+        }
+    }
+}
+
+static void count_type_annotation_visit(ast_node_t *annot, const uint8_t *path, int steps, void *ctx)
+{
+    (void)annot;
+    (void)path;
+    (void)steps;
+    (*(int *)ctx)++;
+}
+
 /**
  * Count type annotations on a type node (recursive for arrays/generics).
  */
 static int count_type_annotations(ast_node_t *type_node, retention_policy_t retention)
 {
-    if (!type_node) {
-        return 0;
-    }
-    
     int count = 0;
-    
-    /* Count annotations directly on this type node */
-    if (type_node->annotations) {
-        count += count_annotations_with_retention(type_node->annotations, retention);
-    }
-    
-    /* For array types, also count annotations on element type */
-    if (type_node->type == AST_ARRAY_TYPE) {
-        slist_t *children = type_node->data.node.children;
-        if (children) {
-            count += count_type_annotations((ast_node_t *)children->data, retention);
-        }
-    }
-    
-    /* For class types with type arguments, count annotations on type args */
-    if (type_node->type == AST_CLASS_TYPE) {
-        slist_t *children = type_node->data.node.children;
-        for (slist_t *n = children; n; n = n->next) {
-            count += count_type_annotations((ast_node_t *)n->data, retention);
-        }
-    }
-    
+    visit_type_annotations(type_node, retention, NULL, 0, count_type_annotation_visit, &count);
     return count;
 }
 
-/**
- * Write a type_path structure for type annotations.
- * For simple types, path_length is 0. For arrays/generics, it describes location.
- * Returns bytes written.
- */
-static int write_type_path(uint8_t **p, ast_node_t *type_node, ast_node_t *annotated_node)
+/** What goes between a type_annotation's target_type and its type_path */
+typedef struct {
+    uint8_t **p;
+    const_pool_t *cp;
+    uint8_t target_type;
+    uint8_t info[8];
+    int info_len;
+} type_annotation_writer_t;
+
+static void write_type_annotation_visit(ast_node_t *annot, const uint8_t *path, int steps, void *ctx)
 {
-    uint8_t *start = *p;
-    
-    /* For now, write empty type_path (path_length = 0) for simple cases */
-    /* TODO: implement proper path for nested array/generic types */
-    (void)type_node;
-    (void)annotated_node;
-    write_be_u1(p, 0);  /* path_length */
-    
-    return *p - start;
+    type_annotation_writer_t *w = (type_annotation_writer_t *)ctx;
+    uint8_t **p = w->p;
+    write_be_u1(p, w->target_type);
+    for (int i = 0; i < w->info_len; i++) {
+        write_be_u1(p, w->info[i]);
+    }
+    write_be_u1(p, (uint8_t)steps);
+    for (int i = 0; i < steps * 2; i++) {
+        write_be_u1(p, path[i]);
+    }
+    write_annotation(p, w->cp, annot);
 }
 
 /**
- * Write a single type_annotation structure.
- * Returns bytes written.
+ * Write the type annotations in a type: for each, target_type, the target_info bytes
+ * given, the type_path, and the annotation.
  */
-static int write_type_annotation(uint8_t **p, const_pool_t *cp, 
-                                  uint8_t target_type, ast_node_t *annot,
-                                  ast_node_t *type_node, ast_node_t *annotated_node)
+static void write_type_annotations_in(uint8_t **p, const_pool_t *cp, ast_node_t *type_node,
+                                      retention_policy_t retention, uint8_t target_type,
+                                      const uint8_t *info, int info_len)
 {
-    uint8_t *start = *p;
-    
-    /* target_type (u1) */
-    write_be_u1(p, target_type);
-    
-    /* target_info (depends on target_type) */
-    switch (target_type) {
-        case TARGET_TYPE_FIELD:
-        case TARGET_TYPE_RETURN:
-        case TARGET_TYPE_RECEIVER:
-            /* empty_target: no additional info */
-            break;
-        case TARGET_TYPE_FORMAL_PARAMETER:
-            /* formal_parameter_target: u1 formal_parameter_index */
-            /* TODO: need to pass the parameter index */
-            write_be_u1(p, 0);  
-            break;
-        case TARGET_TYPE_LOCAL_VARIABLE:
-        case TARGET_TYPE_RESOURCE_VARIABLE:
-            /* localvar_target: u2 table_length, then entries */
-            /* For now, write empty table */
-            write_be_u2(p, 0);
-            break;
-        default:
-            /* Other target types - write empty for now */
-            break;
+    type_annotation_writer_t w;
+    w.p = p;
+    w.cp = cp;
+    w.target_type = target_type;
+    w.info_len = info_len;
+    if (info_len > 0) {
+        memcpy(w.info, info, (size_t)info_len);
     }
-    
-    /* type_path */
-    write_type_path(p, type_node, annotated_node);
-    
-    /* annotation (same as regular annotation) */
-    write_annotation(p, cp, annot);
-    
-    return *p - start;
+    visit_type_annotations(type_node, retention, NULL, 0, write_type_annotation_visit, &w);
+}
+
+static void preadd_type_annotation_visit(ast_node_t *annot, const uint8_t *path, int steps, void *ctx)
+{
+    (void)path;
+    (void)steps;
+    preadd_annotation_cp_entries((const_pool_t *)ctx, annot);
+}
+
+/** The constant pool entries the type annotations in a type will need */
+static void preadd_type_annotations_cp(const_pool_t *cp, ast_node_t *type_node, retention_policy_t retention)
+{
+    visit_type_annotations(type_node, retention, NULL, 0, preadd_type_annotation_visit, cp);
 }
 
 /**
@@ -886,18 +963,7 @@ static int write_field_type_annotations_attribute(uint8_t **p, const_pool_t *cp,
     write_be_u2(p, (uint16_t)count);
     
     /* Write type annotations on the type and its nested types */
-    /* For simplicity, just handle annotations directly on the type for now */
-    if (type_node->annotations) {
-        for (slist_t *n = type_node->annotations; n; n = n->next) {
-            ast_node_t *annot = (ast_node_t *)n->data;
-            if (annot && annot->type == AST_ANNOTATION && annot->data.node.name) {
-                if (get_annotation_retention(annot->data.node.name) == target) {
-                    write_type_annotation(p, cp, TARGET_TYPE_FIELD, annot, 
-                                         type_node, type_node);
-                }
-            }
-        }
-    }
+    write_type_annotations_in(p, cp, type_node, target, TARGET_TYPE_FIELD, NULL, 0);
     
     /* Fill in attribute_length */
     uint32_t attr_len = (*p - len_pos) - 4;
@@ -1014,41 +1080,14 @@ static int write_method_type_annotations_attribute(uint8_t **p, const_pool_t *cp
     
     /* Write return type annotations */
     ast_node_t *return_type = get_method_return_type_node(method_ast);
-    if (return_type && return_type->annotations) {
-        for (slist_t *n = return_type->annotations; n; n = n->next) {
-            ast_node_t *annot = (ast_node_t *)n->data;
-            if (annot && annot->type == AST_ANNOTATION && annot->data.node.name) {
-                if (get_annotation_retention(annot->data.node.name) == target) {
-                    write_type_annotation(p, cp, TARGET_TYPE_RETURN, annot,
-                                         return_type, return_type);
-                }
-            }
-        }
-    }
+    write_type_annotations_in(p, cp, return_type, target, TARGET_TYPE_RETURN, NULL, 0);
     
     /* Write parameter type annotations */
     ast_node_t *param_types[256];
     int param_count = get_method_parameter_type_nodes(method_ast, param_types, 256);
     for (int i = 0; i < param_count; i++) {
-        ast_node_t *param_type = param_types[i];
-        if (param_type && param_type->annotations) {
-            for (slist_t *n = param_type->annotations; n; n = n->next) {
-                ast_node_t *annot = (ast_node_t *)n->data;
-                if (annot && annot->type == AST_ANNOTATION && annot->data.node.name) {
-                    if (get_annotation_retention(annot->data.node.name) == target) {
-                        /* For parameters, we need to temporarily set the index */
-                        /* Write target_type */
-                        write_be_u1(p, TARGET_TYPE_FORMAL_PARAMETER);
-                        /* Write formal_parameter_target: u1 formal_parameter_index */
-                        write_be_u1(p, (uint8_t)i);
-                        /* Write type_path (empty for now) */
-                        write_be_u1(p, 0);
-                        /* Write annotation */
-                        write_annotation(p, cp, annot);
-                    }
-                }
-            }
-        }
+        uint8_t index = (uint8_t)i;
+        write_type_annotations_in(p, cp, param_types[i], target, TARGET_TYPE_FORMAL_PARAMETER, &index, 1);
     }
     
     /* Fill in attribute_length */
@@ -1081,7 +1120,8 @@ static int count_local_var_type_annotations(slist_t *local_var_table, retention_
  * Returns bytes written (0 if no type annotations).
  */
 static int write_local_var_type_annotations_attribute(uint8_t **p, const_pool_t *cp,
-                                                       slist_t *local_var_table, bool runtime_visible)
+                                                       slist_t *local_var_table, size_t code_length,
+                                                       bool runtime_visible)
 {
     if (!local_var_table) {
         return 0;
@@ -1112,30 +1152,16 @@ static int write_local_var_type_annotations_attribute(uint8_t **p, const_pool_t 
     /* Write type annotations for each local variable that has them */
     for (slist_t *lv = local_var_table; lv; lv = lv->next) {
         local_var_t *var = (local_var_t *)lv->data;
-        if (var && var->type_ast && var->type_ast->annotations) {
-            for (slist_t *n = var->type_ast->annotations; n; n = n->next) {
-                ast_node_t *annot = (ast_node_t *)n->data;
-                if (annot && annot->type == AST_ANNOTATION && annot->data.node.name) {
-                    if (get_annotation_retention(annot->data.node.name) == target) {
-                        /* Write target_type = LOCAL_VARIABLE (0x40) */
-                        write_be_u1(p, TARGET_TYPE_LOCAL_VARIABLE);
-                        
-                        /* Write localvar_target: 
-                         * u2 table_length + table_length * {u2 start_pc, u2 length, u2 index} */
-                        write_be_u2(p, 1);  /* table_length = 1 */
-                        write_be_u2(p, var->start_pc);
-                        uint16_t var_length = var->length > 0 ? var->length : 0xFFFF;
-                        write_be_u2(p, var_length);
-                        write_be_u2(p, var->slot);
-                        
-                        /* Write type_path (empty for simple types) */
-                        write_be_u1(p, 0);
-                        
-                        /* Write annotation */
-                        write_annotation(p, cp, annot);
-                    }
-                }
-            }
+        if (var && var->type_ast) {
+            /* localvar_target: u2 table_length, then {u2 start_pc, u2 length, u2 index} */
+            uint16_t var_length = var->length > 0 ? var->length : (uint16_t)(code_length - var->start_pc);
+            uint8_t info[8] = {
+                0, 1,
+                (uint8_t)(var->start_pc >> 8), (uint8_t)var->start_pc,
+                (uint8_t)(var_length >> 8), (uint8_t)var_length,
+                (uint8_t)(var->slot >> 8), (uint8_t)var->slot
+            };
+            write_type_annotations_in(p, cp, var->type_ast, target, TARGET_TYPE_LOCAL_VARIABLE, info, 8);
         }
     }
     
@@ -1303,23 +1329,7 @@ static void preadd_annotation_cp_entries(const_pool_t *cp, ast_node_t *annot)
      * shows no annotation on the member at all). */
     const char *qualified_name = resolve_annotation_qualified_name(annot->data.node.name);
     if (annot->data.node.name) {
-        char *type_desc = NULL;
-        if (g_classwriter_sem) {
-            struct classfile *cf = semantic_load_annotation_classfile(g_classwriter_sem, qualified_name);
-            if (cf && cf->this_class_name) {
-                type_desc = calloc(strlen(cf->this_class_name) + 4, 1);
-                sprintf(type_desc, "L%s;", cf->this_class_name);
-            }
-        }
-        if (!type_desc) {
-            type_desc = calloc(strlen(qualified_name) + 4, 1);
-            sprintf(type_desc, "L%s;", qualified_name);
-            for (char *c = type_desc; *c; c++) {
-                if (*c == '.') {
-                    *c = '/';
-                }
-            }
-        }
+        char *type_desc = annotation_type_descriptor(qualified_name);
         cp_add_utf8(cp, type_desc);
         free(type_desc);
     }
@@ -1575,9 +1585,23 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         method_info_gen_t *mi = (method_info_gen_t *)node->data;
         for (slist_t *lv = mi->local_var_table; lv; lv = lv->next) {
             local_var_t *var = (local_var_t *)lv->data;
-            if (var && var->type_ast && var->type_ast->annotations) {
-                preadd_annotations_list_cp(cg->cp, var->type_ast->annotations, RETENTION_RUNTIME);
+            if (var && var->type_ast) {
+                preadd_type_annotations_cp(cg->cp, var->type_ast, RETENTION_RUNTIME);
             }
+        }
+        if (mi->ast) {
+            preadd_type_annotations_cp(cg->cp, get_method_return_type_node(mi->ast), RETENTION_RUNTIME);
+            ast_node_t *param_types[256];
+            int param_count = get_method_parameter_type_nodes(mi->ast, param_types, 256);
+            for (int i = 0; i < param_count; i++) {
+                preadd_type_annotations_cp(cg->cp, param_types[i], RETENTION_RUNTIME);
+            }
+        }
+    }
+    for (slist_t *node = cg->fields; node; node = node->next) {
+        field_gen_t *fg = (field_gen_t *)node->data;
+        if (fg->ast) {
+            preadd_type_annotations_cp(cg->cp, get_field_type_node(fg->ast), RETENTION_RUNTIME);
         }
     }
     
@@ -2024,7 +2048,8 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
             if (lvt_annot_data) {
                 uint8_t *annot_ptr = lvt_annot_data;
                 lvt_annot_len = write_local_var_type_annotations_attribute(&annot_ptr, cg->cp,
-                                                                            mi->local_var_table, true);
+                                                                            mi->local_var_table,
+                                                                            mi->code->length, true);
             }
         }
         
@@ -2297,10 +2322,17 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     if (emit_nest && cg->nest_members && nm_attr_name) {
         write_be_u2(&p, nm_attr_name);
         
-        /* Count nest members */
+        /* Count nest members (each class once: a retransformation, a mock of the host, rewrites
+         * the attribute without repeats and the JVM rejects that as a changed nest) */
         uint16_t nm_count = 0;
         for (slist_t *node = cg->nest_members; node; node = node->next) {
-            nm_count++;
+            bool repeated = false;
+            for (slist_t *before = cg->nest_members; before != node && !repeated; before = before->next) {
+                repeated = *(uint16_t *)before->data == *(uint16_t *)node->data;
+            }
+            if (!repeated) {
+                nm_count++;
+            }
         }
         
         /* Attribute length: 2 (number_of_classes) + 2 * nm_count */
@@ -2312,7 +2344,13 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         /* Write each nest member class_info index */
         for (slist_t *node = cg->nest_members; node; node = node->next) {
             uint16_t *class_idx = (uint16_t *)node->data;
-            write_be_u2(&p, *class_idx);
+            bool repeated = false;
+            for (slist_t *before = cg->nest_members; before != node && !repeated; before = before->next) {
+                repeated = *(uint16_t *)before->data == *class_idx;
+            }
+            if (!repeated) {
+                write_be_u2(&p, *class_idx);
+            }
         }
     }
     
