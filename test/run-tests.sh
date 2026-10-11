@@ -2119,6 +2119,138 @@ for mr_order in "Types MemberRecordUseTest" "MemberRecordUseTest Types"; do
     fi
 done
 
+for db_order in "Main Iter Source Handle IterHandle" "Source Handle IterHandle Iter Main" "Iter Main Source IterHandle Handle"; do
+    set -- $db_order
+    printf "%-30s ... " "DefaultBridgeStubs ($1 first)"
+    db_out="$TEST_BUILD/defaultbridgestubs-out"
+    rm -rf "$db_out"
+    mkdir -p "$db_out"
+    db_files=""
+    for db_name in "$@"; do
+        db_files="$db_files $TEST_SRC/external/defaultbridgestubs/p/$db_name.java"
+    done
+    if (cd "$db_out" && "$GENESIS" -d "$db_out" $db_files >/dev/null 2>&1) &&
+       "$JAVA" -Xverify:all -cp "$db_out" p.Main >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+printf "%-30s ... " "ProtectedMethodFromNestedClass"
+pm_lib="$TEST_BUILD/protectedmethodlib-lib"
+pm_out="$TEST_BUILD/protectedmethodlib-out"
+rm -rf "$pm_lib" "$pm_out"
+mkdir -p "$pm_lib" "$pm_out"
+if "$GENESIS" -d "$pm_lib" "$TEST_SRC"/external/protectedmethodlib/protlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$pm_lib" -d "$pm_out" \
+       "$TEST_SRC/external/ProtectedMethodFromNestedClassTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$pm_out:$pm_lib" ProtectedMethodFromNestedClassTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "InheritedFromHiddenSuperclass"
+hs_lib="$TEST_BUILD/hiddensuperlib-lib"
+hs_out="$TEST_BUILD/hiddensuperlib-out"
+rm -rf "$hs_lib" "$hs_out"
+mkdir -p "$hs_lib" "$hs_out"
+if "$GENESIS" -d "$hs_lib" "$TEST_SRC"/external/hiddensuperlib/hiddenlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$hs_lib" -d "$hs_out" \
+       "$TEST_SRC/external/InheritedFromHiddenSuperclassTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$hs_out:$hs_lib" InheritedFromHiddenSuperclassTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "ClassFileInterfaceChainOverload"
+ic_lib="$TEST_BUILD/iterablesrclib-lib"
+ic_out="$TEST_BUILD/iterablesrclib-out"
+rm -rf "$ic_lib" "$ic_out"
+mkdir -p "$ic_lib" "$ic_out"
+if "$GENESIS" -d "$ic_lib" "$TEST_SRC"/external/iterablesrclib/itersrc/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ic_lib" -d "$ic_out" \
+       "$TEST_SRC/external/ClassFileInterfaceChainOverloadTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$ic_out:$ic_lib" ClassFileInterfaceChainOverloadTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "WildcardResultOverload"
+wr_lib="$TEST_BUILD/wildcardresultlib-lib"
+wr_out="$TEST_BUILD/wildcardresultlib-out"
+rm -rf "$wr_lib" "$wr_out"
+mkdir -p "$wr_lib" "$wr_out"
+if "$GENESIS" -d "$wr_lib" "$TEST_SRC"/external/wildcardresultlib/wcres/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$wr_lib" -d "$wr_out" \
+       "$TEST_SRC/external/WildcardResultOverloadTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$wr_out:$wr_lib" WildcardResultOverloadTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "ClassFileBoundedResultChain"
+br_lib="$TEST_BUILD/boundedresultlib-lib"
+br_out="$TEST_BUILD/boundedresultlib-out"
+rm -rf "$br_lib" "$br_out"
+mkdir -p "$br_lib" "$br_out"
+if "$GENESIS" -d "$br_lib" "$TEST_SRC"/external/boundedresultlib/bres/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$br_lib" -d "$br_out" \
+       "$TEST_SRC/external/ClassFileBoundedResultChainTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$br_out:$br_lib" ClassFileBoundedResultChainTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "InheritedGenericChain"
+gc_lib="$TEST_BUILD/genericchainlib-lib"
+gc_out="$TEST_BUILD/genericchainlib-out"
+rm -rf "$gc_lib" "$gc_out"
+mkdir -p "$gc_lib" "$gc_out"
+if "$GENESIS" -d "$gc_lib" "$TEST_SRC"/external/genericchainlib/gchain/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$gc_lib" -d "$gc_out" \
+       "$TEST_SRC/external/InheritedGenericChainTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$gc_out:$gc_lib" InheritedGenericChainTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "TypeVariableMethodReference"
+eu_lib="$TEST_BUILD/emptyutilslib-lib"
+eu_out="$TEST_BUILD/emptyutilslib-out"
+rm -rf "$eu_lib" "$eu_out"
+mkdir -p "$eu_lib" "$eu_out"
+if "$GENESIS" -d "$eu_lib" "$TEST_SRC"/external/emptyutilslib/emptyutils/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$eu_lib" -d "$eu_out" \
+       "$TEST_SRC/external/TypeVariableMethodReferenceOverloadTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$eu_out:$eu_lib" TypeVariableMethodReferenceOverloadTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 printf "%-30s ... " "InheritedMemberShadow"
 im_out="$TEST_BUILD/inheritedmembershadow-out"
 rm -rf "$im_out"

@@ -1868,6 +1868,8 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     uint16_t exc_attr_name_index = cp_add_utf8(cg->cp, "Exceptions");  /* For throws clauses */
     /* Pre-add RuntimeVisibleTypeAnnotations for local variable type annotations */
     cp_add_utf8(cg->cp, "RuntimeVisibleTypeAnnotations");
+    uint16_t sf_attr_name = cg->source_file ? cp_add_utf8(cg->cp, "SourceFile") : 0;
+    uint16_t sf_value = cg->source_file ? cp_add_utf8(cg->cp, cg->source_file) : 0;
     
     /* Calculate size (approximate) */
     size_t buf_size = 1024 * 1024;  /* 1MB should be enough for most classes */
@@ -2414,6 +2416,9 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     
     /* Class attributes */
     uint16_t class_attr_count = 0;
+    if (sf_attr_name) {
+        class_attr_count++;
+    }
     if (cg->inner_class_entries) {
         class_attr_count++;
     }
@@ -2448,6 +2453,13 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     }
     
     write_be_u2(&p, class_attr_count);
+
+    /* SourceFile attribute */
+    if (sf_attr_name) {
+        write_be_u2(&p, sf_attr_name);
+        write_be_u4(&p, 2);
+        write_be_u2(&p, sf_value);
+    }
     
     /* Signature attribute (for class) */
     if (cg->signature) {

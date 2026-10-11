@@ -649,6 +649,20 @@ typedef struct pending_field_accessor {
 } pending_field_accessor_t;
 
 /**
+ * The method counterpart of pending_field_accessor_t: a synthetic static method a class emits so
+ * one of its nested classes can call a `protected` method the class inherits from a superclass
+ * in a DIFFERENT package ("access$m0(Outer self, args)" calls self.m(args)).
+ */
+typedef struct pending_method_accessor {
+    symbol_t *method;            /* the inherited method this accessor calls */
+    symbol_t *owner;             /* superclass that actually declares it */
+    char *accessor_name;         /* synthetic method name, e.g. "access$m0" */
+    char *descriptor;            /* the method's own descriptor, "(args)ret" */
+    bool is_static;
+    bool emitted;
+} pending_method_accessor_t;
+
+/**
  * Represents a declared symbol (class, method, variable, etc.)
  */
 struct symbol
@@ -707,6 +721,7 @@ struct symbol
                                          * class declared earlier in the same file needs
                                          * it first, e.g. for @Override checking against
                                          * a not-yet-visited superclass). */
+            slist_t *pending_method_accessors; /* list of pending_method_accessor_t* */
             slist_t *pending_field_accessors; /* list of pending_field_accessor_t*
                                          * this class must emit as synthetic methods -
                                          * see pending_field_accessor_t's own comment. */
@@ -1053,6 +1068,8 @@ char *semantic_format_diagnostics(semantic_t *sem);
 
 /* Type resolution */
 type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node);
+type_t *semantic_ensure_method_result_type(semantic_t *sem, symbol_t *method, symbol_t *from);
+type_t *semantic_method_type_param(symbol_t *method, const char *name);
 symbol_t *semantic_resolve_name(semantic_t *sem, const char *name);
 type_t *get_expression_type(semantic_t *sem, ast_node_t *expr);
 symbol_t *load_external_class(semantic_t *sem, const char *name);

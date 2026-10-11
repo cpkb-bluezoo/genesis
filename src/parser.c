@@ -567,6 +567,7 @@ void parser_free(parser_t *parser)
  * Parser Helpers
  * ======================================================================== */
 
+static ast_node_t *parse_argument(parser_t *parser);
 static inline const char *parser_current_text(parser_t *parser);
 static inline int parser_current_line(parser_t *parser);
 static inline int parser_current_column(parser_t *parser);
@@ -1849,7 +1850,7 @@ static ast_node_t *parse_primary(parser_t *parser)
                     
                     if (!parser_check(parser, TOK_RPAREN)) {
                         do {
-                            ast_node_t *arg = parse_expression(parser);
+                            ast_node_t *arg = parse_argument(parser);
                             if (arg) {
                                 ast_add_child(node, arg);
                             }
@@ -2391,7 +2392,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                         /* Parse arguments */
                         if (!parser_check(parser, TOK_RPAREN)) {
                             do {
-                                ast_node_t *arg = parse_expression(parser);
+                                ast_node_t *arg = parse_argument(parser);
                                 if (arg) {
                                     ast_add_child(call, arg);
                                 }
@@ -2465,7 +2466,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                         /* Parse arguments */
                         if (!parser_check(parser, TOK_RPAREN)) {
                             do {
-                                ast_node_t *arg = parse_expression(parser);
+                                ast_node_t *arg = parse_argument(parser);
                                 if (arg) {
                                     ast_add_child(call, arg);
                                 }
@@ -2490,7 +2491,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                         /* Parse arguments */
                         if (!parser_check(parser, TOK_RPAREN)) {
                             do {
-                                ast_node_t *arg = parse_expression(parser);
+                                ast_node_t *arg = parse_argument(parser);
                                 if (arg) {
                                     ast_add_child(call, arg);
                                 }
@@ -2583,6 +2584,29 @@ static ast_node_t *parse_expression_prec(parser_t *parser, precedence_t min_prec
 ast_node_t *parse_expression(parser_t *parser)
 {
     return parse_expression_prec(parser, PREC_ASSIGNMENT);
+}
+
+/**
+ * An argument of a call or creation. A call, creation, lambda or method reference written in
+ * parentheses ("m((assertArg((v) -> ..)))") is the same argument without them: its typing by the
+ * parameter it fills must not stop at the parentheses.
+ */
+static ast_node_t *parse_argument(parser_t *parser)
+{
+    ast_node_t *arg = parse_expression(parser);
+    while (arg && arg->type == AST_PARENTHESIZED && arg->data.node.children &&
+           !arg->data.node.children->next) {
+        ast_node_t *inner = (ast_node_t *)arg->data.node.children->data;
+        if (!inner || (inner->type != AST_METHOD_CALL && inner->type != AST_NEW_OBJECT &&
+                       inner->type != AST_LAMBDA_EXPR && inner->type != AST_METHOD_REF)) {
+            break;
+        }
+        slist_free(arg->data.node.children);
+        arg->data.node.children = NULL;
+        ast_free(arg);
+        arg = inner;
+    }
+    return arg;
 }
 
 /**
@@ -5165,7 +5189,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
             /* Optional constructor arguments */
             if (parser_match(parser, TOK_LPAREN)) {
                 while (!parser_check(parser, TOK_RPAREN) && !parser_check(parser, TOK_EOF)) {
-                    ast_node_t *arg = parse_expression(parser);
+                    ast_node_t *arg = parse_argument(parser);
                     if (arg) {
                         ast_add_child(constant, arg);
                     }

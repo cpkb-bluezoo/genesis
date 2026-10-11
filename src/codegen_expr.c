@@ -194,6 +194,37 @@ static const char *get_or_create_field_accessor(symbol_t *enclosing, symbol_t *f
     return acc->accessor_name;
 }
 
+/**
+ * Find (or register) the synthetic static accessor "enclosing" emits so a nested class can call
+ * the inherited protected "method" declared in "owner" (another package): see
+ * pending_method_accessor_t. Idempotent per method, like get_or_create_field_accessor().
+ */
+static const char *get_or_create_method_accessor(symbol_t *enclosing, symbol_t *owner, symbol_t *method,
+                                                 const char *descriptor, bool is_static)
+{
+    int index = 0;
+    for (slist_t *p = enclosing->data.class_data.pending_method_accessors; p; p = p->next, index++) {
+        pending_method_accessor_t *acc = (pending_method_accessor_t *)p->data;
+        if (acc->method == method) {
+            return acc->accessor_name;
+        }
+    }
+    pending_method_accessor_t *acc = calloc(1, sizeof(pending_method_accessor_t));
+    acc->method = method;
+    acc->owner = owner;
+    acc->descriptor = strdup(descriptor);
+    acc->is_static = is_static;
+    char name_buf[32];
+    snprintf(name_buf, sizeof(name_buf), "access$m%d", index);
+    acc->accessor_name = strdup(name_buf);
+    if (!enclosing->data.class_data.pending_method_accessors) {
+        enclosing->data.class_data.pending_method_accessors = slist_new(acc);
+    } else {
+        slist_append(enclosing->data.class_data.pending_method_accessors, acc);
+    }
+    return acc->accessor_name;
+}
+
 /** Tracks the constant 1 pushed for ++/-- as its own type, not as untyped depth. */
 static void push_incdec_one(method_gen_t *mg, type_kind_t kind)
 {
@@ -914,7 +945,8 @@ type_kind_t get_expr_type_kind(method_gen_t *mg, ast_node_t *expr)
                 return prim;
             }
         }
-        return expr->sem_type->kind;
+        /* (a wildcard, "list.get(0)" of a List<?>, is a reference: an Object or its bound) */
+        return expr->sem_type->kind == TYPE_WILDCARD ? TYPE_CLASS : expr->sem_type->kind;
     }
     
     /* For identifiers, check local variable type or field type */
@@ -7413,14 +7445,17 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
     g_varargs_inferred_element = NULL;
     if (is_varargs_method && varargs_param && method_sym && method_sym->type &&
         method_sym->type->kind == TYPE_TYPEVAR && method_sym->type->data.type_var.name && expr->sem_type &&
-        expr->sem_type->kind == TYPE_CLASS) {
+        (expr->sem_type->kind == TYPE_CLASS ||
+         (expr->sem_type->kind == TYPE_TYPEVAR && erase_typevar_for_array(expr->sem_type)->kind == TYPE_CLASS &&
+          strcmp(erase_typevar_for_array(expr->sem_type)->data.class_type.name, "java.lang.Object") != 0))) {
         type_t *declared_elem = (varargs_param->type && varargs_param->type->kind == TYPE_ARRAY) ?
             varargs_param->type->data.array_type.element_type : NULL;
         if (declared_elem && declared_elem->kind == TYPE_TYPEVAR && declared_elem->data.type_var.name &&
             strcmp(declared_elem->data.type_var.name, method_sym->type->data.type_var.name) == 0 &&
             erase_typevar_for_array(declared_elem)->kind == TYPE_CLASS &&
             strcmp(erase_typevar_for_array(declared_elem)->data.class_type.name, "java.lang.Object") == 0) {
-            g_varargs_inferred_element = expr->sem_type;
+            g_varargs_inferred_element = expr->sem_type->kind == TYPE_TYPEVAR ?
+                erase_typevar_for_array(expr->sem_type) : expr->sem_type;
         }
     }
 
@@ -7567,9 +7602,97 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         }
     }
 
+    /* A protected method the enclosing class inherits from another package cannot be called
+     * from its nested class directly (JVMS 5.4.4): it goes through a static accessor the
+     * enclosing class emits (like javac's access$NNN) */
+    symbol_t *accessor_home = NULL;
+    if (method_sym && (method_sym->modifiers & MOD_PROTECTED) && !(method_sym->modifiers & MOD_PUBLIC) &&
+        !use_invokespecial && !is_interface_call && mg->class_gen && mg->class_gen->class_sym &&
+        method_sym->scope && method_sym->scope->owner && method_sym->scope->owner->qualified_name &&
+        mg->class_gen->class_sym->qualified_name) {
+        symbol_t *declaring = method_sym->scope->owner;
+        symbol_t *current = mg->class_gen->class_sym;
+        char *decl_pkg = get_package_name(declaring->qualified_name);
+        char *cur_pkg = get_package_name(current->qualified_name);
+        bool same_package = decl_pkg && cur_pkg && strcmp(decl_pkg, cur_pkg) == 0;
+        free(decl_pkg);
+        free(cur_pkg);
+        if (!same_package && !class_inherits_from(current, declaring, 0)) {
+            if (!is_static && receiver) {
+                /* "outer.m()" from a class nested in outer's class */
+                type_t *rt = receiver->sem_type;
+                symbol_t *rsym = (rt && rt->kind == TYPE_CLASS) ? rt->data.class_type.symbol : NULL;
+                for (symbol_t *enc = current->data.class_data.enclosing_class; rsym && enc;
+                     enc = enc->data.class_data.enclosing_class) {
+                    if (enc == rsym && class_inherits_from(enc, declaring, 0)) {
+                        accessor_home = enc;
+                        break;
+                    }
+                }
+            } else if (!is_static && implicit_call_enclosing_owner &&
+                class_inherits_from(implicit_call_enclosing_owner, declaring, 0)) {
+                accessor_home = implicit_call_enclosing_owner;
+            } else if (is_static && !receiver) {
+                for (symbol_t *enc = current->data.class_data.enclosing_class; enc;
+                     enc = enc->data.class_data.enclosing_class) {
+                    if (class_inherits_from(enc, declaring, 0)) {
+                        accessor_home = enc;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /* An inherited method called by its simple name is qualified by the class it is called
+     * in, not the one that declares it (JLS 13.1): a package-private declaring class of
+     * another package cannot be named at all (IllegalAccessError) */
+    char *qualifying_owned = NULL;
+    if (!accessor_home && !receiver && !use_invokespecial && !is_interface_call && method_sym &&
+        method_sym->scope && method_sym->scope->owner && method_sym->scope->owner->qualified_name &&
+        method_sym->scope->owner->kind == SYM_CLASS &&
+        !(method_sym->scope->owner->modifiers & (MOD_PUBLIC | MOD_PROTECTED)) &&
+        mg->class_gen && mg->class_gen->class_sym && mg->class_gen->class_sym->qualified_name) {
+        symbol_t *declaring = method_sym->scope->owner;
+        symbol_t *current = mg->class_gen->class_sym;
+        char *decl_pkg = get_package_name(declaring->qualified_name);
+        char *cur_pkg = get_package_name(current->qualified_name);
+        bool same_package = decl_pkg && cur_pkg && strcmp(decl_pkg, cur_pkg) == 0;
+        free(decl_pkg);
+        free(cur_pkg);
+        if (!same_package) {
+            symbol_t *qualifier = NULL;
+            if (class_inherits_from(current, declaring, 0)) {
+                qualifier = current;
+            } else if (implicit_call_enclosing_owner && class_inherits_from(implicit_call_enclosing_owner, declaring, 0)) {
+                qualifier = implicit_call_enclosing_owner;
+            }
+            if (qualifier && qualifier->qualified_name) {
+                qualifying_owned = class_to_internal_name(qualifier->qualified_name);
+                target_class = qualifying_owned;
+            }
+        }
+    }
+
     /* Use interface methodref for interface calls (both instance and static) */
     uint16_t methodref;
-    if (is_interface_call) {
+    if (accessor_home) {
+        const char *accessor_name = get_or_create_method_accessor(accessor_home, method_sym->scope->owner,
+                                                                  method_sym, descriptor, is_static);
+        char *home_internal = class_to_internal_name(accessor_home->qualified_name);
+        const char *params_end = descriptor;
+        char *accessor_desc;
+        if (is_static) {
+            accessor_desc = strdup(descriptor);
+        } else {
+            size_t len = strlen(home_internal) + strlen(params_end) + 4;
+            accessor_desc = malloc(len);
+            snprintf(accessor_desc, len, "(L%s;%s", home_internal, params_end + 1);
+        }
+        methodref = cp_add_methodref(cp, home_internal, accessor_name, accessor_desc);
+        free(accessor_desc);
+        free(home_internal);
+    } else if (is_interface_call) {
         methodref = cp_add_interface_methodref(cp, target_class, method_name, descriptor);
     } else {
         methodref = cp_add_methodref(cp, target_class, method_name, descriptor);
@@ -7578,6 +7701,10 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
     if (descriptor != custom_descriptor) {
         free(descriptor);
     }
+    if (qualifying_owned && target_class == qualifying_owned) {
+        target_class = NULL;
+    }
+    free(qualifying_owned);
     
     /* Slots the arguments occupy on the stack after conversion to the parameter
      * types; needed for invokeinterface's count operand and to update tracking. */
@@ -7662,7 +7789,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
     }
 
     /* Emit invoke instruction */
-    if (is_static) {
+    if (is_static || accessor_home) {
         bc_emit(mg->code, OP_INVOKESTATIC);
         bc_emit_u2(mg->code, methodref);
         /* Calling static interface method requires class file version 52 */
@@ -9255,7 +9382,16 @@ static bool codegen_new_array(method_gen_t *mg, ast_node_t *expr, const_pool_t *
 
             bc_emit(mg->code, OP_NEWARRAY);
             bc_emit_u1(mg->code, (uint8_t)atype);
-            /* Stack: size -> arrayref (no net change) */
+            /* Stack: size -> arrayref: the verifier's view of the size slot is the array now */
+            {
+                char *ed = ast_type_to_descriptor(type_node);
+                char *ad = malloc(strlen(ed) + 2);
+                snprintf(ad, strlen(ed) + 2, "[%s", ed);
+                mg_pop_typed(mg, 1);
+                mg_push_object_from_descriptor(mg, ad);
+                free(ad);
+                free(ed);
+            }
         } else if (type_node->type == AST_CLASS_TYPE) {
             /* Reference array: use anewarray */
             const char *class_name = type_node->data.node.name;
@@ -9267,11 +9403,18 @@ static bool codegen_new_array(method_gen_t *mg, ast_node_t *expr, const_pool_t *
 
             char *internal_name = class_to_internal_name(class_name);
             uint16_t class_ref = cp_add_class(cp, internal_name);
-            free(internal_name);
 
             bc_emit(mg->code, OP_ANEWARRAY);
             bc_emit_u2(mg->code, class_ref);
-            /* Stack: size -> arrayref (no net change) */
+            /* Stack: size -> arrayref */
+            {
+                char *ad = malloc(strlen(internal_name) + 4);
+                snprintf(ad, strlen(internal_name) + 4, "[L%s;", internal_name);
+                mg_pop_typed(mg, 1);
+                mg_push_object_from_descriptor(mg, ad);
+                free(ad);
+            }
+            free(internal_name);
         } else {
             fprintf(stderr, "codegen: unsupported array element type\n");
             return false;
@@ -9291,11 +9434,18 @@ static bool codegen_new_array(method_gen_t *mg, ast_node_t *expr, const_pool_t *
         free(elem_desc);
 
         uint16_t class_ref = cp_add_class(cp, component_desc);
-        free(component_desc);
 
         bc_emit(mg->code, OP_ANEWARRAY);
         bc_emit_u2(mg->code, class_ref);
-        /* Stack: size -> arrayref (no net change) */
+        /* Stack: size -> arrayref */
+        {
+            char *ad = malloc(strlen(component_desc) + 2);
+            snprintf(ad, strlen(component_desc) + 2, "[%s", component_desc);
+            mg_pop_typed(mg, 1);
+            mg_push_object_from_descriptor(mg, ad);
+            free(ad);
+        }
+        free(component_desc);
     } else {
         /* Multi-dimensional array: use multianewarray */
         /* Build the array type descriptor */
@@ -9325,15 +9475,16 @@ static bool codegen_new_array(method_gen_t *mg, ast_node_t *expr, const_pool_t *
         }
         
         uint16_t array_class = cp_add_class(cp, class_name);
-        free(array_desc);
-        free(class_name);
         
         bc_emit(mg->code, OP_MULTIANEWARRAY);
         bc_emit_u2(mg->code, array_class);
         bc_emit_u1(mg->code, (uint8_t)dim_count);
         
         /* Stack: dim1, dim2, ... dimN -> arrayref */
-        mg_pop_typed(mg, dim_count - 1);  /* Consumes N dims, pushes 1 ref */
+        mg_pop_typed(mg, dim_count);
+        mg_push_object_from_descriptor(mg, array_desc);
+        free(array_desc);
+        free(class_name);
     }
     
     return true;

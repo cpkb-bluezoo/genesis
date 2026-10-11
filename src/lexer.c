@@ -767,133 +767,112 @@ static void lexer_scan_number(lexer_t *lexer)
 }
 
 /**
- * Calculate the minimum indentation for text block processing.
- * Returns the number of leading spaces to strip from each line.
+ * Translate the raw content of a text block (JLS 3.10.6): strip the incidental white space (the
+ * indentation common to the non-blank lines and the closing delimiter's own line, counted in
+ * characters), strip every line's trailing white space, then interpret the escape sequences.
+ * "raw" starts after the opening delimiter's line terminator and ends before the closing
+ * delimiter; its line terminators are \n.
  */
-static int textblock_min_indent(const char *raw, size_t len, int closing_indent)
+static size_t textblock_translate(const char *raw, size_t raw_len, char *out, size_t out_size)
 {
-    int min_indent = closing_indent;
-    int current_indent = 0;
-    bool at_line_start = true;
-    bool line_has_content = false;
-    
-    for (size_t i = 0; i < len; i++) {
-        char c = raw[i];
-        if (c == '\n') {
-            /* Only count this line if it has non-whitespace content */
-            if (line_has_content && current_indent < min_indent) {
-                min_indent = current_indent;
-            }
-            at_line_start = true;
-            line_has_content = false;
-            current_indent = 0;
-        } else if (at_line_start) {
-            if (c == ' ') {
-                current_indent++;
-            } else if (c == '\t') {
-                current_indent += 4;  /* Tab = 4 spaces for indent calculation */
-            } else {
-                at_line_start = false;
-                line_has_content = true;
-                if (current_indent < min_indent) {
-                    min_indent = current_indent;
-                }
-            }
-        } else {
-            line_has_content = true;
+    /* the line starts, and the last line is the one the closing delimiter is on */
+    size_t line_count = 1;
+    for (size_t i = 0; i < raw_len; i++) {
+        if (raw[i] == '\n') {
+            line_count++;
         }
     }
-    
-    /* Handle last line if it has content */
-    if (line_has_content && current_indent < min_indent) {
-        min_indent = current_indent;
+    size_t *starts = malloc(sizeof(size_t) * (line_count + 1));
+    if (!starts) {
+        out[0] = '\0';
+        return 0;
     }
-    
-    return min_indent;
-}
+    size_t n = 0;
+    starts[n++] = 0;
+    for (size_t i = 0; i < raw_len; i++) {
+        if (raw[i] == '\n') {
+            starts[n++] = i + 1;
+        }
+    }
+    starts[n] = raw_len + 1;   /* (one past the end: the line's end is starts[i + 1] - 1) */
 
-/**
- * Process a text block: strip incidental whitespace and handle escape sequences.
- */
-static size_t textblock_process(const char *raw, size_t raw_len, 
-                                char *out, size_t out_size, int strip_indent)
-{
+    size_t min_indent = (size_t)-1;
+    for (size_t li = 0; li < line_count; li++) {
+        size_t b = starts[li], e = starts[li + 1] - 1;
+        size_t indent = 0;
+        while (b + indent < e && (raw[b + indent] == ' ' || raw[b + indent] == '\t' || raw[b + indent] == '\f')) {
+            indent++;
+        }
+        bool blank = (b + indent == e);
+        if ((!blank || li == line_count - 1) && indent < min_indent) {
+            min_indent = indent;
+        }
+    }
+    if (min_indent == (size_t)-1) {
+        min_indent = 0;
+    }
+
+    /* strip, join, then escapes */
+    char *stripped = malloc(raw_len + 2);
+    if (!stripped) {
+        free(starts);
+        out[0] = '\0';
+        return 0;
+    }
+    size_t sp = 0;
+    for (size_t li = 0; li < line_count; li++) {
+        size_t b = starts[li], e = starts[li + 1] - 1;
+        size_t indent = 0;
+        while (b + indent < e && (raw[b + indent] == ' ' || raw[b + indent] == '\t' || raw[b + indent] == '\f')) {
+            indent++;
+        }
+        size_t from = (indent == e - b) ? e : b + (indent < min_indent ? indent : min_indent);
+        size_t to = e;
+        while (to > from && (raw[to - 1] == ' ' || raw[to - 1] == '\t' || raw[to - 1] == '\f')) {
+            /* (a trailing "\s" or "\<space>" is an escape, not white space) */
+            if (to - 1 > from && raw[to - 2] == '\\') {
+                break;
+            }
+            to--;
+        }
+        memcpy(stripped + sp, raw + from, to - from);
+        sp += to - from;
+        if (li + 1 < line_count) {
+            stripped[sp++] = '\n';
+        }
+    }
+    stripped[sp] = '\0';
+    free(starts);
+
     size_t out_pos = 0;
-    int current_indent = 0;
-    bool at_line_start = true;
-    bool skip_chars = true;  /* Skip leading whitespace up to strip_indent */
-    
-    for (size_t i = 0; i < raw_len && out_pos < out_size - 1; i++) {
-        char c = raw[i];
-        
-        if (c == '\n') {
-            out[out_pos++] = '\n';
-            at_line_start = true;
-            skip_chars = true;
-            current_indent = 0;
+    for (size_t i = 0; i < sp && out_pos < out_size - 1; i++) {
+        char c = stripped[i];
+        if (c != '\\' || i + 1 >= sp) {
+            out[out_pos++] = c;
             continue;
         }
-        
-        if (at_line_start && skip_chars) {
-            if (c == ' ') {
-                current_indent++;
-                if (current_indent >= strip_indent) {
-                    skip_chars = false;
+        char next = stripped[++i];
+        switch (next) {
+            case 'n':  out[out_pos++] = '\n'; break;
+            case 't':  out[out_pos++] = '\t'; break;
+            case 'r':  out[out_pos++] = '\r'; break;
+            case 'b':  out[out_pos++] = '\b'; break;
+            case 'f':  out[out_pos++] = '\f'; break;
+            case 's':  out[out_pos++] = ' '; break;
+            case '\n': break;   /* line continuation */
+            case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': {
+                int value = next - '0';
+                int max_digits = (next <= '3') ? 2 : 1;
+                while (max_digits-- > 0 && i + 1 < sp && stripped[i + 1] >= '0' && stripped[i + 1] <= '7') {
+                    value = value * 8 + (stripped[++i] - '0');
                 }
-                continue;
-            } else if (c == '\t') {
-                current_indent += 4;
-                if (current_indent >= strip_indent) {
-                    skip_chars = false;
-                }
-                continue;
-            } else {
-                at_line_start = false;
-                skip_chars = false;
+                out[out_pos++] = (char)value;
+                break;
             }
-        }
-        
-        /* Handle escape sequences */
-        if (c == '\\' && i + 1 < raw_len) {
-            char next = raw[i + 1];
-            switch (next) {
-                case 'n':  out[out_pos++] = '\n'; i++; break;
-                case 't':  out[out_pos++] = '\t'; i++; break;
-                case 'r':  out[out_pos++] = '\r'; i++; break;
-                case 'b':  out[out_pos++] = '\b'; i++; break;
-                case 'f':  out[out_pos++] = '\f'; i++; break;
-                case '\\': out[out_pos++] = '\\'; i++; break;
-                case '"':  out[out_pos++] = '"';  i++; break;
-                case '\'': out[out_pos++] = '\''; i++; break;
-                case 's':  out[out_pos++] = ' ';  i++; break;  /* \s = space */
-                case '\n':
-                    /* Line continuation - skip the newline */
-                    i++;
-                    /* Skip any leading whitespace on the next line */
-                    while (i + 1 < raw_len && (raw[i + 1] == ' ' || raw[i + 1] == '\t')) {
-                        i++;
-                    }
-                    break;
-                case '\r':
-                    /* Line continuation with \r\n */
-                    i++;
-                    if (i + 1 < raw_len && raw[i + 1] == '\n') {
-                        i++;
-                    }
-                    /* Skip any leading whitespace on the next line */
-                    while (i + 1 < raw_len && (raw[i + 1] == ' ' || raw[i + 1] == '\t')) {
-                        i++;
-                    }
-                    break;
-                default:
-                    out[out_pos++] = c;
-                    break;
-            }
-        } else {
-            out[out_pos++] = c;
+            default:   out[out_pos++] = next; break;   /* \\ \" \' and the rest */
         }
     }
-    
+    free(stripped);
     out[out_pos] = '\0';
     return out_pos;
 }
@@ -936,63 +915,37 @@ static void lexer_scan_string(lexer_t *lexer)
             lexer_advance_char(lexer);
         }
         
-        /* Collect raw content until closing """ */
-        /* We use a separate buffer for raw content, then process it */
-        char raw_buf[4096];
+        /* Collect raw content until the closing """ (an escaped quote does not close it) */
+        size_t raw_cap = (size_t)(lexer->end - lexer->pos) + 2;
+        char *raw_buf = malloc(raw_cap);
         size_t raw_pos = 0;
-        int closing_indent = 0;
-        int current_line_indent = 0;
-        bool counting_indent = true;
+        if (!raw_buf) {
+            lexer_set_token_static(lexer, TOK_ERROR, "out of memory", start_line, start_column);
+            return;
+        }
         
         while (lexer->pos < lexer->end) {
-            if (lexer_peek(lexer) == '"' && 
-                lexer_peek_ahead(lexer, 1) == '"' && 
-                lexer_peek_ahead(lexer, 2) == '"') {
-                /* Found closing delimiter - record its indentation */
-                closing_indent = current_line_indent;
+            char c = lexer_peek(lexer);
+            if (c == '"' && lexer_peek_ahead(lexer, 1) == '"' && lexer_peek_ahead(lexer, 2) == '"') {
                 lexer_advance_char(lexer);
                 lexer_advance_char(lexer);
                 lexer_advance_char(lexer);
                 break;
             }
-            
-            char c = lexer_peek(lexer);
-            if (raw_pos < sizeof(raw_buf) - 1) {
+            if (c == '\\' && lexer->pos + 1 < lexer->end) {
                 raw_buf[raw_pos++] = c;
+                lexer_advance_char(lexer);
+                c = lexer_peek(lexer);
             }
-            
-            /* Track indentation for the line containing closing """ */
-            if (c == '\n') {
-                counting_indent = true;
-                current_line_indent = 0;
-            } else if (counting_indent) {
-                if (c == ' ') {
-                    current_line_indent++;
-                } else if (c == '\t') {
-                    current_line_indent += 4;
-                } else {
-                    counting_indent = false;
-                }
+            if (c != '\r') {
+                raw_buf[raw_pos++] = c;   /* (line terminators are \n) */
             }
-            
             lexer_advance_char(lexer);
         }
         raw_buf[raw_pos] = '\0';
         
-        /* Calculate minimum indentation to strip */
-        int min_indent = textblock_min_indent(raw_buf, raw_pos, closing_indent);
-        
-        /* Process the text block: strip indentation and handle escapes */
-        buf_pos = textblock_process(raw_buf, raw_pos, lexer->text_buf, 
-                                    sizeof(lexer->text_buf), min_indent);
-        
-        /* Remove trailing newline if present (Java spec: final line terminator removed
-           only if the closing """ is on its own line) */
-        if (buf_pos > 0 && lexer->text_buf[buf_pos - 1] == '\n') {
-            /* Check if closing """ was on its own line (closing_indent tracked above) */
-            buf_pos--;
-            lexer->text_buf[buf_pos] = '\0';
-        }
+        buf_pos = textblock_translate(raw_buf, raw_pos, lexer->text_buf, sizeof(lexer->text_buf));
+        free(raw_buf);
         
         lexer_set_token_buf(lexer, TOK_TEXT_BLOCK, lexer->text_buf, buf_pos,
                            start_line, start_column);

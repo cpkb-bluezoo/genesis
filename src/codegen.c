@@ -2170,8 +2170,40 @@ static slist_t *extract_throws_types(ast_node_t *method_decl, semantic_t *sem)
             /* This is a throws type node - get the internal class name */
             char *internal_name = NULL;
             
+            /* "throws X" for "<X extends Throwable>": the class file names X's erasure, its bound */
+            type_t *throws_var = (node->sem_type && node->sem_type->kind == TYPE_TYPEVAR) ? node->sem_type : NULL;
+            if (!throws_var && node->type == AST_CLASS_TYPE && node->data.node.name &&
+                !strchr(node->data.node.name, '.') && method_decl->sem_symbol &&
+                method_decl->sem_symbol->kind == SYM_METHOD) {
+                type_t *own = semantic_method_type_param(method_decl->sem_symbol, node->data.node.name);
+                if (own && own->kind == TYPE_TYPEVAR) {
+                    throws_var = own;
+                }
+            }
+            if (throws_var) {
+                type_t *bound = throws_var->data.type_var.bound;
+                if (!bound && sem && node->data.node.name) {
+                    /* (the bound may not be settled yet: it is written in the declaration) */
+                    for (slist_t *c = method_decl->data.node.children; c && !bound; c = c->next) {
+                        ast_node_t *tp = (ast_node_t *)c->data;
+                        if (tp && tp->type == AST_TYPE_PARAMETER && tp->data.node.name &&
+                            strcmp(tp->data.node.name, node->data.node.name) == 0 && tp->data.node.children) {
+                            bound = semantic_resolve_type(sem, (ast_node_t *)tp->data.node.children->data);
+                        }
+                    }
+                }
+                const char *bound_name = (bound && bound->kind == TYPE_CLASS && bound->data.class_type.name) ?
+                    bound->data.class_type.name : "java.lang.Throwable";
+                size_t len = strlen(bound_name);
+                internal_name = malloc(len + 1);
+                if (internal_name) {
+                    for (size_t i = 0; i <= len; i++) {
+                        internal_name[i] = (bound_name[i] == '.') ? '/' : bound_name[i];
+                    }
+                }
+            }
             /* Try to get fully qualified name from resolved sem_type first */
-            if (node->sem_type && node->sem_type->kind == TYPE_CLASS && 
+            else if (node->sem_type && node->sem_type->kind == TYPE_CLASS && 
                 node->sem_type->data.class_type.name) {
                 const char *fqn = node->sem_type->data.class_type.name;
                 /* Convert dots to slashes for internal format */
@@ -2302,6 +2334,12 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
     cg->sem = sem;
     cg->class_sym = class_sym;
     cg->field_map = hashtable_new();
+
+    /* The SourceFile attribute: the file name without its directory (stack traces name it) */
+    if (sem && sem->source && sem->source->filename) {
+        const char *slash = strrchr(sem->source->filename, '/');
+        cg->source_file = strdup(slash ? slash + 1 : sem->source->filename);
+    }
     
     /* Default target version (can be overridden via cg_set_target_version) */
     cg->target_version = 0;  /* 0: automatic, from the features used */
@@ -4160,7 +4198,10 @@ static bool interface_impl_params_match(slist_t *iface_params, slist_t *candidat
         symbol_t *iparam = (symbol_t *)ip->data;
         symbol_t *cparam = (symbol_t *)cp->data;
         if (iparam && iparam->type && iparam->type->kind == TYPE_TYPEVAR) {
-            /* Any concrete candidate type is a valid instantiation. */
+            /* Any reference candidate type is a valid instantiation (not a primitive). */
+            if (cparam && cparam->type && cparam->type->kind >= TYPE_BOOLEAN && cparam->type->kind <= TYPE_DOUBLE) {
+                return false;
+            }
         } else if (iparam && iparam->type && cparam && cparam->type) {
             char *idesc = type_to_descriptor(iparam->type);
             char *cdesc = type_to_descriptor(cparam->type);
@@ -4267,11 +4308,45 @@ static void generate_interface_bridges(class_gen_t *cg)
     for (slist_t *direct = class_sym->data.class_data.interfaces; direct; direct = direct->next) {
         collect_interface_closure(cg->sem, (symbol_t *)direct->data, &all_ifaces);
     }
+    /* ...and those of its superclasses ("Base<T extends Factory> implements Customizer<T>", with
+     * "Concrete<T extends Special> extends Base<T>" declaring customize(T)): the superclass leaves
+     * the interface's erased method to the subclass that narrows it. Such an interface is only
+     * bridged for a method the class itself declares. */
+    slist_t *ancestor_only = NULL;
+    for (symbol_t *anc = class_sym->data.class_data.superclass; anc; anc = anc->data.class_data.superclass) {
+        for (slist_t *ai = anc->data.class_data.interfaces; ai; ai = ai->next) {
+            slist_t *closure = NULL;
+            collect_interface_closure(cg->sem, (symbol_t *)ai->data, &closure);
+            for (slist_t *ci = closure; ci; ci = ci->next) {
+                bool known = false;
+                for (slist_t *k = all_ifaces; k && !known; k = k->next) {
+                    known = k->data == ci->data;
+                }
+                if (!known) {
+                    if (!all_ifaces) {
+                        all_ifaces = slist_new(ci->data);
+                    } else {
+                        slist_append(all_ifaces, ci->data);
+                    }
+                    if (!ancestor_only) {
+                        ancestor_only = slist_new(ci->data);
+                    } else {
+                        slist_append(ancestor_only, ci->data);
+                    }
+                }
+            }
+            slist_free(closure);
+        }
+    }
     for (slist_t *iface_node = all_ifaces; 
          iface_node; iface_node = iface_node->next) {
         symbol_t *iface_sym = (symbol_t *)iface_node->data;
         if (!iface_sym || !iface_sym->data.class_data.members) {
             continue;
+        }
+        bool inherited_interface = false;
+        for (slist_t *k = ancestor_only; k && !inherited_interface; k = k->next) {
+            inherited_interface = k->data == iface_sym;
         }
         
         /* Iterate over interface methods */
@@ -4333,7 +4408,7 @@ static void generate_interface_bridges(class_gen_t *cg)
                             if (class_method && class_method->kind == SYM_METHOD &&
                                 class_method->name && iface_method->name &&
                                 strcmp(class_method->name, iface_method->name) == 0 &&
-                                !(class_method->modifiers & MOD_STATIC) &&
+                                !(class_method->modifiers & (MOD_STATIC | MOD_PRIVATE)) &&
                                 interface_impl_params_match(params, class_method->data.method_data.parameters)) {
                                 impl_method = class_method;
                             }
@@ -4343,7 +4418,7 @@ static void generate_interface_bridges(class_gen_t *cg)
                 }
 
                 /* Also check superclass chain for implementation */
-                if (!impl_method) {
+                if (!impl_method && !inherited_interface) {
                     symbol_t *super = class_sym->data.class_data.superclass;
                     while (super && !impl_method) {
                         if (super->data.class_data.members &&
@@ -4752,7 +4827,9 @@ static void generate_interface_bridges(class_gen_t *cg)
                 entry = entry->next;
             }
         }
-    }    slist_free(all_ifaces);
+    }
+    slist_free(ancestor_only);
+    slist_free(all_ifaces);
 }
 
 /**
@@ -4822,6 +4899,11 @@ static void generate_covariant_override_bridges_for(class_gen_t *cg, symbol_t *s
                 (method->modifiers & MOD_FINAL)) {
                 entry = entry->next;
                 continue;
+            }
+
+            /* a method of another file of the batch is typed lazily */
+            if (!method->type && cg->sem) {
+                semantic_ensure_method_result_type(cg->sem, method, super_sym);
             }
 
             /* Only relevant when the superclass method's own signature
@@ -4943,6 +5025,12 @@ static void generate_covariant_override_bridges_for(class_gen_t *cg, symbol_t *s
             /* Not overridden at all - that's generate_superclass_bridges()'s
              * own job (invokespecial forwarding to super), not ours. */
             if (!impl_method || (!has_type_var && !impl_method->type)) {
+                entry = entry->next;
+                continue;
+            }
+            /* An interface bridges only a default method it declares (an abstract one has
+             * no body to bridge from; the classes implementing it get the bridge) */
+            if (class_sym->kind == SYM_INTERFACE && !(impl_method->modifiers & MOD_DEFAULT)) {
                 entry = entry->next;
                 continue;
             }
@@ -5150,10 +5238,19 @@ static void generate_covariant_override_bridges_for(class_gen_t *cg, symbol_t *s
             }
 
             /* invokevirtual this.<real override>(concrete_desc) */
-            uint16_t methodref = cp_add_methodref(cg->cp, cg->internal_name,
-                                                   impl_method->name, concrete_desc->str);
-            bc_emit(code, OP_INVOKEVIRTUAL);
-            bc_emit_u2(code, methodref);
+            if (class_sym->kind == SYM_INTERFACE) {
+                uint16_t imethodref = cp_add_interface_methodref(cg->cp, cg->internal_name,
+                                                                 impl_method->name, concrete_desc->str);
+                bc_emit(code, OP_INVOKEINTERFACE);
+                bc_emit_u2(code, imethodref);
+                bc_emit_u1(code, (uint8_t)slot);   /* this and the argument words */
+                bc_emit_u1(code, 0);
+            } else {
+                uint16_t methodref = cp_add_methodref(cg->cp, cg->internal_name,
+                                                       impl_method->name, concrete_desc->str);
+                bc_emit(code, OP_INVOKEVIRTUAL);
+                bc_emit_u2(code, methodref);
+            }
 
             type_kind_t ret_kind = impl_method->type ? impl_method->type->kind : TYPE_VOID;
             switch (ret_kind) {
@@ -5195,6 +5292,17 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
     if (!cg || !cg->class_sym) {
         return;
     }
+    if (cg->class_sym->kind == SYM_INTERFACE) {
+        /* a default method overriding a superinterface's with a narrower return type */
+        slist_t *all_ifaces = NULL;
+        for (slist_t *direct = cg->class_sym->data.class_data.interfaces; direct; direct = direct->next) {
+            collect_interface_closure(cg->sem, (symbol_t *)direct->data, &all_ifaces);
+        }
+        for (slist_t *n = all_ifaces; n; n = n->next) {
+            generate_covariant_override_bridges_for(cg, (symbol_t *)n->data);
+        }
+        return;
+    }
     int depth = 0;
     for (symbol_t *super = cg->class_sym->data.class_data.superclass;
          super && depth < 64; super = super->data.class_data.superclass, depth++) {
@@ -5215,6 +5323,85 @@ void generate_pending_field_accessors(class_gen_t *cg)
 {
     if (!cg || !cg->class_sym) {
         return;
+    }
+
+    /* the accessors for protected methods nested classes call (see pending_method_accessor_t) */
+    for (slist_t *p = cg->class_sym->data.class_data.pending_method_accessors; p; p = p->next) {
+        pending_method_accessor_t *acc = (pending_method_accessor_t *)p->data;
+        if (!acc || acc->emitted || !acc->method || !acc->owner || !acc->accessor_name ||
+            !acc->owner->qualified_name) {
+            continue;
+        }
+        method_descriptor_t *md = descriptor_parse_method(acc->descriptor);
+        if (!md) {
+            continue;
+        }
+        acc->emitted = true;
+        char *owner_internal = class_to_internal_name(acc->owner->qualified_name);
+        const char *close = strrchr(acc->descriptor, ')');
+        size_t dlen = strlen(cg->internal_name) + strlen(acc->descriptor) + 4;
+        char *descriptor = malloc(dlen);
+        if (acc->is_static) {
+            snprintf(descriptor, dlen, "%s", acc->descriptor);
+        } else {
+            snprintf(descriptor, dlen, "(L%s;%s", cg->internal_name, acc->descriptor + 1);
+        }
+
+        method_info_gen_t *mi = calloc(1, sizeof(method_info_gen_t));
+        mi->access_flags = ACC_STATIC | ACC_SYNTHETIC;
+        mi->name_index = cp_add_utf8(cg->cp, acc->accessor_name);
+        mi->descriptor_index = cp_add_utf8(cg->cp, descriptor);
+
+        bytecode_t *code = bytecode_new();
+        int slot = 0;
+        int max_stack = 0;
+        if (!acc->is_static) {
+            bc_emit(code, OP_ALOAD_0);
+            slot = 1;
+            max_stack = 1;
+        }
+        for (int i = 0; i < md->param_count; i++) {
+            uint8_t load;
+            int words = 1;
+            switch (md->params[i].type) {
+                case DESC_LONG:   load = OP_LLOAD; words = 2; break;
+                case DESC_DOUBLE: load = OP_DLOAD; words = 2; break;
+                case DESC_FLOAT:  load = OP_FLOAD; break;
+                case DESC_OBJECT:
+                case DESC_ARRAY:  load = OP_ALOAD; break;
+                default:          load = OP_ILOAD; break;
+            }
+            bc_emit(code, load);
+            bc_emit_u1(code, (uint8_t)slot);
+            slot += words;
+            max_stack += words;
+        }
+        uint16_t methodref = cp_add_methodref(cg->cp, owner_internal, acc->method->name, acc->descriptor);
+        bc_emit(code, acc->is_static ? OP_INVOKESTATIC : OP_INVOKEVIRTUAL);
+        bc_emit_u2(code, methodref);
+        int ret_words = 1;
+        switch (md->return_type.type) {
+            case DESC_VOID:   bc_emit(code, OP_RETURN); ret_words = 0; break;
+            case DESC_LONG:   bc_emit(code, OP_LRETURN); ret_words = 2; break;
+            case DESC_DOUBLE: bc_emit(code, OP_DRETURN); ret_words = 2; break;
+            case DESC_FLOAT:  bc_emit(code, OP_FRETURN); break;
+            case DESC_OBJECT:
+            case DESC_ARRAY:  bc_emit(code, OP_ARETURN); break;
+            default:          bc_emit(code, OP_IRETURN); break;
+        }
+        code->max_stack = max_stack > ret_words ? max_stack : ret_words;
+        code->max_locals = slot;
+        mi->code = code;
+        (void)close;
+
+        if (!cg->methods) {
+            cg->methods = slist_new(mi);
+        } else {
+            slist_append(cg->methods, mi);
+        }
+        method_descriptor_free(md);
+        free(owner_internal);
+        free(descriptor);
     }
 
     for (slist_t *p = cg->class_sym->data.class_data.pending_field_accessors; p; p = p->next) {
@@ -5798,7 +5985,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
      * initialValue()") - the mutually-exclusive complement to
      * generate_superclass_bridges() above, which only handles the "not
      * overridden at all" case. */
-    if (!is_interface && !is_annotation) {
+    if (!is_annotation) {
         generate_covariant_override_bridges(cg);
     }
 
@@ -6454,6 +6641,8 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         /* Transfer debug tables */
         init->line_numbers = mg->line_numbers;
         mg->line_numbers = NULL;
+        init->exception_handlers = mg->exception_handlers;
+        mg->exception_handlers = NULL;
         init->local_var_table = mg->local_var_table;
         mg->local_var_table = NULL;
         
@@ -7048,6 +7237,10 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         mg->code->max_stack = mg->max_stack;
         mg->code->max_locals = mg->max_locals > 0 ? mg->max_locals : 0;
         clinit->code = mg->code;
+        clinit->exception_handlers = mg->exception_handlers;
+        mg->exception_handlers = NULL;
+        clinit->line_numbers = mg->line_numbers;
+        mg->line_numbers = NULL;
         
         /* Transfer stackmap */
         if (mg->stackmap && mg->stackmap->num_entries > 0) {
@@ -8172,6 +8365,10 @@ static void codegen_enum_constant_anon_constructor(class_gen_t *cg,
 
     init->line_numbers = mg->line_numbers;
     mg->line_numbers = NULL;
+
+    init->exception_handlers = mg->exception_handlers;
+
+    mg->exception_handlers = NULL;
     init->local_var_table = mg->local_var_table;
     mg->local_var_table = NULL;
 
@@ -8903,6 +9100,8 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         /* Transfer debug tables */
         init->line_numbers = mg->line_numbers;
         mg->line_numbers = NULL;
+        init->exception_handlers = mg->exception_handlers;
+        mg->exception_handlers = NULL;
         init->local_var_table = mg->local_var_table;
         mg->local_var_table = NULL;
         
@@ -8991,6 +9190,10 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         mg->code->max_stack = mg->max_stack;
         mg->code->max_locals = mg->max_locals > 0 ? mg->max_locals : 0;
         clinit->code = mg->code;
+        clinit->exception_handlers = mg->exception_handlers;
+        mg->exception_handlers = NULL;
+        clinit->line_numbers = mg->line_numbers;
+        mg->line_numbers = NULL;
         
         /* Transfer stackmap */
         if (mg->stackmap && mg->stackmap->num_entries > 0) {
