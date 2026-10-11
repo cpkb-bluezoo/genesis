@@ -4377,6 +4377,94 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
 /**
  * Parse a class body member.
  */
+/**
+ * A deep copy of a type node (the node kinds the parser makes for types).
+ */
+static ast_node_t *clone_type_node(const ast_node_t *t)
+{
+    if (!t) {
+        return NULL;
+    }
+    if (t->type == AST_PRIMITIVE_TYPE || t->type == AST_VAR_TYPE) {
+        /* The leaf kinds of type node: a keyword's name only. */
+        ast_node_t *leaf = ast_new_leaf(t->type, t->data.leaf.name, t->line, t->column);
+        if (leaf) {
+            leaf->data.leaf.token_type = t->data.leaf.token_type;
+        }
+        return leaf;
+    }
+    ast_node_t *copy = ast_new(t->type, t->line, t->column);
+    if (!copy) {
+        return NULL;
+    }
+    copy->data.node.flags = t->data.node.flags;
+    copy->data.node.name = t->data.node.name;
+    copy->data.node.op_token = t->data.node.op_token;
+    copy->data.node.extra = clone_type_node(t->data.node.extra);
+    for (slist_t *c = t->data.node.children; c; c = c->next) {
+        ast_node_t *child = clone_type_node((const ast_node_t *)c->data);
+        if (child) {
+            ast_add_child(copy, child);
+        }
+    }
+    return copy;
+}
+
+/**
+ * A compact canonical constructor of a record (JLS 8.10.4.2): "Name { body }".
+ * It is made into the canonical constructor it stands for: one parameter for
+ * each record component, the body as written, and the assignment of every
+ * component field from its parameter ("this.x = x;") after it, so nothing
+ * after parsing needs to know it was compact.
+ */
+static ast_node_t *parse_compact_constructor(parser_t *parser, uint32_t modifiers,
+                                             const char *class_name, int line, int col)
+{
+    ast_node_t *ctor = ast_new(AST_CONSTRUCTOR_DECL, line, col);
+    ctor->data.node.flags = modifiers;
+    ctor->data.node.name = (char *)intern(class_name);
+
+    slist_t *components = NULL;
+    for (slist_t *c = parser->record_decl->data.node.children; c; c = c->next) {
+        ast_node_t *comp = (ast_node_t *)c->data;
+        if (comp && comp->type == AST_PARAMETER && (comp->data.node.flags & MOD_RECORD_COMPONENT)) {
+            ast_node_t *param = ast_new(AST_PARAMETER, comp->line, comp->column);
+            param->data.node.name = comp->data.node.name;
+            param->data.node.flags = 0;
+            if (comp->data.node.children) {
+                ast_add_child(param, clone_type_node((const ast_node_t *)comp->data.node.children->data));
+            }
+            ast_add_child(ctor, param);
+            components = components ? (slist_append(components, comp), components) : slist_new(comp);
+        }
+    }
+
+    ast_node_t *body = parse_block(parser);
+    if (!body) {
+        ast_free(ctor);
+        slist_free(components);
+        return NULL;
+    }
+    for (slist_t *c = components; c; c = c->next) {
+        ast_node_t *comp = (ast_node_t *)c->data;
+        const char *name = comp->data.node.name;
+        ast_node_t *target = ast_new(AST_FIELD_ACCESS, line, col);
+        target->data.node.name = (char *)name;
+        ast_add_child(target, ast_new_leaf(AST_THIS_EXPR, "this", line, col));
+        ast_node_t *assign = ast_new(AST_ASSIGNMENT_EXPR, line, col);
+        assign->data.node.name = (char *)intern("=");
+        assign->data.node.op_token = TOK_ASSIGN;
+        ast_add_child(assign, target);
+        ast_add_child(assign, ast_new_leaf(AST_IDENTIFIER, name, line, col));
+        ast_node_t *stmt = ast_new(AST_EXPR_STMT, line, col);
+        ast_add_child(stmt, assign);
+        ast_add_child(body, stmt);
+    }
+    slist_free(components);
+    ast_add_child(ctor, body);
+    return ctor;
+}
+
 static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
 {
     slist_t *annotations = NULL;
@@ -4482,6 +4570,18 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
         int ctor_col = parser_current_column(parser);
         parser_advance(parser);
         
+        if (parser_check(parser, TOK_LBRACE) && parser->record_decl &&
+            parser->record_decl->data.node.name &&
+            strcmp(parser->record_decl->data.node.name, class_name) == 0 &&
+            !method_type_params) {
+            ast_node_t *ctor = parse_compact_constructor(parser, modifiers, class_name,
+                                                         ctor_line, ctor_col);
+            if (ctor) {
+                ctor->annotations = annotations;
+            }
+            return ctor;
+        }
+
         if (parser_check(parser, TOK_LPAREN)) {
             ast_node_t *ctor = parse_method_decl(parser, modifiers, NULL, class_name,
                                      ctor_line, ctor_col);
@@ -4890,6 +4990,8 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
         fprintf(stderr, "[PARSER] Parsing class body for: %s (type=%d)\n", decl->data.node.name, type);
     }
     int member_count = 0;
+    ast_node_t *saved_record_decl = parser->record_decl;
+    parser->record_decl = (type == AST_RECORD_DECL) ? decl : NULL;
     while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
         if (debug_getenv("GENESIS_DEBUG_PARSER")) {
             fprintf(stderr, "[PARSER] [%s] Loop iteration %d: current_token=%d, line=%d, check_rbrace=%d, check_eof=%d\n", 
@@ -4925,6 +5027,8 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
         }
     }
     
+    parser->record_decl = saved_record_decl;
+
     if (debug_getenv("GENESIS_DEBUG_PARSER")) {
         fprintf(stderr, "[PARSER] Finished parsing class body for: %s, member_count=%d, current_token=%d\n", 
                 decl->data.node.name, member_count, parser_current_type(parser));

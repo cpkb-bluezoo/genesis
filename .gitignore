@@ -40,3 +40,6 @@ jtreg-report/
 *.dSYM/
 .DS_Store
 *~
+
+# Python bytecode of the bench helpers
+__pycache__/

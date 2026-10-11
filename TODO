@@ -163,6 +163,40 @@ KNOWN BUGS
     Until then the README states the requirement, and CI uses a JDK that
     ships jmods.
 
+16. Pattern matching for instanceof (JLS 15.20.2, 6.3.1) only works as the
+    whole condition of an if statement ("if (o instanceof T t) {...}"), and
+    even there the source expression is evaluated a second time in the then
+    branch to get the value to cast (a side effect runs twice). A binding in
+    "o instanceof T t && t.ok()", "!(o instanceof T t) || t.bad()",
+    "o instanceof T t ? t : null", "return o instanceof T t && ...", in a
+    while/for condition, or used after "if (!(o instanceof T t)) return;"
+    fails with "Cannot resolve symbol: t". Doing it properly needs binding
+    scopes following JLS 6.3.1 in the analysis, and jump-based condition
+    codegen (as javac does: the cast and store happen on the true edge of the
+    test, the source stored once in a temporary), because a boolean
+    materialised to 0/1 and tested again loses the verifier's knowledge that
+    the variable is assigned. Spring Boot has 547 such bindings in 308 files,
+    76 of them outside a bare if.
+
+17. -parameters is accepted but no MethodParameters attribute is written, so
+    reflection reports arg0, arg1... for genesis-compiled classes. Spring
+    (6.1 and later) finds parameter names only that way; code compiled with
+    genesis loses @RequestParam-style name inference.
+
+18. make smoke-spring-boot (bench/spring-boot/): with javac, all of core/,
+    module/ and test-support/ of Spring Boot v4.1.1 compiles except
+    spring-boot-gradle-test-support (it needs Gradle TestKit) and 15,055 of
+    15,700 tests pass (the rest need annotation processing, a container or a
+    port). Genesis has five root failures, with everything that depends on
+    them skipped: spring-boot-autoconfigure-processor (3 errors),
+    spring-boot-configuration-metadata (46), spring-boot-test-support (12),
+    spring-boot-configuration-processor (89) and spring-boot (1281, mostly
+    cascades of unresolved types from a few causes, among them item 16).
+    Fixed on the way: compact record constructors, records declared in
+    another file, @Override on a record accessor, static members through a
+    record's name, records declaring their own equals/hashCode/toString or
+    another constructor.
+
 ================================================================================
 OPTIONAL IMPROVEMENTS
 ================================================================================

@@ -10,7 +10,9 @@ SUBDIRS = src
 ## Only user-facing documentation is distributed.  Everything under test/
 ## (regression tests, jtreg glue) is development-only and is
 ## intentionally absent from EXTRA_DIST.
-EXTRA_DIST = CONTRIBUTING TODO README.md bench/compare-compilers.sh bench/gumdrop-ant-test.sh
+EXTRA_DIST = CONTRIBUTING TODO README.md bench/compare-compilers.sh bench/gumdrop-ant-test.sh \
+             bench/spring-boot-smoke.sh bench/spring-boot/maven.py bench/spring-boot/model.py \
+             bench/spring-boot/smoke.py bench/spring-boot/4.1.1.lock
 
 if HAVE_TESTS
 
@@ -34,6 +36,13 @@ gumdrop-smoke: all
 	$(AM_V_at)GENESIS="$(abs_top_builddir)/src/genesis" \
 	  JAVA_HOME="$(JAVA_HOME)" \
 	  $(SHELL) $(top_srcdir)/bench/gumdrop-ant-test.sh
+
+## Spring Boot smoke: compile Spring Boot with javac and genesis, run its unit tests on both
+## (no Gradle or Maven; see bench/spring-boot-smoke.sh)
+smoke-spring-boot: all
+	$(AM_V_at)GENESIS="$(abs_top_builddir)/src/genesis" \
+	  JAVA_HOME="$(JAVA_HOME)" \
+	  $(SHELL) $(top_srcdir)/bench/spring-boot-smoke.sh
 
 check-local: all
 	$(AM_V_at)$(TEST_ENV) $(SHELL) $(top_srcdir)/test/run-tests.sh
@@ -81,6 +90,6 @@ jtreg-test-one: all jtreg-check
 clean-local:
 	-rm -rf test/build $(JTREG_WORK) $(JTREG_REPORT)
 
-.PHONY: bench check-one jtreg-check jtreg-test jtreg-test-one
+.PHONY: bench gumdrop-smoke smoke-spring-boot check-one jtreg-check jtreg-test jtreg-test-one
 
 endif HAVE_TESTS

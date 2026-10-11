@@ -1303,7 +1303,7 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
     if (ident->sem_symbol && 
         (ident->sem_symbol->kind == SYM_CLASS ||
          ident->sem_symbol->kind == SYM_INTERFACE ||
-         ident->sem_symbol->kind == SYM_ENUM)) {
+         ident->sem_symbol->kind == SYM_ENUM || ident->sem_symbol->kind == SYM_RECORD)) {
         /* This is a class reference, not a variable - no code to generate */
         return true;
     }
@@ -1857,7 +1857,7 @@ static const char *resolve_class_name(method_gen_t *mg, const char *name)
         if (class_sym->data.class_data.members) {
             symbol_t *nested = scope_lookup_local(class_sym->data.class_data.members, name);
             if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
-                          nested->kind == SYM_ENUM)) {
+                          nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
                 /* Build internal name: OuterClass$NestedClass */
                 static __thread char nested_internal[256];
                 snprintf(nested_internal, sizeof(nested_internal), "%s$%s",
@@ -1983,7 +1983,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
     if (expr->sem_symbol && 
         (expr->sem_symbol->kind == SYM_CLASS || 
          expr->sem_symbol->kind == SYM_INTERFACE ||
-         expr->sem_symbol->kind == SYM_ENUM) &&
+         expr->sem_symbol->kind == SYM_ENUM || expr->sem_symbol->kind == SYM_RECORD) &&
         (!field_name || strcmp(field_name, "class") != 0)) {
         /* This is a class reference, not a field access - no code to generate */
         return true;
@@ -2362,7 +2362,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
         if (!class_name && receiver->sem_symbol &&
             (receiver->sem_symbol->kind == SYM_CLASS ||
              receiver->sem_symbol->kind == SYM_INTERFACE ||
-             receiver->sem_symbol->kind == SYM_ENUM)) {
+             receiver->sem_symbol->kind == SYM_ENUM || receiver->sem_symbol->kind == SYM_RECORD)) {
             /* External class reference - use the qualified name */
             /* Thread-local to avoid race conditions in parallel compilation */
             static __thread char external_class_name[256];
@@ -2395,7 +2395,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                 if (class_sym->data.class_data.members) {
                     symbol_t *nested = scope_lookup_local(class_sym->data.class_data.members, recv_name);
                     if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
-                                  nested->kind == SYM_ENUM)) {
+                                  nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
                         /* Look up field in nested type */
                         if (nested->data.class_data.members) {
                             symbol_t *field_sym = scope_lookup_local(
@@ -2425,7 +2425,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
             if (!field_desc && receiver->sem_symbol &&
                 (receiver->sem_symbol->kind == SYM_CLASS ||
                  receiver->sem_symbol->kind == SYM_INTERFACE ||
-                 receiver->sem_symbol->kind == SYM_ENUM)) {
+                 receiver->sem_symbol->kind == SYM_ENUM || receiver->sem_symbol->kind == SYM_RECORD)) {
                 symbol_t *ext_class = receiver->sem_symbol;
                 if (ext_class->data.class_data.members) {
                     symbol_t *field_sym = scope_lookup_local(
@@ -2561,7 +2561,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
         if (receiver->sem_symbol &&
             (receiver->sem_symbol->kind == SYM_CLASS ||
              receiver->sem_symbol->kind == SYM_INTERFACE ||
-             receiver->sem_symbol->kind == SYM_ENUM)) {
+             receiver->sem_symbol->kind == SYM_ENUM || receiver->sem_symbol->kind == SYM_RECORD)) {
             /* Static field access on a class/enum */
             symbol_t *class_sym = receiver->sem_symbol;
             char *class_internal = class_to_internal_name(class_sym->qualified_name);
@@ -5765,7 +5765,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
             if (!handled_qualified_super && first->sem_symbol && 
                 (first->sem_symbol->kind == SYM_CLASS || 
                  first->sem_symbol->kind == SYM_INTERFACE ||
-                 first->sem_symbol->kind == SYM_ENUM)) {
+                 first->sem_symbol->kind == SYM_ENUM || first->sem_symbol->kind == SYM_RECORD)) {
                 /* This is a static method call on a class (java.util.Objects.requireNonNull) */
                 /* Don't set receiver - it's not an instance, just a class reference */
                 args = children->next;
@@ -5923,7 +5923,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
             if (first->sem_symbol && 
                 (first->sem_symbol->kind == SYM_CLASS ||
                  first->sem_symbol->kind == SYM_INTERFACE ||
-                 first->sem_symbol->kind == SYM_ENUM)) {
+                 first->sem_symbol->kind == SYM_ENUM || first->sem_symbol->kind == SYM_RECORD)) {
                 /* It's a class reference resolved via import (e.g., Objects after import java.util.Objects) */
                 is_class_ref = true;
                 is_static = true;
@@ -5968,7 +5968,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                         class_sym->data.class_data.members, name);
                     if (nested && (nested->kind == SYM_CLASS || 
                                   nested->kind == SYM_INTERFACE ||
-                                  nested->kind == SYM_ENUM)) {
+                                  nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
                         /* It's a static call on a nested type */
                         is_class_ref = true;
                         is_static = true;
@@ -9420,7 +9420,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             if (!class_name && receiver->sem_symbol &&
                 (receiver->sem_symbol->kind == SYM_CLASS ||
                  receiver->sem_symbol->kind == SYM_INTERFACE ||
-                 receiver->sem_symbol->kind == SYM_ENUM)) {
+                 receiver->sem_symbol->kind == SYM_ENUM || receiver->sem_symbol->kind == SYM_RECORD)) {
                 static __thread char external_class_name[256];
                 if (receiver->sem_symbol->qualified_name) {
                     char *internal = class_to_internal_name(receiver->sem_symbol->qualified_name);
@@ -9450,7 +9450,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                 if (!field_desc && receiver->sem_symbol &&
                     (receiver->sem_symbol->kind == SYM_CLASS ||
                      receiver->sem_symbol->kind == SYM_INTERFACE ||
-                     receiver->sem_symbol->kind == SYM_ENUM)) {
+                     receiver->sem_symbol->kind == SYM_ENUM || receiver->sem_symbol->kind == SYM_RECORD)) {
                     symbol_t *ext_class = receiver->sem_symbol;
                     if (ext_class->data.class_data.members) {
                         symbol_t *field_sym = scope_lookup_local(

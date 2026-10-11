@@ -49,6 +49,8 @@ typedef struct compiler_options
     bool debug_info;                /* Generate debug information */
     bool warnings;                  /* Enable warnings */
     bool werror;                    /* Treat warnings as errors */
+    bool parameters;                /* -parameters: record parameter names (MethodParameters) */
+    char *ignored_value;            /* Value of an accepted but ignored option (sink) */
     int jobs;                       /* Number of parallel jobs (0 = auto, 1 = serial) */
 } compiler_options_t;
 
@@ -552,6 +554,7 @@ typedef struct parser
     int error_line;                 /* Error line number */
     int error_column;               /* Error column number */
     token_type_t pending_token;     /* Pending token from split >> or >>> (0 if none) */
+    ast_node_t *record_decl;        /* Record whose body is being parsed (compact constructors) */
 } parser_t;
 
 /* Parser API */
@@ -571,6 +574,12 @@ ast_node_t *parse_type(parser_t *parser);
 ast_node_t *parse_block(parser_t *parser);
 ast_node_t *parse_array_initializer(parser_t *parser);
 ast_node_t *parse_class_body(parser_t *parser);
+
+/* The written name of a type node, "int", "java.util.List" or "String[]" (type arguments dropped). */
+char *extract_type_name_from_ast(ast_node_t *type_node);
+
+/* True if a record's constructor takes exactly its components, in order and of the same types. */
+bool record_ctor_is_canonical(ast_node_t *ctor, ast_node_t *record_decl);
 
 /* ========================================================================
  * Type System - see type.h for type definitions

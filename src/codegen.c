@@ -5073,6 +5073,32 @@ void generate_pending_field_accessors(class_gen_t *cg)
  * Class Code Generation
  * ======================================================================== */
 
+/**
+ * True if the class declaration declares a method of this name and number of
+ * parameters (a record's own accessor, equals, hashCode or toString).
+ */
+static bool class_declares_method(ast_node_t *class_decl, const char *name, int nparams)
+{
+    for (slist_t *c = class_decl->data.node.children; c; c = c->next) {
+        ast_node_t *m = (ast_node_t *)c->data;
+        if (!m || m->type != AST_METHOD_DECL || !m->data.node.name ||
+            strcmp(m->data.node.name, name) != 0) {
+            continue;
+        }
+        int n = 0;
+        for (slist_t *p = m->data.node.children; p; p = p->next) {
+            ast_node_t *param = (ast_node_t *)p->data;
+            if (param && param->type == AST_PARAMETER) {
+                n++;
+            }
+        }
+        if (n == nparams) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
 {
     if (!cg || !class_decl) {
@@ -5201,6 +5227,25 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     free(internal_name);
                 }
             }
+        }
+    }
+    
+    /* Collect record components for record types */
+    slist_t *record_components = NULL;
+    if (is_record) {
+        /* Collect all record components (AST_PARAMETER with MOD_RECORD_COMPONENT) */
+        slist_t *children_iter = class_decl->data.node.children;
+        while (children_iter) {
+            ast_node_t *member = (ast_node_t *)children_iter->data;
+            if (member->type == AST_PARAMETER && 
+                (member->data.node.flags & MOD_RECORD_COMPONENT)) {
+                if (!record_components) {
+                    record_components = slist_new(member);
+                } else {
+                    slist_append(record_components, member);
+                }
+            }
+            children_iter = children_iter->next;
         }
     }
     
@@ -5373,7 +5418,12 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 break;
             
             case AST_CONSTRUCTOR_DECL:
-                has_constructor = true;
+                /* A record has its canonical constructor implicitly unless it
+                 * declares that one: any other constructor ("Name(a, b)
+                 * { this(a, b, List.of()); }") leaves it to be generated. */
+                if (!is_record || record_ctor_is_canonical(member, class_decl)) {
+                    has_constructor = true;
+                }
                 if (!codegen_method(cg, member)) {
                     return false;
                 }
@@ -5532,25 +5582,6 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         }
         
         children = children->next;
-    }
-    
-    /* Collect record components for record types */
-    slist_t *record_components = NULL;
-    if (is_record) {
-        /* Collect all record components (AST_PARAMETER with MOD_RECORD_COMPONENT) */
-        slist_t *children_iter = class_decl->data.node.children;
-        while (children_iter) {
-            ast_node_t *member = (ast_node_t *)children_iter->data;
-            if (member->type == AST_PARAMETER && 
-                (member->data.node.flags & MOD_RECORD_COMPONENT)) {
-                if (!record_components) {
-                    record_components = slist_new(member);
-                } else {
-                    slist_append(record_components, member);
-                }
-            }
-            children_iter = children_iter->next;
-        }
     }
     
     /* Generate bridge methods for generic superclass inheritance.
@@ -7047,10 +7078,13 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
     
     /* Generate accessor methods, equals(), hashCode(), and toString() for records */
     if (is_record && record_components) {
-        /* Generate accessor methods for each component */
+        /* Generate accessor methods for each component (not one the record declares) */
         for (slist_t *comp = record_components; comp; comp = comp->next) {
             ast_node_t *comp_node = (ast_node_t *)comp->data;
             const char *comp_name = comp_node->data.node.name;
+            if (class_declares_method(class_decl, comp_name, 0)) {
+                continue;
+            }
             ast_node_t *comp_type = NULL;
             if (comp_node->data.node.children) {
                 comp_type = (ast_node_t *)comp_node->data.node.children->data;
@@ -7123,7 +7157,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         }
         
         /* Generate hashCode() method using Objects.hash(fields...) */
-        {
+        if (!class_declares_method(class_decl, "hashCode", 0)) {
             method_info_gen_t *hashcode = calloc(1, sizeof(method_info_gen_t));
             hashcode->access_flags = ACC_PUBLIC;
             hashcode->name_index = cp_add_utf8(cg->cp, "hashCode");
@@ -7253,7 +7287,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         }
         
         /* Generate equals(Object) method */
-        {
+        if (!class_declares_method(class_decl, "equals", 1)) {
             method_info_gen_t *equals = calloc(1, sizeof(method_info_gen_t));
             equals->access_flags = ACC_PUBLIC;
             equals->name_index = cp_add_utf8(cg->cp, "equals");
@@ -7471,7 +7505,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         }
         
         /* Generate toString() method using simple format "RecordName[field1=value1, ...]" */
-        {
+        if (!class_declares_method(class_decl, "toString", 0)) {
             method_info_gen_t *tostr = calloc(1, sizeof(method_info_gen_t));
             tostr->access_flags = ACC_PUBLIC;
             tostr->name_index = cp_add_utf8(cg->cp, "toString");

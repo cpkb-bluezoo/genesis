@@ -116,6 +116,24 @@ Testing
                                        (haltonfailure=no) for a full picture.
                                        See bench/gumdrop-ant-test.sh for all
                                        environment variables.
+   make smoke-spring-boot           - Functional: compile Spring Boot (tag v4.1.1
+                                       of ../spring-boot; core, module and
+                                       test-support) with javac and with genesis,
+                                       project by project in dependency order,
+                                       and run each project's unit tests on both
+                                       sets of classes with the JUnit console
+                                       launcher. javac is the baseline: the smoke
+                                       fails if genesis cannot compile a project
+                                       javac can, or a test that passes on javac's
+                                       classes fails on genesis's. No Gradle or
+                                       Maven: the dependency graph and jars come
+                                       from bench/spring-boot/*.py (Python 3) and
+                                       Maven Central, checked against
+                                       bench/spring-boot/4.1.1.lock. Needs a JDK 25
+                                       with jmods. Environment: SB_DIR, SB_REF,
+                                       SB_PROJECTS (a regular expression, to work
+                                       on a few projects), SB_COMPILERS, SB_NO_TESTS,
+                                       SB_KEEP; see bench/spring-boot/smoke.py.
    make bench                       - Performance: genesis vs javac, straight
                                        command-line invocations (no Ant) over
                                        an explicit list of every gumdrop

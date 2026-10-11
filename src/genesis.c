@@ -113,9 +113,37 @@ compiler_options_t *compiler_options_new(void)
     opts->debug_info = true;
     opts->warnings = true;
     opts->werror = false;
+    opts->parameters = false;
+    opts->ignored_value = NULL;
     opts->jobs = -1;  /* -1 = auto-detect thread count (parallel default) */
     
     return opts;
+}
+
+/**
+ * javac options genesis accepts and ignores, so that a build can hand it the
+ * command line it gives javac: source encoding (genesis reads UTF-8 and the
+ * Unicode encodings only), annotation processing (it does none), lint and
+ * deprecation reporting, and implicit-class handling.
+ *
+ * Returns 0 if the option is not one of them, 1 if it is a flag and 2 if it
+ * takes a value in the next argument.
+ */
+static int ignored_javac_option(const char *arg)
+{
+    if (strcmp(arg, "-encoding") == 0 || strcmp(arg, "-Xmaxerrs") == 0 ||
+        strcmp(arg, "-Xmaxwarns") == 0 || strcmp(arg, "-processorpath") == 0 ||
+        strcmp(arg, "--processor-path") == 0 || strcmp(arg, "-processor") == 0 ||
+        strcmp(arg, "-s") == 0 || strcmp(arg, "-h") == 0) {
+        return 2;
+    }
+    if (strncmp(arg, "-proc:", 6) == 0 || strncmp(arg, "-Xlint", 6) == 0 ||
+        strncmp(arg, "-implicit:", 10) == 0 || strncmp(arg, "-XD", 3) == 0 ||
+        strcmp(arg, "-deprecation") == 0 || strcmp(arg, "-Xdiags:verbose") == 0 ||
+        strcmp(arg, "-Xdoclint:none") == 0 || strncmp(arg, "-Xpkginfo:", 10) == 0) {
+        return 1;
+    }
+    return 0;
 }
 
 /**
@@ -134,6 +162,7 @@ void compiler_options_free(compiler_options_t *opts)
     free(opts->main_class);
     free(opts->classpath);
     free(opts->sourcepath);
+    free(opts->ignored_value);
     slist_free(opts->source_files);
     free(opts);
 }
@@ -3422,6 +3451,15 @@ int main(int argc, char **argv)
                     else if (strcmp(arg, "-verbose") == 0) {
                         opts->verbose = true;
                     }
+                    else if (strcmp(arg, "-parameters") == 0) {
+                        opts->parameters = true;
+                    }
+                    else if (ignored_javac_option(arg) != 0) {
+                        if (ignored_javac_option(arg) == 2) {
+                            expect_value = true;
+                            value_ptr = &opts->ignored_value;
+                        }
+                    }
                     else {
                         fprintf(stderr, "warning: unrecognized option: %s\n", arg);
                     }
@@ -3534,6 +3572,15 @@ int main(int argc, char **argv)
             }
             else if (strcmp(argv[i], "-verbose") == 0) {
                 opts->verbose = true;
+            }
+            else if (strcmp(argv[i], "-parameters") == 0) {
+                opts->parameters = true;
+            }
+            else if (ignored_javac_option(argv[i]) != 0) {
+                if (ignored_javac_option(argv[i]) == 2) {
+                    expect_value = true;
+                    value_ptr = &opts->ignored_value;
+                }
             }
             else if (strcmp(argv[i], "-j") == 0 || 
                      strncmp(argv[i], "-j", 2) == 0) {

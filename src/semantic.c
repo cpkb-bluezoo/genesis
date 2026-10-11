@@ -541,6 +541,182 @@ static void ensure_method_return_from_descriptor(symbol_t *method);
 static type_t *resolve_unresolved_type_full(unresolved_type_t *ut, type_registry_t *reg,
                                             classpath_t *cp, symbol_t *context);
 
+bool record_ctor_is_canonical(ast_node_t *ctor, ast_node_t *record_decl)
+{
+    slist_t *comp = record_decl->data.node.children;
+    for (slist_t *c = ctor->data.node.children; c; c = c->next) {
+        ast_node_t *param = (ast_node_t *)c->data;
+        if (!param || param->type != AST_PARAMETER) {
+            continue;
+        }
+        while (comp) {
+            ast_node_t *k = (ast_node_t *)comp->data;
+            if (k && k->type == AST_PARAMETER && (k->data.node.flags & MOD_RECORD_COMPONENT)) {
+                break;
+            }
+            comp = comp->next;
+        }
+        if (!comp) {
+            return false;
+        }
+        ast_node_t *ctype = (ast_node_t *)((ast_node_t *)comp->data)->data.node.children->data;
+        ast_node_t *ptype = param->data.node.children ? (ast_node_t *)param->data.node.children->data : NULL;
+        char *cname = extract_type_name_from_ast(ctype);
+        char *pname = extract_type_name_from_ast(ptype);
+        bool same = cname && pname && strcmp(cname, pname) == 0;
+        free(cname);
+        free(pname);
+        if (!same) {
+            return false;
+        }
+        comp = comp->next;
+    }
+    for (; comp; comp = comp->next) {
+        ast_node_t *k = (ast_node_t *)comp->data;
+        if (k && k->type == AST_PARAMETER && (k->data.node.flags & MOD_RECORD_COMPONENT)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void enter_record_canonical_ctor(symbol_t *sym, ast_node_t *decl, type_registry_t *reg,
+                                        classpath_t *cp);
+
+/**
+ * Enters the members a record has without declaring them, for a record
+ * entered from another file of the batch: a private final field and an
+ * accessor for each component, and the canonical constructor. (A record
+ * analysed in its own file gets them in pass 1.) Whatever the record does
+ * declare - an explicit accessor, an explicit or compact canonical
+ * constructor - is already there and stays.
+ */
+static void enter_record_members(symbol_t *sym, ast_node_t *decl, type_registry_t *reg,
+                                 classpath_t *cp)
+{
+    scope_t *members = sym->data.class_data.members;
+    int count = 0;
+
+    for (slist_t *c = decl->data.node.children; c; c = c->next) {
+        ast_node_t *comp = (ast_node_t *)c->data;
+        if (!comp || comp->type != AST_PARAMETER || !(comp->data.node.flags & MOD_RECORD_COMPONENT) ||
+            !comp->data.node.name || !comp->data.node.children) {
+            continue;
+        }
+        ast_node_t *ctype = (ast_node_t *)comp->data.node.children->data;
+        const char *name = comp->data.node.name;
+
+        if (!scope_lookup_local(members, name)) {
+            symbol_t *field = calloc(1, sizeof(symbol_t));
+            if (field) {
+                field->kind = SYM_FIELD;
+                field->name = strdup(name);
+                field->modifiers = MOD_PRIVATE | MOD_FINAL;
+                field->ast = comp;
+                field->data.var_data.unresolved_type = unresolved_type_from_ast(ctype);
+                scope_define(members, field);
+            }
+        }
+
+        char key[512];
+        snprintf(key, sizeof(key), "%s()", name);
+        if (!hashtable_lookup(members->symbols, key)) {
+            symbol_t *accessor = calloc(1, sizeof(symbol_t));
+            if (accessor) {
+                accessor->kind = SYM_METHOD;
+                accessor->name = strdup(name);
+                accessor->modifiers = MOD_PUBLIC;
+                accessor->ast = comp;
+                accessor->data.method_data.unresolved_return_type = unresolved_type_from_ast(ctype);
+                accessor->scope = members;
+                hashtable_insert(members->symbols, strdup(key), accessor);
+            }
+        }
+
+        count++;
+    }
+    (void)count;
+    enter_record_canonical_ctor(sym, decl, reg, cp);
+}
+
+/**
+ * Enters the canonical constructor of a record that does not declare one
+ * (an explicit or compact one is a member like any other).
+ */
+static void enter_record_canonical_ctor(symbol_t *sym, ast_node_t *decl, type_registry_t *reg,
+                                        classpath_t *cp)
+{
+    scope_t *members = sym->data.class_data.members;
+    int count = 0;
+    char ctor_key[512];
+    size_t ctor_len = snprintf(ctor_key, sizeof(ctor_key), "%s(", decl->data.node.name);
+    for (slist_t *c = decl->data.node.children; c; c = c->next) {
+        ast_node_t *comp = (ast_node_t *)c->data;
+        if (comp && comp->type == AST_PARAMETER && (comp->data.node.flags & MOD_RECORD_COMPONENT) &&
+            comp->data.node.name && comp->data.node.children) {
+            char *tname = extract_type_name_from_ast((ast_node_t *)comp->data.node.children->data);
+            if (tname && ctor_len < sizeof(ctor_key) - 1) {
+                ctor_len += snprintf(ctor_key + ctor_len, sizeof(ctor_key) - ctor_len, "%s%s",
+                                     count ? "," : "", tname);
+            }
+            free(tname);
+            count++;
+        }
+        if (comp && comp->type == AST_CONSTRUCTOR_DECL && record_ctor_is_canonical(comp, decl)) {
+            return;             /* declared: the member loops enter it */
+        }
+    }
+    if (ctor_len < sizeof(ctor_key) - 1) {
+        ctor_key[ctor_len++] = ')';
+        ctor_key[ctor_len] = '\0';
+    }
+    if (hashtable_lookup(members->symbols, ctor_key)) {
+        return;
+    }
+
+    symbol_t *ctor = calloc(1, sizeof(symbol_t));
+    if (!ctor) {
+        return;
+    }
+    ctor->kind = SYM_CONSTRUCTOR;
+    ctor->name = strdup(decl->data.node.name);
+    ctor->modifiers = decl->data.node.flags & (MOD_PUBLIC | MOD_PROTECTED | MOD_PRIVATE);
+    ctor->ast = decl;
+    ctor->data.method_data.param_count = count;
+    if (count > 0) {
+        ctor->data.method_data.params = calloc(count, sizeof(symbol_t *));
+        ctor->data.method_data.unresolved_param_types = calloc(count, sizeof(unresolved_type_t *));
+    }
+    int idx = 0;
+    for (slist_t *c = decl->data.node.children; c && idx < count; c = c->next) {
+        ast_node_t *comp = (ast_node_t *)c->data;
+        if (!comp || comp->type != AST_PARAMETER || !(comp->data.node.flags & MOD_RECORD_COMPONENT) ||
+            !comp->data.node.name || !comp->data.node.children) {
+            continue;
+        }
+        symbol_t *param = calloc(1, sizeof(symbol_t));
+        if (!param) {
+            break;
+        }
+        param->kind = SYM_PARAMETER;
+        param->name = strdup(comp->data.node.name);
+        unresolved_type_t *put = unresolved_type_from_ast((ast_node_t *)comp->data.node.children->data);
+        ctor->data.method_data.params[idx] = param;
+        ctor->data.method_data.unresolved_param_types[idx] = put;
+        if (put) {
+            param->type = resolve_unresolved_type_full(put, reg, cp, sym);
+        }
+        if (!ctor->data.method_data.parameters) {
+            ctor->data.method_data.parameters = slist_new(param);
+        } else {
+            slist_append(ctor->data.method_data.parameters, param);
+        }
+        idx++;
+    }
+    ctor->scope = members;
+    hashtable_insert(members->symbols, strdup(ctor_key), ctor);
+}
+
 /**
  * Enter methods and fields for a single type symbol from its AST.
  * Type references are stored as unresolved names.
@@ -1038,6 +1214,11 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
         }
     }
     
+    /* The members of a record that its declaration does not write out. */
+    if (decl->type == AST_RECORD_DECL) {
+        enter_record_members(sym, decl, reg, cp);
+    }
+
     /* Process extends and implements - they are type nodes with flags:
      * flags == 1: extends
      * flags == 2: implements
@@ -2621,7 +2802,7 @@ symbol_t *symbol_get_superclass(symbol_t *sym)
     if (!sym) {
         return NULL;
     }
-    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM) {
+    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM || sym->kind == SYM_RECORD) {
         return sym->data.class_data.superclass;
     }
     return NULL;
@@ -2632,7 +2813,7 @@ const char *symbol_get_unresolved_superclass(symbol_t *sym)
     if (!sym) {
         return NULL;
     }
-    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM) {
+    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM || sym->kind == SYM_RECORD) {
         return sym->data.class_data.unresolved_superclass;
     }
     return NULL;
@@ -2643,7 +2824,7 @@ void symbol_set_superclass(symbol_t *sym, symbol_t *super)
     if (!sym) {
         return;
     }
-    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM) {
+    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM || sym->kind == SYM_RECORD) {
         /* Only set if not already set (avoid race conditions) */
         if (!sym->data.class_data.superclass) {
             sym->data.class_data.superclass = super;
@@ -2656,7 +2837,7 @@ slist_t *symbol_get_interfaces(symbol_t *sym)
     if (!sym) {
         return NULL;
     }
-    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM) {
+    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM || sym->kind == SYM_RECORD) {
         return sym->data.class_data.interfaces;
     }
     return NULL;
@@ -3402,7 +3583,7 @@ void symbol_complete(symbol_t *sym)
     
     if (debug_getenv("GENESIS_DEBUG_COMPLETER")) {
         int member_count = 0;
-        if ((sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM) &&
+        if ((sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM || sym->kind == SYM_RECORD) &&
             sym->data.class_data.members && sym->data.class_data.members->symbols) {
             member_count = (int)sym->data.class_data.members->symbols->count;
         }
@@ -12738,6 +12919,12 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             
                             /* Restore scope */
                             sem->current_scope = saved_scope_for_tparams;
+
+                            /* A record's implicit canonical constructor is a member too,
+                             * for "this(...)" and "new R(...)" to resolve against. */
+                            if (kind == SYM_RECORD) {
+                                enter_record_canonical_ctor(sym, node, sem->shared_registry, sem->classpath);
+                            }
                             
                             /* Process extends and implements from children 
                              * Parser marks: flags=1 for extends, flags=2 for implements
@@ -13619,6 +13806,30 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                                             /* Found a method in the enum with the same name */
                                                             actually_overrides = true;
                                                         }
+                                                    }
+                                                }
+                                            }
+                                            /* An explicit accessor of a record component may
+                                             * carry @Override (JLS 9.6.4.4). */
+                                            if (!actually_overrides && sem->current_class &&
+                                                sem->current_class->kind == SYM_RECORD &&
+                                                sem->current_class->ast) {
+                                                bool takes_params = false;
+                                                for (slist_t *pc = node->data.node.children; pc; pc = pc->next) {
+                                                    ast_node_t *ch = (ast_node_t *)pc->data;
+                                                    if (ch && ch->type == AST_PARAMETER) {
+                                                        takes_params = true;
+                                                        break;
+                                                    }
+                                                }
+                                                for (slist_t *rc = sem->current_class->ast->data.node.children;
+                                                     rc && !takes_params && !actually_overrides; rc = rc->next) {
+                                                    ast_node_t *comp = (ast_node_t *)rc->data;
+                                                    if (comp && comp->type == AST_PARAMETER &&
+                                                        (comp->data.node.flags & MOD_RECORD_COMPONENT) &&
+                                                        comp->data.node.name &&
+                                                        strcmp(comp->data.node.name, name) == 0) {
+                                                        actually_overrides = true;
                                                     }
                                                 }
                                             }
@@ -15355,7 +15566,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         
                         if (class_sym && (class_sym->kind == SYM_CLASS || 
                                          class_sym->kind == SYM_INTERFACE ||
-                                         class_sym->kind == SYM_ENUM)) {
+                                         class_sym->kind == SYM_ENUM || class_sym->kind == SYM_RECORD)) {
                             /* It's a static method call on a class/enum type */
                             target_class = class_sym;
                             
@@ -16903,7 +17114,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                             super->data.class_data.members, first_part);
                                         if (first_sym && !(first_sym->kind == SYM_CLASS ||
                                                            first_sym->kind == SYM_INTERFACE ||
-                                                           first_sym->kind == SYM_ENUM)) {
+                                                           first_sym->kind == SYM_ENUM || first_sym->kind == SYM_RECORD)) {
                                             first_sym = NULL;  /* Not a type, ignore */
                                         }
                                     }
@@ -16917,7 +17128,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                                 iface_sym->data.class_data.members, first_part);
                                             if (first_sym && !(first_sym->kind == SYM_CLASS ||
                                                                first_sym->kind == SYM_INTERFACE ||
-                                                               first_sym->kind == SYM_ENUM)) {
+                                                               first_sym->kind == SYM_ENUM || first_sym->kind == SYM_RECORD)) {
                                                 first_sym = NULL;  /* Not a type, ignore */
                                             }
                                         }
@@ -16935,7 +17146,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                             iface_sym->data.class_data.members, first_part);
                                         if (first_sym && !(first_sym->kind == SYM_CLASS ||
                                                            first_sym->kind == SYM_INTERFACE ||
-                                                           first_sym->kind == SYM_ENUM)) {
+                                                           first_sym->kind == SYM_ENUM || first_sym->kind == SYM_RECORD)) {
                                             first_sym = NULL;  /* Not a type, ignore */
                                         }
                                     }
@@ -16965,7 +17176,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         }
                         
                         if (!resolved_class && first_sym && (first_sym->kind == SYM_CLASS || 
-                            first_sym->kind == SYM_INTERFACE || first_sym->kind == SYM_ENUM)) {
+                            first_sym->kind == SYM_INTERFACE || first_sym->kind == SYM_ENUM || first_sym->kind == SYM_RECORD)) {
                             /* First part resolves to a class, now find nested classes */
                             resolved_class = first_sym;
                             remaining_parts = parts->next;
@@ -17019,7 +17230,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 }
                                 
                                 if (nested && (nested->kind == SYM_CLASS || 
-                                    nested->kind == SYM_INTERFACE || nested->kind == SYM_ENUM)) {
+                                    nested->kind == SYM_INTERFACE || nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
                                     resolved_class = nested;
                                     
                                     /* Mark the corresponding AST node with the class symbol */
@@ -17160,7 +17371,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     
                                     if (field_sym->kind == SYM_CLASS || 
                                         field_sym->kind == SYM_INTERFACE || 
-                                        field_sym->kind == SYM_ENUM) {
+                                        field_sym->kind == SYM_ENUM || field_sym->kind == SYM_RECORD) {
                                         /* It's a nested type, continue traversal */
                                         current_class = field_sym;
                                         current_type = field_sym->type;

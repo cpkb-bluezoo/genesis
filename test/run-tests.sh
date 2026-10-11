@@ -1415,6 +1415,50 @@ else
 fi
 
 echo
+echo "--- javac options a build passes are accepted (and ignored), on the command line and in an @argfile ---"
+printf "%-30s ... " "JavacOptionsAccepted"
+jo_out="$TEST_BUILD/javacoptions-out"
+jo_args="$TEST_BUILD/javacoptions.args"
+rm -rf "$jo_out"
+mkdir -p "$jo_out/a" "$jo_out/b"
+printf '%s\n' -encoding UTF-8 -parameters -proc:none -Xlint:unchecked -deprecation \
+    -d "$jo_out/b" "$TEST_SRC/external/javacoptions/Hello.java" >"$jo_args"
+jo_msgs=$("$GENESIS" -encoding UTF-8 -parameters -proc:none -Xlint:all -deprecation -Xmaxerrs 5 \
+              -implicit:none -d "$jo_out/a" "$TEST_SRC/external/javacoptions/Hello.java" 2>&1;
+          "$GENESIS" "@$jo_args" 2>&1)
+if [ -z "$jo_msgs" ] &&
+   "$JAVA" -cp "$jo_out/a" Hello >/dev/null 2>&1 &&
+   "$JAVA" -cp "$jo_out/b" Hello >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    echo "$jo_msgs" | head -3
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Records declared in another file of the batch (accessors, constructors) ---"
+for rc_order in "RecordCrossFileTest Resource Named" "Named RecordCrossFileTest Resource" "Resource Named RecordCrossFileTest"; do
+    set -- $rc_order
+    printf "%-30s ... " "RecordCrossFile ($1 first)"
+    rc_out="$TEST_BUILD/recordcrossfile-out"
+    rm -rf "$rc_out"
+    mkdir -p "$rc_out"
+    if (cd "$rc_out" && "$GENESIS" -j1 -d "$rc_out" \
+           "$TEST_SRC/external/recordcrossfile/p/$1.java" \
+           "$TEST_SRC/external/recordcrossfile/p/$2.java" \
+           "$TEST_SRC/external/recordcrossfile/p/$3.java" >/dev/null 2>&1) &&
+       "$JAVA" -cp "$rc_out" p.RecordCrossFileTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+echo
 echo "--- Narrowing a non-constant or an out-of-range constant must fail to compile ---"
 printf "%-30s ... " "NarrowingRejected"
 nr_out="$TEST_BUILD/narrowingrejected-out"
