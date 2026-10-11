@@ -12708,6 +12708,14 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                            expr->sem_type->data.class_type.name : NULL);
                 }
 
+                /* What the then branch left on top of the stack, for a ternary whose own type is not known */
+                verification_type_t then_top = vtype_top();
+                bool have_then_top = false;
+                if (mg->stackmap && mg->stackmap->current_stack_size > 0) {
+                    then_top = mg->stackmap->current_stack[mg->stackmap->current_stack_size - 1];
+                    have_then_top = true;
+                }
+
                 /* goto end (skip else branch) */
                 size_t goto_pos = mg->code->length;
                 slist_t *end_label = NULL;
@@ -12798,6 +12806,18 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         mg_push_object_from_descriptor(mg, merged_desc);
                         mg->stack_depth--;  /* mg_push_object_from_descriptor increments, but we already pushed */
                         free(merged_desc);
+                    }
+                }
+
+                /* No type for the whole ternary (an operand whose type could not be worked
+                 * out): a branch that is the null literal says nothing, so the frame takes
+                 * the other branch's - and Object if they disagree. */
+                if (mg->stackmap && mg->stackmap->current_stack_size > 0 && have_then_top &&
+                    !(expr->sem_type && (expr->sem_type->kind == TYPE_CLASS || expr->sem_type->kind == TYPE_ARRAY ||
+                                         expr->sem_type->kind == TYPE_TYPEVAR))) {
+                    verification_type_t *top = &mg->stackmap->current_stack[mg->stackmap->current_stack_size - 1];
+                    if (top->tag == VT_NULL && then_top.tag != VT_NULL && then_top.tag != VT_TOP) {
+                        *top = then_top;
                     }
                 }
 
@@ -13291,6 +13311,66 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 lambda_mg->next_slot = slot;
                 lambda_mg->max_locals = slot;
                 
+                /* The frames of the lambda's method start with what its descriptor declares:
+                 * the captured variables and the parameters. Without them a branch before
+                 * the first use of one records the slot as top, and the load that follows
+                 * is a VerifyError. */
+                if (lambda_mg->stackmap) {
+                    const char *d = impl_desc->str;
+                    uint16_t at = captures_this ? 1 : 0;
+                    if (*d == '(') {
+                        d++;
+                    }
+                    while (*d && *d != ')') {
+                        switch (*d) {
+                            case 'I': case 'Z': case 'B': case 'C': case 'S':
+                                stackmap_set_local_int(lambda_mg->stackmap, at++);
+                                d++;
+                                break;
+                            case 'F':
+                                stackmap_set_local_float(lambda_mg->stackmap, at++);
+                                d++;
+                                break;
+                            case 'J':
+                                stackmap_set_local_long(lambda_mg->stackmap, at);
+                                at += 2;
+                                d++;
+                                break;
+                            case 'D':
+                                stackmap_set_local_double(lambda_mg->stackmap, at);
+                                at += 2;
+                                d++;
+                                break;
+                            default: {
+                                const char *start = d;
+                                while (*d == '[') {
+                                    d++;
+                                }
+                                if (*d == 'L') {
+                                    while (*d && *d != ';') {
+                                        d++;
+                                    }
+                                }
+                                if (*d) {
+                                    d++;
+                                }
+                                size_t len = (size_t)(d - start);
+                                char *name = malloc(len + 1);
+                                memcpy(name, start, len);
+                                name[len] = '\0';
+                                if (name[0] == 'L') {
+                                    name[len - 1] = '\0';
+                                    stackmap_set_local_object(lambda_mg->stackmap, at++, cg->cp, name + 1);
+                                } else {
+                                    stackmap_set_local_object(lambda_mg->stackmap, at++, cg->cp, name);
+                                }
+                                free(name);
+                                break;
+                            }
+                        }
+                    }
+                }
+                
                 /* Generate lambda body bytecode */
                 ast_node_t *body = children && children->next ? 
                                    (ast_node_t *)children->next->data : NULL;
@@ -13526,9 +13606,10 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         mh_kind = REF_invokeSpecial;
                     }
                 } else {
-                    /* Static lambda method */
-                    impl_ref = cp_add_methodref(cg->cp, cg->internal_name,
-                                                lambda_method_name, impl_desc->str);
+                    /* Static lambda method (in an interface, an InterfaceMethodref) */
+                    impl_ref = is_interface_method ?
+                        cp_add_interface_methodref(cg->cp, cg->internal_name, lambda_method_name, impl_desc->str) :
+                        cp_add_methodref(cg->cp, cg->internal_name, lambda_method_name, impl_desc->str);
                     mh_kind = REF_invokeStatic;
                 }
                 uint16_t impl_mh = cp_add_method_handle(cg->cp, mh_kind, impl_ref);
@@ -13772,8 +13853,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     char *sam_descriptor = method_to_descriptor(sam);
                     
                     /* Create methodref for synthetic method */
-                    uint16_t synth_ref = cp_add_methodref(cg->cp, cg->internal_name,
-                                                          synth_method_name, synth_desc);
+                    uint16_t synth_ref = (cg->class_sym && cg->class_sym->kind == SYM_INTERFACE) ?
+                        cp_add_interface_methodref(cg->cp, cg->internal_name, synth_method_name, synth_desc) :
+                        cp_add_methodref(cg->cp, cg->internal_name, synth_method_name, synth_desc);
                     
                     /* Create method handle for synthetic method */
                     uint16_t impl_handle = cp_add_method_handle(cg->cp, REF_invokeStatic, synth_ref);

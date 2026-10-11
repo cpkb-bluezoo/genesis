@@ -2862,6 +2862,19 @@ ast_node_t *parse_type(parser_t *parser)
                 slist_t *parsed_type_args = NULL;
                 
                 do {
+                    /* An annotation on a wildcard: Consumer<@Nullable ? super T> */
+                    if (parser_check(parser, TOK_AT)) {
+                        lexer_pos_t before_annotations = lexer_save_pos(parser->lexer);
+                        slist_t *wildcard_annotations = parse_type_annotations(parser);
+                        if (parser_check(parser, TOK_QUESTION)) {
+                            for (slist_t *a = wildcard_annotations; a; a = a->next) {
+                                ast_free((ast_node_t *)a->data);
+                            }
+                        } else {
+                            lexer_restore_pos(parser->lexer, before_annotations);
+                        }
+                        slist_free(wildcard_annotations);
+                    }
                     if (parser_check(parser, TOK_QUESTION)) {
                         /* Wildcard */
                         ast_node_t *wildcard = ast_new(AST_WILDCARD_TYPE,

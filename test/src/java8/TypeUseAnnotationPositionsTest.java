@@ -13,7 +13,8 @@ import java.util.function.Function;
  * everywhere in Spring Boot) in the positions that failed to parse: after a
  * method's type parameters, as the first type argument of a parameter, in a
  * cast, on a for or enhanced-for variable, on a lambda parameter, and on a
- * nested type named through its outer one (Outer.@Nullable Inner). */
+ * nested type named through its outer one (Outer.@Nullable Inner), and on a
+ * wildcard (Consumer<@Nullable ? super T>). */
 public class TypeUseAnnotationPositionsTest {
     @Target({ElementType.TYPE_USE, ElementType.TYPE_PARAMETER})
     @Retention(RetentionPolicy.RUNTIME)
@@ -53,6 +54,11 @@ public class TypeUseAnnotationPositionsTest {
         return list.size() + (other == null ? 0 : other.size());
     }
 
+    // an annotated wildcard
+    static void wildcard(java.util.function.Consumer<@Nullable ? super String> c, List<@Nullable ?> any) {
+        c.accept("w" + any.size());
+    }
+
     // a cast to an annotated type
     static String cast(Object o) {
         return (@Nullable String) o;
@@ -87,6 +93,9 @@ public class TypeUseAnnotationPositionsTest {
         check(cast("abc"), "abc");
         check(loops(new ArrayList<>(Arrays.asList("ab", "c"))), 1000 + 3 + 2);
         check(lambda("x"), "x!");
+        StringBuilder wild = new StringBuilder();
+        wildcard((s) -> wild.append(s), List.of());
+        check(wild.toString(), "w0");
         check(nested(List.of(new Outer.Inner()), null), 1);
         check(new TypeUseAnnotationPositionsTest(1, new Outer.Inner()).inner != null, true);
         System.out.println("TypeUseAnnotationPositionsTest passed!");

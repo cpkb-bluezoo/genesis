@@ -1459,6 +1459,26 @@ for rc_order in "RecordCrossFileTest Resource Named" "Named RecordCrossFileTest 
 done
 
 echo
+echo "--- Type::new for a class in another file that declares no constructor ---"
+for dc_order in "DefaultCtorRefTest Conv" "Conv DefaultCtorRefTest"; do
+    set -- $dc_order
+    printf "%-30s ... " "DefaultCtorRef ($1 first)"
+    dc_out="$TEST_BUILD/defaultctorref-out"
+    rm -rf "$dc_out"
+    mkdir -p "$dc_out"
+    if (cd "$dc_out" && "$GENESIS" -j1 -d "$dc_out" \
+           "$TEST_SRC/external/defaultctorref/p/$1.java" \
+           "$TEST_SRC/external/defaultctorref/p/$2.java" >/dev/null 2>&1) &&
+       "$JAVA" -cp "$dc_out" p.DefaultCtorRefTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+echo
 echo "--- Narrowing a non-constant or an out-of-range constant must fail to compile ---"
 printf "%-30s ... " "NarrowingRejected"
 nr_out="$TEST_BUILD/narrowingrejected-out"
