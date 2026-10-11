@@ -1831,8 +1831,11 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
     /* Interface constants (static final fields on implemented interfaces). */
     if (mg->class_gen && mg->class_gen->class_sym) {
         semantic_t *sem = mg->class_gen->sem;
-        symbol_t *check_class = mg->class_gen->class_sym;
-        while (check_class) {
+        symbol_t *outer_class = mg->class_gen->class_sym;
+        symbol_t *check_class = outer_class;
+        while (outer_class) {
+            /* the class's own interfaces, then those of each superclass */
+            check_class = check_class ? check_class : outer_class;
             for (slist_t *iface_node = check_class->data.class_data.interfaces;
                  iface_node; iface_node = iface_node->next) {
                 symbol_t *iface = (symbol_t *)iface_node->data;
@@ -1875,7 +1878,12 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
                     }
                 }
             }
-            check_class = check_class->data.class_data.enclosing_class;
+            if (check_class->data.class_data.superclass) {
+                check_class = check_class->data.class_data.superclass;
+            } else {
+                outer_class = outer_class->data.class_data.enclosing_class;
+                check_class = outer_class;
+            }
         }
     }
     
@@ -5906,6 +5914,18 @@ bool codegen_varargs_tail(method_gen_t *mg, const_pool_t *cp, symbol_t *varargs_
          * box exactly when the array being built is NOT one of the
          * primitive-element arrays created via NEWARRAY above. */
         bool va_array_is_primitive = elem_type && type_kind_to_atype(elem_type->kind) >= 0;
+        /* A boxed argument for a primitive element ("total(Integer)" for "int...") is
+         * unboxed first */
+        if (va_array_is_primitive && va_arg->sem_type && va_arg->sem_type->kind == TYPE_CLASS &&
+            va_arg->sem_type->data.class_type.name) {
+            type_kind_t unboxed = get_primitive_for_wrapper(va_arg->sem_type->data.class_type.name);
+            if (unboxed >= TYPE_BOOLEAN && unboxed <= TYPE_DOUBLE) {
+                char *wrapper = class_to_internal_name(va_arg->sem_type->data.class_type.name);
+                emit_unboxing(mg, cp, unboxed, wrapper);
+                free(wrapper);
+                va_kind = unboxed;
+            }
+        }
         if (!va_array_is_primitive &&
             va_kind >= TYPE_BOOLEAN && va_kind <= TYPE_DOUBLE) {
             emit_boxing(mg, cp, va_kind);
@@ -6918,6 +6938,14 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                     target_class = class_to_internal_name(recv_type->data.class_type.name);
                     symbol_t *recv_sym = recv_type->data.class_type.symbol;
                     is_interface_call = (recv_sym && (recv_sym->kind == SYM_INTERFACE || recv_sym->kind == SYM_ANNOTATION));
+                }
+                /* A variable the receiver's own bound does not name ("<T extends B> T m()", B
+                 * bound by a class variable): the method that is called says whose it is */
+                if (!target_class && recv_type && recv_type->kind == TYPE_TYPEVAR && method_sym &&
+                    method_sym->scope && method_sym->scope->owner && method_sym->scope->owner->qualified_name) {
+                    symbol_t *owner = method_sym->scope->owner;
+                    target_class = class_to_internal_name(owner->qualified_name);
+                    is_interface_call = owner->kind == SYM_INTERFACE || owner->kind == SYM_ANNOTATION;
                 }
             }
             break;

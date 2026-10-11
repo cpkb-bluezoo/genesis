@@ -1379,6 +1379,114 @@ else
 fi
 
 echo
+echo "--- A lambda passed to a method of a generic class-file type a generic call returned ---"
+printf "%-30s ... " "ChainedGenericCallbackLambda"
+cb_lib="$TEST_BUILD/callbackslib-lib"
+cb_out="$TEST_BUILD/callbackslib-out"
+rm -rf "$cb_lib" "$cb_out"
+mkdir -p "$cb_lib" "$cb_out"
+if "$GENESIS" -d "$cb_lib" "$TEST_SRC"/external/callbackslib/callbackslib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$cb_lib" -d "$cb_out" \
+       "$TEST_SRC/external/ChainedGenericCallbackLambdaTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$cb_out:$cb_lib" ChainedGenericCallbackLambdaTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- A chain of calls on a self-typed class-file API reached through a wildcard receiver ---"
+printf "%-30s ... " "WildcardSelfTypeChain"
+st_lib="$TEST_BUILD/selftypelib-lib"
+st_out="$TEST_BUILD/selftypelib-out"
+rm -rf "$st_lib" "$st_out"
+mkdir -p "$st_lib" "$st_out"
+if "$GENESIS" -d "$st_lib" "$TEST_SRC"/external/selftypelib/selftypelib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$st_lib" -d "$st_out" \
+       "$TEST_SRC/external/WildcardSelfTypeChainTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$st_out:$st_lib" WildcardSelfTypeChainTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- A generic call returning its bare type variable, passed as an argument, types its lambda ---"
+printf "%-30s ... " "ArgumentMatcherLambda"
+am_lib="$TEST_BUILD/argmatcherlib-lib"
+am_out="$TEST_BUILD/argmatcherlib-out"
+rm -rf "$am_lib" "$am_out"
+mkdir -p "$am_lib" "$am_out"
+if "$GENESIS" -d "$am_lib" "$TEST_SRC"/external/argmatcherlib/argmatcherlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$am_lib" -d "$am_out" \
+       "$TEST_SRC/external/ArgumentMatcherLambdaTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$am_out:$am_lib" ArgumentMatcherLambdaTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- A method variable bounded by a class variable, reached through a wildcard ---"
+printf "%-30s ... " "MethodVariableBoundByClassVar"
+mv_lib="$TEST_BUILD/methodvarbound-lib"
+mv_out="$TEST_BUILD/methodvarbound-out"
+rm -rf "$mv_lib" "$mv_out"
+mkdir -p "$mv_lib" "$mv_out"
+if "$GENESIS" -d "$mv_lib" "$TEST_SRC"/external/selftypelib/selftypelib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$mv_lib" -d "$mv_out" \
+       "$TEST_SRC/external/MethodVariableBoundByClassVariableTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$mv_out:$mv_lib" MethodVariableBoundByClassVariableTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- A type variable fixed through the supertypes of the argument's class ---"
+printf "%-30s ... " "SubtypeArgumentInference"
+sa_lib="$TEST_BUILD/providerlib-lib"
+sa_out="$TEST_BUILD/providerlib-out"
+rm -rf "$sa_lib" "$sa_out"
+mkdir -p "$sa_lib" "$sa_out"
+if "$GENESIS" -d "$sa_lib" "$TEST_SRC"/external/providerlib/providerlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$sa_lib" -d "$sa_out" \
+       "$TEST_SRC/external/SubtypeArgumentInferenceTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$sa_out:$sa_lib" SubtypeArgumentInferenceTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- An Object result of a non-generic interface is not a type argument of its subinterface ---"
+printf "%-30s ... " "ObjectReturnOfNonGenericIface"
+or_lib="$TEST_BUILD/objectreturnlib-lib"
+or_out="$TEST_BUILD/objectreturnlib-out"
+rm -rf "$or_lib" "$or_out"
+mkdir -p "$or_lib" "$or_out"
+if "$GENESIS" -d "$or_lib" "$TEST_SRC"/external/objectreturnlib/objectreturnlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$or_lib" -d "$or_out" \
+       "$TEST_SRC/external/ObjectReturnOfNonGenericInterfaceTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$or_out:$or_lib" ObjectReturnOfNonGenericInterfaceTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "--- A single-type import of a nested class beats another class's nested type of the same name ---"
 printf "%-30s ... " "ImportedNestedReceiver"
 in_out="$TEST_BUILD/importednested-out"
@@ -1681,6 +1789,116 @@ for tg_order in "TwoLevelGenericAdapterTest Adapter StepAdapter ConfigAdapter Pr
     done
     if (cd "$tg_out" && "$GENESIS" -j1 -d "$tg_out" $tg_files >/dev/null 2>&1) &&
        "$JAVA" -cp "$tg_out" p.TwoLevelGenericAdapterTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for fm_order in "FlatMapUnboundRefTest Composite Items" "Items Composite FlatMapUnboundRefTest" "Composite Items FlatMapUnboundRefTest"; do
+    set -- $fm_order
+    printf "%-30s ... " "FlatMapUnboundRef ($1 first)"
+    fm_out="$TEST_BUILD/flatmapunboundref-out"
+    rm -rf "$fm_out"
+    mkdir -p "$fm_out"
+    fm_files=""
+    for fm_name in "$@"; do
+        fm_files="$fm_files $TEST_SRC/external/flatmapunboundref/p/$fm_name.java"
+    done
+    if (cd "$fm_out" && "$GENESIS" -j1 -d "$fm_out" $fm_files >/dev/null 2>&1) &&
+       "$JAVA" -cp "$fm_out" p.FlatMapUnboundRefTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+printf "%-30s ... " "QualifiedThisFieldInitializer"
+qt_out="$TEST_BUILD/qualifiedthisfield-out"
+rm -rf "$qt_out"
+mkdir -p "$qt_out"
+if (cd "$qt_out" && "$GENESIS" -j1 -d "$qt_out" \
+       "$TEST_SRC/external/qualifiedthisfield/p/QualifiedThisFieldInitializerTest.java" >/dev/null 2>&1) &&
+   "$JAVA" -cp "$qt_out" p.QualifiedThisFieldInitializerTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "NestedSiblingInterface"
+ns_lib="$TEST_BUILD/nestedsiblinglib-lib"
+ns_out="$TEST_BUILD/nestedsiblinglib-out"
+rm -rf "$ns_lib" "$ns_out"
+mkdir -p "$ns_lib" "$ns_out"
+if "$GENESIS" -d "$ns_lib" "$TEST_SRC"/external/nestedsiblinglib/nestedsiblinglib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ns_lib" -d "$ns_out" \
+       "$TEST_SRC/external/NestedSiblingInterfaceTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ns_out:$ns_lib" NestedSiblingInterfaceTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+for ci_order in "q/Limits p/Props r/Marker r/ImportedConstantInAnnotationTest" "r/ImportedConstantInAnnotationTest r/Marker p/Props q/Limits" "p/Props r/ImportedConstantInAnnotationTest q/Limits r/Marker"; do
+    set -- $ci_order
+    printf "%-30s ... " "ImportedConstantAnnotation ($1 first)"
+    ci_out="$TEST_BUILD/crossfileconstimport-out"
+    rm -rf "$ci_out"
+    mkdir -p "$ci_out"
+    ci_files=""
+    for ci_name in "$@"; do
+        ci_files="$ci_files $TEST_SRC/external/crossfileconstimport/$ci_name.java"
+    done
+    if (cd "$ci_out" && "$GENESIS" -j1 -d "$ci_out" $ci_files >/dev/null 2>&1) &&
+       "$JAVA" -cp "$ci_out" r.ImportedConstantInAnnotationTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for is_order in "InheritedSamVarargsTest SrvFactory SrvCustomizer Srv" "Srv SrvCustomizer SrvFactory InheritedSamVarargsTest" "SrvFactory InheritedSamVarargsTest Srv SrvCustomizer"; do
+    set -- $is_order
+    printf "%-30s ... " "InheritedSamVarargs ($1 first)"
+    is_out="$TEST_BUILD/inheritedsamvarargs-out"
+    rm -rf "$is_out"
+    mkdir -p "$is_out"
+    is_files=""
+    for is_name in "$@"; do
+        is_files="$is_files $TEST_SRC/external/inheritedsamvarargs/p/$is_name.java"
+    done
+    if (cd "$is_out" && "$GENESIS" -j1 -d "$is_out" $is_files >/dev/null 2>&1) &&
+       "$JAVA" -cp "$is_out" p.InheritedSamVarargsTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for ic_order in "IterableClassForEachTest Builder Convs Conv" "Conv Convs Builder IterableClassForEachTest" "Builder IterableClassForEachTest Conv Convs"; do
+    set -- $ic_order
+    printf "%-30s ... " "IterableClassForEach ($1 first)"
+    ic_out="$TEST_BUILD/iterableclassforeach-out"
+    rm -rf "$ic_out"
+    mkdir -p "$ic_out"
+    ic_files=""
+    for ic_name in "$@"; do
+        ic_files="$ic_files $TEST_SRC/external/iterableclassforeach/p/$ic_name.java"
+    done
+    if (cd "$ic_out" && "$GENESIS" -j1 -d "$ic_out" $ic_files >/dev/null 2>&1) &&
+       "$JAVA" -cp "$ic_out" p.IterableClassForEachTest >/dev/null 2>&1; then
         echo PASS
         passed=$((passed + 1))
     else

@@ -1594,9 +1594,11 @@ static ast_node_t *parse_primary(parser_t *parser)
                             looks_like_lambda_params = false;
                         }
                         continue;
-                    } else if (tok == TOK_IDENTIFIER) {
+                    } else if (tok == TOK_IDENTIFIER ||
+                               (is_contextual_keyword(tok) && tok != TOK_VAR && tok != TOK_WHEN)) {
                         /* Could be untyped (x) or typed (Type x) or typed with generics (List<T> x)
-                         * or typed with qualified name (Map.Entry<K,V> x) */
+                         * or typed with qualified name (Map.Entry<K,V> x); "record", "open", ... are
+                         * names as much as any other */
                         parser_advance(parser);
                         
                         /* Handle qualified type names: Outer.Inner or a.b.c.Type */
@@ -1641,7 +1643,8 @@ static ast_node_t *parse_primary(parser_t *parser)
                                 looks_like_lambda_params = false;
                                 break;
                             }
-                        } else if (parser_check(parser, TOK_IDENTIFIER)) {
+                        } else if (parser_check_identifier_or_contextual(parser) &&
+                                   !parser_check(parser, TOK_WHEN)) {
                             /* Two identifiers = typed: Type name */
                             typed_params = true;
                             parser_advance(parser);  /* consume name */
@@ -1692,7 +1695,7 @@ static ast_node_t *parse_primary(parser_t *parser)
                             param_type = parse_type(parser);
                         }
                         
-                        if (!parser_check(parser, TOK_IDENTIFIER)) {
+                        if (!parser_check_identifier_or_contextual(parser) || parser_check(parser, TOK_WHEN)) {
                             ast_free(params_list);
                             return NULL;
                         }
@@ -2853,7 +2856,7 @@ ast_node_t *parse_type(parser_t *parser)
                 slist_free(nested_annotations);
             }
             
-            if (parser_check(parser, TOK_IDENTIFIER)) {
+            if (parser_check_identifier_or_contextual(parser)) {
                 string_append_c(name, '.');
                 string_append(name, parser_current_text(parser));
                 parser_advance(parser);
@@ -4273,13 +4276,9 @@ static ast_node_t *parse_annotation(parser_t *parser)
                     pair->data.node.name = (char *)first_text;
                     parse_annotation_element_value(parser, pair);
                     ast_add_child(annot, pair);
-                } else if (parser_check(parser, TOK_IDENTIFIER) ||
-                           parser_check(parser, TOK_STRING_LITERAL) ||
-                           parser_check(parser, TOK_INTEGER_LITERAL) ||
-                           parser_check(parser, TOK_TRUE) ||
-                           parser_check(parser, TOK_FALSE) ||
-                           parser_check(parser, TOK_AT) ||
-                           parser_check(parser, TOK_LBRACE)) {
+                } else if (!parser_check(parser, TOK_RPAREN) && !parser_check(parser, TOK_EOF)) {
+                    /* the one unnamed element value, an expression of any shape: -1, (1 + 2),
+                     * 'c', 2L, Name.CONSTANT, "a" + "b", Foo.class */
                     ast_node_t *pair = ast_new(AST_ANNOTATION_VALUE,
                                                parser_current_line(parser),
                                                parser_current_column(parser));

@@ -863,6 +863,9 @@ typedef struct semantic
     symbol_t *current_method;   /* Current method being analyzed */
     bool in_static_field_init;  /* True when processing a static field initializer */
     ast_node_t *current_lambda; /* Current lambda being analyzed (for capture tracking) */
+    type_t *lambda_return_type;   /* What the body of the lambda being walked returns: its functional interface's
+                                   * result type, with the arguments of the target type put in */
+    symbol_t *lambda_return_sam;  /* The functional interface method lambda_return_type is the result of */
     scope_t *lambda_enclosing_scope; /* Scope at lambda definition (parent of lambda params) */
     type_t *target_type;         /* Target type for expression (for type inference) */
     

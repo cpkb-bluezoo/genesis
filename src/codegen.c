@@ -1415,7 +1415,7 @@ static char *generate_type_params_signature(slist_t *type_params)
                 if (!bound_name) {
                     bound_name = bound->data.node.name;
                 }
-                if (bound_name) {
+                if (bound_name || (bound->sem_type && bound->sem_type->kind == TYPE_TYPEVAR)) {
                     /* Check if this is an interface (for determining class bound vs interface bound)
                      * For now, assume first bound is class bound unless it looks like an interface */
                     if (!first_bound) {
@@ -1423,11 +1423,21 @@ static char *generate_type_params_signature(slist_t *type_params)
                         string_append_c(sig, ':');
                     }
                     
-                    char *internal = class_to_internal_name(bound_name);
-                    string_append_c(sig, 'L');
-                    string_append(sig, internal);
-                    string_append_c(sig, ';');
-                    free(internal);
+                    /* The bound as written, with its type arguments ("Comparable<T>") or the type
+                     * variable it names ("U extends T"); only its class name when it was not resolved */
+                    if (bound->sem_type && (bound->sem_type->kind == TYPE_TYPEVAR ||
+                                            (bound->sem_type->kind == TYPE_CLASS &&
+                                             bound->sem_type->data.class_type.type_args))) {
+                        char *bound_sig = type_to_signature(bound->sem_type);
+                        string_append(sig, bound_sig);
+                        free(bound_sig);
+                    } else {
+                        char *internal = class_to_internal_name(bound_name);
+                        string_append_c(sig, 'L');
+                        string_append(sig, internal);
+                        string_append_c(sig, ';');
+                        free(internal);
+                    }
                     
                     if (first_bound) {
                         has_class_bound = true;
@@ -1448,10 +1458,42 @@ static char *generate_type_params_signature(slist_t *type_params)
 }
 
 /**
- * Generate class signature from class declaration AST and symbol.
- * Returns NULL if no signature is needed (non-generic class with non-generic superclass).
+ * The interface types a class declaration names ("implements"; an interface's "extends"), as types
+ * with their type arguments, in order. NULL when there are none, or without a semantic context.
  */
-char *generate_class_signature(ast_node_t *class_decl, symbol_t *class_sym)
+static slist_t *declared_interface_types(semantic_t *sem, ast_node_t *class_decl, symbol_t *class_sym)
+{
+    if (!sem || !class_decl || !class_sym) {
+        return NULL;
+    }
+    bool is_interface = class_sym->kind == SYM_INTERFACE;
+    slist_t *result = NULL;
+    scope_t *saved_scope = sem->current_scope;
+    symbol_t *saved_class = sem->current_class;
+    sem->current_class = class_sym;
+    if (class_sym->data.class_data.members) {
+        sem->current_scope = class_sym->data.class_data.members;
+    }
+    for (slist_t *c = class_decl->data.node.children; c; c = c->next) {
+        ast_node_t *child = (ast_node_t *)c->data;
+        if (child && child->type == AST_CLASS_TYPE && child->data.node.flags == (is_interface ? 1 : 2)) {
+            type_t *t = semantic_resolve_type(sem, child);
+            if (t && t->kind == TYPE_CLASS) {
+                result = result ? (slist_append(result, t), result) : slist_new(t);
+            }
+        }
+    }
+    sem->current_scope = saved_scope;
+    sem->current_class = saved_class;
+    return result;
+}
+
+/**
+ * Generate class signature from class declaration AST and symbol.
+ * Returns NULL if no signature is needed (a class that is not generic and whose superclass and
+ * interfaces are not parameterized).
+ */
+char *generate_class_signature(semantic_t *sem, ast_node_t *class_decl, symbol_t *class_sym)
 {
     if (!class_decl) {
         return NULL;
@@ -1485,9 +1527,20 @@ char *generate_class_signature(ast_node_t *class_decl, symbol_t *class_sym)
             has_parameterized_super = true;
         }
     }
+
+    /* ...or any interface it names: the Signature lists every one of them, or none */
+    slist_t *interface_types = declared_interface_types(sem, class_decl, class_sym);
+    bool has_parameterized_interface = false;
+    for (slist_t *i = interface_types; i; i = i->next) {
+        type_t *t = (type_t *)i->data;
+        if (t->data.class_type.type_args) {
+            has_parameterized_interface = true;
+        }
+    }
     
-    /* If no type parameters and no parameterized superclass, no signature needed */
-    if (!type_params && !has_parameterized_super) {
+    /* If no type parameters and nothing parameterized above it, no signature needed */
+    if (!type_params && !has_parameterized_super && !has_parameterized_interface) {
+        slist_free(interface_types);
         return NULL;
     }
     
@@ -1504,11 +1557,11 @@ char *generate_class_signature(ast_node_t *class_decl, symbol_t *class_sym)
     }
     
     /* Class signature: SuperclassSignature [SuperinterfaceSignature*]
-     * Interfaces always have java.lang.Object as the superclass slot; parameterized
-     * extends clauses go in the superinterface signature list. */
+     * Interfaces always have java.lang.Object as the superclass slot; their "extends" clauses
+     * go in the superinterface list. */
     if (is_interface) {
         string_append(sig, "Ljava/lang/Object;");
-        if (has_parameterized_super && super_type) {
+        if (!interface_types && has_parameterized_super && super_type) {
             char *iface_sig = type_to_signature(super_type);
             if (iface_sig) {
                 string_append(sig, iface_sig);
@@ -1523,9 +1576,25 @@ char *generate_class_signature(ast_node_t *class_decl, symbol_t *class_sym)
         } else {
             string_append(sig, "Ljava/lang/Object;");
         }
+    } else if (class_sym && class_sym->data.class_data.superclass &&
+               class_sym->data.class_data.superclass->qualified_name) {
+        char *internal = class_to_internal_name(class_sym->data.class_data.superclass->qualified_name);
+        string_append_c(sig, 'L');
+        string_append(sig, internal);
+        string_append_c(sig, ';');
+        free(internal);
     } else {
         string_append(sig, "Ljava/lang/Object;");
     }
+
+    for (slist_t *i = interface_types; i; i = i->next) {
+        char *iface_sig = type_to_signature((type_t *)i->data);
+        if (iface_sig) {
+            string_append(sig, iface_sig);
+            free(iface_sig);
+        }
+    }
+    slist_free(interface_types);
     
     return string_free(sig, false);
 }
@@ -1734,17 +1803,8 @@ char *ast_type_to_descriptor(ast_node_t *type_node)
             {
                 /* Check for type variable (generics) - use erased type */
                 if (type_node->sem_type && type_node->sem_type->kind == TYPE_TYPEVAR) {
-                    type_t *bound = type_node->sem_type->data.type_var.bound;
-                    if (bound && bound->kind == TYPE_CLASS && bound->data.class_type.name) {
-                        char *internal = class_to_internal_name(bound->data.class_type.name);
-                        size_t len = strlen(internal) + 3;
-                        char *desc = malloc(len);
-                        snprintf(desc, len, "L%s;", internal);
-                        free(internal);
-                        return desc;
-                    }
-                    /* Unbounded type variable erases to Object */
-                    return strdup("Ljava/lang/Object;");
+                    /* its bound's erasure, which may be another variable's ("T extends B") */
+                    return type_to_descriptor(type_node->sem_type);
                 }
                 
                 /* Use resolved type if available (from semantic analysis) */
@@ -5119,7 +5179,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
     cg->class_ast = class_decl;
     
     /* Generate class signature if class has type parameters or parameterized superclass */
-    cg->signature = generate_class_signature(class_decl, cg->class_sym);
+    cg->signature = generate_class_signature(cg->sem, class_decl, cg->class_sym);
     
     /* Check if this is an interface */
     bool is_interface = (class_decl->type == AST_INTERFACE_DECL);
@@ -6802,9 +6862,12 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             bc_emit(mg->code, OP_GOTO);
             bc_emit_u2(mg->code, 0);
             
-            /* set_false: iconst_0 */
+            /* set_false: iconst_0 (reached by the branch, with the stack the goto left) */
+            mg_pop(mg, 1);
+            mg_record_frame(mg);
             size_t set_false_target = mg->code->length;
             bc_emit(mg->code, OP_ICONST_0);
+            mg_push_int(mg);
             
             /* Patch jumps */
             int16_t ifne_offset = (int16_t)(set_false_target - ifne_pos);
@@ -6816,6 +6879,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             mg->code->code[goto_pos + 1] = (goto_offset >> 8) & 0xFF;
             mg->code->code[goto_pos + 2] = goto_offset & 0xFF;
             
+            mg_record_frame(mg);   /* the goto lands here, with the boolean on the stack */
             /* putstatic $assertionsDisabled */
             uint16_t field_ref = cp_add_fieldref(cg->cp, 
                 cg->internal_name, "$assertionsDisabled", "Z");

@@ -33,6 +33,19 @@
  * Resolve an exception class name to its fully qualified internal name.
  * Handles common java.lang exception classes that may be used without import.
  */
+
+/* A condition of type Boolean is unboxed before it is tested. */
+static void unbox_boolean_condition(method_gen_t *mg, ast_node_t *condition)
+{
+    if (condition->sem_type && condition->sem_type->kind == TYPE_CLASS &&
+        condition->sem_type->data.class_type.name &&
+        get_primitive_for_wrapper(condition->sem_type->data.class_type.name) == TYPE_BOOLEAN) {
+        char *internal = class_to_internal_name(condition->sem_type->data.class_type.name);
+        emit_unboxing(mg, mg->cp, TYPE_BOOLEAN, internal);
+        free(internal);
+    }
+}
+
 static const char *resolve_exception_class(const char *name)
 {
     if (!name) {
@@ -3017,6 +3030,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         if (!codegen_expr(mg, condition, mg->cp)) {
                             return false;
                         }
+                        unbox_boolean_condition(mg, condition);
                         
                         /* ifne loop_start (continue if condition true) */
                         int16_t back_offset = (int16_t)(loop_start - mg->code->length);
@@ -3120,6 +3134,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     if (!codegen_expr(mg, condition, mg->cp)) {
                         return false;
                     }
+                    unbox_boolean_condition(mg, condition);
                     
                     /* ifeq loop_end */
                     branch_pos = mg->code->length;
@@ -3851,6 +3866,13 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         /* Use qualified name from semantic type if available */
                         if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS) {
                             type_name = type_node->sem_type->data.class_type.name;
+                        } else if (type_node->sem_type && type_node->sem_type->kind == TYPE_TYPEVAR) {
+                            /* "for (C callback : callbacks)": a type variable erases to its bound
+                             * (nothing to cast to when that is Object) */
+                            type_t *bound = type_node->sem_type->data.type_var.bound;
+                            type_name = (bound && bound->kind == TYPE_CLASS && bound->data.class_type.name &&
+                                         strcmp(bound->data.class_type.name, "java.lang.Object") != 0) ?
+                                        bound->data.class_type.name : NULL;
                         }
                         if (type_name) {
                             const char *internal = class_to_internal_name(type_name);
@@ -5158,6 +5180,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 
                 /* skip: Patch both branches to here */
                 size_t skip_target = mg->code->length;
+                mg_record_frame(mg);  /* both branches land here: it needs a frame */
                 int16_t offset1 = (int16_t)(skip_target - skip_disabled_pos);
                 mg->code->code[skip_disabled_pos + 1] = (offset1 >> 8) & 0xFF;
                 mg->code->code[skip_disabled_pos + 2] = offset1 & 0xFF;
