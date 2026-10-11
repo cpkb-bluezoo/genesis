@@ -1479,6 +1479,26 @@ for dc_order in "DefaultCtorRefTest Conv" "Conv DefaultCtorRefTest"; do
 done
 
 echo
+echo "--- A varargs method of another file, called with an array, still returns its own type ---"
+for vr_order in "VarargsReturnTest SP" "SP VarargsReturnTest"; do
+    set -- $vr_order
+    printf "%-30s ... " "VarargsReturn ($1 first)"
+    vr_out="$TEST_BUILD/varargsreturn-out"
+    rm -rf "$vr_out"
+    mkdir -p "$vr_out"
+    if (cd "$vr_out" && "$GENESIS" -j1 -d "$vr_out" \
+           "$TEST_SRC/external/varargsreturn/p/$1.java" \
+           "$TEST_SRC/external/varargsreturn/p/$2.java" >/dev/null 2>&1) &&
+       "$JAVA" -cp "$vr_out" p.VarargsReturnTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+echo
 echo "--- Narrowing a non-constant or an out-of-range constant must fail to compile ---"
 printf "%-30s ... " "NarrowingRejected"
 nr_out="$TEST_BUILD/narrowingrejected-out"

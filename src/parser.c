@@ -714,6 +714,7 @@ static bool parser_check_identifier_or_contextual(parser_t *parser)
     token_type_t tok = parser_current_type(parser);
     return tok == TOK_IDENTIFIER ||
            /* Module keywords (contextual) */
+           tok == TOK_MODULE ||
            tok == TOK_TO ||
            tok == TOK_WITH ||
            tok == TOK_OPEN ||
@@ -1272,6 +1273,7 @@ static ast_node_t *parse_primary(parser_t *parser)
             
         case TOK_IDENTIFIER:
         /* Contextual keywords can be used as identifiers in expression context */
+        case TOK_MODULE:
         case TOK_OPEN:
         case TOK_OPENS:
         case TOK_TO:
@@ -1496,6 +1498,8 @@ static ast_node_t *parse_primary(parser_t *parser)
                          * A cast like (int)++x is rare and would need prefix ++. */
                         bool looks_like_cast = 
                             next_type == TOK_IDENTIFIER ||
+                            /* module, open, to, with...: names as much as any other */
+                            (is_contextual_keyword(next_type) && next_type != TOK_WHEN) ||
                             next_type == TOK_INTEGER_LITERAL ||
                             next_type == TOK_LONG_LITERAL ||
                             next_type == TOK_FLOAT_LITERAL ||
@@ -2168,6 +2172,15 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     
                     parser_advance(parser);  /* consume final > */
                     
+                    /* Array dimensions: Class<?>[]::new */
+                    while (parser_check(parser, TOK_LBRACKET)) {
+                        parser_advance(parser);
+                        if (!parser_check(parser, TOK_RBRACKET)) {
+                            break;
+                        }
+                        parser_advance(parser);
+                    }
+                    
                     /* Check if :: follows */
                     if (!parser_check(parser, TOK_DOUBLE_COLON)) {
                         /* Not a method reference - restore and let pratt parser handle */
@@ -2196,7 +2209,24 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     parser_advance(parser);  /* consume < */
                     
                     do {
-                        ast_node_t *type_arg = parse_type(parser);
+                        ast_node_t *type_arg;
+                        if (parser_check(parser, TOK_QUESTION)) {
+                            /* a wildcard: ?, ? extends T, ? super T */
+                            type_arg = ast_new(AST_WILDCARD_TYPE, parser_current_line(parser),
+                                               parser_current_column(parser));
+                            parser_advance(parser);
+                            if (parser_check(parser, TOK_EXTENDS) || parser_check(parser, TOK_SUPER)) {
+                                type_arg->data.node.name = (char *)intern(
+                                    parser_check(parser, TOK_EXTENDS) ? "extends" : "super");
+                                parser_advance(parser);
+                                ast_node_t *bound = parse_type(parser);
+                                if (bound) {
+                                    ast_add_child(type_arg, bound);
+                                }
+                            }
+                        } else {
+                            type_arg = parse_type(parser);
+                        }
                         if (type_arg) {
                             ast_add_child(type_node, type_arg);
                         }
@@ -2208,6 +2238,19 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     }
                     
                     expr = type_node;
+                    /* Array dimensions: Class<?>[]::new */
+                    while (parser_check(parser, TOK_LBRACKET)) {
+                        lexer_pos_t before_dim = lexer_save_pos(parser->lexer);
+                        parser_advance(parser);
+                        if (!parser_check(parser, TOK_RBRACKET)) {
+                            lexer_restore_pos(parser->lexer, before_dim);
+                            break;
+                        }
+                        parser_advance(parser);
+                        ast_node_t *array_type = ast_new(AST_ARRAY_TYPE, expr->line, expr->column);
+                        ast_add_child(array_type, expr);
+                        expr = array_type;
+                    }
                     /* Continue loop - next iteration will handle :: */
                 }
                 break;

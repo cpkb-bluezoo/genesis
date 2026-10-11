@@ -2988,6 +2988,9 @@ static int check_symbol_population(symbol_t *sym, const char *context)
 /* Forward declarations for lambda/method ref binding */
 static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type_t *target_type);
 static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, type_t *target_type);
+/* The method whose own type variables substitute_from_receiver() must leave alone: a method's
+ * "<E extends Throwable> E find(Class<E>)" is not the receiver's E, however the two are named */
+static __thread symbol_t *g_own_type_vars_of = NULL;
 static type_t *substitute_from_receiver(type_t *type, type_t *recv_type);
 static type_t *infer_array_return_from_args(semantic_t *sem, type_t *return_type,
                                             symbol_t *method, slist_t *args);
@@ -6987,6 +6990,26 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
                 (int)(decl->data.node.children ? slist_length(decl->data.node.children) : 0));
     }
     
+    /* The type parameters of this class are in scope in the types nested in it (an inner
+     * class's "implements Converter<T, E>" and "convert(T source)" name its outer's T); declare
+     * them now, for the class's own pass to reuse, as a nested class's are below. */
+    for (slist_t *tc = decl->data.node.children; tc; tc = tc->next) {
+        ast_node_t *tpn = (ast_node_t *)tc->data;
+        if (tpn && tpn->type == AST_TYPE_PARAMETER && tpn->data.node.name &&
+            !scope_lookup_local(parent_scope, tpn->data.node.name)) {
+            symbol_t *ctp = symbol_new(SYM_TYPE_PARAM, tpn->data.node.name);
+            type_t *ctv = malloc(sizeof(type_t));
+            if (ctv) {
+                memset(ctv, 0, sizeof(*ctv));
+                ctv->kind = TYPE_TYPEVAR;
+                ctv->data.type_var.name = strdup(tpn->data.node.name);
+                ctv->data.type_var.bound = type_new_class("java.lang.Object");
+            }
+            ctp->type = ctv;
+            scope_define(parent_scope, ctp);
+        }
+    }
+    
     /* Collect nested types for second pass */
     slist_t *nested_infos = NULL;
     
@@ -10392,6 +10415,24 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
             continue;
         }
 
+        /* A private method of another top-level class is no candidate when there is another
+         * (getJavaDoc(RecordComponentElement) private, getJavaDoc(Element) not: the call
+         * from another class is the second, however much more specific the first is) */
+        if (method->ast && (method->modifiers & MOD_PRIVATE) && method->scope && method->scope->owner &&
+            sem->current_class && candidates->next) {
+            symbol_t *owner_top = method->scope->owner;
+            while (owner_top->data.class_data.enclosing_class) {
+                owner_top = owner_top->data.class_data.enclosing_class;
+            }
+            symbol_t *current_top = sem->current_class;
+            while (current_top->data.class_data.enclosing_class) {
+                current_top = current_top->data.class_data.enclosing_class;
+            }
+            if (owner_top != current_top) {
+                continue;
+            }
+        }
+
         /* Count parameters */
         int param_count = 0;
         slist_t *params = method->data.method_data.parameters;
@@ -10429,17 +10470,37 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                     /* A lambda or method reference is only ever passed as a functional
                      * interface: never where a class is expected (DateTimeFormatter.parse's
                      * ParsePosition, against the TemporalQuery that "Instant::from" is). */
-                    if (param->type->kind == TYPE_TYPEVAR) {
-                        type_mismatch = true;   /* a type variable is not a functional interface */
+                    type_t *pfi = param->type;
+                    if (is_varargs && param_node->next == NULL && pfi->kind == TYPE_ARRAY &&
+                        pfi->data.array_type.element_type) {
+                        pfi = pfi->data.array_type.element_type;   /* each of the arguments is an element */
+                    }
+                    if (pfi->kind == TYPE_TYPEVAR && pfi->data.type_var.name &&
+                        lookup_method_type_param(method, pfi->data.type_var.name)) {
+                        /* the method's own type variable is not a functional interface (the
+                         * receiver's, "Consumer<T>.accept(T)", is whatever the receiver says) */
+                        type_mismatch = true;
                         break;
                     }
-                    if (param->type->kind == TYPE_CLASS) {
-                        symbol_t *expected = param->type->data.class_type.symbol;
-                        if (!expected && param->type->data.class_type.name) {
-                            expected = load_external_class(sem, param->type->data.class_type.name);
+                    if (pfi->kind == TYPE_ARRAY ||
+                        (pfi->kind >= TYPE_BOOLEAN && pfi->kind <= TYPE_DOUBLE)) {
+                        type_mismatch = true;   /* an array or a primitive is not a functional interface */
+                        break;
+                    }
+                    if (pfi->kind == TYPE_CLASS) {
+                        symbol_t *expected = pfi->data.class_type.symbol;
+                        if (!expected && pfi->data.class_type.name) {
+                            expected = load_external_class(sem, pfi->data.class_type.name);
                         }
                         if (expected && (expected->kind == SYM_CLASS || expected->kind == SYM_ENUM ||
                                          expected->kind == SYM_RECORD)) {
+                            type_mismatch = true;
+                            break;
+                        }
+                        /* an interface with no single abstract method is no target either
+                         * (commons-logging's Log, against the Supplier<Log> overload) */
+                        if (expected && expected->kind == SYM_INTERFACE && expected->data.class_data.members &&
+                            !get_functional_interface_sam(expected)) {
                             type_mismatch = true;
                             break;
                         }
@@ -10701,7 +10762,11 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                     if (speculative) {
                         sem->loading_dependency = true;
                     }
+                    /* the target type is the call's own, not its arguments' */
+                    type_t *saved_call_target = sem->target_type;
+                    sem->target_type = NULL;
                     arg_types[arg_index] = get_expression_type(sem, arg);
+                    sem->target_type = saved_call_target;
                     sem->loading_dependency = saved_quiet;
                     arg_typed[arg_index] = true;
                 }
@@ -10726,7 +10791,9 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                  * E.g., for Function<Integer, String>.apply(T t), param_type is T,
                  * which should be substituted with Integer from recv_type. */
                 if (recv_type && param_type) {
+                    g_own_type_vars_of = method;
                     param_type = substitute_from_receiver(param_type, recv_type);
+                    g_own_type_vars_of = NULL;
                 }
                 
                 /* For varargs, the last parameter is an array. Individual args match the element type. */
@@ -10773,7 +10840,15 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                         }
                     } else if (arg_type->kind == TYPE_ARRAY && compare_type->kind == TYPE_ARRAY) {
                         exact_match = type_equals(arg_type, compare_type);
-                        if (!exact_match && type_assignable(compare_type, arg_type)) {
+                        type_t *param_elem = compare_type->data.array_type.element_type;
+                        type_t *arg_elem = arg_type->data.array_type.element_type;
+                        if (!exact_match && param_elem && param_elem->kind == TYPE_TYPEVAR && arg_elem &&
+                            (arg_elem->kind == TYPE_CLASS || arg_elem->kind == TYPE_ARRAY ||
+                             arg_type->data.array_type.dimensions > compare_type->data.array_type.dimensions)) {
+                            /* "T[]" takes an array of any reference type, arrays included */
+                            score += 85;
+                            array_conversion_scored = true;
+                        } else if (!exact_match && type_assignable(compare_type, arg_type)) {
                             score += 85;
                             array_conversion_scored = true;
                         } else if (!exact_match &&
@@ -11306,6 +11381,21 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                         if (type_param->type) {
                             type_node->sem_type = type_param->type;
                             return type_param->type;
+                        }
+                    }
+                }
+
+                /* A type parameter of an enclosing class (an inner class sees its outer's T) */
+                if (sem->current_class) {
+                    for (symbol_t *outer = sem->current_class->data.class_data.enclosing_class; outer;
+                         outer = outer->data.class_data.enclosing_class) {
+                        if (!outer->data.class_data.members || (outer->modifiers & MOD_STATIC)) {
+                            continue;
+                        }
+                        symbol_t *outer_param = scope_lookup_local(outer->data.class_data.members, name);
+                        if (outer_param && outer_param->kind == SYM_TYPE_PARAM && outer_param->type) {
+                            type_node->sem_type = outer_param->type;
+                            return outer_param->type;
                         }
                     }
                 }
@@ -13892,6 +13982,24 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                                     }
                                                 }
                                             }
+                                            /* An interface may redeclare the public methods of Object
+                                             * (JLS 9.6.4.4): "@Override String toString();" */
+                                            if (!actually_overrides && sem->current_class &&
+                                                sem->current_class->kind == SYM_INTERFACE) {
+                                                int nparams = 0;
+                                                for (slist_t *pc = node->data.node.children; pc; pc = pc->next) {
+                                                    ast_node_t *ch = (ast_node_t *)pc->data;
+                                                    if (ch && ch->type == AST_PARAMETER) {
+                                                        nparams++;
+                                                    }
+                                                }
+                                                if (nparams == 0 && (strcmp(name, "toString") == 0 ||
+                                                                     strcmp(name, "hashCode") == 0)) {
+                                                    actually_overrides = true;
+                                                } else if (nparams == 1 && strcmp(name, "equals") == 0) {
+                                                    actually_overrides = true;
+                                                }
+                                            }
                                             if (!actually_overrides) {
                                                 semantic_error(sem, node->line, node->column,
                                                     "Method '%s' does not override a method from its superclass or interfaces",
@@ -14117,7 +14225,16 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             
                             /* Validate main method signature.
                              * Java 25+ (JEP 512) allows instance main and non-public main. */
+                            /* Only the forms a launcher would run: main() and main(String[]). Any
+                             * other method called main (a builder's main(Class<?>)) is just a method. */
+                            bool main_shaped = false;
                             if (kind == SYM_METHOD && strcmp(name, "main") == 0) {
+                                slist_t *mp = sym->data.method_data.parameters;
+                                main_shaped = !mp || (!mp->next && mp->data &&
+                                    ((symbol_t *)mp->data)->type &&
+                                    ((symbol_t *)mp->data)->type->kind == TYPE_ARRAY);
+                            }
+                            if (main_shaped) {
                                 bool valid_main = true;
                                 bool flexible_main = (sem->source_version >= 25);
                                 
@@ -15273,6 +15390,40 @@ static type_t *conditional_result_type(semantic_t *sem, type_t *then_type, type_
 }
 
 /**
+ * A lambda or method reference takes its type from where it is: bound to a target type here,
+ * and so are the ones that are an operand of a "?:" (or in parentheses) that has that target.
+ */
+static void bind_poly_operands(semantic_t *sem, ast_node_t *expr, type_t *target)
+{
+    if (!expr || !target || target->kind != TYPE_CLASS) {
+        return;
+    }
+    switch (expr->type) {
+        case AST_PARENTHESIZED:
+            if (expr->data.node.children) {
+                bind_poly_operands(sem, (ast_node_t *)expr->data.node.children->data, target);
+            }
+            break;
+        case AST_CONDITIONAL_EXPR: {
+            slist_t *c = expr->data.node.children;
+            if (c && c->next && c->next->next) {
+                bind_poly_operands(sem, (ast_node_t *)c->next->data, target);
+                bind_poly_operands(sem, (ast_node_t *)c->next->next->data, target);
+            }
+            break;
+        }
+        case AST_LAMBDA_EXPR:
+            bind_lambda_to_target_type(sem, expr, target);
+            break;
+        case AST_METHOD_REF:
+            bind_method_ref_to_target_type(sem, expr, target);
+            break;
+        default:
+            break;
+    }
+}
+
+/**
  * Get the type of an expression (iterative).
  */
 type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
@@ -15435,6 +15586,9 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     
                     symbol_t *host = sem->current_class;
                     while (host) {
+                        /* the host seen as the superclass being searched, in the host's own
+                         * variables: Base<Map<String, Object>> for "extends Base<Map<...>>" */
+                        type_t *seen_as_super = host->data.class_data.superclass_type;
                         symbol_t *search_class = host->data.class_data.superclass;
                         if (!search_class && host->data.class_data.superclass_type &&
                             host->data.class_data.superclass_type->kind == TYPE_CLASS &&
@@ -15473,8 +15627,16 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                             inherited->type = type_new_primitive(TYPE_UNKNOWN);
                                         }
                                         expr->sem_symbol = inherited;
-                                        expr->sem_type = inherited->type;
-                                        return inherited->type;
+                                        /* "T source" of "Base<T>", read in a "Derived extends Base<Map<..>>" */
+                                        type_t *field_type = inherited->type;
+                                        if (seen_as_super && seen_as_super->kind == TYPE_CLASS &&
+                                            seen_as_super->data.class_type.type_args &&
+                                            !(inherited->modifiers & MOD_STATIC)) {
+                                            field_type = substitute_from_receiver(field_type, seen_as_super);
+                                            ensure_type_symbol_loaded(sem, field_type);
+                                        }
+                                        expr->sem_type = field_type;
+                                        return field_type;
                                     }
                                 }
                             }
@@ -15482,6 +15644,13 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             if (!next_super && search_class->data.class_data.unresolved_superclass) {
                                 next_super = load_external_class(sem,
                                     search_class->data.class_data.unresolved_superclass);
+                            }
+                            if (seen_as_super && search_class->data.class_data.superclass_type &&
+                                seen_as_super->kind == TYPE_CLASS && seen_as_super->data.class_type.type_args) {
+                                seen_as_super = substitute_from_receiver(
+                                    search_class->data.class_data.superclass_type, seen_as_super);
+                            } else {
+                                seen_as_super = search_class->data.class_data.superclass_type;
                             }
                             search_class = next_super;
                         }
@@ -16604,20 +16773,29 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 /* Walk up the superclass chain to find the method */
                                 symbol_t *super = recv_class->data.class_data.superclass;
                                 type_t *superclass_type_at_depth = recv_class->data.class_data.superclass_type;
+                                /* the receiver, seen as each superclass in turn: a superclass type is
+                                 * written in the variables of the class that extends it */
+                                type_t *walk_recv = recv_type;
                                 while (super && (!method || method->kind != SYM_METHOD)) {
+                                    type_t *seen_as_super = superclass_type_at_depth;
+                                    if (seen_as_super && walk_recv && walk_recv->kind == TYPE_CLASS &&
+                                        walk_recv->data.class_type.type_args) {
+                                        seen_as_super = substitute_from_receiver(seen_as_super, walk_recv);
+                                    }
                                     if (super->data.class_data.members) {
                                         method = scope_lookup_method_with_types(sem,
                                             super->data.class_data.members, method_name, args);
                                         if (method && method->kind == SYM_METHOD) {
                                             /* Method found in superclass at this depth.
                                              * Use the parameterized superclass type for substitution */
-                                            if (superclass_type_at_depth) {
-                                                recv_type_for_subst = superclass_type_at_depth;
+                                            if (seen_as_super) {
+                                                recv_type_for_subst = seen_as_super;
                                     }
                                             break;
                                         }
                                     }
                                     /* Move to next level: use this superclass's superclass_type */
+                                    walk_recv = seen_as_super;
                                     superclass_type_at_depth = super->data.class_data.superclass_type;
                                     super = super->data.class_data.superclass;
                                 }
@@ -16633,6 +16811,11 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     recv_class->data.class_data.superclass_type->kind == TYPE_CLASS &&
                                     recv_class->data.class_data.superclass_type->data.class_type.type_args) {
                                     recv_type_for_subst = recv_class->data.class_data.superclass_type;
+                                    if (recv_type && recv_type->kind == TYPE_CLASS &&
+                                        recv_type->data.class_type.type_args) {
+                                        /* in the receiver's own arguments, not its declaration's variables */
+                                        recv_type_for_subst = substitute_from_receiver(recv_type_for_subst, recv_type);
+                                    }
                                 }
                             }
                             
@@ -17031,8 +17214,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         
                         /* Substitute receiver type arguments into parameter type */
                         if (recv_type_for_subst && param_type) {
-                            param_type = substitute_from_receiver(param_type,
-                                receiver_for_method(sem, recv_type_for_subst, found_method));
+                            type_t *for_params = receiver_for_method(sem, recv_type_for_subst, found_method);
+                            g_own_type_vars_of = found_method;
+                            param_type = substitute_from_receiver(param_type, for_params);
+                            g_own_type_vars_of = NULL;
                         }
                         
                         /* Check if this is a varargs parameter */
@@ -17134,17 +17319,31 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         
                         /* A method reference passed as Function<..., R> (or a TemporalQuery<T>, a
                          * Supplier<T>...) says what R is: what the method it names returns. */
-                        if (unwrapped_arg->type == AST_METHOD_REF && unwrapped_arg->sem_symbol &&
-                            param->type && param->type->kind == TYPE_CLASS &&
-                            param->type->data.class_type.type_args) {
-                            symbol_t *fi = param->type->data.class_type.symbol;
-                            if (!fi && param->type->data.class_type.name) {
-                                fi = load_external_class(sem, param->type->data.class_type.name);
+                        type_t *fi_decl = param->type;
+                        type_t *fi_subst = param_type;
+                        if (is_varargs_param && fi_decl && fi_decl->kind == TYPE_ARRAY) {
+                            fi_decl = fi_decl->data.array_type.element_type;
+                            fi_subst = (fi_subst && fi_subst->kind == TYPE_ARRAY) ?
+                                       fi_subst->data.array_type.element_type : fi_subst;
+                        }
+                        bool array_ctor_ref = unwrapped_arg->type == AST_METHOD_REF &&
+                            (unwrapped_arg->data.node.flags & MOD_NATIVE) != 0;
+                        if (unwrapped_arg->type == AST_METHOD_REF && (unwrapped_arg->sem_symbol || array_ctor_ref) &&
+                            fi_decl && fi_decl->kind == TYPE_CLASS &&
+                            fi_decl->data.class_type.type_args) {
+                            symbol_t *fi = fi_decl->data.class_type.symbol;
+                            if (!fi && fi_decl->data.class_type.name) {
+                                fi = load_external_class(sem, fi_decl->data.class_type.name);
                             }
                             symbol_t *fi_sam = fi ? get_functional_interface_sam(fi) : NULL;
                             symbol_t *referred = unwrapped_arg->sem_symbol;
                             type_t *produced = NULL;
-                            if (referred->kind == SYM_CONSTRUCTOR) {
+                            if (array_ctor_ref) {
+                                /* String[]::new produces a String[] */
+                                ast_node_t *ref_target = unwrapped_arg->data.node.children ?
+                                    (ast_node_t *)unwrapped_arg->data.node.children->data : NULL;
+                                produced = ref_target ? ref_target->sem_type : NULL;
+                            } else if (referred->kind == SYM_CONSTRUCTOR) {
                                 ast_node_t *ref_target = unwrapped_arg->data.node.children ?
                                     (ast_node_t *)unwrapped_arg->data.node.children->data : NULL;
                                 produced = ref_target ? ref_target->sem_type : NULL;
@@ -17157,7 +17356,26 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                              * (Comparator.comparing(String::length): T is String). */
                             ast_node_t *recv_ref_target = unwrapped_arg->data.node.children ?
                                 (ast_node_t *)unwrapped_arg->data.node.children->data : NULL;
-                            if (fi_sam && fi_sam->data.method_data.parameters && referred->kind == SYM_METHOD &&
+                            /* A bound "expr::method" returns what the method does for expr's type:
+                             * Name.class::cast on a Class<Name> is a Name */
+                            if (!array_ctor_ref && referred && referred->kind == SYM_METHOD && recv_ref_target &&
+                                (unwrapped_arg->data.node.flags & MOD_PRIVATE) && referred->type &&
+                                referred->type->kind != TYPE_VOID && !produced) {
+                                type_t *bound_recv = recv_ref_target->sem_type;
+                                if (!bound_recv) {
+                                    bound_recv = get_expression_type(sem, recv_ref_target);
+                                }
+                                if (bound_recv && bound_recv->kind == TYPE_CLASS && bound_recv->data.class_type.type_args) {
+                                    symbol_t *own_owner = g_own_type_vars_of;
+                                    g_own_type_vars_of = referred;
+                                    type_t *seen = substitute_from_receiver(referred->type, bound_recv);
+                                    g_own_type_vars_of = own_owner;
+                                    if (seen && seen->kind != TYPE_TYPEVAR && seen->kind != TYPE_WILDCARD) {
+                                        produced = seen;
+                                    }
+                                }
+                            }
+                            if (fi_sam && fi_sam->data.method_data.parameters && referred && referred->kind == SYM_METHOD &&
                                 !(unwrapped_arg->data.node.flags & (MOD_STATIC | MOD_PRIVATE | MOD_ABSTRACT)) &&
                                 recv_ref_target && recv_ref_target->sem_type &&
                                 recv_ref_target->sem_type->kind == TYPE_CLASS) {
@@ -17172,7 +17390,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                             break;
                                         }
                                     }
-                                    slist_t *parg = param->type->data.class_type.type_args;
+                                    slist_t *parg = (fi_subst && fi_subst->kind == TYPE_CLASS &&
+                                                     fi_subst->data.class_type.type_args) ?
+                                                    fi_subst->data.class_type.type_args :
+                                                    fi_decl->data.class_type.type_args;
                                     for (int k = 0; k < ppos && parg; k++) {
                                         parg = parg->next;
                                     }
@@ -17180,6 +17401,19 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     if (recv_declared && recv_declared->kind == TYPE_WILDCARD &&
                                         recv_declared->data.wildcard.bound) {
                                         recv_declared = recv_declared->data.wildcard.bound;   /* ? super T */
+                                    }
+                                    /* What the method returns, in the terms of the receiver the functional
+                                     * interface hands it: Map.Entry::getKey on an Entry<String, V> is a String */
+                                    if (recv_declared && recv_declared->kind == TYPE_CLASS &&
+                                        recv_declared->data.class_type.type_args && referred->type &&
+                                        referred->type->kind != TYPE_VOID) {
+                                        symbol_t *own_owner = g_own_type_vars_of;
+                                        g_own_type_vars_of = referred;
+                                        type_t *seen = substitute_from_receiver(referred->type, recv_declared);
+                                        g_own_type_vars_of = own_owner;
+                                        if (seen && seen->kind != TYPE_TYPEVAR && seen->kind != TYPE_WILDCARD) {
+                                            produced = seen;
+                                        }
                                     }
                                     if (recv_declared && recv_declared->kind == TYPE_TYPEVAR &&
                                         recv_declared->data.type_var.name) {
@@ -17205,7 +17439,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                         break;
                                     }
                                 }
-                                slist_t *targ = param->type->data.class_type.type_args;
+                                slist_t *targ = fi_decl->data.class_type.type_args;
                                 for (int k = 0; k < pos && targ; k++) {
                                     targ = targ->next;
                                 }
@@ -17213,13 +17447,15 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 if (declared && declared->kind == TYPE_WILDCARD && declared->data.wildcard.bound) {
                                     declared = declared->data.wildcard.bound;   /* ? extends U */
                                 }
-                                if (declared && declared->kind == TYPE_TYPEVAR && declared->data.type_var.name) {
+                                if (declared) {
                                     for (int tpi = 0; tpi < n_type_params; tpi++) {
-                                        if ((!inferred_types[tpi] || inferred_types[tpi]->kind == TYPE_TYPEVAR ||
-                                             inferred_types[tpi]->kind == TYPE_UNKNOWN ||
-                                             inferred_types[tpi]->kind == TYPE_WILDCARD) &&
-                                            strcmp(type_param_names[tpi], declared->data.type_var.name) == 0) {
-                                            inferred_types[tpi] = type_boxed(produced);
+                                        if (!inferred_types[tpi] || inferred_types[tpi]->kind == TYPE_TYPEVAR ||
+                                            inferred_types[tpi]->kind == TYPE_UNKNOWN ||
+                                            inferred_types[tpi]->kind == TYPE_WILDCARD) {
+                                            type_t *got = infer_type_arg(declared, produced, type_param_names[tpi]);
+                                            if (got) {
+                                                inferred_types[tpi] = got;
+                                            }
                                         }
                                     }
                                 }
@@ -17299,6 +17535,14 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                                                         arg_type, tv)) {
                                     arg_ok = true;
                                 }
+                            }
+                            if (!arg_ok && param_type->kind == TYPE_ARRAY && arg_type->kind == TYPE_ARRAY &&
+                                param_type->data.array_type.element_type &&
+                                param_type->data.array_type.element_type->kind == TYPE_TYPEVAR &&
+                                param_type->data.array_type.element_type->data.type_var.name) {
+                                /* "T[]" takes an array of any reference type, arrays among them */
+                                arg_ok = infer_type_arg(param_type, arg_type,
+                                    param_type->data.array_type.element_type->data.type_var.name) != NULL;
                             }
                             if (!arg_ok && param_type->kind == TYPE_CLASS &&
                                 param_type->data.class_type.type_args &&
@@ -17416,7 +17660,9 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         if (from_args) {
                             return_type = from_args;
                         } else {
+                            g_own_type_vars_of = found_method;
                             return_type = substitute_from_receiver(return_type, subst_recv);
+                            g_own_type_vars_of = NULL;
                         }
                         /* Ensure the substituted type has its symbol loaded */
                         ensure_type_symbol_loaded(sem, return_type);
@@ -17528,6 +17774,11 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                    !return_type->data.class_type.symbol) {
                             ret_var = return_type->data.class_type.name;
                         }
+                        /* only a type variable of the method itself is fixed by an argument: a class
+                         * named like String, whose symbol is not loaded yet, is not one */
+                        if (ret_var && !lookup_method_type_param(found_method, ret_var)) {
+                            ret_var = NULL;
+                        }
                         if (ret_var) {
                             slist_t *arg_list = has_explicit_receiver ? children->next : children;
                             slist_t *pnode = params;
@@ -17637,6 +17888,49 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 if (import_class && method_sym) {
                     /* Store the import class on the expression for codegen */
                     expr->sem_symbol = method_sym;
+                    /* A generic method (<T> T mock(Class<T>)) is typed by what it is called with:
+                     * the call as "pkg.Class.method(args)", which does that. */
+                    type_t *declared_return = method_sym->type;
+                    if (declared_return && (declared_return->kind == TYPE_TYPEVAR ||
+                        (declared_return->kind == TYPE_CLASS && declared_return->data.class_type.type_args) ||
+                        declared_return->kind == TYPE_ARRAY) && import_class->qualified_name) {
+                        ast_node_t *receiver = NULL;
+                        char qn[512];
+                        snprintf(qn, sizeof(qn), "%s", import_class->qualified_name);
+                        for (char *c = qn; *c; c++) {
+                            if (*c == '$') {
+                                *c = '.';
+                            }
+                        }
+                        char *seg = qn;
+                        while (seg && *seg) {
+                            char *dot = strchr(seg, '.');
+                            if (dot) {
+                                *dot = '\0';
+                            }
+                            if (!receiver) {
+                                receiver = ast_new_leaf(AST_IDENTIFIER, seg, expr->line, expr->column);
+                            } else {
+                                ast_node_t *fa = ast_new(AST_FIELD_ACCESS, expr->line, expr->column);
+                                fa->data.node.name = (char *)intern(seg);
+                                ast_add_child(fa, receiver);
+                                receiver = fa;
+                            }
+                            seg = dot ? dot + 1 : NULL;
+                        }
+                        ast_node_t *qualified = ast_new(AST_METHOD_CALL, expr->line, expr->column);
+                        qualified->data.node.name = expr->data.node.name;
+                        qualified->data.node.flags = expr->data.node.flags | AST_METHOD_CALL_EXPLICIT_RECEIVER;
+                        ast_add_child(qualified, receiver);
+                        for (slist_t *a = children; a; a = a->next) {
+                            ast_add_child(qualified, (ast_node_t *)a->data);
+                        }
+                        type_t *typed = get_expression_type(sem, qualified);
+                        if (typed && typed->kind != TYPE_UNKNOWN) {
+                            expr->sem_type = typed;
+                            return typed;
+                        }
+                    }
                     return method_sym->type;
                 }
                 
@@ -18199,6 +18493,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     
                     /* Search class hierarchy for field */
                     symbol_t *search_class = class_sym;
+                    /* the object's type as the class being searched: its own at first, then
+                     * each superclass as the one before extends it (Base<Map<..>> for
+                     * "Derived extends Base<Map<..>>"), so an inherited "T source" is a Map */
+                    type_t *field_recv = object_type;
                     while (search_class) {
                         if (search_class->data.class_data.members) {
                         symbol_t *field = scope_lookup_local(
@@ -18384,7 +18682,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             
                             if (field->type) {
                                 /* Substitute type parameters with actual type arguments */
-                                type_t *field_type = substitute_from_receiver(field->type, object_type);
+                                type_t *field_type = substitute_from_receiver(field->type, field_recv);
                                     
                                     /* Ensure the returned type has its symbol set for chained access */
                                     if (field_type && field_type->kind == TYPE_CLASS &&
@@ -18414,6 +18712,13 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         }
                         }
                         /* Move to superclass (only if field not found in current class) */
+                        if (search_class->data.class_data.superclass_type &&
+                            search_class->data.class_data.superclass_type->kind == TYPE_CLASS) {
+                            field_recv = (field_recv && field_recv->kind == TYPE_CLASS &&
+                                          field_recv->data.class_type.type_args) ?
+                                substitute_from_receiver(search_class->data.class_data.superclass_type, field_recv) :
+                                search_class->data.class_data.superclass_type;
+                        }
                         search_class = search_class->data.class_data.superclass;
                     }
                 }
@@ -19097,6 +19402,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 /* Type is common type of true/false branches */
                 slist_t *children = expr->data.node.children;
                 if (children && children->next && children->next->next) {
+                    bind_poly_operands(sem, expr, sem->target_type);
                     type_t *then_type = expression_type_with_bindings(sem, children->data, true,
                                                                       children->next->data);
                     type_t *else_type = expression_type_with_bindings(sem, children->data, false,
@@ -20005,6 +20311,18 @@ static type_t *infer_type_arg(type_t *param_type, type_t *arg_type, const char *
         return NULL;
     }
     
+    /* Array type: T[] with long[][] => T = long[] */
+    if (param_type->kind == TYPE_ARRAY && arg_type->kind == TYPE_ARRAY &&
+        param_type->data.array_type.element_type &&
+        param_type->data.array_type.element_type->kind == TYPE_TYPEVAR &&
+        param_type->data.array_type.element_type->data.type_var.name &&
+        strcmp(param_type->data.array_type.element_type->data.type_var.name, var_name) == 0 &&
+        arg_type->data.array_type.dimensions > param_type->data.array_type.dimensions &&
+        arg_type->data.array_type.element_type) {
+        return type_new_array(arg_type->data.array_type.element_type,
+                              arg_type->data.array_type.dimensions - param_type->data.array_type.dimensions);
+    }
+    
     /* Array type: T[] with String[] => T = String */
     if (param_type->kind == TYPE_ARRAY && arg_type->kind == TYPE_ARRAY) {
         return infer_type_arg(param_type->data.array_type.element_type, 
@@ -20381,9 +20699,35 @@ static type_t *substitute_from_receiver(type_t *type, type_t *recv_type)
         return type;  /* No type arguments on receiver */
     }
     
+    /* A type variable a stub left as a bare class named like it ("T"): the receiver's own
+     * type parameter of that name, if it has one */
+    if (type->kind == TYPE_CLASS && !type->data.class_type.type_args && !type->data.class_type.symbol &&
+        type->data.class_type.name && !strchr(type->data.class_type.name, '.') &&
+        recv_type->data.class_type.symbol &&
+        !(g_own_type_vars_of && lookup_method_type_param(g_own_type_vars_of, type->data.class_type.name))) {
+        int idx = 0;
+        for (slist_t *tp = recv_type->data.class_type.symbol->data.class_data.type_params; tp; tp = tp->next, idx++) {
+            symbol_t *param_sym = (symbol_t *)tp->data;
+            if (param_sym && param_sym->name && strcmp(param_sym->name, type->data.class_type.name) == 0) {
+                slist_t *arg = recv_type_args;
+                for (int i = 0; i < idx && arg; i++) {
+                    arg = arg->next;
+                }
+                if (arg && arg->data) {
+                    return (type_t *)arg->data;
+                }
+                break;
+            }
+        }
+        return type;
+    }
+    
     if (type->kind == TYPE_TYPEVAR) {
         const char *var_name = type->data.type_var.name;
         if (!var_name) {
+            return type;
+        }
+        if (g_own_type_vars_of && lookup_method_type_param(g_own_type_vars_of, var_name)) {
             return type;
         }
         
@@ -20420,6 +20764,10 @@ static type_t *substitute_from_receiver(type_t *type, type_t *recv_type)
                         /* An unbounded "?" (or "? super X") stands for what the type parameter
                          * is declared to extend: Holder<?>.get() is a Runnable for
                          * "Holder<T extends Runnable>", an Object otherwise. */
+                        if (result && result->kind == TYPE_WILDCARD && result->data.wildcard.bound_kind == 1 &&
+                            result->data.wildcard.bound) {
+                            return result->data.wildcard.bound;   /* "? extends B": what it yields is a B */
+                        }
                         if (result && result->kind == TYPE_WILDCARD && result->data.wildcard.bound_kind != 1) {
                             type_t *declared = param_sym->type;
                             type_t *upper = (declared && declared->kind == TYPE_TYPEVAR) ?
@@ -20745,6 +21093,67 @@ static void sam_method_key(const symbol_t *sym, char *buf, size_t size)
     snprintf(buf, size, "%s/%d", sym->name ? sym->name : "", arity);
 }
 
+/* Whether two parameter types can be the same parameter of one method: an interface's
+ * generic "m(T)" is "m(String)" in a sub-interface that specializes it, so a type variable
+ * (or a type not known yet) fits any; otherwise the types are the same class, array or primitive. */
+static bool sam_param_compatible(type_t *a, type_t *b)
+{
+    if (!a || !b || a->kind == TYPE_TYPEVAR || b->kind == TYPE_TYPEVAR || a->kind == TYPE_UNKNOWN ||
+        b->kind == TYPE_UNKNOWN || a->kind == TYPE_WILDCARD || b->kind == TYPE_WILDCARD) {
+        return true;
+    }
+    if (a->kind != b->kind) {
+        return false;
+    }
+    if (a->kind == TYPE_ARRAY) {
+        return a->data.array_type.dimensions == b->data.array_type.dimensions &&
+               sam_param_compatible(a->data.array_type.element_type, b->data.array_type.element_type);
+    }
+    if (a->kind == TYPE_CLASS) {
+        const char *x = a->data.class_type.name, *y = b->data.class_type.name;
+        return !x || !y || strcmp(x, y) == 0;
+    }
+    return true;
+}
+
+static bool sam_methods_compatible(const symbol_t *a, const symbol_t *b)
+{
+    slist_t *pa = a->data.method_data.parameters, *pb = b->data.method_data.parameters;
+    for (; pa && pb; pa = pa->next, pb = pb->next) {
+        symbol_t *x = (symbol_t *)pa->data, *y = (symbol_t *)pb->data;
+        if (!sam_param_compatible(x ? x->type : NULL, y ? y->type : NULL)) {
+            return false;
+        }
+    }
+    return !pa && !pb;
+}
+
+/* The tables of methods seen map "name/arity" to the list of those methods */
+static symbol_t *sam_table_find(hashtable_t *table, const char *key, const symbol_t *like)
+{
+    for (slist_t *l = (slist_t *)hashtable_lookup(table, key); l; l = l->next) {
+        if (sam_methods_compatible((const symbol_t *)l->data, like)) {
+            return (symbol_t *)l->data;
+        }
+    }
+    return NULL;
+}
+
+static void sam_table_add(hashtable_t *table, const char *key, symbol_t *sym)
+{
+    hashtable_insert(table, key, slist_prepend((slist_t *)hashtable_lookup(table, key), sym));
+}
+
+static void sam_table_free_lists(hashtable_t *table)
+{
+    for (size_t bi = 0; bi < table->size; bi++) {
+        for (hashtable_entry_t *e = table->buckets[bi]; e; e = e->next) {
+            slist_free((slist_t *)e->value);
+            e->value = NULL;
+        }
+    }
+}
+
 /* Helper to recursively collect abstract methods from interface hierarchy */
 static void collect_sam_from_interface(symbol_t *iface, hashtable_t *seen_methods, 
                                        hashtable_t *default_methods,
@@ -20770,8 +21179,8 @@ static void collect_sam_from_interface(symbol_t *iface, hashtable_t *seen_method
                     /* This is a default method - record it to "cancel out" abstract versions */
                     char key[320];
                     sam_method_key(sym, key, sizeof(key));
-                    if (sym->name && !hashtable_lookup(default_methods, key)) {
-                        hashtable_insert(default_methods, key, sym);
+                    if (sym->name && !sam_table_find(default_methods, key, sym)) {
+                        sam_table_add(default_methods, key, sym);
                     }
                 }
             }
@@ -20826,19 +21235,19 @@ static void collect_sam_from_interface(symbol_t *iface, hashtable_t *seen_method
                     /* Skip if a default method with this name exists (overrides abstract) */
                     char key[320];
                     sam_method_key(sym, key, sizeof(key));
-                    if (name && hashtable_lookup(default_methods, key)) {
+                    if (name && sam_table_find(default_methods, key, sym)) {
                         continue;
                     }
                     
                     /* Check if we've already seen a method with this name
                      * (handles diamond inheritance) */
-                    void *existing = hashtable_lookup(seen_methods, key);
+                    void *existing = sam_table_find(seen_methods, key, sym);
                     if (debug) {
                         fprintf(stderr, "DEBUG collect_sam: lookup '%s' in seen_methods -> %p\n",
                                 name ? name : "<null>", existing);
                     }
                     if (name && !existing) {
-                        hashtable_insert(seen_methods, key, sym);
+                        sam_table_add(seen_methods, key, sym);
                         (*count)++;
                         if (debug) {
                             fprintf(stderr, "DEBUG collect_sam: added '%s', count now=%d\n", name, *count);
@@ -20914,6 +21323,8 @@ symbol_t *get_functional_interface_sam(symbol_t *iface_sym)
     
     collect_sam_from_interface(iface_sym, seen_methods, default_methods, &sam, &count);
     
+    sam_table_free_lists(seen_methods);
+    sam_table_free_lists(default_methods);
     hashtable_free(seen_methods);
     hashtable_free(default_methods);
     
@@ -21135,6 +21546,9 @@ static void scan_lambda_body_for_this_capture(semantic_t *sem, ast_node_t *node,
             if (sem->current_class->data.class_data.members) {
                 method_sym = scope_lookup_local(
                     sem->current_class->data.class_data.members, method_name);
+                if (method_sym && method_sym->kind != SYM_METHOD) {
+                    method_sym = NULL;   /* a field called like the method is not it */
+                }
             }
             
             /* Also search current scope (might catch method defined earlier in same body) */
@@ -21206,13 +21620,40 @@ static void scan_lambda_body_for_this_capture(semantic_t *sem, ast_node_t *node,
         case AST_VAR_DECL:
         case AST_LAMBDA_EXPR:
         case AST_VAR_DECLARATOR:
+        case AST_METHOD_DECL:
+        case AST_CONSTRUCTOR_DECL:
+        case AST_FIELD_DECL:
             {
+                /* The body of an anonymous class created here names the locals it captures: the
+                 * lambda must capture them to hand them to the class's constructor. What the
+                 * body's own "this" and members are is the class's, not the lambda's. */
+                bool anonymous_body = false;
+                bool this_before = lambda->lambda_captures_this;
+                if (node->type == AST_NEW_OBJECT) {
+                    for (slist_t *c = node->data.node.children; c; c = c->next) {
+                        if (!c->next && c->data && ((ast_node_t *)c->data)->type == AST_BLOCK) {
+                            anonymous_body = true;
+                        }
+                    }
+                }
                 slist_t *children = node->data.node.children;
                 for (slist_t *c = children; c; c = c->next) {
                     ast_node_t *child = (ast_node_t *)c->data;
                     if (child) {
+                        bool is_body = anonymous_body && !c->next;
+                        bool before = lambda->lambda_captures_this;
                         scan_lambda_body_for_this_capture(sem, child, lambda);
+                        if (is_body) {
+                            lambda->lambda_captures_this = before;
+                        }
                     }
+                }
+                (void)this_before;
+                if (anonymous_body && sem->current_method && !(sem->current_method->modifiers & MOD_STATIC) &&
+                    sem->current_class && !(sem->current_class->kind == SYM_INTERFACE &&
+                                            (sem->current_method->modifiers & MOD_STATIC))) {
+                    /* the class's outer instance is the lambda's this */
+                    lambda->lambda_captures_this = true;
                 }
                 /* Also check extra (e.g., for statement updates, ternary else) */
                 if (node->data.node.extra) {
@@ -21734,6 +22175,10 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
         sem->current_lambda = lambda;  /* Track this lambda for capture detection */
         sem->lambda_enclosing_scope = saved_scope;  /* Remember where captures come from */
         
+        /* The target type was the lambda's own, not the body's */
+        type_t *saved_lambda_target = sem->target_type;
+        sem->target_type = NULL;
+        
         /* Initialize capture tracking on the lambda node */
         lambda->lambda_captures = NULL;
         lambda->lambda_captures_this = false;
@@ -21853,7 +22298,14 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                     }
                 }
                 
+                /* An expression body is typed against what the interface returns: a generic call
+                 * in it ("gson.fromJson(text, type)", a T) takes that as its target */
+                if (expected_return_type && (expected_return_type->kind == TYPE_CLASS ||
+                                             expected_return_type->kind == TYPE_ARRAY)) {
+                    sem->target_type = expected_return_type;
+                }
                 type_t *body_type = get_expression_type(sem, body);
+                sem->target_type = NULL;
                 
                 /* Scan for 'this' capture (same as block body) */
                 scan_lambda_body_for_this_capture(sem, body, lambda);
@@ -21960,6 +22412,7 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
         }
         
         /* Restore scope and lambda tracking */
+        sem->target_type = saved_lambda_target;
         sem->current_scope = saved_scope;
         sem->current_lambda = saved_lambda;
         sem->lambda_enclosing_scope = saved_enclosing;
@@ -22071,6 +22524,31 @@ static symbol_t *mref_lookup(semantic_t *sem, scope_t *members, const char *name
     }
     slist_free(candidates);
     return best;
+}
+
+/**
+ * mref_lookup() through a class's whole hierarchy: its own members, then its interfaces (a
+ * method declared on a super-interface is named through the sub-interface: Environment::
+ * containsProperty is PropertyResolver's), then its superclasses.
+ */
+static symbol_t *mref_lookup_inherited(semantic_t *sem, symbol_t *sym, const char *name, int arity,
+                                       type_t **ptypes, int nptypes, int want_static, int depth)
+{
+    if (!sym || depth > 16) {
+        return NULL;
+    }
+    symbol_t *found = mref_lookup(sem, sym->data.class_data.members, name, arity, ptypes, nptypes, want_static);
+    if (found) {
+        return found;
+    }
+    for (slist_t *i = sym->data.class_data.interfaces; i && !found; i = i->next) {
+        found = mref_lookup_inherited(sem, (symbol_t *)i->data, name, arity, ptypes, nptypes, want_static, depth + 1);
+    }
+    if (!found && sym->data.class_data.superclass) {
+        found = mref_lookup_inherited(sem, sym->data.class_data.superclass, name, arity, ptypes, nptypes,
+                                      want_static, depth + 1);
+    }
+    return found;
 }
 
 static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, type_t *target_type)
@@ -22403,14 +22881,8 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
                 for (slist_t *sp = sam->data.method_data.parameters; sp; sp = sp->next) {
                     sam_n++;
                 }
-                resolved_method = mref_lookup(sem, target_class_sym->data.class_data.members, method_name,
-                                              sam_n, sam_ptypes, sam_pcount, 0);
-                for (symbol_t *up = target_class_sym->data.class_data.superclass;
-                     up && !resolved_method && up->data.class_data.members;
-                     up = up->data.class_data.superclass) {
-                    resolved_method = mref_lookup(sem, up->data.class_data.members, method_name,
-                                                  sam_n, sam_ptypes, sam_pcount, 0);
-                }
+                resolved_method = mref_lookup_inherited(sem, target_class_sym, method_name,
+                                                        sam_n, sam_ptypes, sam_pcount, 0, 0);
                 if (!resolved_method) {
                     resolved_method = scope_lookup_method(target_class_sym->data.class_data.members, method_name);
                 }
@@ -22669,8 +23141,8 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
         }
         
         if (target_class_sym && target_class_sym->data.class_data.members) {
-            resolved_method = mref_lookup(sem, target_class_sym->data.class_data.members, method_name,
-                                          sam_param_count, sam_ptypes, sam_pcount, 0);
+            resolved_method = mref_lookup_inherited(sem, target_class_sym, method_name,
+                                                    sam_param_count, sam_ptypes, sam_pcount, 0, 0);
             if (!resolved_method) {
                 resolved_method = scope_lookup_method_with_args(
                     target_class_sym->data.class_data.members, method_name, sam_param_count);
@@ -24522,6 +24994,55 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                              * constant with no body has no such symbol and
                              * is walked unchanged, exactly as before this
                              * fix. */
+                            /* The lambdas and method references among the constructor's arguments
+                             * ("MICROS(ChronoUnit.MICROS, "us", (duration) -> ...)") are bound to the
+                             * constructor's parameter types, as a "new" would bind them. */
+                            if (sem->current_class && sem->current_class->data.class_data.members) {
+                                slist_t *args = NULL;
+                                int nargs = 0;
+                                for (slist_t *c = node->data.node.children; c; c = c->next) {
+                                    ast_node_t *a = (ast_node_t *)c->data;
+                                    if (!a || a->type == AST_METHOD_DECL || a->type == AST_FIELD_DECL ||
+                                        a->type == AST_CONSTRUCTOR_DECL || a->type == AST_CLASS_DECL ||
+                                        a->type == AST_INTERFACE_DECL || a->type == AST_ENUM_DECL ||
+                                        a->type == AST_RECORD_DECL || a->type == AST_BLOCK) {
+                                        break;
+                                    }
+                                    args = args ? args : c;
+                                    nargs++;
+                                }
+                                scope_t *enum_members = sem->current_class->data.class_data.members;
+                                slist_t *ctors = scope_find_all_methods(enum_members, sem->current_class->name);
+                                slist_t *inits = scope_find_all_methods(enum_members, "<init>");
+                                symbol_t *chosen = NULL;
+                                for (int round = 0; round < 2 && !chosen; round++) {
+                                    for (slist_t *k = round == 0 ? ctors : inits; k && !chosen; k = k->next) {
+                                        symbol_t *ctor = (symbol_t *)k->data;
+                                        if (!ctor || ctor->kind != SYM_CONSTRUCTOR) {
+                                            continue;
+                                        }
+                                        int count = 0;
+                                        for (slist_t *p = ctor->data.method_data.parameters; p; p = p->next) {
+                                            count++;
+                                        }
+                                        if (count == nargs) {
+                                            chosen = ctor;
+                                        }
+                                    }
+                                }
+                                if (chosen && args) {
+                                    slist_t *a = args;
+                                    for (slist_t *p = chosen->data.method_data.parameters; p && a; p = p->next, a = a->next) {
+                                        symbol_t *ps = (symbol_t *)p->data;
+                                        if (ps && ps->type) {
+                                            bind_poly_operands(sem, (ast_node_t *)a->data, ps->type);
+                                        }
+                                    }
+                                }
+                                slist_free(ctors);
+                                slist_free(inits);
+                            }
+                            
                             symbol_t *field_sym = node->sem_symbol;
                             symbol_t *anon_sym = (field_sym && field_sym->kind == SYM_FIELD) ?
                                 field_sym->data.var_data.enum_constant_anon_class : NULL;
@@ -24981,7 +25502,12 @@ define_local_var:
                                     }
                                     
                                     /* Return with value */
+                                    type_t *saved_return_target = sem->target_type;
+                                    if (!is_void_method && expected && expected->kind == TYPE_CLASS) {
+                                        sem->target_type = expected;
+                                    }
                                     type_t *actual = get_expression_type(sem, ret_expr);
+                                    sem->target_type = saved_return_target;
                                     
                                     if (is_void_method) {
                                         /* Cannot return a value from void method */
@@ -25536,6 +26062,33 @@ define_local_var:
                                             param_sym->column = params->column;
                                             scope_define(lambda_scope, param_sym);
                                             params->sem_symbol = param_sym;
+                                        }
+                                    } else if (params && (params->type == AST_PARENTHESIZED || params->type == AST_BINARY_EXPR)) {
+                                        /* "(x)" and "(x, y)" / "x, y": the identifiers inside, with the types
+                                         * binding gave them */
+                                        ast_node_t *stack[32];
+                                        int top = 0;
+                                        stack[top++] = params;
+                                        while (top > 0) {
+                                            ast_node_t *n = stack[--top];
+                                            if (!n) {
+                                                continue;
+                                            }
+                                            if (n->type == AST_IDENTIFIER) {
+                                                if (!(sem->source_version >= 22 && is_unnamed_name(n->data.leaf.name)) &&
+                                                    !scope_lookup_local(lambda_scope, n->data.leaf.name)) {
+                                                    symbol_t *param_sym = symbol_new(SYM_PARAMETER, n->data.leaf.name);
+                                                    param_sym->type = n->sem_type ? n->sem_type : type_new_primitive(TYPE_UNKNOWN);
+                                                    param_sym->line = n->line;
+                                                    param_sym->column = n->column;
+                                                    scope_define(lambda_scope, param_sym);
+                                                    n->sem_symbol = param_sym;
+                                                }
+                                            } else if (n->type == AST_PARENTHESIZED || n->type == AST_BINARY_EXPR) {
+                                                for (slist_t *c = n->data.node.children; c && top < 31; c = c->next) {
+                                                    stack[top++] = (ast_node_t *)c->data;
+                                                }
+                                            }
                                         }
                                     } else if (params && params->type == AST_LAMBDA_PARAMS) {
                                         /* Multiple parameters - define each one */

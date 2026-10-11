@@ -4239,10 +4239,11 @@ static void generate_interface_bridges(class_gen_t *cg)
                     }
                 }
                 
-                if (!impl_has_concrete) {
-                    entry = entry->next;
-                    continue;
-                }
+                /* A type-variable parameter erases to its bound as the interface method's does, so
+                 * the parameters alone say nothing - but the RETURN type may still differ
+                 * ("E apply(T)" for "R apply(T)", E extends Enum): the descriptor comparison
+                 * below decides whether a bridge is owed. */
+                (void)impl_has_concrete;
                 
                 /* An interface method's own return type is often never
                  * resolved at all (iface_method->type stays NULL) - nothing

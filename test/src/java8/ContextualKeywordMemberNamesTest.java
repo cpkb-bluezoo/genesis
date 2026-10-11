@@ -46,6 +46,14 @@ public class ContextualKeywordMemberNamesTest {
         return sb.toString();
     }
 
+    static String castOperands() {
+        Object module = "m";
+        Object open = "o";
+        int to = 3;
+        String moduleName = module.toString() + "!";
+        return (String) module + (String) open + (int) to + moduleName;
+    }
+
     static int count(Consumer<Appendable> c) {
         return c == null ? 0 : 1;
     }
@@ -68,12 +76,12 @@ public class ContextualKeywordMemberNamesTest {
         String viaCall = this.with("b") + requires("c") + uses();
         int permits = open + exports;
         int when = permits * 2;
-        return drain(this::to) + log + w.apply("x") + r.apply("y") + u.get() + viaCall + permits + when;
+        return drain(this::to) + log + w.apply("x") + r.apply("y") + u.get() + viaCall + permits + when + castOperands();
     }
 
     public static void main(String[] args) throws java.io.IOException {
         String got = new ContextualKeywordMemberNamesTest().run();
-        String want = "torecord:a;with:xrequires:yuseswith:brequires:cuses36";
+        String want = "torecord:a;with:xrequires:yuseswith:brequires:cuses36mo3m!";
         if (!want.equals(got)) {
             throw new RuntimeException(got);
         }

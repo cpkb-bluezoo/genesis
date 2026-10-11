@@ -12893,7 +12893,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 /* Get lambda info from semantic analysis */
                 type_t *func_interface = expr->sem_type;
                 if (!func_interface || func_interface->kind != TYPE_CLASS) {
-                    fprintf(stderr, "codegen: lambda without target type\n");
+                    fprintf(stderr, "codegen: lambda without target type (line %d)\n", expr->line);
                     return false;
                 }
                 
@@ -13673,7 +13673,13 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     }
                 }
                 mg_pop_typed(mg, capture_count);  /* Pop captures */
-                mg_push(mg, 1);  /* Push result */
+                {
+                    /* the functional interface instance, typed for the frames that follow */
+                    char *result_internal = class_to_internal_name(iface_sym->qualified_name ?
+                                                                   iface_sym->qualified_name : iface_sym->name);
+                    mg_push_object(mg, result_internal);
+                    free(result_internal);
+                }
                 
                 cg->uses_invokedynamic = true;
                 return true;
@@ -13693,7 +13699,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 
                 type_t *func_interface = expr->sem_type;
                 if (!func_interface || func_interface->kind != TYPE_CLASS) {
-                    fprintf(stderr, "codegen: method reference without target type\n");
+                    fprintf(stderr, "codegen: method reference without target type (line %d)\n", expr->line);
                     return false;
                 }
                 
@@ -13982,6 +13988,10 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                         }
                                         if (ta) {
                                             actual = (type_t *)ta->data;
+                                            if (actual && actual->kind == TYPE_WILDCARD) {
+                                                /* "? super String" is passed as a String */
+                                                actual = actual->data.wildcard.bound ? actual->data.wildcard.bound : NULL;
+                                            }
                                         }
                                         break;
                                     }
@@ -14011,6 +14021,10 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                     }
                                     if (ta) {
                                         actual = (type_t *)ta->data;
+                                            if (actual && actual->kind == TYPE_WILDCARD) {
+                                                /* "? super String" is passed as a String */
+                                                actual = actual->data.wildcard.bound ? actual->data.wildcard.bound : NULL;
+                                            }
                                     }
                                     break;
                                 }
@@ -14146,7 +14160,70 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     snprintf(receiver_desc, n, "(L%s;%s", target_internal, spec_desc_str + 19);
                     spec_desc_str = receiver_desc;
                 }
+                /* An argument the functional interface leaves as Object (a type variable nothing
+                 * fixed) that the method takes as a more specific reference type: the call site
+                 * says that type, and the metafactory casts */
+                char *refined_desc = NULL;
+                if (!is_constructor && strstr(spec_desc_str, "Ljava/lang/Object;") != NULL) {
+                    size_t sn = strlen(spec_desc_str) + strlen(method_descriptor) + 64;
+                    refined_desc = malloc(sn);
+                    size_t out = 0;
+                    refined_desc[out++] = '(';
+                    const char *sp = spec_desc_str + 1;
+                    const char *ip = method_descriptor + 1;
+                    /* the receiver of an unbound reference has no parameter of the method's */
+                    bool skip_receiver = !is_static && !is_bound;
+                    bool first_slot = true;
+                    bool changed = false;
+                    while (*sp && *sp != ')') {
+                        const char *s_start = sp;
+                        while (*sp == '[') {
+                            sp++;
+                        }
+                        if (*sp == 'L') {
+                            while (*sp && *sp != ';') {
+                                sp++;
+                            }
+                        }
+                        if (*sp) {
+                            sp++;
+                        }
+                        size_t s_len = (size_t)(sp - s_start);
+                        const char *use = s_start;
+                        size_t use_len = s_len;
+                        if (skip_receiver && first_slot) {
+                            first_slot = false;
+                        } else {
+                            const char *i_start = ip;
+                            while (*ip == '[') {
+                                ip++;
+                            }
+                            if (*ip == 'L') {
+                                while (*ip && *ip != ';') {
+                                    ip++;
+                                }
+                            }
+                            if (*ip) {
+                                ip++;
+                            }
+                            size_t i_len = (size_t)(ip - i_start);
+                            if (s_len == 18 && strncmp(s_start, "Ljava/lang/Object;", 18) == 0 &&
+                                i_len > 1 && i_start[0] == 'L' && strncmp(i_start, "Ljava/lang/Object;", 18) != 0) {
+                                use = i_start;
+                                use_len = i_len;
+                                changed = true;
+                            }
+                        }
+                        memcpy(refined_desc + out, use, use_len);
+                        out += use_len;
+                    }
+                    strcpy(refined_desc + out, sp);   /* ")" and the return type */
+                    if (changed) {
+                        spec_desc_str = refined_desc;
+                    }
+                }
                 uint16_t specialized_type = cp_add_method_type(cp, spec_desc_str);
+                free(refined_desc);
                 free(receiver_desc);
                 if (erased_type == 0 || specialized_type == 0) {
                     fprintf(stderr, "codegen: failed to add method types\n");
