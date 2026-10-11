@@ -124,10 +124,36 @@ def read_lock():
     return lock
 
 
+def lock_check(coord, digest):
+    """Compare a downloaded file with its lock entry; record it when the lock has none."""
+    lock = read_lock()
+    if coord in lock:
+        if lock[coord] != digest:
+            die("checksum mismatch against %s: %s" % (LOCK, coord))
+        return
+    lock[coord] = digest
+    write_lock(lock)
+    log("Recorded %s in %s" % (coord, LOCK))
+
+
+def write_lock(lock):
+    with open(LOCK, "w") as f:
+        f.write("# sha256 of every jar the Spring Boot %s smoke uses\n" % SB_VERSION)
+        for c in sorted(lock):
+            f.write("%s  %s\n" % (lock[c], c))
+
+
+model.check_digest = lock_check
+# Gradle's distribution stays in the Spring Boot tree (its .gradle is git-ignored)
+model.gradle_dir = os.path.join(SB_DIR, ".gradle", "genesis-bench")
+
+
 def fetch_jars(artifacts):
     """Download every jar and check it against the lock file (written if absent)."""
     lock = read_lock()
     fresh = not lock
+    local = [a for a in artifacts if isinstance(a, maven.LocalArtifact)]
+    artifacts = [a for a in artifacts if not isinstance(a, maven.LocalArtifact)]
     arts = sorted({a.coord: a for a in artifacts if a.has_jar}.values(), key=lambda a: a.coord)
 
     def get(a):
@@ -144,12 +170,11 @@ def fetch_jars(artifacts):
     if bad:
         die("checksum mismatch against %s: %s" % (LOCK, ", ".join(bad[:5])))
     if fresh or any(c not in lock for c in got):
-        with open(LOCK, "w") as f:
-            f.write("# sha256 of every jar the Spring Boot %s smoke uses\n" % SB_VERSION)
-            for c in sorted(got):
-                f.write("%s  %s\n" % (got[c], c))
+        kept = {c: d for c, d in lock.items() if c.startswith("gradle-dist:")}
+        kept.update(got)
+        write_lock(kept)
         log("Wrote %s (%d jars)" % (LOCK, len(got)))
-    return arts
+    return arts + sorted({a.coord: a for a in local}.values(), key=lambda a: a.coord)
 
 
 # ----------------------------------------------------------------------------

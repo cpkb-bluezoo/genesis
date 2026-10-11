@@ -164,6 +164,7 @@ ed74711a78d793ca37f6075e4a1e93d107233dfd20d0bb17e32bad88d38e56aa  commons-valida
 d4ccdb74ce41ddf06c53d13750eafda6a0ce500c36df15280b3d0e4cd9bf7a21  dev.cel:common:0.13.0
 d343b22e4d1507c636fca5d61c8272f2394a3fd0c1e1729568a8f575a9002143  dev.cel:protobuf:0.13.0
 3deaba45e430e26370953c6982d0c4f6421a1fac575f9be06f5687e0f982d005  dev.cel:runtime:0.13.0
+84fbba45c7f4c64abc77460e1c00f541e9f960e3c7ed2538f1ede19eacd873ae  gradle-dist:gradle-9.7.0-bin.zip
 a32eb2f88f7c0fbc2846535c55d6f7bd8fc5763470bc3e1142cbaef2110a6bf3  info.ganglia.gmetric4j:gmetric4j:1.0.10
 5c6f685e41664d10c70c65837cba9e58d39ff3896811e3b5707a934b11c85ad0  io.dropwizard.metrics:metrics-core:3.2.2
 a735eb5b62f425181efa53aefa5b7edad2b0e48cd0fa91105aa0ec1a45169e0b  io.dropwizard.metrics:metrics-core:4.1.18

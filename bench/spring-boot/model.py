@@ -24,9 +24,12 @@
 # the Spring Boot BOM (the published pom) and the internal BOM (a Gradle DSL
 # file).
 
+import glob
 import os
 import re
+import shutil
 import sys
+import zipfile
 
 import maven
 
@@ -47,10 +50,71 @@ class GDep:
 
     def __init__(self, config, kind, target, exclusions, transitive):
         self.config = config
-        self.kind = kind            # "project", "fixtures" or "external"
+        self.kind = kind            # "project", "fixtures", "external" or "gradle"
         self.target = target        # ":core:spring-boot" or "group:artifact[:version[:classifier]]"
         self.exclusions = exclusions
         self.transitive = transitive
+
+
+# Set by the driver: check_digest(coord, sha256) compares a download with the lock file (and
+# records it there when it is new).
+check_digest = None
+
+# Where the Gradle distribution is kept. The driver sets it inside the Spring Boot tree (whose
+# .gitignore already ignores .gradle), so nothing of Gradle's lands anywhere else on the machine.
+gradle_dir = None
+
+
+def _wrapper_distribution_url(root):
+    path = os.path.join(root, "gradle", "wrapper", "gradle-wrapper.properties")
+    try:
+        with open(path) as f:
+            for line in f:
+                if line.startswith("distributionUrl="):
+                    return line.split("=", 1)[1].strip().replace("\\:", ":")
+    except OSError:
+        pass
+    return None
+
+
+def gradle_distribution_jars(root):
+    """The jars of the Gradle distribution the source tree's own wrapper names (gradleApi(),
+    gradleTestKit()), which are not on Maven Central.
+
+    The distribution is downloaded once into `gradle_dir`, checked against the lock file and
+    unpacked there, so a clean machine gets the same jars as any other. SB_GRADLE_HOME names an
+    already unpacked one instead (not checked). Empty when the tree names none."""
+    home = os.environ.get("SB_GRADLE_HOME")
+    if not home:
+        url = _wrapper_distribution_url(root)
+        if not url:
+            return []
+        name = os.path.basename(url)
+        base = gradle_dir or os.path.join(maven.CACHE, "gradle")
+        zip_path = os.path.join(base, name)
+        home = os.path.join(base, name[:-len(".zip")] if name.endswith(".zip") else name)
+        done = home + ".unpacked"
+        if not os.path.exists(done):
+            os.makedirs(base, exist_ok=True)
+            if not (os.path.exists(zip_path) and os.path.getsize(zip_path) > 0):
+                maven.download(url, zip_path)
+            digest = maven.sha256(zip_path)
+            if check_digest:
+                check_digest("gradle-dist:" + name, digest)
+            shutil.rmtree(home, ignore_errors=True)
+            with zipfile.ZipFile(zip_path) as z:
+                for member in z.namelist():
+                    target = os.path.realpath(os.path.join(base, member))
+                    if not target.startswith(os.path.realpath(base) + os.sep):
+                        raise RuntimeError("unsafe path in %s: %s" % (name, member))
+                z.extractall(base)
+            open(done, "wb").close()
+        # the archive holds one directory, gradle-<version>
+        inner = os.path.join(base, "gradle-" + name.split("-")[1])
+        home = inner if os.path.isdir(os.path.join(inner, "lib")) else home
+    ver = os.path.basename(home.rstrip("/"))
+    jars = glob.glob(os.path.join(home, "lib", "*.jar")) + glob.glob(os.path.join(home, "lib", "plugins", "*.jar"))
+    return [maven.LocalArtifact(os.path.basename(j)[:-4], ver, j) for j in sorted(jars)]
 
 
 class Project:
@@ -140,6 +204,9 @@ def parse_dependencies(text):
             if brace > 0 and line.rstrip().endswith("{"):
                 closure, end = _block(body, d.start() + brace)
             pos = max(end, line_end + 1)
+            if first in ("gradleTestKit", "gradleApi"):
+                out.append(GDep(config, "gradle", first, [], True))
+                continue
             if first in ("platform", "enforcedPlatform", "files") or first.startswith("gradle"):
                 continue
             exclusions = [(g, a) for g, a in re.findall(
@@ -261,7 +328,10 @@ class Build:
             parts = d.target.split(":")
             roots.append(maven.Dep(parts[0], parts[1], parts[2] if len(parts) > 2 else None,
                                    exclusions=d.exclusions))
-        return self._resolve_roots(roots, runtime)
+        arts = list(self._resolve_roots(roots, runtime))
+        if project.configs(configs, ("gradle",)):
+            arts += gradle_distribution_jars(self.root)
+        return arts
 
     def _resolve_roots(self, roots, runtime):
         key = (tuple((r.group, r.artifact, r.version, r.exclusions) for r in roots), runtime)

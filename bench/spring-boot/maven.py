@@ -21,6 +21,7 @@
 
 import hashlib
 import os
+import shutil
 import re
 import sys
 import time
@@ -76,6 +77,23 @@ def fetch(path):
     # Remember the absence, so a missing optional file is asked for once.
     open(missing, "wb").close()
     return None
+
+
+def download(url, local):
+    """Download one URL to `local` (retrying), atomically."""
+    last = None
+    for attempt in range(4):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "genesis-bench"})
+            tmp = "%s.tmp.%d" % (local, os.getpid())
+            with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as f:
+                shutil.copyfileobj(resp, f)
+            os.replace(tmp, local)
+            return local
+        except (urllib.error.URLError, OSError) as e:
+            last = e
+            time.sleep(1 + attempt * 2)
+    raise RuntimeError("cannot fetch %s: %s" % (url, last))
 
 
 def sha256(path):
@@ -262,6 +280,18 @@ class Artifact:
 
     def path(self):
         return repo_path(self.group, self.artifact, self.version, self.classifier)
+
+
+class LocalArtifact(Artifact):
+    """A jar that is not in a Maven repository but on this machine (a Gradle distribution's)."""
+    __slots__ = ("file",)
+
+    def __init__(self, name, version, file):
+        Artifact.__init__(self, "local", name, version)
+        self.file = file
+
+    def path(self):
+        return self.file
 
 
 def resolve(roots, managed, runtime):
