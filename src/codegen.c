@@ -1513,6 +1513,65 @@ static slist_t *declared_interface_types(semantic_t *sem, ast_node_t *class_decl
     return result;
 }
 
+extern slist_t *scope_find_all_methods(scope_t *scope, const char *name);
+
+/* The varargs constructor ("Base(String... names)") of the superclass that a call of super()
+ * with no arguments reaches: it has no constructor without parameters - NULL otherwise */
+static symbol_t *varargs_only_super_ctor(class_gen_t *cg)
+{
+    symbol_t *varargs_only = NULL;
+    symbol_t *super_sym = cg->class_sym ? cg->class_sym->data.class_data.superclass : NULL;
+    if (!super_sym || !super_sym->data.class_data.members) {
+        return NULL;
+    }
+    bool has_noarg = false;
+    slist_t *ctors = scope_find_all_methods(super_sym->data.class_data.members, "<init>");
+    if (!ctors && super_sym->name) {
+        ctors = scope_find_all_methods(super_sym->data.class_data.members, super_sym->name);
+    }
+    for (slist_t *c = ctors; c; c = c->next) {
+        symbol_t *ctor = (symbol_t *)c->data;
+        if (!ctor || ctor->kind != SYM_CONSTRUCTOR) {
+            continue;
+        }
+        int n = (int)slist_length(ctor->data.method_data.parameters);
+        if (n == 0) {
+            has_noarg = true;
+        } else if (n == 1 && (ctor->modifiers & MOD_VARARGS) && !varargs_only) {
+            varargs_only = ctor;
+        }
+    }
+    slist_free(ctors);
+    return has_noarg ? NULL : varargs_only;
+}
+
+/* super() when nothing else is written: the superclass's constructor without arguments - or,
+ * where its only constructor that fits is a varargs one, with the empty array */
+static void emit_implicit_super_call(method_gen_t *mg, class_gen_t *cg)
+{
+    symbol_t *varargs_only = varargs_only_super_ctor(cg);
+    if (varargs_only) {
+        symbol_t *param = (symbol_t *)varargs_only->data.method_data.parameters->data;
+        codegen_varargs_tail(mg, cg->cp, param, NULL, false);
+        char *array_desc = type_to_descriptor(param->type);
+        size_t dlen = strlen(array_desc) + 4;
+        char *init_desc = malloc(dlen);
+        snprintf(init_desc, dlen, "(%s)V", array_desc);
+        uint16_t init_ref = cp_add_methodref(cg->cp, cg->superclass, "<init>", init_desc);
+        bc_emit(mg->code, OP_INVOKESPECIAL);
+        bc_emit_u2(mg->code, init_ref);
+        mg_pop_typed(mg, 2);  /* Consumes 'this' and the array */
+        free(init_desc);
+        free(array_desc);
+    } else {
+        uint16_t init_ref = cp_add_methodref(cg->cp, cg->superclass, "<init>", "()V");
+        bc_emit(mg->code, OP_INVOKESPECIAL);
+        bc_emit_u2(mg->code, init_ref);
+        mg_pop(mg, 1);  /* Consumes 'this' */
+    }
+}
+
+
 /**
  * Generate class signature from class declaration AST and symbol.
  * Returns NULL if no signature is needed (a class that is not generic and whose superclass and
@@ -1787,6 +1846,9 @@ char *ast_type_to_descriptor(ast_node_t *type_node)
     }
     
     switch (type_node->type) {
+        case AST_VAR_TYPE:
+            /* "var": the type inferred for it */
+            return type_node->sem_type ? type_to_descriptor(type_node->sem_type) : strdup("Ljava/lang/Object;");
         case AST_PRIMITIVE_TYPE:
             {
                 const char *name = type_node->data.leaf.name;
@@ -3329,11 +3391,7 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                     stackmap_init_this(mg->stackmap, cg->cp, cg->internal_name);
                 }
             } else {
-                uint16_t init_ref = cp_add_methodref(cg->cp, cg->superclass, 
-                                                      "<init>", "()V");
-                bc_emit(mg->code, OP_INVOKESPECIAL);
-                bc_emit_u2(mg->code, init_ref);
-                mg_pop(mg, 1);  /* Consumes 'this' */
+                emit_implicit_super_call(mg, cg);
             }
             
             /* Mark 'this' as initialized in stackmap after super() */
@@ -4360,8 +4418,27 @@ static void generate_interface_bridges(class_gen_t *cg)
                 if (!iface_return_type && iface_method->ast &&
                     iface_method->ast->type == AST_METHOD_DECL &&
                     iface_method->ast->data.node.extra && cg->sem) {
-                    iface_return_type = semantic_resolve_type(cg->sem,
+                    /* ...read as the interface itself reads it: its own type variables ("O" of
+                     * "Collection<O> getOperations()") are in scope, and what is worked out is
+                     * cached on that declaration's tree - as a class named O it would be wrong
+                     * for the interface's own file too */
+                    semantic_t *sem = cg->sem;
+                    symbol_t *owner = iface_sym;
+                    scope_t *saved_scope = sem->current_scope;
+                    symbol_t *saved_class = sem->current_class;
+                    bool saved_quiet = sem->loading_dependency;
+                    if (owner) {
+                        sem->current_class = owner;
+                        if (owner->data.class_data.members) {
+                            sem->current_scope = owner->data.class_data.members;
+                        }
+                    }
+                    sem->loading_dependency = true;
+                    iface_return_type = semantic_resolve_type(sem,
                         (ast_node_t *)iface_method->ast->data.node.extra);
+                    sem->loading_dependency = saved_quiet;
+                    sem->current_scope = saved_scope;
+                    sem->current_class = saved_class;
                 }
 
                 /* Check if we already have a bridge with the erased signature.
@@ -5588,6 +5665,8 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         fg->ast = member;
                         fg->name = strdup(comp_name);
                         fg->descriptor = comp_type ? ast_type_to_descriptor(comp_type) : strdup("Ljava/lang/Object;");
+                        fg->signature = (comp_type && comp_type->sem_type) ?
+                            generate_field_signature(comp_type->sem_type) : NULL;
                         
                         fg->name_index = cp_add_utf8(cg->cp, fg->name);
                         fg->descriptor_index = cp_add_utf8(cg->cp, fg->descriptor);
@@ -5763,6 +5842,8 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         
         /* For records, constructor takes all component types */
         if (is_record && record_components) {
+            string_t *ctor_signature = string_new("(");
+            bool generic_components = false;
             for (slist_t *comp = record_components; comp; comp = comp->next) {
                 ast_node_t *comp_node = (ast_node_t *)comp->data;
                 ast_node_t *comp_type = NULL;
@@ -5771,8 +5852,21 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 }
                 char *comp_desc = comp_type ? ast_type_to_descriptor(comp_type) : strdup("Ljava/lang/Object;");
                 string_append(desc, comp_desc);
+                char *component_signature = (comp_type && comp_type->sem_type) ?
+                    generate_field_signature(comp_type->sem_type) : NULL;
+                string_append(ctor_signature, component_signature ? component_signature : comp_desc);
+                generic_components = generic_components || component_signature != NULL;
+                free(component_signature);
                 free(comp_desc);
             }
+            string_append(ctor_signature, ")V");
+            /* the implicit canonical constructor: its Signature and its (mandated) parameter names */
+            init->parameters_from = class_decl;
+            init->mandated_parameters = true;
+            if (generic_components && !cg->is_inner_class) {
+                init->signature = strdup(ctor_signature->str);
+            }
+            string_free(ctor_signature, true);
         }
         
         /* For inner classes, constructor takes outer instance as parameter */
@@ -6226,10 +6320,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 stackmap_init_this(mg->stackmap, cg->cp, cg->internal_name);
             }
         } else {
-            uint16_t super_init = cp_add_methodref(cg->cp, cg->superclass, "<init>", "()V");
-            bc_emit(mg->code, OP_INVOKESPECIAL);
-            bc_emit_u2(mg->code, super_init);
-            mg_pop(mg, 1);
+            emit_implicit_super_call(mg, cg);
 
             /* Mark 'this' as initialized in stackmap after super() */
             if (mg->stackmap && cg->internal_name) {
@@ -7235,6 +7326,16 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             accessor->name_index = cp_add_utf8(cg->cp, comp_name);
             accessor->descriptor_index = cp_add_utf8(cg->cp, accessor_desc->str);
             string_free(accessor_desc, true);
+            {
+                char *component_signature = (comp_type && comp_type->sem_type) ?
+                    generate_field_signature(comp_type->sem_type) : NULL;
+                if (component_signature) {
+                    size_t len = strlen(component_signature) + 3;
+                    accessor->signature = malloc(len);
+                    snprintf(accessor->signature, len, "()%s", component_signature);
+                    free(component_signature);
+                }
+            }
             
             method_gen_t *mg = calloc(1, sizeof(method_gen_t));
             mg->code = bytecode_new();
@@ -8101,6 +8202,30 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
     }
     
     ast_node_t *body = anon_sym->data.class_data.anonymous_body;
+
+    /* "new Ref<List<String>>() { }": the class's Signature names the parameterized type it
+     * extends or implements, which reflection (ParameterizedTypeReference) reads back */
+    if (!cg->signature && anon_sym->ast && anon_sym->ast->type == AST_NEW_OBJECT &&
+        anon_sym->ast->data.node.children) {
+        ast_node_t *type_node = (ast_node_t *)anon_sym->ast->data.node.children->data;
+        type_t *base = type_node ? type_node->sem_type : NULL;
+        if ((!base || base->kind != TYPE_CLASS) && type_node && cg->sem) {
+            base = semantic_resolve_type(cg->sem, type_node);
+        }
+        if (base && base->kind == TYPE_CLASS && base->data.class_type.type_args) {
+            char *base_sig = type_to_signature(base);
+            if (base_sig) {
+                symbol_t *base_sym = base->data.class_type.symbol;
+                bool is_interface = base_sym && (base_sym->kind == SYM_INTERFACE || base_sym->kind == SYM_ANNOTATION);
+                size_t len = strlen(base_sig) + 24;
+                cg->signature = malloc(len);
+                if (cg->signature) {
+                    snprintf(cg->signature, len, "%s%s", is_interface ? "Ljava/lang/Object;" : "", base_sig);
+                }
+                free(base_sig);
+            }
+        }
+    }
     
     /* Track whether we have an explicit constructor */
     bool has_constructor = false;
@@ -8698,6 +8823,22 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             }
         }
         
+        /* "new Base<>() { }" for "Base(String... names)": the empty array */
+        if (!super_ctor_args) {
+            symbol_t *varargs_only = varargs_only_super_ctor(cg);
+            if (varargs_only) {
+                symbol_t *param = (symbol_t *)varargs_only->data.method_data.parameters->data;
+                codegen_varargs_tail(mg, cg->cp, param, NULL, false);
+                char *array_desc = type_to_descriptor(param->type);
+                string_free(super_desc, true);
+                super_desc = string_new("(");
+                string_append(super_desc, array_desc);
+                string_append(super_desc, ")V");
+                free(array_desc);
+                super_arg_count++;
+            }
+        }
+
         /* invokespecial superclass.<init> with proper descriptor */
         uint16_t super_init = cp_add_methodref(cg->cp, cg->superclass, "<init>", super_desc->str);
         bc_emit(mg->code, OP_INVOKESPECIAL);

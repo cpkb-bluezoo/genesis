@@ -1372,6 +1372,8 @@ static ast_node_t *find_field_var_declarator(ast_node_t *field_decl, const char 
     return NULL;
 }
 
+static bool codegen_classfile_constant(method_gen_t *mg, const_pool_t *cp, symbol_t *field);
+
 static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
 {
     if (!ident || ident->type != AST_IDENTIFIER) {
@@ -1379,6 +1381,12 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
     }
     
     const char *name = ident->data.leaf.name;
+
+    /* a constant of a class read from a class file (imported statically, or inherited) is its value */
+    if (ident->sem_symbol && ident->sem_symbol->kind == SYM_FIELD &&
+        codegen_classfile_constant(mg, mg->cp, ident->sem_symbol)) {
+        return true;
+    }
     
     /* Check if this identifier is a class reference (e.g., "java" in java.util.Objects, or "Objects" after import).
      * In that case, sem_symbol is set to a class/interface/enum symbol by semantic analysis, and we should NOT
@@ -2059,6 +2067,67 @@ static symbol_t *lookup_field_with_superclass(symbol_t *class_sym, const char *f
  * Generate code for field access (obj.field or Class.staticField).
  * Handles both instance and static field access, including chained access.
  */
+/**
+ * A "static final" field of a class read from a class file, with a ConstantValue attribute, is a
+ * constant variable (JLS 4.12.4): its value is compiled into the use, not read from the class at
+ * run time (which would load, and initialize, a class - possibly one not on the run time path).
+ * Emits the value and returns true when the field is one.
+ */
+static bool codegen_classfile_constant(method_gen_t *mg, const_pool_t *cp, symbol_t *field)
+{
+    if (!field || field->kind != SYM_FIELD || !field->type || field->ast ||
+        (field->modifiers & (MOD_STATIC | MOD_FINAL)) != (MOD_STATIC | MOD_FINAL)) {
+        return false;
+    }
+    ast_node_t *lit = NULL;
+    switch (field->type->kind) {
+        case TYPE_BOOLEAN:
+        case TYPE_BYTE:
+        case TYPE_CHAR:
+        case TYPE_SHORT:
+        case TYPE_INT:
+            if (field->data.var_data.has_const_value) {
+                lit = ast_new(AST_LITERAL, 0, 0);
+                lit->data.leaf.token_type = TOK_INTEGER_LITERAL;
+                lit->data.leaf.value.int_val = field->data.var_data.const_value;
+            }
+            break;
+        case TYPE_LONG:
+            if (field->data.var_data.has_const_value) {
+                lit = ast_new(AST_LITERAL, 0, 0);
+                lit->data.leaf.token_type = TOK_LONG_LITERAL;
+                lit->data.leaf.value.int_val = field->data.var_data.const_value;
+            }
+            break;
+        case TYPE_FLOAT:
+        case TYPE_DOUBLE:
+            if (field->data.var_data.has_const_fp) {
+                lit = ast_new(AST_LITERAL, 0, 0);
+                lit->data.leaf.token_type = field->type->kind == TYPE_FLOAT ? TOK_FLOAT_LITERAL : TOK_DOUBLE_LITERAL;
+                lit->data.leaf.value.float_val = field->data.var_data.const_fp;
+            }
+            break;
+        case TYPE_CLASS:
+            if (field->data.var_data.const_str_value && field->type->data.class_type.name &&
+                strcmp(field->type->data.class_type.name, "java.lang.String") == 0) {
+                lit = ast_new(AST_LITERAL, 0, 0);
+                lit->data.leaf.token_type = TOK_STRING_LITERAL;
+                lit->data.leaf.value.str_val = field->data.var_data.const_str_value;
+                lit->data.leaf.str_len = strlen(field->data.var_data.const_str_value);
+            }
+            break;
+        default:
+            break;
+    }
+    if (!lit) {
+        return false;
+    }
+    lit->sem_type = field->type;
+    bool ok = codegen_literal(mg, lit, cp);
+    lit->data.leaf.value.str_val = NULL;
+    return ok;
+}
+
 static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 {
     if (!expr || expr->type != AST_FIELD_ACCESS) {
@@ -2466,6 +2535,28 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
         }
         
         if (class_name) {
+            /* A constant of a class read from a class file is its value, not a read of the class */
+            {
+                symbol_t *constant_class = receiver->sem_symbol;
+                if (!constant_class && mg->class_gen && mg->class_gen->sem) {
+                    char *dotted = strdup(class_name);
+                    for (char *c = dotted; dotted && *c; c++) {
+                        if (*c == '/') {
+                            *c = '.';
+                        }
+                    }
+                    constant_class = dotted ? load_external_class(mg->class_gen->sem, dotted) : NULL;
+                    free(dotted);
+                }
+                if (constant_class && (constant_class->kind == SYM_CLASS || constant_class->kind == SYM_INTERFACE ||
+                                       constant_class->kind == SYM_ENUM || constant_class->kind == SYM_RECORD)) {
+                    symbol_t *constant = lookup_field_with_superclass(constant_class, field_name);
+                    if (codegen_classfile_constant(mg, cp, constant)) {
+                        return true;
+                    }
+                }
+            }
+
             /* Static field access */
             const char *field_desc = get_known_static_field_descriptor(class_name, field_name);
             
@@ -5271,6 +5362,28 @@ void coerce_value_to_descriptor(method_gen_t *mg, const_pool_t *cp,
 }
 
 /**
+ * Whether a primitive of this kind, boxed, is assignable to the class called "name" because
+ * the class is a supertype of its wrapper (a double passed to a Number parameter).
+ */
+static bool boxed_supertype_name(const char *name, type_kind_t prim)
+{
+    static const char *const any[] = {
+        "java.io.Serializable", "Serializable", "java.lang.Comparable", "Comparable",
+        "java.lang.constant.Constable", "Constable", NULL
+    };
+    for (int i = 0; any[i]; i++) {
+        if (strcmp(name, any[i]) == 0) {
+            return true;
+        }
+    }
+    if (prim == TYPE_BOOLEAN || prim == TYPE_CHAR) {
+        return false;
+    }
+    return strcmp(name, "java.lang.Number") == 0 || strcmp(name, "Number") == 0 ||
+           strcmp(name, "java.lang.constant.ConstantDesc") == 0 || strcmp(name, "ConstantDesc") == 0;
+}
+
+/**
  * Convert an already-generated argument to its parameter type: box a primitive
  * passed to a wrapper, Object or type-variable parameter, unbox a wrapper
  * passed to a primitive parameter, and widen primitives (int -> long etc.).
@@ -5322,7 +5435,8 @@ static void coerce_arg_to_param(method_gen_t *mg, const_pool_t *cp, ast_node_t *
             type_kind_t target_prim = get_primitive_for_wrapper(param_name);
             if (target_prim != TYPE_UNKNOWN || 
                 strcmp(param_name, "java.lang.Object") == 0 ||
-                strcmp(param_name, "Object") == 0) {
+                strcmp(param_name, "Object") == 0 ||
+                boxed_supertype_name(param_name, arg_kind)) {
                 emit_boxing(mg, cp, arg_kind);
             }
         }
@@ -11460,6 +11574,10 @@ static void checkcast_generic_field(method_gen_t *mg, const_pool_t *cp, ast_node
         ast_node_t *receiver = (ast_node_t *)expr->data.node.children->data;
         type_t *rt = receiver ? receiver_member_type(receiver->sem_type) : NULL;
         symbol_t *cls = (rt && rt->kind == TYPE_CLASS) ? rt->data.class_type.symbol : NULL;
+        /* a bare "this" carries no sem_type: it is the class being generated */
+        if (!cls && receiver && receiver->type == AST_THIS_EXPR && mg->class_gen) {
+            cls = mg->class_gen->class_sym;
+        }
         field = NULL;
         for (; cls && !field; cls = cls->data.class_data.superclass) {
             if (cls->data.class_data.members) {

@@ -1307,6 +1307,40 @@ bool classfile_get_attribute_constant_value(classfile_t *cf, attribute_info_t *a
     return false;
 }
 
+bool classfile_get_attribute_constant_value_fp(classfile_t *cf, attribute_info_t *attrs,
+                                               uint16_t attr_count, double *out_value)
+{
+    if (!cf || !out_value) {
+        return false;
+    }
+    for (uint16_t i = 0; i < attr_count; i++) {
+        char *name = classfile_get_utf8(cf, attrs[i].attribute_name_index);
+        bool is_const_value = name && strcmp(name, "ConstantValue") == 0;
+        free(name);
+        if (!is_const_value) {
+            continue;
+        }
+        if (attrs[i].attribute_length < 2 || !attrs[i].info) {
+            return false;
+        }
+        uint16_t const_index = ((uint16_t)attrs[i].info[0] << 8) | attrs[i].info[1];
+        if (const_index == 0 || const_index >= cf->constant_pool_count) {
+            return false;
+        }
+        cp_info_t *cp = &cf->constant_pool[const_index];
+        if (cp->tag == CONSTANT_Float) {
+            *out_value = (double)cp->info.float_value;
+            return true;
+        }
+        if (cp->tag == CONSTANT_Double) {
+            *out_value = cp->info.double_value;
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 bool classfile_get_attribute_constant_value_string(classfile_t *cf, attribute_info_t *attrs,
                                                      uint16_t attr_count, char **out_value)
 {
@@ -1540,8 +1574,10 @@ static generic_type_t *parse_class_type_signature(const char **sig)
         parse_class_segment(sig, &segment, &segment_args);
         
         if (segment) {
+            /* "Outer<A>.Inner": the class after a '.' is a member of the one before it, its
+             * binary name Outer$Inner */
             if (strlen(full_name) > 0) {
-                strcat(full_name, ".");
+                strcat(full_name, "$");
             }
             /* Convert / to . for internal names */
             for (char *p = segment; *p; p++) {
@@ -1553,11 +1589,9 @@ static generic_type_t *parse_class_type_signature(const char **sig)
             free(segment);
         }
         
-        /* Keep track of the last type arguments (for outermost class) */
-        if (segment_args) {
-            /* TODO: properly handle nested class type args */
-            final_type_args = segment_args;
-        }
+        /* The arguments are those of the last class named: "Outer<A>.Inner" is an Inner
+         * without arguments of its own (A is the outer instance's) */
+        final_type_args = segment_args;
         
         /* Check for inner class suffix */
         if (**sig == '.') {

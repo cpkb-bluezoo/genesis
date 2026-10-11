@@ -1436,6 +1436,11 @@ static void register_type_decl(type_registry_t *reg, ast_node_t *decl,
     /* Create symbol stub and register it */
     symbol_t *sym = create_type_stub(qname, decl, package);
     if (sym) {
+        /* A member enum, record or interface is implicitly static (JLS 8.9, 8.10, 9.1.1.3) */
+        if (parent_qname && (decl->type == AST_ENUM_DECL || decl->type == AST_RECORD_DECL ||
+                             decl->type == AST_INTERFACE_DECL || decl->type == AST_ANNOTATION_DECL)) {
+            sym->modifiers |= MOD_STATIC;
+        }
         if (parent_qname) {
             symbol_t *parent_sym = type_registry_lookup(reg, parent_qname);
             if (parent_sym) {
@@ -3453,6 +3458,7 @@ int main(int argc, char **argv)
                     }
                     else if (strcmp(arg, "-parameters") == 0) {
                         opts->parameters = true;
+                        classwriter_set_method_parameters(true);
                     }
                     else if (ignored_javac_option(arg) != 0) {
                         if (ignored_javac_option(arg) == 2) {
@@ -3575,6 +3581,7 @@ int main(int argc, char **argv)
             }
             else if (strcmp(argv[i], "-parameters") == 0) {
                 opts->parameters = true;
+                        classwriter_set_method_parameters(true);
             }
             else if (ignored_javac_option(argv[i]) != 0) {
                 if (ignored_javac_option(argv[i]) == 2) {

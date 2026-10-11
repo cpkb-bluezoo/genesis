@@ -404,6 +404,8 @@ bool classfile_get_attribute_constant_value(classfile_t *cf, attribute_info_t *a
  * returns false for a String-typed field. Returns a malloc'd copy the
  * caller must free(); false (with *out_value left untouched) if no
  * ConstantValue attribute is present or it names a non-String constant. */
+bool classfile_get_attribute_constant_value_fp(classfile_t *cf, attribute_info_t *attrs,
+                                               uint16_t attr_count, double *out_value);
 bool classfile_get_attribute_constant_value_string(classfile_t *cf, attribute_info_t *attrs,
                                                      uint16_t attr_count, char **out_value);
 

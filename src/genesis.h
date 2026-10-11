@@ -508,6 +508,7 @@ struct ast_node
 #define MOD_RECORD_COMPONENT 0x8000  /* Record component (generates field + accessor) */
 #define MOD_MODULE_IMPORT    0x40000 /* import module M; (JEP 511, Java 25+) */
 #define MOD_COMPACT_SOURCE   0x80000 /* Implicitly declared class (JEP 512) */
+#define MOD_COMPACT_CTOR     0x100000 /* Compact canonical constructor of a record */
 
 /* True if name is the unnamed variable/parameter "_" (JEP 456, Java 22+). */
 static inline bool is_unnamed_name(const char *name)
@@ -750,6 +751,8 @@ struct symbol
                                           * instead (sym->ast), which a classfile-
                                           * loaded field has none of. */
             long long const_value;      /* The resolved constant, when has_const_value */
+            bool has_const_fp;          /* A float or double ConstantValue (const_fp) */
+            double const_fp;
             char *const_str_value;      /* A classfile-loaded "static final String"
                                           * field's own ConstantValue attribute (JVMS
                                           * 4.7.2), e.g. an external/JDK class's
@@ -946,6 +949,7 @@ char *semantic_resolve_annotation_element_descriptor(semantic_t *sem,
  * classwriter.c. */
 struct classfile *semantic_load_annotation_classfile(semantic_t *sem, const char *qualified_name);
 char *semantic_registry_binary_name(semantic_t *sem, const char *qualified_name);
+void classwriter_set_method_parameters(bool enabled);
 
 /*
  * Shared Type Registry for Parallel Compilation

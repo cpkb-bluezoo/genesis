@@ -1711,8 +1711,16 @@ static void emit_pending_finally_blocks(method_gen_t *mg, size_t stop_depth)
  * a type variable the class its bounds erase to; NULL when that is Object (nothing to cast to) */
 static const char *loop_var_class_name(ast_node_t *type_node)
 {
-    if (!type_node || type_node->type != AST_CLASS_TYPE) {
+    if (!type_node || (type_node->type != AST_CLASS_TYPE && type_node->type != AST_VAR_TYPE)) {
         return NULL;
+    }
+    if (type_node->type == AST_VAR_TYPE) {
+        type_t *t = type_node->sem_type;
+        for (int hops = 0; t && t->kind == TYPE_TYPEVAR && hops < 8; hops++) {
+            t = t->data.type_var.bound;
+        }
+        return (t && t->kind == TYPE_CLASS && t->data.class_type.name &&
+                strcmp(t->data.class_type.name, "java.lang.Object") != 0) ? t->data.class_type.name : NULL;
     }
     type_t *t = type_node->sem_type;
     if (t && t->kind == TYPE_CLASS) {
@@ -3506,6 +3514,15 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 } else if (type_node->type == AST_ARRAY_TYPE) {
                     var_is_ref = true;
                     var_kind = TYPE_ARRAY;
+                } else if (type_node->type == AST_VAR_TYPE && type_node->sem_type) {
+                    /* "var": what the loop yields (set by semantic analysis) */
+                    type_kind_t k = type_node->sem_type->kind;
+                    if (k == TYPE_CLASS || k == TYPE_TYPEVAR || k == TYPE_ARRAY) {
+                        var_is_ref = true;
+                        var_kind = (k == TYPE_ARRAY) ? TYPE_ARRAY : TYPE_CLASS;
+                    } else if (k >= TYPE_BOOLEAN && k <= TYPE_DOUBLE) {
+                        var_kind = k;
+                    }
                 } else if (type_node->type == AST_PRIMITIVE_TYPE) {
                     const char *prim_name = type_node->data.leaf.name;
                     if (prim_name) {
@@ -3661,7 +3678,8 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             bc_emit(mg->code, OP_AALOAD);
                             mg_pop_typed(mg, 1);
                             /* Add checkcast for class types (aaload returns Object) */
-                            if (var_kind == TYPE_CLASS && type_node && type_node->type == AST_CLASS_TYPE) {
+                            if (var_kind == TYPE_CLASS && type_node &&
+                                (type_node->type == AST_CLASS_TYPE || type_node->type == AST_VAR_TYPE)) {
                                 const char *type_name = loop_var_class_name(type_node);
                                 if (type_name) {
                                     const char *internal = class_to_internal_name(type_name);
@@ -3929,8 +3947,18 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * type - shared below for the stackmap update too, since
                      * both need the identical descriptor string. */
                     char *array_desc = NULL;
-                    if (type_node && type_node->type == AST_CLASS_TYPE) {
-                        const char *type_name = type_node->data.node.name;
+                    if (type_node && type_node->type == AST_VAR_TYPE && type_node->sem_type &&
+                        type_node->sem_type->kind == TYPE_ARRAY) {
+                        /* "for (var a : listOfArrays)": the array type var was given */
+                        array_desc = type_to_descriptor(type_node->sem_type);
+                        uint16_t class_idx = cp_add_class(mg->cp, array_desc);
+                        bc_emit(mg->code, OP_CHECKCAST);
+                        bc_emit_u2(mg->code, class_idx);
+                    } else if (type_node && (type_node->type == AST_CLASS_TYPE ||
+                                             (type_node->type == AST_VAR_TYPE && type_node->sem_type &&
+                                              (type_node->sem_type->kind == TYPE_CLASS ||
+                                               type_node->sem_type->kind == TYPE_TYPEVAR)))) {
+                        const char *type_name = type_node->type == AST_CLASS_TYPE ? type_node->data.node.name : NULL;
                         /* Use qualified name from semantic type if available */
                         if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS) {
                             type_name = type_node->sem_type->data.class_type.name;

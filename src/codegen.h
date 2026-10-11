@@ -490,6 +490,8 @@ typedef struct method_info_gen
     stack_map_table_t *stackmap; /* StackMapTable for verification (Java 6+) */
     ast_node_t *ast;             /* Original AST (for annotations) */
     slist_t *throws;             /* List of exception class names (internal format) */
+    ast_node_t *parameters_from; /* Declaration whose AST_PARAMETER children name the parameters, when not ast (a record's implicit canonical constructor) */
+    bool mandated_parameters;    /* Write MethodParameters (mandated parameters) whether or not -parameters was given */
 } method_info_gen_t;
 
 /*

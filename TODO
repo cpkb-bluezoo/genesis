@@ -116,20 +116,14 @@ KNOWN BUGS
     Until then the README states the requirement, and CI uses a JDK that
     ships jmods.
 
-12. -parameters is accepted but no MethodParameters attribute is written, so
-    reflection reports arg0, arg1... for genesis-compiled classes. Spring
-    (6.1 and later) finds parameter names only that way; code compiled with
-    genesis loses @RequestParam-style name inference.
-
-13. make smoke-spring-boot (bench/spring-boot/): with javac, all of core/,
+12. make smoke-spring-boot (bench/spring-boot/): with javac, all of core/,
     module/ and test-support/ of Spring Boot v4.1.1 compiles except
     spring-boot-gradle-test-support (it needs Gradle TestKit) and 15,055 of
     15,700 tests pass (the rest need annotation processing, a container or a
-    port). Genesis compiles every source set, but only 12,205 of those
+    port). Genesis compiles every source set, but only 13,828 of those
     15,055 tests pass. Left: Spring application contexts that fail to start
     (the largest group, each from some underlying codegen or annotation bug),
-    ClassCastException Long -> Integer in PropertyMapper users, missing
-    parameter names (item 12), type-use annotations written in modifier
+    type-use annotations written in modifier
     position ("@Nullable String") not emitted as type annotations, and
     NoSuchMethodError on constructors of nested classes. Iterate with
     SB_COMPILERS=genesis SB_KEEP=1 and compare against the javac reports.

@@ -467,6 +467,61 @@ else
     failed=$((failed + 1))
 fi
 
+# The library is compiled with REAL javac so its class file carries the generic Signature
+# "Consumer<Liplib/Configurer<...>.Registry;>" a lambda's parameter type is read from.
+printf "%-30s ... " "InnerOfParameterizedTypeTest"
+ip_lib="$TEST_BUILD/innerofparameterizedlib-lib"
+ip_out="$TEST_BUILD/innerofparameterizedlib-out"
+rm -rf "$ip_lib" "$ip_out"
+mkdir -p "$ip_lib" "$ip_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$ip_lib" "$TEST_SRC"/external/innerofparameterizedlib/iplib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ip_lib" -d "$ip_out" \
+       "$TEST_SRC/external/InnerOfParameterizedTypeTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$ip_out:$ip_lib" InnerOfParameterizedTypeTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The constants class is compiled with REAL javac (its ConstantValue attributes) and is NOT on
+# the class path the client is run with: the constants must be in the client's own code.
+printf "%-30s ... " "ClassFileConstantInliningTest"
+cc_lib="$TEST_BUILD/constantlib-lib"
+cc_out="$TEST_BUILD/constantlib-out"
+rm -rf "$cc_lib" "$cc_out"
+mkdir -p "$cc_lib" "$cc_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$cc_lib" "$TEST_SRC"/external/constantlib/constlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$cc_lib" -d "$cc_out" \
+       "$TEST_SRC/external/ClassFileConstantInliningTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$cc_out" ClassFileConstantInliningTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The library is compiled by genesis itself: the ConstantValue it writes is what the client inlines.
+printf "%-30s ... " "EmbeddedNulConstantValueTest"
+nc_lib="$TEST_BUILD/nulconstlib-lib"
+nc_out="$TEST_BUILD/nulconstlib-out"
+rm -rf "$nc_lib" "$nc_out"
+mkdir -p "$nc_lib" "$nc_out"
+if "$GENESIS" -d "$nc_lib" "$TEST_SRC"/external/nulconstlib/nulconst/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$nc_lib" -d "$nc_out" \
+       "$TEST_SRC/external/EmbeddedNulConstantValueTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$nc_out" EmbeddedNulConstantValueTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 # The interface is deliberately compiled with REAL javac (see
 # ExternalStringConstants.java's own comment), so the client's String
 # switch case labels must resolve a classfile-loaded String constant's
@@ -1931,6 +1986,19 @@ else
     failed=$((failed + 1))
 fi
 
+printf "%-30s ... " "MethodParameters (-parameters)"
+mp_out="$TEST_BUILD/methodparameters-out"
+rm -rf "$mp_out"
+mkdir -p "$mp_out"
+if "$GENESIS" -parameters -d "$mp_out" "$TEST_SRC/external/MethodParametersTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$mp_out" MethodParametersTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 for ci_order in "q/Limits p/Props r/Marker r/ImportedConstantInAnnotationTest" "r/ImportedConstantInAnnotationTest r/Marker p/Props q/Limits" "p/Props r/ImportedConstantInAnnotationTest q/Limits r/Marker"; do
     set -- $ci_order
     printf "%-30s ... " "ImportedConstantAnnotation ($1 first)"
@@ -2030,6 +2098,40 @@ for ae_order in "Cond SingleValueForArrayElementTest" "SingleValueForArrayElemen
         failed=$((failed + 1))
     fi
 done
+
+for mr_order in "Types MemberRecordUseTest" "MemberRecordUseTest Types"; do
+    set -- $mr_order
+    printf "%-30s ... " "MemberRecordUse ($1 first)"
+    mr_out="$TEST_BUILD/memberrecordstubs-out"
+    rm -rf "$mr_out"
+    mkdir -p "$mr_out"
+    mr_files=""
+    for mr_name in "$@"; do
+        mr_files="$mr_files $TEST_SRC/external/memberrecordstubs/p/$mr_name.java"
+    done
+    if (cd "$mr_out" && "$GENESIS" -j1 -d "$mr_out" $mr_files >/dev/null 2>&1) &&
+       "$JAVA" -Xverify:all -cp "$mr_out" p.MemberRecordUseTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+printf "%-30s ... " "InheritedMemberShadow"
+im_out="$TEST_BUILD/inheritedmembershadow-out"
+rm -rf "$im_out"
+mkdir -p "$im_out"
+if (cd "$im_out" && "$GENESIS" -j1 -d "$im_out" -sourcepath "$TEST_SRC/external/inheritedmembershadow" \
+       "$TEST_SRC/external/inheritedmembershadow/p/InheritedMemberShadowTest.java" >/dev/null 2>&1) &&
+   "$JAVA" -Xverify:all -cp "$im_out" p.InheritedMemberShadowTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
 
 for is_order in "InheritedSamVarargsTest SrvFactory SrvCustomizer Srv" "Srv SrvCustomizer SrvFactory InheritedSamVarargsTest" "SrvFactory InheritedSamVarargsTest Srv SrvCustomizer"; do
     set -- $is_order

@@ -110,7 +110,8 @@ static uint16_t field_gen_constant_value_index(const_pool_t *cp, field_gen_t *fg
         token_type_t tt = init_expr->data.leaf.token_type;
         if (is_string) {
             if (tt == TOK_STRING_LITERAL && init_expr->data.leaf.value.str_val) {
-                return cp_add_string(cp, init_expr->data.leaf.value.str_val);
+                /* str_len, not strlen(): the literal may hold a NUL of its own ("\u0000") */
+                return cp_add_string_len(cp, init_expr->data.leaf.value.str_val, init_expr->data.leaf.str_len);
             }
             return 0;
         }
@@ -178,6 +179,14 @@ char *ast_type_to_descriptor(ast_node_t *type_node);
  * semantic.c).
  */
 static __thread semantic_t *g_classwriter_sem = NULL;
+
+/* -parameters: write a MethodParameters attribute naming each parameter */
+static bool g_emit_method_parameters = false;
+
+void classwriter_set_method_parameters(bool enabled)
+{
+    g_emit_method_parameters = enabled;
+}
 
 /**
  * Resolve an annotation type name (as parsed from source, e.g. "Test" or
@@ -1196,6 +1205,193 @@ static int count_method_parameter_annotations(ast_node_t *method_ast, retention_
     return total;
 }
 
+/** The parameters of a method that a MethodParameters attribute can name: every one the
+ * descriptor has is a source parameter (a constructor with an outer instance, captured variable or
+ * enum name and ordinal in front has more, which the attribute would have to list as well), and
+ * none is unnamed. Returns the count, or 0 for no attribute. */
+static bool method_parameters_forced(const class_gen_t *cg, const method_info_gen_t *mi)
+{
+    if (mi->mandated_parameters ||
+        (mi->ast && mi->ast->type == AST_CONSTRUCTOR_DECL && (mi->ast->data.node.flags & MOD_COMPACT_CTOR))) {
+        return true;
+    }
+    /* a record's canonical constructor: its parameters are the components, in order */
+    if (cg->is_record && cg->class_ast && mi->ast && mi->ast->type == AST_CONSTRUCTOR_DECL) {
+        slist_t *params = NULL;
+        for (slist_t *n = mi->ast->data.node.children; n; n = n->next) {
+            ast_node_t *child = (ast_node_t *)n->data;
+            if (child && child->type == AST_PARAMETER) {
+                params = params ? (slist_append(params, child), params) : slist_new(child);
+            }
+        }
+        bool same = true;
+        slist_t *p = params;
+        for (slist_t *n = cg->class_ast->data.node.children; n; n = n->next) {
+            ast_node_t *comp = (ast_node_t *)n->data;
+            if (comp && comp->type == AST_PARAMETER && (comp->data.node.flags & MOD_RECORD_COMPONENT)) {
+                ast_node_t *param = p ? (ast_node_t *)p->data : NULL;
+                if (!param || !param->data.node.name || !comp->data.node.name ||
+                    strcmp(param->data.node.name, comp->data.node.name) != 0) {
+                    same = false;
+                    break;
+                }
+                p = p->next;
+            }
+        }
+        same = same && !p;
+        slist_free(params);
+        return same;
+    }
+    return false;
+}
+
+static ast_node_t *method_parameters_source(const method_info_gen_t *mi)
+{
+    return mi->parameters_from ? mi->parameters_from : mi->ast;
+}
+
+static int method_parameters_attribute_count(const class_gen_t *cg, const method_info_gen_t *mi)
+{
+    const_pool_t *cp = cg->cp;
+    ast_node_t *source = mi ? method_parameters_source(mi) : NULL;
+    if (!source || (!g_emit_method_parameters && !method_parameters_forced(cg, mi)) ||
+        source->type == AST_LAMBDA_EXPR) {
+        return 0;
+    }
+    int named = 0;
+    for (slist_t *n = source->data.node.children; n; n = n->next) {
+        ast_node_t *child = (ast_node_t *)n->data;
+        if (child && child->type == AST_PARAMETER) {
+            if (!child->data.node.name || strcmp(child->data.node.name, "_") == 0) {
+                return 0;
+            }
+            named++;
+        }
+    }
+    if (named == 0 || mi->descriptor_index == 0 || mi->descriptor_index >= cp->count ||
+        cp->entries[mi->descriptor_index].type != CONST_UTF8) {
+        return 0;
+    }
+    const char *desc = cp->entries[mi->descriptor_index].data.utf8;
+    int in_descriptor = 0;
+    const char *d = desc + 1;
+    while (*d && *d != ')') {
+        while (*d == '[') {
+            d++;
+        }
+        if (*d == 'L') {
+            d = strchr(d, ';');
+            if (!d) {
+                return 0;
+            }
+        }
+        d++;
+        in_descriptor++;
+    }
+    return in_descriptor == named ? named : 0;
+}
+
+static void preadd_method_parameters_cp(const class_gen_t *cg, const method_info_gen_t *mi)
+{
+    const_pool_t *cp = cg->cp;
+    if (method_parameters_attribute_count(cg, mi) == 0) {
+        return;
+    }
+    cp_add_utf8(cp, "MethodParameters");
+    for (slist_t *n = method_parameters_source(mi)->data.node.children; n; n = n->next) {
+        ast_node_t *child = (ast_node_t *)n->data;
+        if (child && child->type == AST_PARAMETER) {
+            cp_add_utf8(cp, child->data.node.name);
+        }
+    }
+}
+
+static void write_method_parameters_attribute(uint8_t **p, const class_gen_t *cg, const method_info_gen_t *mi, int count)
+{
+    const_pool_t *cp = cg->cp;
+    write_be_u2(p, cp_add_utf8(cp, "MethodParameters"));
+    write_be_u4(p, 1 + 4 * count);
+    write_be_u1(p, (uint8_t)count);
+    bool mandated = method_parameters_forced(cg, mi);
+    for (slist_t *n = method_parameters_source(mi)->data.node.children; n; n = n->next) {
+        ast_node_t *child = (ast_node_t *)n->data;
+        if (child && child->type == AST_PARAMETER) {
+            write_be_u2(p, cp_add_utf8(cp, child->data.node.name));
+            write_be_u2(p, mandated ? 0x8000 : ((child->data.node.flags & MOD_FINAL) ? 0x0010 : 0));
+        }
+    }
+}
+
+/* The components of a record (its AST_PARAMETERs flagged as such), each with the field the class
+ * keeps it in: the Record attribute lists name, descriptor and Signature of each */
+static int record_component_count(const class_gen_t *cg)
+{
+    int n = 0;
+    if (cg->is_record && cg->class_ast) {
+        for (slist_t *c = cg->class_ast->data.node.children; c; c = c->next) {
+            ast_node_t *m = (ast_node_t *)c->data;
+            if (m && m->type == AST_PARAMETER && (m->data.node.flags & MOD_RECORD_COMPONENT)) {
+                n++;
+            }
+        }
+    }
+    return n;
+}
+
+static void preadd_record_attribute_cp(const_pool_t *cp, class_gen_t *cg)
+{
+    if (record_component_count(cg) == 0) {
+        return;
+    }
+    cp_add_utf8(cp, "Record");
+    for (slist_t *c = cg->class_ast->data.node.children; c; c = c->next) {
+        ast_node_t *m = (ast_node_t *)c->data;
+        if (m && m->type == AST_PARAMETER && (m->data.node.flags & MOD_RECORD_COMPONENT)) {
+            field_gen_t *field = hashtable_lookup(cg->field_map, m->data.node.name);
+            cp_add_utf8(cp, m->data.node.name);
+            if (field) {
+                cp_add_utf8(cp, field->descriptor);
+                if (field->signature) {
+                    cp_add_utf8(cp, "Signature");
+                    cp_add_utf8(cp, field->signature);
+                }
+            }
+        }
+    }
+}
+
+static void write_record_attribute(uint8_t **p, class_gen_t *cg)
+{
+    int count = record_component_count(cg);
+    uint8_t *len_pos;
+    write_be_u2(p, cp_add_utf8(cg->cp, "Record"));
+    len_pos = *p;
+    *p += 4;
+    write_be_u2(p, (uint16_t)count);
+    for (slist_t *c = cg->class_ast->data.node.children; c; c = c->next) {
+        ast_node_t *m = (ast_node_t *)c->data;
+        if (!m || m->type != AST_PARAMETER || !(m->data.node.flags & MOD_RECORD_COMPONENT)) {
+            continue;
+        }
+        field_gen_t *field = hashtable_lookup(cg->field_map, m->data.node.name);
+        write_be_u2(p, cp_add_utf8(cg->cp, m->data.node.name));
+        write_be_u2(p, cp_add_utf8(cg->cp, field ? field->descriptor : "Ljava/lang/Object;"));
+        if (field && field->signature) {
+            write_be_u2(p, 1);
+            write_be_u2(p, cp_add_utf8(cg->cp, "Signature"));
+            write_be_u4(p, 2);
+            write_be_u2(p, cp_add_utf8(cg->cp, field->signature));
+        } else {
+            write_be_u2(p, 0);
+        }
+    }
+    uint32_t len = (uint32_t)((*p - len_pos) - 4);
+    uint8_t *save = *p;
+    *p = len_pos;
+    write_be_u4(p, len);
+    *p = save;
+}
+
 /**
  * Count the number of parameters in a method.
  */
@@ -1568,6 +1764,10 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         }
     }
     
+    for (slist_t *node = cg->methods; node; node = node->next) {
+        preadd_method_parameters_cp(cg, (method_info_gen_t *)node->data);
+    }
+    
     /* Pre-add annotation constant pool entries for fields */
     for (slist_t *node = cg->fields; node; node = node->next) {
         field_gen_t *fg = (field_gen_t *)node->data;
@@ -1605,6 +1805,8 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         }
     }
     
+    preadd_record_attribute_cp(cg->cp, cg);
+
     /* Pre-add Signature attribute constant pool entries */
     if (cg->signature) {
         cp_add_utf8(cg->cp, "Signature");
@@ -1940,6 +2142,10 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
             if (has_annotation_default) {
                 abstract_attr_count++;
             }
+            int abstract_parameters = method_parameters_attribute_count(cg, mi);
+            if (abstract_parameters > 0) {
+                abstract_attr_count++;
+            }
             
             write_be_u2(&p, abstract_attr_count);
             
@@ -1980,6 +2186,9 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
                 write_annotation_default_attribute(&p, cg->cp, mi->ast->annotation_default,
                                                    method_return_descriptor(cg->cp, mi->descriptor_index));
             }
+            if (abstract_parameters > 0) {
+                write_method_parameters_attribute(&p, cg, mi, abstract_parameters);
+            }
             continue;
         }
         
@@ -2004,6 +2213,10 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
             method_attr_count++;
         }
         if (method_type_annots > 0) {
+            method_attr_count++;
+        }
+        int concrete_parameters = method_parameters_attribute_count(cg, mi);
+        if (concrete_parameters > 0) {
             method_attr_count++;
         }
         write_be_u2(&p, method_attr_count);
@@ -2193,6 +2406,10 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         if (method_type_annots > 0) {
             write_method_type_annotations_attribute(&p, cg->cp, mi->ast, true);
         }
+        
+        if (concrete_parameters > 0) {
+            write_method_parameters_attribute(&p, cg, mi, concrete_parameters);
+        }
     }
     
     /* Class attributes */
@@ -2215,6 +2432,10 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     if (emit_nest && cg->nest_host) {
         class_attr_count++;
     }     /* NestHost (Java 11+) */
+    bool write_record = record_component_count(cg) > 0;
+    if (write_record) {
+        class_attr_count++;
+    }
     
     /* Check for class-level annotations with RUNTIME retention */
     int runtime_annot_count = 0;
@@ -2240,6 +2461,11 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     /* RuntimeVisibleAnnotations attribute (for class) */
     if (runtime_annot_count > 0) {
         write_annotations_attribute(&p, cg->cp, cg->class_ast->annotations, true);
+    }
+
+    /* Record attribute: the components of a record, which reflection reads */
+    if (write_record) {
+        write_record_attribute(&p, cg);
     }
     
     /* InnerClasses attribute */

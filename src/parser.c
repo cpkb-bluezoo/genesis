@@ -2979,6 +2979,29 @@ ast_node_t *parse_type(parser_t *parser)
                 
                 parser_advance(parser);  /* consume > */
                 
+                /* "Outer<A>.Inner": a member type of a parameterized one is named Outer.Inner;
+                 * the arguments are the outer instance's, and are dropped */
+                if (parser_check(parser, TOK_DOT)) {
+                    lexer_pos_t save_dot = lexer_save_pos(parser->lexer);
+                    parser_advance(parser);
+                    if (parser_check_identifier_or_contextual(parser)) {
+                        size_t len = strlen(type_node->data.node.name) + 1 +
+                            strlen(parser_current_text(parser)) + 1;
+                        char *joined = malloc(len);
+                        snprintf(joined, len, "%s.%s", type_node->data.node.name, parser_current_text(parser));
+                        type_node->data.node.name = (char *)intern(joined);
+                        free(joined);
+                        parser_advance(parser);
+                        for (slist_t *node = parsed_type_args; node; node = node->next) {
+                            ast_free((ast_node_t *)node->data);
+                        }
+                        slist_free(parsed_type_args);
+                        parsed_type_args = NULL;
+                    } else {
+                        lexer_restore_pos(parser->lexer, save_dot);
+                    }
+                }
+                
                 /* Add the parsed type arguments to the type node */
                 for (slist_t *node = parsed_type_args; node; node = node->next) {
                     ast_add_child(type_node, (ast_node_t *)node->data);
@@ -4590,7 +4613,7 @@ static ast_node_t *parse_compact_constructor(parser_t *parser, uint32_t modifier
                                              const char *class_name, int line, int col)
 {
     ast_node_t *ctor = ast_new(AST_CONSTRUCTOR_DECL, line, col);
-    ctor->data.node.flags = modifiers;
+    ctor->data.node.flags = modifiers | MOD_COMPACT_CTOR;
     ctor->data.node.name = (char *)intern(class_name);
 
     slist_t *components = NULL;

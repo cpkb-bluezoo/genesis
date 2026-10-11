@@ -880,7 +880,13 @@ static bool primitive_boxes_to(type_t *target, type_t *source)
         return true;
     }
 
-    if (type_is_numeric(source) && strcmp(target_name, "java.lang.Number") == 0) {
+    if (type_is_numeric(source) && source->kind != TYPE_CHAR && strcmp(target_name, "java.lang.Number") == 0) {
+        return true;
+    }
+
+    /* The interfaces every wrapper implements */
+    if (strcmp(target_name, "java.lang.Comparable") == 0 || strcmp(target_name, "java.io.Serializable") == 0 ||
+        strcmp(target_name, "java.lang.constant.Constable") == 0) {
         return true;
     }
 
