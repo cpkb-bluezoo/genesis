@@ -2388,48 +2388,47 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 ast_node_t *else_stmt = (children->next && children->next->next) ?
                                         (ast_node_t *)children->next->next->data : NULL;
                 
-                /* Check for pattern matching instanceof (Java 16+)
-                 * If condition is: obj instanceof Type patternVar
-                 * We need to generate the pattern variable binding after the branch */
-                ast_node_t *pattern_var = NULL;
-                ast_node_t *pattern_type_node = NULL;
-                ast_node_t *pattern_source = NULL;
-                if (condition->type == AST_INSTANCEOF_EXPR) {
-                    slist_t *inst_children = condition->data.node.children;
-                    if (inst_children && inst_children->next && inst_children->next->next) {
-                        pattern_source = (ast_node_t *)inst_children->data;
-                        pattern_type_node = (ast_node_t *)inst_children->next->data;
-                        pattern_var = (ast_node_t *)inst_children->next->next->data;
+                /* A condition that tests with an instanceof binding is compiled to jumps:
+                 * the then branch is entered along the edge where the test
+                 * succeeded, with the binding assigned, and the else branch (or what
+                 * follows) along the other edges. */
+                bool jump_cond = cond_has_binding(condition);
+                slist_t *else_label = NULL;
+                size_t branch_pos = 0;
+
+                if (jump_cond) {
+                    if (!codegen_cond_jump(mg, mg->cp, condition, false, &else_label)) {
+                        return false;
                     }
+                } else {
+                    /* Generate condition */
+                    if (!codegen_expr(mg, condition, mg->cp)) {
+                        return false;
+                    }
+
+                    /* Auto-unbox Boolean to boolean for if condition */
+                    if (condition->sem_type && condition->sem_type->kind == TYPE_CLASS &&
+                        condition->sem_type->data.class_type.name &&
+                        strcmp(condition->sem_type->data.class_type.name, "java.lang.Boolean") == 0) {
+                        uint16_t unbox_ref = cp_add_methodref(mg->cp,
+                            "java/lang/Boolean", "booleanValue", "()Z");
+                        bc_emit(mg->code, OP_INVOKEVIRTUAL);
+                        bc_emit_u2(mg->code, unbox_ref);
+                        /* Stack stays same size (Boolean -> int) */
+                    }
+
+                    /* Save position for branch offset patching */
+                    branch_pos = mg->code->length;
+
+                    /* Emit: ifeq else_label (branch if false/zero) */
+                    bc_emit(mg->code, OP_IFEQ);
+                    bc_emit_u2(mg->code, 0);  /* Placeholder - will patch */
+                    mg_pop_typed(mg, 1);  /* Condition consumed */
                 }
-                
-                /* Generate condition */
-                if (!codegen_expr(mg, condition, mg->cp)) {
-                    return false;
-                }
-                
-                /* Auto-unbox Boolean to boolean for if condition */
-                if (condition->sem_type && condition->sem_type->kind == TYPE_CLASS &&
-                    condition->sem_type->data.class_type.name &&
-                    strcmp(condition->sem_type->data.class_type.name, "java.lang.Boolean") == 0) {
-                    uint16_t unbox_ref = cp_add_methodref(mg->cp,
-                        "java/lang/Boolean", "booleanValue", "()Z");
-                    bc_emit(mg->code, OP_INVOKEVIRTUAL);
-                    bc_emit_u2(mg->code, unbox_ref);
-                    /* Stack stays same size (Boolean -> int) */
-                }
-                
-                /* Save position for branch offset patching */
-                size_t branch_pos = mg->code->length;
-                
-                /* Emit: ifeq else_label (branch if false/zero) */
-                bc_emit(mg->code, OP_IFEQ);
-                bc_emit_u2(mg->code, 0);  /* Placeholder - will patch */
-                mg_pop_typed(mg, 1);  /* Condition consumed */
-                
+
                 /* Save stackmap state before the then block - locals allocated inside
-                 * the then block (including pattern variables) should not be visible
-                 * at join points. */
+                 * the then block should not be visible at join points. (For a jump
+                 * condition this includes the bindings, which are assigned on the way in.) */
                 stackmap_state_t *pre_then_state = NULL;
                 uint16_t pre_then_slot = mg->next_slot;
                 uint16_t pre_then_locals_count = 0;
@@ -2437,54 +2436,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     pre_then_state = stackmap_save_state(mg->stackmap);
                     pre_then_locals_count = mg_save_locals_count(mg);
                 }
-                
-                /* Handle pattern variable binding for instanceof pattern matching */
-                if (pattern_var && pattern_type_node) {
-                    /* Re-evaluate the source expression to get the object */
-                    if (!codegen_expr(mg, pattern_source, mg->cp)) {
-                        return false;
-                    }
-                    
-                    /* Get the class name for checkcast */
-                    const char *class_name = NULL;
-                    if (pattern_type_node->type == AST_CLASS_TYPE) {
-                        class_name = pattern_type_node->data.node.name;
-                    }
-                    
-                    if (class_name) {
-                        /* Emit checkcast */
-                        const char *resolved = resolve_java_lang_class(class_name);
-                        char *internal_name = class_to_internal_name(resolved);
-                        uint16_t class_index = cp_add_class(mg->cp, internal_name);
-                        bc_emit(mg->code, OP_CHECKCAST);
-                        bc_emit_u2(mg->code, class_index);
-                        
-                        /* Allocate local variable slot for pattern variable */
-                        const char *var_name = pattern_var->data.leaf.name;
-                        type_t *var_type = pattern_var->sem_type;
-                        if (!var_type) {
-                            /* Create class type if sem_type not set */
-                            var_type = type_new_class(internal_name);
-                        }
-                        uint16_t slot = mg_allocate_local(mg, var_name, var_type);
-                        
-                        /* Emit astore to save the cast object */
-                        if (slot <= 3) {
-                            bc_emit(mg->code, OP_ASTORE_0 + slot);
-                        } else if (slot <= 255) {
-                            bc_emit(mg->code, OP_ASTORE);
-                            bc_emit_u1(mg->code, slot);
-                        } else {
-                            bc_emit(mg->code, OP_WIDE);
-                            bc_emit(mg->code, OP_ASTORE);
-                            bc_emit_u2(mg->code, slot);
-                        }
-                        mg_pop_typed(mg, 1);  /* Object consumed by astore */
-                        
-                        free(internal_name);
-                    }
-                }
-                
+
                 /* Reset last_opcode before generating the then branch - it may
                  * otherwise carry over stale state from whatever code preceded
                  * this if-statement, which has nothing to do with whether THIS
@@ -2572,6 +2524,15 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     }
                     
                     /* Patch the branch to else */
+                    if (jump_cond) {
+                        /* The else branch is reached by the false edges of the condition:
+                         * the state is what they carry, not what the then branch had. */
+                        cond_bind_label(mg, &else_label, false);
+                        if (pre_then_state && mg->stackmap) {
+                            mg_restore_locals_count(mg, pre_then_locals_count);
+                            mg->next_slot = pre_then_slot;
+                        }
+                    } else {
                     int16_t else_offset = (int16_t)(mg->code->length - branch_pos);
                     mg->code->code[branch_pos + 1] = (else_offset >> 8) & 0xFF;
                     mg->code->code[branch_pos + 2] = else_offset & 0xFF;
@@ -2586,6 +2547,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     
                     /* Record frame at else branch target */
                     mg_record_frame(mg);
+                    }
 
                     /* Reset last_opcode before generating the else branch - see
                      * the identical reset (and its full reasoning) before the
@@ -2690,6 +2652,23 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         mg->last_opcode = 0;
                     }
                 } else {
+                    if (jump_cond) {
+                        /* The end is reached by the false edges of the condition and, if the
+                         * then branch can complete, by falling out of it. */
+                        bool then_completes = !(mg->last_opcode == OP_RETURN ||
+                                                mg->last_opcode == OP_IRETURN ||
+                                                mg->last_opcode == OP_LRETURN ||
+                                                mg->last_opcode == OP_FRETURN ||
+                                                mg->last_opcode == OP_DRETURN ||
+                                                mg->last_opcode == OP_ARETURN ||
+                                                mg->last_opcode == OP_ATHROW ||
+                                                mg->last_opcode == OP_GOTO);
+                        cond_bind_label(mg, &else_label, then_completes);
+                        if (pre_then_state && mg->stackmap) {
+                            mg_restore_locals_count(mg, pre_then_locals_count);
+                            mg->next_slot = pre_then_slot;
+                        }
+                    } else {
                     /* Patch branch to end (no else) */
                     int16_t end_offset = (int16_t)(mg->code->length - branch_pos);
                     mg->code->code[branch_pos + 1] = (end_offset >> 8) & 0xFF;
@@ -2707,6 +2686,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * Even if then-block ends with return, the if-false path still exists
                      * and may branch to this location. */
                     mg_record_frame(mg);
+                    }
                     
                     /* For if-without-else, there's always a code path (the false branch)
                      * that doesn't return, so we must NOT mark this as terminating. */
@@ -2788,7 +2768,14 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     cond_unwrapped->data.leaf.token_type == TOK_TRUE;
 
                 slist_t *false_positions = NULL;
-                if (!condition_always_true &&
+                bool jump_cond = !condition_always_true && cond_has_binding(condition);
+                if (jump_cond) {
+                    /* A condition testing with an instanceof binding: the body is entered
+                     * along the edge where the test succeeded, with the binding assigned. */
+                    if (!codegen_cond_jump(mg, mg->cp, condition, false, &false_positions)) {
+                        return false;
+                    }
+                } else if (!condition_always_true &&
                     !codegen_condition_and_chain_false_branch(mg, mg->cp, condition, &false_positions)) {
                     return false;
                 }
@@ -2865,6 +2852,13 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * break). */
                 size_t loop_end = mg->code->length;
                 stackmap_state_t *loop_exit_state = NULL;
+                bool loop_never_exits = condition_always_true && mg->loop_stack &&
+                    !((loop_context_t *)mg->loop_stack->data)->break_offsets;
+
+                if (jump_cond) {
+                    /* The loop is left by the false edges of the condition. */
+                    cond_bind_label(mg, &false_positions, false);
+                } else {
                 for (slist_t *node = false_positions; node; ) {
                     slist_t *next = node->next;
                     pending_condition_branch_t *pending = (pending_condition_branch_t *)node->data;
@@ -2890,14 +2884,12 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * a branch target either, so it gets no frame: a frame
                  * there would shadow that of an exception handler starting
                  * at the same offset. */
-                bool loop_never_exits = condition_always_true && mg->loop_stack &&
-                    !((loop_context_t *)mg->loop_stack->data)->break_offsets;
-
                 /* Record frame at loop end (break target) */
                 if (!loop_never_exits) {
                     mg_record_frame(mg);
                 }
                 stackmap_state_free(loop_exit_state);
+                }
 
                 /* Pop loop context and patch breaks */
                 mg_pop_loop(mg, loop_end);
@@ -2996,7 +2988,15 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * preceding fall-through into it is itself dead. */
                 if (!body_ends_with_terminal || has_pending_continue) {
                     /* Generate condition */
-                    if (condition) {
+                    if (condition && cond_has_binding(condition)) {
+                        /* A condition testing with an instanceof binding: jump back to the
+                         * start along the edge where the test succeeded. */
+                        slist_t *back = NULL;
+                        if (!codegen_cond_jump(mg, mg->cp, condition, true, &back)) {
+                            return false;
+                        }
+                        cond_patch_label_back(mg, &back, loop_start);
+                    } else if (condition) {
                         if (!codegen_expr(mg, condition, mg->cp)) {
                             return false;
                         }
@@ -3089,7 +3089,16 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 mg_record_frame(mg);
 
                 size_t branch_pos = 0;
-                if (condition && condition->type != AST_EMPTY_STMT) {
+                bool for_jump_cond = condition && condition->type != AST_EMPTY_STMT &&
+                                     cond_has_binding(condition);
+                slist_t *for_false = NULL;
+                if (for_jump_cond) {
+                    /* A condition testing with an instanceof binding: the body is entered
+                     * along the edge where the test succeeded. */
+                    if (!codegen_cond_jump(mg, mg->cp, condition, false, &for_false)) {
+                        return false;
+                    }
+                } else if (condition && condition->type != AST_EMPTY_STMT) {
                     /* Generate condition */
                     if (!codegen_expr(mg, condition, mg->cp)) {
                         return false;
@@ -3101,6 +3110,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     bc_emit_u2(mg->code, 0);  /* Placeholder */
                     mg_pop_typed(mg, 1);
                 }
+                /* The locals the loop is entered with: the update still sees the
+                 * bindings of a jump condition. */
+                uint16_t cond_locals_count = mg_save_locals_count(mg);
                 
                 /* Continue target is where update starts (or loop_start if no update) */
                 /* We need to know where update will be, so use a placeholder */
@@ -3148,7 +3160,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * a target frame declaring fewer locals - the same
                  * reasoning already relied on for this loop's own break
                  * target). */
-                mg_restore_locals_count(mg, saved_locals_count);
+                mg_restore_locals_count(mg, for_jump_cond ? cond_locals_count : saved_locals_count);
 
                 /* Finalize continue target to here (before update
                  * expression), and patch every `continue` in the body to
@@ -3240,11 +3252,16 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 bool for_never_exits = !(condition && condition->type != AST_EMPTY_STMT) &&
                     mg->loop_stack &&
                     !((loop_context_t *)mg->loop_stack->data)->break_offsets;
+                if (for_jump_cond) {
+                    /* The loop is left by the false edges of the condition. */
+                    cond_bind_label(mg, &for_false, false);
+                } else {
                 if (loop_entry_state && mg->stackmap) {
                     stackmap_restore_state(mg->stackmap, loop_entry_state);
                 }
                 if (!for_never_exits) {
                     mg_record_frame(mg);
+                }
                 }
                 stackmap_state_free(loop_entry_state);
 
@@ -3259,7 +3276,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * mg->code->code[1]/[2] - i.e. bytes 1-2 of the METHOD
                  * ITSELF - clobbering whatever real instruction happens to
                  * start there. */
-                if (condition && condition->type != AST_EMPTY_STMT) {
+                if (condition && condition->type != AST_EMPTY_STMT && !for_jump_cond) {
                     int16_t end_offset = (int16_t)(loop_end - branch_pos);
                     mg->code->code[branch_pos + 1] = (end_offset >> 8) & 0xFF;
                     mg->code->code[branch_pos + 2] = end_offset & 0xFF;

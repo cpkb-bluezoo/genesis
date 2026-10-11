@@ -888,6 +888,8 @@ static uint32_t modifier_flag(token_type_t type)
     }
 }
 
+static uint32_t parse_modifiers_with_annotations(parser_t *parser, slist_t **annotations);
+
 /**
  * Check if token starts a type.
  */
@@ -1411,8 +1413,9 @@ static ast_node_t *parse_primary(parser_t *parser)
                     }
                 }
                 
-                /* Check for reference type cast: (ClassName) expr */
-                if (parser_current_type(parser) == TOK_IDENTIFIER) {
+                /* Check for reference type cast: (ClassName) expr, or (@Nullable ClassName) expr */
+                if (parser_current_type(parser) == TOK_IDENTIFIER ||
+                    parser_current_type(parser) == TOK_AT) {
                     /* Peek ahead to see if this is (Type) expr or (expr) */
                     lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
                     
@@ -1548,10 +1551,15 @@ static ast_node_t *parse_primary(parser_t *parser)
                 while (looks_like_lambda_params) {
                     token_type_t tok = parser_current_type(parser);
                     
-                    /* Skip 'final' modifier if present */
-                    if (tok == TOK_FINAL) {
-                        typed_params = true;  /* final requires type */
-                        parser_advance(parser);
+                    /* Skip 'final' and annotations if present */
+                    if (tok == TOK_FINAL || tok == TOK_AT) {
+                        typed_params = true;  /* a modifier or annotation requires a type */
+                        slist_t *skipped = NULL;
+                        parse_modifiers_with_annotations(parser, &skipped);
+                        for (slist_t *a = skipped; a; a = a->next) {
+                            ast_free((ast_node_t *)a->data);
+                        }
+                        slist_free(skipped);
                         tok = parser_current_type(parser);  /* get actual type */
                     }
                     
@@ -1668,8 +1676,10 @@ static ast_node_t *parse_primary(parser_t *parser)
                         ast_node_t *param_type = NULL;
                         bool param_is_final = false;
                         
-                        /* Check for 'final' modifier */
-                        if (parser_match(parser, TOK_FINAL)) {
+                        /* Check for 'final' modifier and annotations */
+                        slist_t *param_annotations = NULL;
+                        uint32_t param_modifiers = parse_modifiers_with_annotations(parser, &param_annotations);
+                        if (param_modifiers & MOD_FINAL) {
                             param_is_final = true;
                         }
                         
@@ -1690,6 +1700,7 @@ static ast_node_t *parse_primary(parser_t *parser)
                         if (param_is_final) {
                             param->data.node.flags |= MOD_FINAL;
                         }
+                        param->annotations = param_annotations;
                         param->data.node.name = (char *)intern(parser_current_text(parser));
                         if (param_type) {
                             ast_add_child(param, param_type);
@@ -2619,6 +2630,9 @@ static ast_node_t *parse_expression_prec(parser_t *parser, precedence_t min_prec
             int col = parser_current_column(parser);
             parser_advance(parser);
             
+            /* "o instanceof final T t": the modifier changes nothing here. */
+            parser_match(parser, TOK_FINAL);
+            
             ast_node_t *type_node = parse_type(parser);
             if (!type_node) {
                 ast_free(left);
@@ -2812,6 +2826,7 @@ ast_node_t *parse_type(parser_t *parser)
             bool looks_like_type_args = (after_lt == TOK_GT ||  /* diamond <> */
                                          after_lt == TOK_QUESTION ||  /* wildcard ? */
                                          after_lt == TOK_IDENTIFIER ||
+                                         after_lt == TOK_AT ||  /* Callable<@Nullable Object> */
                                          is_primitive_type(after_lt));
             
             if (!looks_like_type_args) {
@@ -3105,6 +3120,9 @@ static ast_node_t *parse_statement(parser_t *parser)
                         is_var_decl = true;
                     } else if (var_mods != 0) {
                         /* If we saw 'final', it MUST be a var declaration */
+                        is_var_decl = true;
+                    } else if (first_type == TOK_AT) {
+                        /* An annotation can only start a declaration here */
                         is_var_decl = true;
                     } else if (first_type == TOK_IDENTIFIER) {
                         /* Could be a type - peek ahead */
@@ -4602,6 +4620,17 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
         lexer_restore_pos(parser->lexer, save_pos);
     }
     
+    /* "static <K> @Nullable Object f(K k)": a type annotation after the type
+     * parameters belongs to the return type; it is kept with the declaration's own. */
+    if (method_type_params && parser_check(parser, TOK_AT)) {
+        slist_t *more = parse_type_annotations(parser);
+        for (slist_t *a = more; a; a = a->next) {
+            annotations = annotations ? (slist_append(annotations, a->data), annotations)
+                                      : slist_new(a->data);
+        }
+        slist_free(more);
+    }
+
     /* Method or field - need to parse type and name first */
     if (!is_type_start(parser_current_type(parser))) {
         parser_error(parser, "Expected type or constructor");

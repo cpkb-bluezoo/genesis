@@ -12257,6 +12257,8 @@ typedef struct walk_frame
     symbol_t *saved_method; /* Method to restore on exit */
     bool saved_static_field_init; /* in_static_field_init to restore on exit */
     void *extra;            /* Extra data for specific passes */
+    scope_t *binding_saved_scope; /* Scope to restore after this node, if a pattern-binding scope was opened for it */
+    bool binding_scope_open;
 } walk_frame_t;
 
 /**
@@ -14748,6 +14750,300 @@ static symbol_t *find_common_ancestor_symbol(symbol_t *a, symbol_t *b)
     return result;
 }
 
+/* ========================================================================
+ * Pattern bindings (JLS 6.3.1)
+ *
+ * "o instanceof T t" introduces t where the test is known to have succeeded:
+ * to the right of && when it is on the left, to the right of || when the test
+ * is negated, in the branches of ?: and if, in the body of a loop, and - for
+ * an if or loop that cannot complete normally the other way - after it.
+ * ======================================================================== */
+
+/** The type node and binding identifier of "e instanceof T name", else false. */
+static bool instanceof_binding(ast_node_t *inst, ast_node_t **type_node, ast_node_t **var)
+{
+    if (!inst || inst->type != AST_INSTANCEOF_EXPR) {
+        return false;
+    }
+    slist_t *c = inst->data.node.children;
+    if (!c || !c->next || !c->next->next) {
+        return false;
+    }
+    ast_node_t *v = (ast_node_t *)c->next->next->data;
+    if (!v || v->type != AST_IDENTIFIER) {
+        return false;
+    }
+    if (type_node) {
+        *type_node = (ast_node_t *)c->next->data;
+    }
+    if (var) {
+        *var = v;
+    }
+    return true;
+}
+
+/** The symbol of the binding an instanceof test declares, made on first use. */
+static symbol_t *pattern_binding_symbol(semantic_t *sem, ast_node_t *inst)
+{
+    ast_node_t *type_node = NULL;
+    ast_node_t *var = NULL;
+    if (!instanceof_binding(inst, &type_node, &var)) {
+        return NULL;
+    }
+    if (inst->sem_symbol && inst->sem_symbol->kind == SYM_LOCAL_VAR) {
+        return inst->sem_symbol;
+    }
+    if (sem->source_version < 16) {
+        semantic_error(sem, inst->line, inst->column,
+            "pattern matching for instanceof is not supported in -source %d (use 16 or higher)",
+            sem->source_version);
+    }
+    type_t *type = semantic_resolve_type(sem, type_node);
+    symbol_t *sym = symbol_new(SYM_LOCAL_VAR, var->data.leaf.name);
+    sym->type = type;
+    sym->ast = var;
+    sym->line = var->line;
+    sym->column = var->column;
+    var->sem_symbol = sym;
+    var->sem_type = type;
+    inst->sem_symbol = sym;
+    return sym;
+}
+
+/**
+ * The bindings expr introduces when it evaluates to when_true: appended to
+ * *out as the symbols of the instanceof tests.
+ */
+static void collect_pattern_bindings(semantic_t *sem, ast_node_t *expr, bool when_true, slist_t **out)
+{
+    if (!expr) {
+        return;
+    }
+    switch (expr->type) {
+        case AST_PARENTHESIZED:
+            if (expr->data.node.children) {
+                collect_pattern_bindings(sem, (ast_node_t *)expr->data.node.children->data,
+                                         when_true, out);
+            }
+            return;
+        case AST_UNARY_EXPR:
+            if (expr->data.node.op_token == TOK_NOT && expr->data.node.children) {
+                collect_pattern_bindings(sem, (ast_node_t *)expr->data.node.children->data,
+                                         !when_true, out);
+            }
+            return;
+        case AST_BINARY_EXPR: {
+            token_type_t op = expr->data.node.op_token;
+            slist_t *c = expr->data.node.children;
+            if (!c || !c->next) {
+                return;
+            }
+            /* a && b is true only if both are, a || b false only if both are. */
+            if ((op == TOK_AND && when_true) || (op == TOK_OR && !when_true)) {
+                collect_pattern_bindings(sem, (ast_node_t *)c->data, when_true, out);
+                collect_pattern_bindings(sem, (ast_node_t *)c->next->data, when_true, out);
+            }
+            return;
+        }
+        case AST_INSTANCEOF_EXPR:
+            if (when_true) {
+                symbol_t *sym = pattern_binding_symbol(sem, expr);
+                if (sym) {
+                    *out = slist_prepend(*out, sym);
+                }
+            }
+            return;
+        default:
+            return;
+    }
+}
+
+/** A scope (child of the current one) holding the given bindings, or NULL for none. */
+static scope_t *pattern_binding_scope(semantic_t *sem, slist_t *bindings)
+{
+    if (!bindings) {
+        return NULL;
+    }
+    scope_t *scope = scope_new(SCOPE_BLOCK, sem->current_scope);
+    for (slist_t *b = bindings; b; b = b->next) {
+        scope_define(scope, (symbol_t *)b->data);
+    }
+    return scope;
+}
+
+/**
+ * Analyses `expr` with the bindings `cond` introduces (when it is when_true) in scope.
+ */
+static type_t *expression_type_with_bindings(semantic_t *sem, ast_node_t *cond, bool when_true,
+                                             ast_node_t *expr)
+{
+    slist_t *bindings = NULL;
+    collect_pattern_bindings(sem, cond, when_true, &bindings);
+    scope_t *scope = pattern_binding_scope(sem, bindings);
+    slist_free(bindings);
+    if (!scope) {
+        return get_expression_type(sem, expr);
+    }
+    scope_t *saved = sem->current_scope;
+    sem->current_scope = scope;
+    type_t *t = get_expression_type(sem, expr);
+    sem->current_scope = saved;
+    return t;
+}
+
+/**
+ * True if the statement cannot complete normally: it ends in return, throw,
+ * break or continue on every path (a block by its last statement, an if by
+ * both of its branches).
+ */
+static bool statement_cannot_complete(ast_node_t *stmt)
+{
+    if (!stmt) {
+        return false;
+    }
+    switch (stmt->type) {
+        case AST_RETURN_STMT:
+        case AST_THROW_STMT:
+        case AST_BREAK_STMT:
+        case AST_CONTINUE_STMT:
+            return true;
+        case AST_BLOCK: {
+            ast_node_t *last = NULL;
+            for (slist_t *c = stmt->data.node.children; c; c = c->next) {
+                last = (ast_node_t *)c->data;
+            }
+            return statement_cannot_complete(last);
+        }
+        case AST_IF_STMT: {
+            slist_t *c = stmt->data.node.children;
+            return c && c->next && c->next->next &&
+                   statement_cannot_complete((ast_node_t *)c->next->data) &&
+                   statement_cannot_complete((ast_node_t *)c->next->next->data);
+        }
+        default:
+            return false;
+    }
+}
+
+/** True if a break inside stmt can leave stmt itself (not an inner loop or switch). */
+static bool contains_break_out(ast_node_t *stmt, bool nested)
+{
+    if (!stmt) {
+        return false;
+    }
+    if (stmt->type == AST_BREAK_STMT) {
+        return stmt->data.node.name != NULL || !nested;
+    }
+    bool inner = nested || stmt->type == AST_WHILE_STMT || stmt->type == AST_DO_STMT ||
+                 stmt->type == AST_FOR_STMT || stmt->type == AST_ENHANCED_FOR_STMT ||
+                 stmt->type == AST_SWITCH_STMT;
+    if (stmt->type == AST_LAMBDA_EXPR || stmt->type == AST_CLASS_DECL) {
+        return false;
+    }
+    for (slist_t *c = ast_get_children(stmt); c; c = c->next) {
+        if (contains_break_out((ast_node_t *)c->data, inner)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * The bindings a statement leaves in scope after it (JLS 6.3.2): an if whose
+ * then branch cannot complete normally introduces what its condition does when
+ * false; one whose else branch cannot, what it does when true; a loop that is
+ * not left by a break, what its condition does when false.
+ */
+static void statement_flow_bindings(semantic_t *sem, ast_node_t *stmt, slist_t **out)
+{
+    slist_t *c = stmt->data.node.children;
+    if (!c) {
+        return;
+    }
+    switch (stmt->type) {
+        case AST_IF_STMT: {
+            ast_node_t *cond = (ast_node_t *)c->data;
+            ast_node_t *then_s = c->next ? (ast_node_t *)c->next->data : NULL;
+            ast_node_t *else_s = (c->next && c->next->next) ? (ast_node_t *)c->next->next->data : NULL;
+            bool then_ends = statement_cannot_complete(then_s);
+            bool else_ends = else_s && statement_cannot_complete(else_s);
+            if (then_ends && !else_ends) {
+                collect_pattern_bindings(sem, cond, false, out);
+            } else if (else_ends && !then_ends) {
+                collect_pattern_bindings(sem, cond, true, out);
+            }
+            return;
+        }
+        case AST_WHILE_STMT:
+            if (!contains_break_out((ast_node_t *)(c->next ? c->next->data : NULL), false)) {
+                collect_pattern_bindings(sem, (ast_node_t *)c->data, false, out);
+            }
+            return;
+        case AST_FOR_STMT: {
+            /* children: init, condition, update, body */
+            ast_node_t *cond = c->next ? (ast_node_t *)c->next->data : NULL;
+            slist_t *rest = c->next && c->next->next ? c->next->next->next : NULL;
+            ast_node_t *body = rest ? (ast_node_t *)rest->data : NULL;
+            if (cond && cond->type != AST_EMPTY_STMT && !contains_break_out(body, false)) {
+                collect_pattern_bindings(sem, cond, false, out);
+            }
+            return;
+        }
+        default:
+            return;
+    }
+}
+
+/**
+ * The bindings in scope in child number `index` of node: the right operand of
+ * && and ||, the branches of ?: and if, the body of a loop.
+ */
+static scope_t *pattern_binding_scope_for_child(semantic_t *sem, ast_node_t *node, int index)
+{
+    slist_t *c = node->data.node.children;
+    if (!c || index < 1) {
+        return NULL;
+    }
+    ast_node_t *first = (ast_node_t *)c->data;
+    slist_t *bindings = NULL;
+    switch (node->type) {
+        case AST_BINARY_EXPR:
+            if (index == 1 && node->data.node.op_token == TOK_AND) {
+                collect_pattern_bindings(sem, first, true, &bindings);
+            } else if (index == 1 && node->data.node.op_token == TOK_OR) {
+                collect_pattern_bindings(sem, first, false, &bindings);
+            }
+            break;
+        case AST_CONDITIONAL_EXPR:
+        case AST_IF_STMT:
+            if (index == 1) {
+                collect_pattern_bindings(sem, first, true, &bindings);
+            } else if (index == 2) {
+                collect_pattern_bindings(sem, first, false, &bindings);
+            }
+            break;
+        case AST_WHILE_STMT:
+            if (index == 1) {
+                collect_pattern_bindings(sem, first, true, &bindings);
+            }
+            break;
+        case AST_FOR_STMT:
+            /* children: init, condition, update, body */
+            if (index >= 2 && c->next) {
+                ast_node_t *cond = (ast_node_t *)c->next->data;
+                if (cond && cond->type != AST_EMPTY_STMT) {
+                    collect_pattern_bindings(sem, cond, true, &bindings);
+                }
+            }
+            break;
+        default:
+            break;
+    }
+    scope_t *scope = pattern_binding_scope(sem, bindings);
+    slist_free(bindings);
+    return scope;
+}
+
 /**
  * Get the type of an expression (iterative).
  */
@@ -15243,7 +15539,16 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 }
                 
                 type_t *left_type = get_expression_type(sem, children->data);
-                type_t *right_type = get_expression_type(sem, children->next->data);
+                type_t *right_type;
+                if (expr->data.node.op_token == TOK_AND) {
+                    right_type = expression_type_with_bindings(sem, children->data, true,
+                                                               children->next->data);
+                } else if (expr->data.node.op_token == TOK_OR) {
+                    right_type = expression_type_with_bindings(sem, children->data, false,
+                                                               children->next->data);
+                } else {
+                    right_type = get_expression_type(sem, children->next->data);
+                }
                 const char *op = expr->data.node.name;
                 
                 /* Warn about division by literal zero */
@@ -18405,8 +18710,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 /* Type is common type of true/false branches */
                 slist_t *children = expr->data.node.children;
                 if (children && children->next && children->next->next) {
-                    type_t *then_type = get_expression_type(sem, children->next->data);
-                    type_t *else_type = get_expression_type(sem, children->next->next->data);
+                    type_t *then_type = expression_type_with_bindings(sem, children->data, true,
+                                                                      children->next->data);
+                    type_t *else_type = expression_type_with_bindings(sem, children->data, false,
+                                                                      children->next->next->data);
                     
                     /* If one branch is null, use the type of the other branch */
                     if (then_type && then_type->kind == TYPE_NULL && else_type) {
@@ -20378,7 +20685,10 @@ static void scan_lambda_body_for_this_capture(semantic_t *sem, ast_node_t *node,
         const char *name = node->data.leaf.name;
         if (name && sem->current_class->data.class_data.members) {
             symbol_t *sym = scope_lookup_local(sem->current_class->data.class_data.members, name);
-            if (sym && sym->kind == SYM_FIELD && !(sym->modifiers & MOD_STATIC)) {
+            /* A local variable or parameter of the same name hides the field. */
+            symbol_t *visible = sem->current_scope ? scope_lookup(sem->current_scope, name) : NULL;
+            bool hidden = visible && (visible->kind == SYM_LOCAL_VAR || visible->kind == SYM_PARAMETER);
+            if (sym && sym->kind == SYM_FIELD && !(sym->modifiers & MOD_STATIC) && !hidden) {
                 /* Identifier refers to an instance field - need 'this' capture */
                 lambda->lambda_captures_this = true;
             }
@@ -23058,13 +23368,6 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                             frame->saved_scope = sem->current_scope;
                             sem->current_scope = block_scope;
                             frame->extra = block_scope;  /* Remember to free */
-                            
-                            /* Check for pending pattern variable from instanceof pattern matching.
-                             * This is consumed only by the first block entered (the then block). */
-                            if (sem->pending_pattern_var) {
-                                scope_define(block_scope, sem->pending_pattern_var);
-                                sem->pending_pattern_var = NULL;
-                                }
                             }
                         }
                         break;
@@ -24122,6 +24425,11 @@ define_local_var:
                         }
                         break;
                     
+                    case AST_INSTANCEOF_EXPR:
+                        /* Declare the binding before its identifier child is walked. */
+                        pattern_binding_symbol(sem, node);
+                        break;
+
                     case AST_METHOD_REF:
                         {
                             /* Method ref already handled in assignment/decl context.
@@ -24337,44 +24645,8 @@ define_local_var:
                                         "condition is always %s", condition->data.leaf.name);
                                 }
                                 
-                                /* Handle pattern matching for instanceof (Java 16+)
-                                 * If condition is: obj instanceof Type patternVar
-                                 * Then patternVar should be in scope for the then block */
-                                if (condition->type == AST_INSTANCEOF_EXPR) {
-                                    slist_t *inst_children = condition->data.node.children;
-                                    if (inst_children && inst_children->next && inst_children->next->next) {
-                                        ast_node_t *type_node = (ast_node_t *)inst_children->next->data;
-                                        ast_node_t *pattern_var = (ast_node_t *)inst_children->next->next->data;
-                                        
-                                        if (pattern_var && pattern_var->type == AST_IDENTIFIER) {
-                                            /* Pattern matching in instanceof requires Java 16+ */
-                                            if (sem->source_version < 16) {
-                                                semantic_error(sem, condition->line, condition->column,
-                                                    "pattern matching for instanceof is not supported in -source %d (use 16 or higher)",
-                                                    sem->source_version);
-                                            }
-                                            /* Resolve the pattern type */
-                                            type_t *pattern_type = semantic_resolve_type(sem, type_node);
-                                            
-                                            /* Create symbol for the pattern variable */
-                                            symbol_t *sym = symbol_new(SYM_LOCAL_VAR, pattern_var->data.leaf.name);
-                                            sym->type = pattern_type;
-                                            sym->ast = pattern_var;
-                                            sym->line = pattern_var->line;
-                                            sym->column = pattern_var->column;
-                                            
-                                            /* Store the symbol on the pattern variable AST node */
-                                            pattern_var->sem_symbol = sym;
-                                            pattern_var->sem_type = pattern_type;
-                                            
-                                            /* Store in condition for codegen to use */
-                                            condition->sem_symbol = sym;
-                                            
-                                            /* Set pending pattern var to be added to next block scope */
-                                            sem->pending_pattern_var = sym;
-                                        }
-                                    }
-                                }
+                                /* Pattern bindings of the condition are scoped by the walker
+                                 * (see pattern_binding_scope_for_child). */
                             }
                         }
                         break;
@@ -25131,7 +25403,26 @@ define_local_var:
                         stack = realloc(stack, sizeof(walk_frame_t *) * stack_capacity);
                     }
                     
-                    stack[stack_top++] = walk_frame_new(child);
+                    walk_frame_t *child_frame = walk_frame_new(child);
+
+                    /* A child in which a pattern binding is in scope (the right
+                     * operand of &&, a branch of if or ?:, a loop body) is walked
+                     * with a scope holding it. */
+                    if (node->type == AST_BINARY_EXPR || node->type == AST_CONDITIONAL_EXPR ||
+                        node->type == AST_IF_STMT || node->type == AST_WHILE_STMT ||
+                        node->type == AST_FOR_STMT) {
+                        int index = 0;
+                        for (slist_t *c = node->data.node.children; c && c->data != child; c = c->next) {
+                            index++;
+                        }
+                        scope_t *bscope = pattern_binding_scope_for_child(sem, node, index);
+                        if (bscope) {
+                            child_frame->binding_saved_scope = sem->current_scope;
+                            child_frame->binding_scope_open = true;
+                            sem->current_scope = bscope;
+                        }
+                    }
+                    stack[stack_top++] = child_frame;
                 } else {
                     frame->state = WALK_EXIT;
                 }
@@ -25293,7 +25584,22 @@ define_local_var:
                     default:
                         break;
                 }
-                
+
+                /* What the statement leaves in scope after it: "if (!(o instanceof T t))
+                 * return;" makes t available to the rest of the block. */
+                if (node->type == AST_IF_STMT || node->type == AST_WHILE_STMT ||
+                    node->type == AST_FOR_STMT) {
+                    slist_t *flow = NULL;
+                    statement_flow_bindings(sem, node, &flow);
+                    for (slist_t *b = flow; b; b = b->next) {
+                        scope_define(sem->current_scope, (symbol_t *)b->data);
+                    }
+                    slist_free(flow);
+                }
+
+                if (frame->binding_scope_open) {
+                    sem->current_scope = frame->binding_saved_scope;
+                }
                 free(stack[--stack_top]);
                 break;
         }

@@ -260,6 +260,18 @@ typedef struct {
 bool codegen_condition_and_chain_false_branch(method_gen_t *mg, const_pool_t *cp,
                                                ast_node_t *expr, slist_t **false_positions);
 
+/**
+ * Jump-code conditions (see codegen_expr.c): used for any condition that tests
+ * with an instanceof binding, whose cast and store must sit on the edge where
+ * the test succeeded. A label is the list of pending jumps to it.
+ */
+bool cond_has_binding(ast_node_t *expr);
+bool codegen_cond_jump(method_gen_t *mg, const_pool_t *cp, ast_node_t *expr, bool jump_when,
+                       slist_t **label);
+bool codegen_cond_value(method_gen_t *mg, const_pool_t *cp, ast_node_t *expr);
+void cond_bind_label(method_gen_t *mg, slist_t **label, bool fallthrough_reachable);
+void cond_patch_label_back(method_gen_t *mg, slist_t **label, size_t target);
+
 /* Autoboxing/unboxing code generation */
 bool emit_boxing(method_gen_t *mg, const_pool_t *cp, type_kind_t prim_kind);
 bool emit_unboxing(method_gen_t *mg, const_pool_t *cp, type_kind_t target_prim, const char *wrapper_class);

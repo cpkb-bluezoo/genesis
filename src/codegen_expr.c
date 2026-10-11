@@ -3197,6 +3197,349 @@ static bool codegen_string_concat(method_gen_t *mg, ast_node_t *expr, const_pool
     return true;
 }
 
+/* ========================================================================
+ * Jump-code conditions
+ *
+ * A boolean expression that tests with "instanceof T t" cannot be computed to
+ * a 0/1 and tested again: the verifier only knows t is assigned along the edge
+ * where the test succeeded. These functions branch on the operands directly,
+ * as javac does, so the cast and the store of the binding sit on that edge:
+ *
+ *   codegen_cond_jump(e, jump_when, label)   jumps to label if e == jump_when,
+ *                                            falls through otherwise
+ *
+ * A label is the list of the jumps to it (pending_condition_branch_t, as for
+ * the && chains of loops), each with the frame state it carries.
+ * ======================================================================== */
+
+/** True if the boolean structure of expr (&&, ||, !, parentheses) tests with a binding. */
+bool cond_has_binding(ast_node_t *expr)
+{
+    if (!expr) {
+        return false;
+    }
+    switch (expr->type) {
+        case AST_PARENTHESIZED:
+            return expr->data.node.children &&
+                   cond_has_binding((ast_node_t *)expr->data.node.children->data);
+        case AST_UNARY_EXPR:
+            return expr->data.node.op_token == TOK_NOT && expr->data.node.children &&
+                   cond_has_binding((ast_node_t *)expr->data.node.children->data);
+        case AST_BINARY_EXPR: {
+            slist_t *c = expr->data.node.children;
+            return (expr->data.node.op_token == TOK_AND || expr->data.node.op_token == TOK_OR) &&
+                   c && c->next &&
+                   (cond_has_binding((ast_node_t *)c->data) ||
+                    cond_has_binding((ast_node_t *)c->next->data));
+        }
+        case AST_INSTANCEOF_EXPR: {
+            slist_t *c = expr->data.node.children;
+            return c && c->next && c->next->next &&
+                   ((ast_node_t *)c->next->next->data)->type == AST_IDENTIFIER;
+        }
+        default:
+            return false;
+    }
+}
+
+/** Emits a jump whose target is not known yet; it is recorded on the label with the state it carries. */
+static void cond_emit_jump(method_gen_t *mg, uint8_t opcode, int pops, slist_t **label)
+{
+    size_t pos = mg->code->length;
+    bc_emit(mg->code, opcode);
+    bc_emit_u2(mg->code, 0);
+    if (pops) {
+        mg_pop_typed(mg, pops);
+    }
+    pending_condition_branch_t *pending = malloc(sizeof(*pending));
+    pending->branch_pos = pos;
+    pending->state = mg->stackmap ? stackmap_save_state(mg->stackmap) : NULL;
+    slist_t *node = slist_append(*label, pending);
+    if (!*label) {
+        *label = node;
+    }
+}
+
+/**
+ * Makes the current position the target of every jump on the label, and the
+ * frame there the merge of what each jump carries (a local assigned on one edge
+ * and not on another is unset), and of the state falling through, if code can
+ * reach this position that way.
+ */
+void cond_bind_label(method_gen_t *mg, slist_t **label, bool fallthrough_reachable)
+{
+    size_t target = mg->code->length;
+    stackmap_state_t *current = (fallthrough_reachable && mg->stackmap) ? stackmap_save_state(mg->stackmap) : NULL;
+    stackmap_state_t *first = current;
+    uint16_t count = current ? current->num_locals : 0;
+    bool have_count = current != NULL;
+
+    for (slist_t *n = *label; n; n = n->next) {
+        pending_condition_branch_t *p = (pending_condition_branch_t *)n->data;
+        bc_patch_u2(mg->code, p->branch_pos + 1, (uint16_t)(int16_t)(target - p->branch_pos));
+        if (p->state) {
+            if (!first) {
+                first = p->state;
+            }
+            if (!have_count || p->state->num_locals < count) {
+                count = p->state->num_locals;
+                have_count = true;
+            }
+        }
+    }
+
+    if (first && mg->stackmap) {
+        stackmap_state_t merged;
+        merged.num_locals = count;
+        merged.locals = count ? malloc(count * sizeof(verification_type_t)) : NULL;
+        merged.stack_size = first->stack_size;
+        merged.stack = first->stack_size ? malloc(first->stack_size * sizeof(verification_type_t)) : NULL;
+        if (merged.stack) {
+            memcpy(merged.stack, first->stack, first->stack_size * sizeof(verification_type_t));
+        }
+        for (uint16_t i = 0; i < count; i++) {
+            verification_type_t t = first->locals[i];
+            bool agree = true;
+            if (current && current != first) {
+                verification_type_t o = current->locals[i];
+                agree = o.tag == t.tag &&
+                        (t.tag != VT_OBJECT || o.data.cp_index == t.data.cp_index);
+            }
+            for (slist_t *n = *label; n && agree; n = n->next) {
+                pending_condition_branch_t *p = (pending_condition_branch_t *)n->data;
+                if (!p->state || p->state == first) {
+                    continue;
+                }
+                verification_type_t o = p->state->locals[i];
+                agree = o.tag == t.tag &&
+                        (t.tag != VT_OBJECT || o.data.cp_index == t.data.cp_index);
+            }
+            if (merged.locals) {
+                merged.locals[i] = agree ? t : vtype_top();
+            }
+        }
+        stackmap_restore_state(mg->stackmap, &merged);
+        free(merged.locals);
+        free(merged.stack);
+    }
+    mg_record_frame(mg);
+
+    for (slist_t *n = *label; n; ) {
+        slist_t *next = n->next;
+        pending_condition_branch_t *p = (pending_condition_branch_t *)n->data;
+        stackmap_state_free(p->state);
+        free(p);
+        free(n);
+        n = next;
+    }
+    *label = NULL;
+    stackmap_state_free(current);
+}
+
+/** Points every jump on the label at an earlier position (a loop's start), which already has its frame. */
+void cond_patch_label_back(method_gen_t *mg, slist_t **label, size_t target)
+{
+    for (slist_t *n = *label; n; ) {
+        slist_t *next = n->next;
+        pending_condition_branch_t *p = (pending_condition_branch_t *)n->data;
+        bc_patch_u2(mg->code, p->branch_pos + 1, (uint16_t)(int16_t)((long)target - (long)p->branch_pos));
+        stackmap_state_free(p->state);
+        free(p);
+        free(n);
+        n = next;
+    }
+    *label = NULL;
+}
+
+/** The class constant an instanceof or cast to this type node uses: an internal name, or an array descriptor. */
+static char *instanceof_class_ref(ast_node_t *type_node)
+{
+    if (type_node->type == AST_CLASS_TYPE) {
+        const char *class_name = NULL;
+        if (type_node->sem_type && type_node->sem_type->kind == TYPE_CLASS) {
+            if (type_node->sem_type->data.class_type.symbol &&
+                type_node->sem_type->data.class_type.symbol->qualified_name) {
+                class_name = type_node->sem_type->data.class_type.symbol->qualified_name;
+            } else if (type_node->sem_type->data.class_type.name) {
+                class_name = type_node->sem_type->data.class_type.name;
+            }
+        }
+        if (!class_name) {
+            class_name = type_node->data.node.name;
+        }
+        return class_to_internal_name(resolve_java_lang_class(class_name));
+    }
+    if (type_node->type == AST_ARRAY_TYPE) {
+        return ast_type_to_descriptor(type_node);
+    }
+    return NULL;
+}
+
+/**
+ * "src instanceof T t" as a jump: the cast and the store of t are on the edge
+ * where the test succeeds, and src is evaluated once.
+ */
+static bool cond_jump_instanceof(method_gen_t *mg, const_pool_t *cp, ast_node_t *inst,
+                                 bool jump_when, slist_t **label)
+{
+    slist_t *c = inst->data.node.children;
+    ast_node_t *src = (ast_node_t *)c->data;
+    ast_node_t *type_node = (ast_node_t *)c->next->data;
+    ast_node_t *var = (ast_node_t *)c->next->next->data;
+
+    char *class_ref = instanceof_class_ref(type_node);
+    if (!class_ref) {
+        fprintf(stderr, "codegen: instanceof without class type\n");
+        return false;
+    }
+    uint16_t class_idx = cp_add_class(cp, class_ref);
+
+    /* The binding's slot; until the test has succeeded it is not assigned. */
+    type_t *vtype = var->sem_type;
+    if (!vtype) {
+        vtype = type_new_class(class_ref);
+    }
+    uint16_t vslot = mg_allocate_local(mg, var->data.leaf.name, vtype);
+    if (mg->stackmap) {
+        stackmap_set_local(mg->stackmap, vslot, vtype_top());
+    }
+
+    /* The object: a local is read again, anything else is kept in a temporary. */
+    uint16_t oslot = 0;
+    bool in_local = false;
+    if (src->type == AST_IDENTIFIER) {
+        local_var_info_t *li = (local_var_info_t *)hashtable_lookup(mg->locals, src->data.leaf.name);
+        if (li && li->is_ref) {
+            oslot = li->slot;
+            in_local = true;
+        }
+    }
+    if (in_local) {
+        mg_emit_load_local(mg, oslot, TYPE_CLASS);
+    } else {
+        if (!codegen_expr(mg, src, cp)) {
+            free(class_ref);
+            return false;
+        }
+        char tmp_name[32];
+        snprintf(tmp_name, sizeof(tmp_name), "$pat%d", (int)mg->next_slot);
+        oslot = mg_allocate_local(mg, tmp_name, type_object());
+        bc_emit(mg->code, OP_DUP);
+        mg_dup(mg);
+        verification_type_t top = vtype_top();
+        if (mg->stackmap && mg->stackmap->current_stack_size > 0) {
+            top = mg->stackmap->current_stack[mg->stackmap->current_stack_size - 1];
+        }
+        mg_emit_store_local(mg, oslot, TYPE_CLASS);
+        if (mg->stackmap) {
+            stackmap_set_local(mg->stackmap, oslot, top);
+        }
+    }
+
+    bc_emit(mg->code, OP_INSTANCEOF);
+    bc_emit_u2(mg->code, class_idx);
+    mg_pop_typed(mg, 1);
+    mg_push_int(mg);
+
+    slist_t *skip = NULL;
+    cond_emit_jump(mg, OP_IFEQ, 1, jump_when ? &skip : label);
+
+    /* The test succeeded: cast and store the binding. */
+    mg_emit_load_local(mg, oslot, TYPE_CLASS);
+    bc_emit(mg->code, OP_CHECKCAST);
+    bc_emit_u2(mg->code, class_idx);
+    mg_pop_typed(mg, 1);
+    mg_push_object(mg, class_ref);
+    mg_emit_store_local(mg, vslot, TYPE_CLASS);
+    if (mg->stackmap) {
+        stackmap_set_local_object(mg->stackmap, vslot, mg->cp, class_ref);
+    }
+    free(class_ref);
+
+    if (jump_when) {
+        cond_emit_jump(mg, OP_GOTO, 0, label);
+        cond_bind_label(mg, &skip, false);
+    }
+    return true;
+}
+
+bool codegen_cond_jump(method_gen_t *mg, const_pool_t *cp, ast_node_t *expr, bool jump_when,
+                       slist_t **label)
+{
+    while (expr->type == AST_PARENTHESIZED) {
+        if (!expr->data.node.children) {
+            return false;
+        }
+        expr = (ast_node_t *)expr->data.node.children->data;
+    }
+
+    if (expr->type == AST_UNARY_EXPR && expr->data.node.op_token == TOK_NOT &&
+        expr->data.node.children) {
+        return codegen_cond_jump(mg, cp, (ast_node_t *)expr->data.node.children->data,
+                                 !jump_when, label);
+    }
+
+    if (expr->type == AST_BINARY_EXPR &&
+        (expr->data.node.op_token == TOK_AND || expr->data.node.op_token == TOK_OR) &&
+        expr->data.node.children && expr->data.node.children->next) {
+        ast_node_t *left = (ast_node_t *)expr->data.node.children->data;
+        ast_node_t *right = (ast_node_t *)expr->data.node.children->next->data;
+        bool is_and = expr->data.node.op_token == TOK_AND;
+        if (jump_when == !is_and) {
+            /* a && b jumps when false, a || b when true: either operand decides. */
+            return codegen_cond_jump(mg, cp, left, jump_when, label) &&
+                   codegen_cond_jump(mg, cp, right, jump_when, label);
+        }
+        /* a && b jumps when true only if both are, a || b when false only if both are. */
+        slist_t *skip = NULL;
+        if (!codegen_cond_jump(mg, cp, left, !jump_when, &skip) ||
+            !codegen_cond_jump(mg, cp, right, jump_when, label)) {
+            return false;
+        }
+        cond_bind_label(mg, &skip, true);
+        return true;
+    }
+
+    if (expr->type == AST_INSTANCEOF_EXPR && cond_has_binding(expr)) {
+        return cond_jump_instanceof(mg, cp, expr, jump_when, label);
+    }
+
+    /* Anything else: compute its value and branch on it. */
+    if (!codegen_expr(mg, expr, cp)) {
+        return false;
+    }
+    if (expr->sem_type && expr->sem_type->kind == TYPE_CLASS &&
+        expr->sem_type->data.class_type.name) {
+        type_kind_t prim = get_primitive_for_wrapper(expr->sem_type->data.class_type.name);
+        if (prim == TYPE_BOOLEAN) {
+            char *internal = class_to_internal_name(expr->sem_type->data.class_type.name);
+            emit_unboxing(mg, cp, prim, internal);
+            free(internal);
+        }
+    }
+    cond_emit_jump(mg, jump_when ? OP_IFNE : OP_IFEQ, 1, label);
+    return true;
+}
+
+/** The value (0 or 1) of a condition that tests with a binding, computed by jumps. */
+bool codegen_cond_value(method_gen_t *mg, const_pool_t *cp, ast_node_t *expr)
+{
+    slist_t *is_false = NULL;
+    slist_t *end = NULL;
+    if (!codegen_cond_jump(mg, cp, expr, false, &is_false)) {
+        return false;
+    }
+    bc_emit(mg->code, OP_ICONST_1);
+    mg_push_int(mg);
+    cond_emit_jump(mg, OP_GOTO, 0, &end);
+    mg_pop_typed(mg, 1);
+    cond_bind_label(mg, &is_false, false);
+    bc_emit(mg->code, OP_ICONST_0);
+    mg_push_int(mg);
+    cond_bind_label(mg, &end, true);
+    return true;
+}
+
 /**
  * Generate code for a boolean condition that branches to a not-yet-known
  * target when `expr` evaluates false, WITHOUT ever materializing an
@@ -10518,6 +10861,12 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
     if (!expr) {
         return false;
     }
+
+    /* A condition that tests with an instanceof binding is computed by jumps. */
+    if ((expr->type == AST_BINARY_EXPR || expr->type == AST_UNARY_EXPR ||
+         expr->type == AST_INSTANCEOF_EXPR) && cond_has_binding(expr)) {
+        return codegen_cond_value(mg, cp, expr);
+    }
     
     switch (expr->type) {
         case AST_LITERAL:
@@ -11975,6 +12324,17 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 ast_node_t *then_expr = (ast_node_t *)children->next->data;
                 ast_node_t *else_expr = (ast_node_t *)children->next->next->data;
                 
+                /* A condition testing with an instanceof binding is jump code: the
+                 * binding is assigned along the edge into the then branch only. */
+                bool jump_cond = cond_has_binding(condition);
+                slist_t *else_label = NULL;
+                size_t ifeq_pos = 0;
+
+                if (jump_cond) {
+                    if (!codegen_cond_jump(mg, cp, condition, false, &else_label)) {
+                        return false;
+                    }
+                } else {
                 /* Generate condition */
                 if (!codegen_expr(mg, condition, cp)) {
                     return false;
@@ -11996,10 +12356,11 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 }
 
                 /* ifeq else_branch (jump if condition is false/0) */
-                size_t ifeq_pos = mg->code->length;
+                ifeq_pos = mg->code->length;
                 bc_emit(mg->code, OP_IFEQ);
                 bc_emit_u2(mg->code, 0);  /* Placeholder */
                 mg_pop_typed(mg, 1);  /* Condition consumed */
+                }
                 
                 /* Save stackmap state AFTER consuming condition.
                  * This preserves the full type information of items on the stack. */
@@ -12031,9 +12392,20 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 
                 /* goto end (skip else branch) */
                 size_t goto_pos = mg->code->length;
-                bc_emit(mg->code, OP_GOTO);
-                bc_emit_u2(mg->code, 0);  /* Placeholder */
+                slist_t *end_label = NULL;
+                if (jump_cond) {
+                    cond_emit_jump(mg, OP_GOTO, 0, &end_label);
+                } else {
+                    bc_emit(mg->code, OP_GOTO);
+                    bc_emit_u2(mg->code, 0);  /* Placeholder */
+                }
                 
+                if (jump_cond) {
+                    /* The false edges of the condition arrive here; their merged state is
+                     * the frame, with the then branch's value off the stack. */
+                    cond_bind_label(mg, &else_label, false);
+                    mg->stack_depth = saved_stack_depth;
+                } else {
                 /* Patch ifeq to jump here (else branch) */
                 uint16_t else_offset = (uint16_t)(mg->code->length - ifeq_pos);
                 bc_patch_u2(mg->code, ifeq_pos + 1, else_offset);
@@ -12046,6 +12418,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 
                 /* Record frame at else branch target */
                 mg_record_frame(mg);
+                }
                 
                 /* Generate else branch */
                 if (!codegen_expr(mg, else_expr, cp)) {
@@ -12065,8 +12438,10 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 }
 
                 /* Patch goto to jump here (end) */
-                uint16_t end_offset = (uint16_t)(mg->code->length - goto_pos);
-                bc_patch_u2(mg->code, goto_pos + 1, end_offset);
+                if (!jump_cond) {
+                    uint16_t end_offset = (uint16_t)(mg->code->length - goto_pos);
+                    bc_patch_u2(mg->code, goto_pos + 1, end_offset);
+                }
 
                 /* mg->stackmap's tracked stack-top type at this point just
                  * reflects whichever branch was generated last (the else
@@ -12109,7 +12484,24 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 }
 
                 /* Record frame at merge point */
+                if (jump_cond) {
+                    /* The then branch's edge carries its own state, with the binding
+                     * unset where the condition was negated; the frame is the merge of
+                     * both, with the type of the whole expression on top of the stack. */
+                    if (mg->stackmap && mg->stackmap->current_stack_size > 0) {
+                        verification_type_t top =
+                            mg->stackmap->current_stack[mg->stackmap->current_stack_size - 1];
+                        for (slist_t *e = end_label; e; e = e->next) {
+                            pending_condition_branch_t *pe = (pending_condition_branch_t *)e->data;
+                            if (pe->state && pe->state->stack_size > 0) {
+                                pe->state->stack[pe->state->stack_size - 1] = top;
+                            }
+                        }
+                    }
+                    cond_bind_label(mg, &end_label, true);
+                } else {
                 mg_record_frame(mg);
+                }
                 
                 stackmap_state_free(saved_state);
                 

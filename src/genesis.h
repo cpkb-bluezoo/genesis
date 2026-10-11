@@ -863,7 +863,6 @@ typedef struct semantic
     bool in_static_field_init;  /* True when processing a static field initializer */
     ast_node_t *current_lambda; /* Current lambda being analyzed (for capture tracking) */
     scope_t *lambda_enclosing_scope; /* Scope at lambda definition (parent of lambda params) */
-    symbol_t *pending_pattern_var; /* Pattern variable from instanceof to add to next scope */
     type_t *target_type;         /* Target type for expression (for type inference) */
     
     slist_t *diagnostics;       /* List of diagnostic_t* */
