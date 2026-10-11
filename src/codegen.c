@@ -4956,6 +4956,15 @@ static void generate_covariant_override_bridges(class_gen_t *cg)
                                 bc_emit_u2(code, cast_class);
                                 free(internal);
                             }
+                        } else if (sp_sym && sp_sym->type && sp_sym->type->kind == TYPE_TYPEVAR &&
+                                   cp_sym && cp_sym->type && cp_sym->type->kind == TYPE_ARRAY) {
+                            /* ...or an array ("Sender<URI, byte[]>"): its CHECKCAST class
+                             * constant is the array's own descriptor */
+                            char *array_desc = type_to_descriptor(cp_sym->type);
+                            uint16_t cast_class = cp_add_class(cg->cp, array_desc);
+                            bc_emit(code, OP_CHECKCAST);
+                            bc_emit_u2(code, cast_class);
+                            free(array_desc);
                         }
                         break;
                 }

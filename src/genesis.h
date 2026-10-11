@@ -1022,6 +1022,7 @@ typedef struct unresolved_type {
     char *name;             /* Simple or qualified type name */
     int array_dims;         /* Array dimensions */
     slist_t *type_args;     /* Type arguments (list of unresolved_type*) */
+    int wildcard_kind;      /* 0 not a wildcard, 1 "?", 2 "? extends B", 3 "? super B" (B is type_args) */
 } unresolved_type_t;
 
 /* Create/free unresolved type references */

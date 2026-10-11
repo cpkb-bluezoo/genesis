@@ -1499,6 +1499,197 @@ for vr_order in "VarargsReturnTest SP" "SP VarargsReturnTest"; do
 done
 
 echo
+echo "--- A member interface's own type variable in a method of another file ---"
+for ng_order in "NestedGenericBuilderTest Cust" "Cust NestedGenericBuilderTest"; do
+    set -- $ng_order
+    printf "%-30s ... " "NestedGenericBuilder ($1 first)"
+    ng_out="$TEST_BUILD/nestedgenericbuilder-out"
+    rm -rf "$ng_out"
+    mkdir -p "$ng_out"
+    if (cd "$ng_out" && "$GENESIS" -j1 -d "$ng_out" \
+           "$TEST_SRC/external/nestedgenericbuilder/p/$1.java" \
+           "$TEST_SRC/external/nestedgenericbuilder/p/$2.java" >/dev/null 2>&1) &&
+       "$JAVA" -cp "$ng_out" p.NestedGenericBuilderTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for sl_order in "StubLambdaParamTest Holder" "Holder StubLambdaParamTest"; do
+    set -- $sl_order
+    printf "%-30s ... " "StubLambdaParam ($1 first)"
+    sl_out="$TEST_BUILD/stublambdaparam-out"
+    rm -rf "$sl_out"
+    mkdir -p "$sl_out"
+    if (cd "$sl_out" && "$GENESIS" -j1 -d "$sl_out" \
+           "$TEST_SRC/external/stublambdaparam/p/$1.java" \
+           "$TEST_SRC/external/stublambdaparam/p/$2.java" >/dev/null 2>&1) &&
+       "$JAVA" -cp "$sl_out" p.StubLambdaParamTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for bo_order in "BoundedOverloadTest Asserts" "Asserts BoundedOverloadTest"; do
+    set -- $bo_order
+    printf "%-30s ... " "BoundedOverload ($1 first)"
+    bo_out="$TEST_BUILD/boundedoverload-out"
+    rm -rf "$bo_out"
+    mkdir -p "$bo_out"
+    if (cd "$bo_out" && "$GENESIS" -j1 -d "$bo_out" \
+           "$TEST_SRC/external/boundedoverload/p/$1.java" \
+           "$TEST_SRC/external/boundedoverload/p/$2.java" >/dev/null 2>&1) &&
+       "$JAVA" -cp "$bo_out" p.BoundedOverloadTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+printf "%-30s ... " "PrivateClassfileOverload"
+pc_lib="$TEST_BUILD/privateclassfileoverload-lib"
+pc_out="$TEST_BUILD/privateclassfileoverload-out"
+rm -rf "$pc_lib" "$pc_out"
+mkdir -p "$pc_lib" "$pc_out"
+if (cd "$pc_lib" && "$GENESIS" -j1 -d "$pc_lib" \
+       "$TEST_SRC/external/privateclassfileoverload/p/Gate.java" >/dev/null 2>&1) &&
+   (cd "$pc_out" && "$GENESIS" -j1 -cp "$pc_lib" -d "$pc_out" \
+       "$TEST_SRC/external/privateclassfileoverload/p/PrivateClassfileOverloadTest.java" >/dev/null 2>&1) &&
+   "$JAVA" -cp "$pc_out:$pc_lib" p.PrivateClassfileOverloadTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "InheritedMethodRef"
+im_lib="$TEST_BUILD/inheritedmethodref-lib"
+im_out="$TEST_BUILD/inheritedmethodref-out"
+rm -rf "$im_lib" "$im_out"
+mkdir -p "$im_lib" "$im_out"
+if (cd "$im_lib" && "$GENESIS" -j1 -d "$im_lib" \
+       "$TEST_SRC/external/inheritedmethodref/p/NamedHint.java" \
+       "$TEST_SRC/external/inheritedmethodref/p/Hint.java" >/dev/null 2>&1) &&
+   (cd "$im_out" && "$GENESIS" -j1 -cp "$im_lib" -d "$im_out" \
+       "$TEST_SRC/external/inheritedmethodref/p/InheritedMethodRefTest.java" >/dev/null 2>&1) &&
+   "$JAVA" -cp "$im_out:$im_lib" p.InheritedMethodRefTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+for sm_order in "SuperInterfaceMemberTypeTest AnyPhased BasePhased Phased" "Phased BasePhased AnyPhased SuperInterfaceMemberTypeTest"; do
+    set -- $sm_order
+    printf "%-30s ... " "SuperInterfaceMemberType ($1 first)"
+    sm_out="$TEST_BUILD/superinterfacemembertype-out"
+    rm -rf "$sm_out"
+    mkdir -p "$sm_out"
+    sm_files=""
+    for sm_name in "$@"; do
+        sm_files="$sm_files $TEST_SRC/external/superinterfacemembertype/p/$sm_name.java"
+    done
+    if (cd "$sm_out" && "$GENESIS" -j1 -d "$sm_out" $sm_files >/dev/null 2>&1) &&
+       "$JAVA" -cp "$sm_out" p.SuperInterfaceMemberTypeTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for fs_order in "FunctionalSuperInterfaceTest JmxEndpoints Endpoints JmxExposable Exposable" "Exposable JmxExposable Endpoints JmxEndpoints FunctionalSuperInterfaceTest" "JmxEndpoints Endpoints Exposable JmxExposable FunctionalSuperInterfaceTest"; do
+    set -- $fs_order
+    printf "%-30s ... " "FunctionalSuperInterface ($1 first)"
+    fs_out="$TEST_BUILD/functionalsuperinterface-out"
+    rm -rf "$fs_out"
+    mkdir -p "$fs_out"
+    fs_files=""
+    for fs_name in "$@"; do
+        fs_files="$fs_files $TEST_SRC/external/functionalsuperinterface/p/$fs_name.java"
+    done
+    if (cd "$fs_out" && "$GENESIS" -j1 -d "$fs_out" $fs_files >/dev/null 2>&1) &&
+       "$JAVA" -cp "$fs_out" p.FunctionalSuperInterfaceTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for ig_order in "InheritedGenericMemberTest ExposableJmx Exposable JmxOperation Operation" "Operation JmxOperation Exposable ExposableJmx InheritedGenericMemberTest" "ExposableJmx InheritedGenericMemberTest Exposable Operation JmxOperation"; do
+    set -- $ig_order
+    printf "%-30s ... " "InheritedGenericMember ($1 first)"
+    ig_out="$TEST_BUILD/inheritedgenericmember-out"
+    rm -rf "$ig_out"
+    mkdir -p "$ig_out"
+    ig_files=""
+    for ig_name in "$@"; do
+        ig_files="$ig_files $TEST_SRC/external/inheritedgenericmember/p/$ig_name.java"
+    done
+    if (cd "$ig_out" && "$GENESIS" -j1 -d "$ig_out" $ig_files >/dev/null 2>&1) &&
+       "$JAVA" -cp "$ig_out" p.InheritedGenericMemberTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for iq_order in "InheritedMemberTypeQualifiedTest Sub Base" "Base Sub InheritedMemberTypeQualifiedTest" "Sub InheritedMemberTypeQualifiedTest Base"; do
+    set -- $iq_order
+    printf "%-30s ... " "InheritedMemberTypeQualified ($1 first)"
+    iq_out="$TEST_BUILD/inheritedmembertypequalified-out"
+    rm -rf "$iq_out"
+    mkdir -p "$iq_out"
+    iq_files=""
+    for iq_name in "$@"; do
+        iq_files="$iq_files $TEST_SRC/external/inheritedmembertypequalified/p/$iq_name.java"
+    done
+    if (cd "$iq_out" && "$GENESIS" -j1 -d "$iq_out" $iq_files >/dev/null 2>&1) &&
+       "$JAVA" -cp "$iq_out" p.InheritedMemberTypeQualifiedTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+for tg_order in "TwoLevelGenericAdapterTest Adapter StepAdapter ConfigAdapter Props StepProperties Config" "Config StepProperties Props ConfigAdapter StepAdapter Adapter TwoLevelGenericAdapterTest" "Adapter StepAdapter ConfigAdapter Props StepProperties Config TwoLevelGenericAdapterTest"; do
+    set -- $tg_order
+    printf "%-30s ... " "TwoLevelGenericAdapter ($1 first)"
+    tg_out="$TEST_BUILD/twolevelgenericadapter-out"
+    rm -rf "$tg_out"
+    mkdir -p "$tg_out"
+    tg_files=""
+    for tg_name in "$@"; do
+        tg_files="$tg_files $TEST_SRC/external/twolevelgenericadapter/p/$tg_name.java"
+    done
+    if (cd "$tg_out" && "$GENESIS" -j1 -d "$tg_out" $tg_files >/dev/null 2>&1) &&
+       "$JAVA" -cp "$tg_out" p.TwoLevelGenericAdapterTest >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+echo
 echo "--- Narrowing a non-constant or an out-of-range constant must fail to compile ---"
 printf "%-30s ... " "NarrowingRejected"
 nr_out="$TEST_BUILD/narrowingrejected-out"

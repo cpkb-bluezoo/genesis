@@ -4698,6 +4698,12 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
     if (parser_check(parser, TOK_LT)) {
         parser_advance(parser);
         do {
+            /* "<@Nullable P extends @Nullable Object>": an annotation on the declaration */
+            slist_t *param_annotations = parse_type_annotations(parser);
+            for (slist_t *a = param_annotations; a; a = a->next) {
+                ast_free((ast_node_t *)a->data);
+            }
+            slist_free(param_annotations);
             if (parser_check(parser, TOK_IDENTIFIER)) {
                 ast_node_t *type_param = ast_new(AST_TYPE_PARAMETER,
                                                   parser_current_line(parser),
@@ -4961,6 +4967,12 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
     if (parser_check(parser, TOK_LT)) {
         parser_advance(parser);
         do {
+            /* "<@Nullable P extends @Nullable Object>": an annotation on the declaration */
+            slist_t *param_annotations = parse_type_annotations(parser);
+            for (slist_t *a = param_annotations; a; a = a->next) {
+                ast_free((ast_node_t *)a->data);
+            }
+            slist_free(param_annotations);
             if (parser_check(parser, TOK_IDENTIFIER)) {
                 ast_node_t *type_param = ast_new(AST_TYPE_PARAMETER,
                                                   parser_current_line(parser),

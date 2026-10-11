@@ -1031,6 +1031,16 @@ bool classpath_setup_jdk(classpath_t *cp, jdk_info_t *jdk)
             "java.security.jgss.jmod", /* org.ietf.jgss (GSSAPI / Kerberos) */
             "java.naming.jmod",     /* javax.naming (JNDI) */
             "java.desktop.jmod",    /* java.beans (BeanInfo, Introspector) */
+            "java.net.http.jmod",   /* java.net.http (HttpClient) */
+            "java.prefs.jmod",      /* java.util.prefs */
+            "java.scripting.jmod",  /* javax.script */
+            "java.instrument.jmod", /* java.lang.instrument */
+            "java.rmi.jmod",        /* java.rmi */
+            "java.xml.crypto.jmod", /* javax.xml.crypto */
+            "java.transaction.xa.jmod", /* javax.transaction.xa */
+            "java.datatransfer.jmod",   /* java.awt.datatransfer */
+            "java.sql.rowset.jmod",     /* javax.sql.rowset */
+            "java.management.rmi.jmod", /* javax.management.remote.rmi */
             NULL
         };
         

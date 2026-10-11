@@ -157,6 +157,7 @@ static char *build_array_descriptor(type_kind_t base_kind, const char *base_clas
  * path) can use it too.
  */
 static void codegen_load_enclosing_this(method_gen_t *mg, const_pool_t *cp, symbol_t *target_owner);
+static symbol_t *lookup_member_inherited(symbol_t *cls, const char *name, int depth);
 
 /**
  * Find (or register) the synthetic static accessor 'enclosing' must emit so
@@ -292,6 +293,88 @@ static bool codegen_this_instance_field_incdec(method_gen_t *mg, const_pool_t *c
         bc_emit_u2(mg->code, fieldref);
         mg_pop_typed(mg, is_wide ? 3 : 2);
     }
+    return true;
+}
+
+/**
+ * Emit ++/-- on a static field, leaving the old (post) or new (pre) value on the stack.
+ * field_owner_internal is the class that declares the field (the current class, an
+ * enclosing one or a superclass).
+ */
+static bool codegen_static_field_incdec(method_gen_t *mg, const_pool_t *cp,
+                                        const char *field_owner_internal,
+                                        const char *field_name, const char *field_desc,
+                                        bool is_post, bool is_inc)
+{
+    uint8_t add_op = OP_IADD;
+    uint8_t sub_op = OP_ISUB;
+    uint8_t const1_op = OP_ICONST_1;
+    bool is_wide = false;
+    type_kind_t value_kind = TYPE_INT;
+
+    switch (field_desc[0]) {
+    case 'J':
+        add_op = OP_LADD;
+        sub_op = OP_LSUB;
+        const1_op = OP_LCONST_1;
+        is_wide = true;
+        value_kind = TYPE_LONG;
+        break;
+    case 'D':
+        add_op = OP_DADD;
+        sub_op = OP_DSUB;
+        const1_op = OP_DCONST_1;
+        is_wide = true;
+        value_kind = TYPE_DOUBLE;
+        break;
+    case 'F':
+        add_op = OP_FADD;
+        sub_op = OP_FSUB;
+        const1_op = OP_FCONST_1;
+        value_kind = TYPE_FLOAT;
+        break;
+    default:
+        break;
+    }
+
+    uint16_t fieldref = cp_add_fieldref(cp, field_owner_internal, field_name, field_desc);
+
+    bc_emit(mg->code, OP_GETSTATIC);
+    bc_emit_u2(mg->code, fieldref);
+    push_incdec_one(mg, value_kind);                      /* [old] */
+
+    if (is_post) {
+        bc_emit(mg->code, is_wide ? OP_DUP2 : OP_DUP);
+        if (is_wide) {
+            mg_dup2(mg);
+        } else {
+            mg_dup(mg);
+        }                                                   /* [old,old] */
+    }
+    bc_emit(mg->code, const1_op);
+    push_incdec_one(mg, value_kind);
+    bc_emit(mg->code, is_inc ? add_op : sub_op);
+    mg_pop_typed(mg, is_wide ? 2 : 1);                      /* [(old),new] */
+
+    /* a byte, short or char field wraps around on its own width */
+    switch (field_desc[0]) {
+    case 'B': bc_emit(mg->code, OP_I2B); break;
+    case 'S': bc_emit(mg->code, OP_I2S); break;
+    case 'C': bc_emit(mg->code, OP_I2C); break;
+    default: break;
+    }
+
+    if (!is_post) {
+        bc_emit(mg->code, is_wide ? OP_DUP2 : OP_DUP);
+        if (is_wide) {
+            mg_dup2(mg);
+        } else {
+            mg_dup(mg);
+        }                                                   /* [new,new] */
+    }
+    bc_emit(mg->code, OP_PUTSTATIC);
+    bc_emit_u2(mg->code, fieldref);
+    mg_pop_typed(mg, is_wide ? 2 : 1);                      /* [old] or [new] */
     return true;
 }
 
@@ -2319,8 +2402,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                     }
                 }
                 if (outer_sym && outer_sym->data.class_data.members) {
-                    symbol_t *nested_sym = scope_lookup_local(
-                        outer_sym->data.class_data.members, nested_simple);
+                    symbol_t *nested_sym = lookup_member_inherited(outer_sym, nested_simple, 0);
                     if (nested_sym && nested_sym->kind == SYM_ENUM &&
                         nested_sym->data.class_data.members) {
                         symbol_t *const_sym = scope_lookup_local(
@@ -5237,6 +5319,67 @@ static void coerce_arg_to_param(method_gen_t *mg, const_pool_t *cp, ast_node_t *
  * or one of its superclasses (e.g. calling an outer class's method with
  * no explicit qualifier from inside a non-static inner class).
  */
+/**
+ * A member (type) called "name" of "cls" or inherited from a superclass or superinterface:
+ * "Sub.Mode" names the Mode its superclass declares.
+ */
+static symbol_t *lookup_member_inherited(symbol_t *cls, const char *name, int depth)
+{
+    if (!cls || !name || depth > 16) {
+        return NULL;
+    }
+    symbol_complete(cls);
+    if (cls->data.class_data.members) {
+        symbol_t *found = scope_lookup_local(cls->data.class_data.members, name);
+        if (found) {
+            return found;
+        }
+    }
+    symbol_t *found = lookup_member_inherited(cls->data.class_data.superclass, name, depth + 1);
+    for (slist_t *i = cls->data.class_data.interfaces; i && !found; i = i->next) {
+        found = lookup_member_inherited((symbol_t *)i->data, name, depth + 1);
+    }
+    return found;
+}
+
+/**
+ * Whether "cls" inherits members from "owner": owner is a superclass of it, or an interface
+ * it (or one of its superclasses) implements, directly or through other interfaces
+ * (a default method is inherited).
+ */
+static bool class_inherits_from(symbol_t *cls, symbol_t *owner, int depth);
+
+static bool interface_inherits_from(symbol_t *iface, symbol_t *owner, int depth)
+{
+    if (!iface || depth > 24) {
+        return false;
+    }
+    if (iface == owner) {
+        return true;
+    }
+    for (slist_t *i = iface->data.class_data.interfaces; i; i = i->next) {
+        if (interface_inherits_from((symbol_t *)i->data, owner, depth + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool class_inherits_from(symbol_t *cls, symbol_t *owner, int depth)
+{
+    for (symbol_t *s = cls; s && depth < 24; s = s->data.class_data.superclass, depth++) {
+        if (s != cls && s == owner) {
+            return true;
+        }
+        for (slist_t *i = s->data.class_data.interfaces; i; i = i->next) {
+            if (interface_inherits_from((symbol_t *)i->data, owner, 0)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void codegen_load_enclosing_this(method_gen_t *mg, const_pool_t *cp, symbol_t *target_owner)
 {
     if (!mg->class_gen || !mg->class_gen->class_sym) {
@@ -6839,14 +6982,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                  * stack", the invoked method's owner type not assignable
                  * from the inner class pushed). */
                 if (!is_static && owner_class != class_sym) {
-                    bool is_inherited = false;
-                    for (symbol_t *s = class_sym->data.class_data.superclass; s;
-                         s = s->data.class_data.superclass) {
-                        if (s == owner_class) {
-                            is_inherited = true;
-                            break;
-                        }
-                    }
+                    bool is_inherited = class_inherits_from(class_sym, owner_class, 0);
                     if (!is_inherited) {
                         /* owner_class might not be a LEXICALLY enclosing
                          * class at all - it could be a superclass of one
@@ -6879,14 +7015,7 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
                                 walk_target = enc;
                                 break;
                             }
-                            bool enc_inherits = false;
-                            for (symbol_t *s = enc->data.class_data.superclass; s;
-                                 s = s->data.class_data.superclass) {
-                                if (s == owner_class) {
-                                    enc_inherits = true;
-                                    break;
-                                }
-                            }
+                            bool enc_inherits = class_inherits_from(enc, owner_class, 0);
                             if (enc_inherits) {
                                 walk_target = enc;
                                 break;
@@ -7116,6 +7245,11 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
          * exactly what real javac itself emits for this shape. */
         if (!is_static && receiver) {
             type_t *recv_type = receiver->sem_type;
+            if (!recv_type && receiver->type == AST_THIS_EXPR && mg->class_gen && mg->class_gen->class_sym) {
+                /* "this" is the class being generated, not whichever one the analyzer last
+                 * walked (get_expression_type() answers with ITS current class) */
+                recv_type = mg->class_gen->class_sym->type;
+            }
             if (!recv_type && mg->class_gen && mg->class_gen->sem) {
                 recv_type = get_expression_type(mg->class_gen->sem, receiver);
             }
@@ -7538,14 +7672,47 @@ static bool codegen_explicit_ctor_call(method_gen_t *mg, ast_node_t *expr, const
     int arg_count = (is_enum_this_call ? 2 : 0) + (forward_outer ? 1 : 0);
     slist_t *ctor_param_node = (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR) ?
         expr->sem_symbol->data.method_data.parameters : NULL;
-    for (slist_t *node = expr->data.node.children; node; node = node->next) {
+
+    /* A varargs target constructor takes its trailing arguments as one array */
+    symbol_t *target_ctor = (expr->sem_symbol && expr->sem_symbol->kind == SYM_CONSTRUCTOR) ?
+        expr->sem_symbol : NULL;
+    bool is_varargs_ctor = target_ctor && (target_ctor->modifiers & MOD_VARARGS);
+    int fixed_param_count = 0;
+    symbol_t *varargs_param = NULL;
+    if (is_varargs_ctor) {
+        for (slist_t *p = target_ctor->data.method_data.parameters; p; p = p->next) {
+            fixed_param_count++;
+            varargs_param = (symbol_t *)p->data;
+        }
+        fixed_param_count--;
+        if (!varargs_param) {
+            is_varargs_ctor = false;
+        }
+    }
+    int arg_index = 0;
+    bool varargs_array_pushed = false;
+    for (slist_t *node = expr->data.node.children; node; node = node->next, arg_index++) {
         ast_node_t *arg = (ast_node_t *)node->data;
+        if (is_varargs_ctor && arg_index == fixed_param_count) {
+            varargs_array_pushed = true;
+            if (!codegen_varargs_tail(mg, cp, varargs_param, node, false)) {
+                return false;
+            }
+            arg_count++;
+            break;
+        }
         if (!codegen_expr(mg, arg, cp)) {
             return false;
         }
         if (ctor_param_node) {
             coerce_arg_to_param(mg, cp, arg, (symbol_t *)ctor_param_node->data, false);
             ctor_param_node = ctor_param_node->next;
+        }
+        arg_count++;
+    }
+    if (is_varargs_ctor && !varargs_array_pushed) {
+        if (!codegen_varargs_tail(mg, cp, varargs_param, NULL, false)) {
+            return false;
         }
         arg_count++;
     }
@@ -11435,44 +11602,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 if (mg->class_gen) {
                                     field_gen_t *field = hashtable_lookup(mg->class_gen->field_map, name);
                                     if (field && (field->access_flags & ACC_STATIC)) {
-                                        /* Static field: ClassName.field++ or ++ClassName.field */
-                                        uint16_t fieldref = cp_add_fieldref(mg->cp, mg->class_gen->internal_name,
-                                                                             field->name, field->descriptor);
-                                        
-                                        if (is_post) {
-                                            /* Post: getstatic, dup, iconst_1, iadd/isub, putstatic */
-                                            /* Stack trace: [] -> [old] -> [old,old] -> [old,old,1] -> [old,new] -> [old] */
-                                            bc_emit(mg->code, OP_GETSTATIC);
-                                            bc_emit_u2(mg->code, fieldref);
-                                            mg_push_int(mg);  /* [old] */
-                                            bc_emit(mg->code, OP_DUP);
-                                            mg_push_int(mg);  /* [old,old] */
-                                            bc_emit(mg->code, OP_ICONST_1);
-                                            mg_push_int(mg);  /* [old,old,1] */
-                                            bc_emit(mg->code, is_inc ? OP_IADD : OP_ISUB);
-                                            mg_pop_typed(mg, 1);   /* [old,new] */
-                                            bc_emit(mg->code, OP_PUTSTATIC);
-                                            bc_emit_u2(mg->code, fieldref);
-                                            mg_pop_typed(mg, 1);   /* [old] - putstatic consumes value */
-                                            /* Result: old value on stack, stack_depth = 1 */
-                                        } else {
-                                            /* Pre: getstatic, iconst_1, iadd/isub, dup, putstatic */
-                                            /* Stack trace: [] -> [old] -> [old,1] -> [new] -> [new,new] -> [new] */
-                                            bc_emit(mg->code, OP_GETSTATIC);
-                                            bc_emit_u2(mg->code, fieldref);
-                                            mg_push_int(mg);  /* [old] */
-                                            bc_emit(mg->code, OP_ICONST_1);
-                                            mg_push_int(mg);  /* [old,1] */
-                                            bc_emit(mg->code, is_inc ? OP_IADD : OP_ISUB);
-                                            mg_pop_typed(mg, 1);   /* [new] */
-                                            bc_emit(mg->code, OP_DUP);
-                                            mg_push_int(mg);  /* [new,new] */
-                                            bc_emit(mg->code, OP_PUTSTATIC);
-                                            bc_emit_u2(mg->code, fieldref);
-                                            mg_pop_typed(mg, 1);   /* [new] - putstatic consumes value */
-                                            /* Result: new value on stack, stack_depth = 1 */
-                                        }
-                                        return true;
+                                        return codegen_static_field_incdec(mg, cp, mg->class_gen->internal_name,
+                                                                           field->name, field->descriptor,
+                                                                           is_post, is_inc);
                                     }
                                 }
                                 
@@ -11646,6 +11778,30 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                     }
                                 }
                                 
+                                /* A static field of an enclosing class, or inherited by this one or by an
+                                 * enclosing one */
+                                if (mg->class_gen && mg->class_gen->class_sym) {
+                                    for (symbol_t *scope_class = mg->class_gen->class_sym; scope_class;
+                                         scope_class = scope_class->data.class_data.enclosing_class) {
+                                        for (symbol_t *declaring = scope_class; declaring;
+                                             declaring = declaring->data.class_data.superclass) {
+                                            symbol_t *static_field = declaring->data.class_data.members ?
+                                                scope_lookup_local(declaring->data.class_data.members, name) : NULL;
+                                            if (static_field && static_field->kind == SYM_FIELD &&
+                                                (static_field->modifiers & MOD_STATIC) &&
+                                                static_field->type && declaring->qualified_name) {
+                                                char *owner_internal = class_to_internal_name(declaring->qualified_name);
+                                                char *field_desc = type_to_descriptor(static_field->type);
+                                                bool ok = codegen_static_field_incdec(mg, cp, owner_internal, name,
+                                                                                      field_desc, is_post, is_inc);
+                                                free(owner_internal);
+                                                free(field_desc);
+                                                return ok;
+                                            }
+                                        }
+                                    }
+                                }
+
                                 fprintf(stderr, "codegen: cannot resolve variable for increment/decrement: %s\n", name);
                                 return false;
                             }
