@@ -41,7 +41,7 @@ static symbol_t *registry_lookup_nested_members(semantic_t *sem, const char *out
 static symbol_t *lookup_same_package_type(semantic_t *sem, const char *simple_name);
 static const char *semantic_package_name(semantic_t *sem, char *buf, size_t buf_len);
 static symbol_t *resolve_iface_member_type(semantic_t *sem, symbol_t *iface_sym,
-                                           const char *simple_name);
+                                           const char *simple_name, int depth);
 static symbol_t *lookup_superclass_nested_type(semantic_t *sem, symbol_t *start_class,
                                                const char *simple_name);
 static void ensure_interface_parameterized_extends(semantic_t *sem, symbol_t *sym);
@@ -2993,6 +2993,7 @@ static type_t *infer_array_return_from_args(semantic_t *sem, type_t *return_type
                                             symbol_t *method, slist_t *args);
 static type_t *interface_extends_type_for_subst(semantic_t *sem, symbol_t *iface_sym);
 static type_t *enrich_recv_type_for_subst(semantic_t *sem, type_t *recv_type);
+static type_t *receiver_for_method(semantic_t *sem, type_t *recv_type, symbol_t *method);
 static void bind_array_init_elements(semantic_t *sem, ast_node_t *init, type_t *array_type);
 static type_t *infer_type_arg(type_t *param_type, type_t *arg_type, const char *var_name);
 static type_t *infer_type_arg_from_expression(semantic_t *sem, type_t *param_type,
@@ -8878,7 +8879,7 @@ static symbol_t *lookup_same_package_type(semantic_t *sem, const char *simple_na
  * Classpath stubs may omit nested interfaces from members; load by binary name if needed.
  */
 static symbol_t *resolve_iface_member_type(semantic_t *sem, symbol_t *iface_sym,
-                                           const char *simple_name)
+                                           const char *simple_name, int depth)
 {
     if (!sem || !iface_sym || !simple_name) {
         return NULL;
@@ -8904,6 +8905,15 @@ static symbol_t *resolve_iface_member_type(semantic_t *sem, symbol_t *iface_sym,
                    loaded->kind == SYM_ENUM || loaded->kind == SYM_RECORD)) {
         return loaded;
     }
+    /* A member type of a superinterface is inherited too (JLS 8.5) */
+    if (depth < 16) {
+        for (slist_t *super = iface_sym->data.class_data.interfaces; super; super = super->next) {
+            symbol_t *nested = resolve_iface_member_type(sem, (symbol_t *)super->data, simple_name, depth + 1);
+            if (nested) {
+                return nested;
+            }
+        }
+    }
     return NULL;
 }
 
@@ -8922,7 +8932,7 @@ static symbol_t *lookup_superclass_nested_type(semantic_t *sem, symbol_t *start_
         for (slist_t *iface = check_class->data.class_data.interfaces; iface;
              iface = iface->next) {
             symbol_t *iface_sym = (symbol_t *)iface->data;
-            symbol_t *nested = resolve_iface_member_type(sem, iface_sym, simple_name);
+            symbol_t *nested = resolve_iface_member_type(sem, iface_sym, simple_name, 0);
             if (nested) {
                 return nested;
             }
@@ -8938,7 +8948,7 @@ static symbol_t *lookup_superclass_nested_type(semantic_t *sem, symbol_t *start_
             }
             for (slist_t *iface = super->data.class_data.interfaces; iface; iface = iface->next) {
                 symbol_t *iface_sym = (symbol_t *)iface->data;
-                symbol_t *nested = resolve_iface_member_type(sem, iface_sym, simple_name);
+                symbol_t *nested = resolve_iface_member_type(sem, iface_sym, simple_name, 0);
                 if (nested) {
                     return nested;
                 }
@@ -10398,6 +10408,21 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                 
                 /* Special handling for lambda/method ref arguments - they match any functional interface */
                 if (unwrapped_arg->type == AST_LAMBDA_EXPR || unwrapped_arg->type == AST_METHOD_REF) {
+                    /* A lambda or method reference is only ever passed as a functional
+                     * interface: never where a class is expected (DateTimeFormatter.parse's
+                     * ParsePosition, against the TemporalQuery that "Instant::from" is). */
+                    if (param->type->kind == TYPE_CLASS) {
+                        symbol_t *expected = param->type->data.class_type.symbol;
+                        if (!expected && param->type->data.class_type.name) {
+                            expected = load_external_class(sem, param->type->data.class_type.name);
+                        }
+                        if (expected && (expected->kind == SYM_CLASS || expected->kind == SYM_ENUM ||
+                                         expected->kind == SYM_RECORD)) {
+                            type_mismatch = true;
+                            break;
+                        }
+                    }
+                    
                     /* First check if lambda parameter count matches SAM parameter count */
                     if (unwrapped_arg->type == AST_LAMBDA_EXPR && param->type && 
                         param->type->kind == TYPE_CLASS) {
@@ -11381,7 +11406,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                 /* Only check valid interface symbols */
                                 if (iface_sym && (iface_sym->kind == SYM_INTERFACE ||
                                                   iface_sym->kind == SYM_CLASS)) {
-                                    symbol_t *nested = resolve_iface_member_type(sem, iface_sym, name);
+                                    symbol_t *nested = resolve_iface_member_type(sem, iface_sym, name, 0);
                                     if (debug_getenv("GENESIS_DEBUG_IFACE_NESTED")) {
                                         fprintf(stderr, "DEBUG iface_nested:   looked up '%s' in '%s' -> %p (kind=%d, type=%p)\n",
                                             name, iface_sym->name ? iface_sym->name : "(null)",
@@ -15045,6 +15070,177 @@ static scope_t *pattern_binding_scope_for_child(semantic_t *sem, ast_node_t *nod
 }
 
 /**
+ * The type of "c ? then : else" (JLS 15.25), also how the arms of a switch
+ * expression are joined, two at a time. then_expr and else_expr are the
+ * operands, used to tell an int constant that fits a narrower type.
+ */
+static type_t *conditional_result_type(semantic_t *sem, type_t *then_type, type_t *else_type,
+                                       ast_node_t *then_expr, ast_node_t *else_expr)
+{
+    /* If one branch is null, use the type of the other branch */
+    if (then_type && then_type->kind == TYPE_NULL && else_type) {
+        return else_type;
+    }
+    if (else_type && else_type->kind == TYPE_NULL && then_type) {
+        return then_type;
+    }
+
+    /* Numeric binary promotion (JLS 15.25): if both branches are
+     * numeric (primitive or a boxed wrapper) and differ, the
+     * conditional's type is their common promoted type, e.g.
+     * "b ? someInt : someLong" is long, not int. */
+    if (then_type && else_type) {
+        type_kind_t then_kind = then_type->kind;
+        type_kind_t else_kind = else_type->kind;
+        if (then_kind == TYPE_CLASS && then_type->data.class_type.name) {
+            type_kind_t prim = get_primitive_for_wrapper(then_type->data.class_type.name);
+            if (prim != TYPE_UNKNOWN) {
+                then_kind = prim;
+            }
+        }
+        if (else_kind == TYPE_CLASS && else_type->data.class_type.name) {
+            type_kind_t prim = get_primitive_for_wrapper(else_type->data.class_type.name);
+            if (prim != TYPE_UNKNOWN) {
+                else_kind = prim;
+            }
+        }
+        bool then_numeric = (then_kind >= TYPE_BYTE && then_kind <= TYPE_DOUBLE);
+        bool else_numeric = (else_kind >= TYPE_BYTE && else_kind <= TYPE_DOUBLE);
+        if (then_numeric && else_numeric && then_kind != else_kind) {
+            if (then_kind == TYPE_DOUBLE || else_kind == TYPE_DOUBLE) {
+                return type_double();
+            }
+            if (then_kind == TYPE_FLOAT || else_kind == TYPE_FLOAT) {
+                return type_float();
+            }
+            if (then_kind == TYPE_LONG || else_kind == TYPE_LONG) {
+                return type_long();
+            }
+            /* byte with short is short. */
+            if ((then_kind == TYPE_BYTE && else_kind == TYPE_SHORT) ||
+                (then_kind == TYPE_SHORT && else_kind == TYPE_BYTE)) {
+                return type_short();
+            }
+            /* T (byte, short, char) with an int constant that
+             * fits in T is T, not int ("char b = c ? ch : 0"). */
+                                    if (else_type->kind == TYPE_INT &&
+                (then_kind == TYPE_BYTE || then_kind == TYPE_SHORT || then_kind == TYPE_CHAR)) {
+                type_t *t = then_kind == TYPE_BYTE ? type_byte() :
+                            then_kind == TYPE_SHORT ? type_short() : type_char();
+                if (narrowing_constant_allowed(sem, t, else_expr, else_type)) {
+                    return t;
+                }
+            }
+            if (then_type->kind == TYPE_INT &&
+                (else_kind == TYPE_BYTE || else_kind == TYPE_SHORT || else_kind == TYPE_CHAR)) {
+                type_t *t = else_kind == TYPE_BYTE ? type_byte() :
+                            else_kind == TYPE_SHORT ? type_short() : type_char();
+                if (narrowing_constant_allowed(sem, t, then_expr, then_type)) {
+                    return t;
+                }
+            }
+            return type_int();
+        }
+    }
+
+    /* One branch primitive, the other an unrelated reference
+     * ("c == null ? "none" : arr.length"): the primitive is boxed
+     * and the result is the lub of its wrapper and the other
+     * type - Object for these purposes, never the reference
+     * branch's own type (whose frame the boxed value would not
+     * fit: "Integer is not assignable to String"). */
+    if (then_type && else_type) {
+        bool then_prim = then_type->kind >= TYPE_BOOLEAN && then_type->kind <= TYPE_DOUBLE;
+        bool else_prim = else_type->kind >= TYPE_BOOLEAN && else_type->kind <= TYPE_DOUBLE;
+        if (then_prim != else_prim) {
+            type_t *ref = then_prim ? else_type : then_type;
+            if (ref->kind == TYPE_CLASS && ref->data.class_type.name &&
+                get_primitive_for_wrapper(ref->data.class_type.name) == TYPE_UNKNOWN &&
+                strcmp(ref->data.class_type.name, "java.lang.Object") != 0 &&
+                strcmp(ref->data.class_type.name, "java.lang.Number") != 0 &&
+                strcmp(ref->data.class_type.name, "java.lang.Comparable") != 0 &&
+                strcmp(ref->data.class_type.name, "java.io.Serializable") != 0) {
+                return type_object();
+            }
+        }
+    }
+
+    /* Reference conditional (JLS 15.25): prefer whichever
+     * branch's type is the wider one, when one is simply a
+     * subtype of the other (e.g. "cond ? this : someMethod()"
+     * where `this` is a MemoryPath and the method declares
+     * Path) - not a full LUB computation for the general
+     * case (unrelated types still fall back to then_type,
+     * as before), but enough to avoid narrowing the
+     * ternary's type to whichever branch happens to be more
+     * specific. Getting this wrong isn't just a type-
+     * checking nicety: codegen uses this exact type to
+     * correct the stack-map frame at the ternary's join
+     * point (see codegen_expr.c's AST_CONDITIONAL_EXPR
+     * handling), so a too-narrow type here produced a
+     * classfile the verifier rejected outright whenever the
+     * other branch's real value didn't fit that narrower
+     * declared frame. */
+    if (then_type && else_type && then_type != else_type) {
+        if (type_assignable(else_type, then_type)) {
+            return else_type;
+        }
+        if (type_assignable(then_type, else_type)) {
+            return then_type;
+        }
+    }
+
+    /* Neither is a subtype of the other (e.g. two
+     * unrelated final classes both implementing a common
+     * interface, like HandshakeSecurityInfo and
+     * Tls12SecurityInfo both implementing SecurityInfo,
+     * neither a subclass of the other) - find a real
+     * (if not necessarily tightest) common ancestor via
+     * find_common_ancestor_symbol() instead of blindly
+     * falling back to then_type (as this function used
+     * to, unconditionally), which used a type the OTHER
+     * branch's real value often isn't actually assignable
+     * to - corrupting the ternary's own join-point
+     * stack-map frame (codegen_expr.c's
+     * AST_CONDITIONAL_EXPR handling uses this exact type
+     * for that correction) whenever the runtime path
+     * actually takes the else branch. A blind
+     * java.lang.Object fallback would also work for
+     * bytecode verification alone, but is too wide for
+     * this function's OTHER callers - e.g. checking that
+     * `Info info = flag ? new A() : new B();` is a valid
+     * assignment - which need the tightest common type
+     * available, not just any safe one. */
+    if (then_type && else_type && then_type != else_type &&
+        then_type->kind == TYPE_CLASS && else_type->kind == TYPE_CLASS) {
+        /* Not the same type_t instance, but still the
+         * identical named class - common for a classfile-
+         * loaded type (e.g. java.nio.channels.FileChannel)
+         * whose type_t may carry no ->symbol at all, two
+         * separate resolutions of which produce two
+         * distinct type_t objects with the same name.
+         * find_common_ancestor_symbol() below has nothing
+         * to walk without a symbol on at least one side,
+         * and would wrongly fall back to Object for what
+         * is actually an exact match - check by name
+         * first, before ever needing a symbol at all. */
+        if (then_type->data.class_type.name && else_type->data.class_type.name &&
+            strcmp(then_type->data.class_type.name, else_type->data.class_type.name) == 0) {
+            return then_type;
+        }
+        symbol_t *common = find_common_ancestor_symbol(
+            then_type->data.class_type.symbol, else_type->data.class_type.symbol);
+        if (common && common->qualified_name) {
+            return type_new_class(common->qualified_name);
+        }
+        return type_object();
+    }
+
+    /* Otherwise use the then branch type (could be improved to find LUB) */
+    return then_type;
+}
+
+/**
  * Get the type of an expression (iterative).
  */
 type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
@@ -15322,7 +15518,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 symbol_t *iface_sym = (symbol_t *)iface->data;
                                 if (iface_sym && (iface_sym->kind == SYM_INTERFACE ||
                                                   iface_sym->kind == SYM_CLASS)) {
-                                    symbol_t *nested = resolve_iface_member_type(sem, iface_sym, name);
+                                    symbol_t *nested = resolve_iface_member_type(sem, iface_sym, name, 0);
                                     if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
                                                    nested->kind == SYM_ENUM || nested->kind == SYM_RECORD) &&
                                         nested->type) {
@@ -16293,7 +16489,20 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         /* e.g., "abc".trim(), new String().length(), (obj).method() */
                         /* Also handles chained method calls: "abc".trim().toUpperCase() */
                         /* Only when there's an explicit receiver (dot notation) */
+                        /* The receiver is not what the target type is for: "String s =
+                         * id(x).toString()" does not make id's T a String. */
+                        type_t *outer_target = sem->target_type;
+                        sem->target_type = NULL;
                         type_t *recv_type = get_expression_type(sem, first);
+                        sem->target_type = outer_target;
+                        if (outer_target && (!recv_type || recv_type->kind == TYPE_UNKNOWN ||
+                                             recv_type->kind == TYPE_TYPEVAR)) {
+                            /* Not found without it: a type variable of the receiver's own
+                             * supertypes that substitution does not reach (self-bounded
+                             * generics, "Leaf l = new Leaf().named(x).level(3)") is
+                             * settled by the target. */
+                            recv_type = get_expression_type(sem, first);
+                        }
                         recv_type_for_subst = recv_type;  /* Track for type arg substitution */
                         if (recv_type && recv_type->kind == TYPE_CLASS &&
                             !recv_type->data.class_type.type_args &&
@@ -16763,7 +16972,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         /* Substitute receiver type arguments into parameter type */
                         if (recv_type_for_subst && param_type) {
                             param_type = substitute_from_receiver(param_type,
-                                enrich_recv_type_for_subst(sem, recv_type_for_subst));
+                                receiver_for_method(sem, recv_type_for_subst, found_method));
                         }
                         
                         /* Check if this is a varargs parameter */
@@ -16848,6 +17057,54 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 if (!inferred_types[tpi]) {
                                     inferred_types[tpi] = infer_type_arg_from_expression(
                                         sem, infer_from, arg, arg_type, type_param_names[tpi]);
+                                }
+                            }
+                        }
+                        
+                        /* A method reference passed as Function<..., R> (or a TemporalQuery<T>, a
+                         * Supplier<T>...) says what R is: what the method it names returns. */
+                        if (unwrapped_arg->type == AST_METHOD_REF && unwrapped_arg->sem_symbol &&
+                            param->type && param->type->kind == TYPE_CLASS &&
+                            param->type->data.class_type.type_args) {
+                            symbol_t *fi = param->type->data.class_type.symbol;
+                            if (!fi && param->type->data.class_type.name) {
+                                fi = load_external_class(sem, param->type->data.class_type.name);
+                            }
+                            symbol_t *fi_sam = fi ? get_functional_interface_sam(fi) : NULL;
+                            symbol_t *referred = unwrapped_arg->sem_symbol;
+                            type_t *produced = NULL;
+                            if (referred->kind == SYM_CONSTRUCTOR) {
+                                ast_node_t *ref_target = unwrapped_arg->data.node.children ?
+                                    (ast_node_t *)unwrapped_arg->data.node.children->data : NULL;
+                                produced = ref_target ? ref_target->sem_type : NULL;
+                            } else if (referred->type && referred->type->kind != TYPE_VOID &&
+                                       referred->type->kind != TYPE_TYPEVAR) {
+                                produced = referred->type;
+                            }
+                            if (fi_sam && fi_sam->type && fi_sam->type->kind == TYPE_TYPEVAR &&
+                                fi_sam->type->data.type_var.name && produced &&
+                                produced->kind != TYPE_UNKNOWN) {
+                                int pos = 0;
+                                for (slist_t *tp = fi->data.class_data.type_params; tp; tp = tp->next, pos++) {
+                                    symbol_t *tpsym = (symbol_t *)tp->data;
+                                    if (tpsym && tpsym->name &&
+                                        strcmp(tpsym->name, fi_sam->type->data.type_var.name) == 0) {
+                                        break;
+                                    }
+                                }
+                                slist_t *targ = param->type->data.class_type.type_args;
+                                for (int k = 0; k < pos && targ; k++) {
+                                    targ = targ->next;
+                                }
+                                type_t *declared = targ ? (type_t *)targ->data : NULL;
+                                if (declared && declared->kind == TYPE_TYPEVAR && declared->data.type_var.name) {
+                                    for (int tpi = 0; tpi < n_type_params; tpi++) {
+                                        if ((!inferred_types[tpi] || inferred_types[tpi]->kind == TYPE_TYPEVAR ||
+                                             inferred_types[tpi]->kind == TYPE_UNKNOWN) &&
+                                            strcmp(type_param_names[tpi], declared->data.type_var.name) == 0) {
+                                            inferred_types[tpi] = type_boxed(produced);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -17014,7 +17271,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             found_method->type = return_type;
                         }
                     }
-                    type_t *subst_recv = enrich_recv_type_for_subst(sem, recv_type_for_subst);
+                    type_t *subst_recv = receiver_for_method(sem, recv_type_for_subst, found_method);
                     if (subst_recv && return_type) {
                         /* If method returns Object and we have parameterized superclass,
                          * look for generic version of method in superclass hierarchy */
@@ -17130,8 +17387,12 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                         }
                     }
 
-                    /* <T> T m(T arg) — infer return from the argument when names match */
-                    if (return_type && params) {
+                    /* <T> T m(T arg) — infer return from the argument when names match.
+                     * Only for the method's own return type: one substituted from the
+                     * receiver's type arguments (Function<String, T>.apply returns this
+                     * method's T, which is no relation of apply's own parameter T) is
+                     * already settled. */
+                    if (return_type && params && return_type == found_method->type) {
                         const char *ret_var = NULL;
                         if (return_type->kind == TYPE_TYPEVAR &&
                             return_type->data.type_var.name) {
@@ -18715,169 +18976,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     type_t *else_type = expression_type_with_bindings(sem, children->data, false,
                                                                       children->next->next->data);
                     
-                    /* If one branch is null, use the type of the other branch */
-                    if (then_type && then_type->kind == TYPE_NULL && else_type) {
-                        return else_type;
-                    }
-                    if (else_type && else_type->kind == TYPE_NULL && then_type) {
-                        return then_type;
-                    }
-
-                    /* Numeric binary promotion (JLS 15.25): if both branches are
-                     * numeric (primitive or a boxed wrapper) and differ, the
-                     * conditional's type is their common promoted type, e.g.
-                     * "b ? someInt : someLong" is long, not int. */
-                    if (then_type && else_type) {
-                        type_kind_t then_kind = then_type->kind;
-                        type_kind_t else_kind = else_type->kind;
-                        if (then_kind == TYPE_CLASS && then_type->data.class_type.name) {
-                            type_kind_t prim = get_primitive_for_wrapper(then_type->data.class_type.name);
-                            if (prim != TYPE_UNKNOWN) {
-                                then_kind = prim;
-                            }
-                        }
-                        if (else_kind == TYPE_CLASS && else_type->data.class_type.name) {
-                            type_kind_t prim = get_primitive_for_wrapper(else_type->data.class_type.name);
-                            if (prim != TYPE_UNKNOWN) {
-                                else_kind = prim;
-                            }
-                        }
-                        bool then_numeric = (then_kind >= TYPE_BYTE && then_kind <= TYPE_DOUBLE);
-                        bool else_numeric = (else_kind >= TYPE_BYTE && else_kind <= TYPE_DOUBLE);
-                        if (then_numeric && else_numeric && then_kind != else_kind) {
-                            if (then_kind == TYPE_DOUBLE || else_kind == TYPE_DOUBLE) {
-                                return type_double();
-                            }
-                            if (then_kind == TYPE_FLOAT || else_kind == TYPE_FLOAT) {
-                                return type_float();
-                            }
-                            if (then_kind == TYPE_LONG || else_kind == TYPE_LONG) {
-                                return type_long();
-                            }
-                            /* byte with short is short. */
-                            if ((then_kind == TYPE_BYTE && else_kind == TYPE_SHORT) ||
-                                (then_kind == TYPE_SHORT && else_kind == TYPE_BYTE)) {
-                                return type_short();
-                            }
-                            /* T (byte, short, char) with an int constant that
-                             * fits in T is T, not int ("char b = c ? ch : 0"). */
-                            ast_node_t *then_expr = children->next->data;
-                            ast_node_t *else_expr = children->next->next->data;
-                            if (else_type->kind == TYPE_INT &&
-                                (then_kind == TYPE_BYTE || then_kind == TYPE_SHORT || then_kind == TYPE_CHAR)) {
-                                type_t *t = then_kind == TYPE_BYTE ? type_byte() :
-                                            then_kind == TYPE_SHORT ? type_short() : type_char();
-                                if (narrowing_constant_allowed(sem, t, else_expr, else_type)) {
-                                    return t;
-                                }
-                            }
-                            if (then_type->kind == TYPE_INT &&
-                                (else_kind == TYPE_BYTE || else_kind == TYPE_SHORT || else_kind == TYPE_CHAR)) {
-                                type_t *t = else_kind == TYPE_BYTE ? type_byte() :
-                                            else_kind == TYPE_SHORT ? type_short() : type_char();
-                                if (narrowing_constant_allowed(sem, t, then_expr, then_type)) {
-                                    return t;
-                                }
-                            }
-                            return type_int();
-                        }
-                    }
-
-                    /* One branch primitive, the other an unrelated reference
-                     * ("c == null ? "none" : arr.length"): the primitive is boxed
-                     * and the result is the lub of its wrapper and the other
-                     * type - Object for these purposes, never the reference
-                     * branch's own type (whose frame the boxed value would not
-                     * fit: "Integer is not assignable to String"). */
-                    if (then_type && else_type) {
-                        bool then_prim = then_type->kind >= TYPE_BOOLEAN && then_type->kind <= TYPE_DOUBLE;
-                        bool else_prim = else_type->kind >= TYPE_BOOLEAN && else_type->kind <= TYPE_DOUBLE;
-                        if (then_prim != else_prim) {
-                            type_t *ref = then_prim ? else_type : then_type;
-                            if (ref->kind == TYPE_CLASS && ref->data.class_type.name &&
-                                get_primitive_for_wrapper(ref->data.class_type.name) == TYPE_UNKNOWN &&
-                                strcmp(ref->data.class_type.name, "java.lang.Object") != 0 &&
-                                strcmp(ref->data.class_type.name, "java.lang.Number") != 0 &&
-                                strcmp(ref->data.class_type.name, "java.lang.Comparable") != 0 &&
-                                strcmp(ref->data.class_type.name, "java.io.Serializable") != 0) {
-                                return type_object();
-                            }
-                        }
-                    }
-
-                    /* Reference conditional (JLS 15.25): prefer whichever
-                     * branch's type is the wider one, when one is simply a
-                     * subtype of the other (e.g. "cond ? this : someMethod()"
-                     * where `this` is a MemoryPath and the method declares
-                     * Path) - not a full LUB computation for the general
-                     * case (unrelated types still fall back to then_type,
-                     * as before), but enough to avoid narrowing the
-                     * ternary's type to whichever branch happens to be more
-                     * specific. Getting this wrong isn't just a type-
-                     * checking nicety: codegen uses this exact type to
-                     * correct the stack-map frame at the ternary's join
-                     * point (see codegen_expr.c's AST_CONDITIONAL_EXPR
-                     * handling), so a too-narrow type here produced a
-                     * classfile the verifier rejected outright whenever the
-                     * other branch's real value didn't fit that narrower
-                     * declared frame. */
-                    if (then_type && else_type && then_type != else_type) {
-                        if (type_assignable(else_type, then_type)) {
-                            return else_type;
-                        }
-                        if (type_assignable(then_type, else_type)) {
-                            return then_type;
-                        }
-                    }
-
-                    /* Neither is a subtype of the other (e.g. two
-                     * unrelated final classes both implementing a common
-                     * interface, like HandshakeSecurityInfo and
-                     * Tls12SecurityInfo both implementing SecurityInfo,
-                     * neither a subclass of the other) - find a real
-                     * (if not necessarily tightest) common ancestor via
-                     * find_common_ancestor_symbol() instead of blindly
-                     * falling back to then_type (as this function used
-                     * to, unconditionally), which used a type the OTHER
-                     * branch's real value often isn't actually assignable
-                     * to - corrupting the ternary's own join-point
-                     * stack-map frame (codegen_expr.c's
-                     * AST_CONDITIONAL_EXPR handling uses this exact type
-                     * for that correction) whenever the runtime path
-                     * actually takes the else branch. A blind
-                     * java.lang.Object fallback would also work for
-                     * bytecode verification alone, but is too wide for
-                     * this function's OTHER callers - e.g. checking that
-                     * `Info info = flag ? new A() : new B();` is a valid
-                     * assignment - which need the tightest common type
-                     * available, not just any safe one. */
-                    if (then_type && else_type && then_type != else_type &&
-                        then_type->kind == TYPE_CLASS && else_type->kind == TYPE_CLASS) {
-                        /* Not the same type_t instance, but still the
-                         * identical named class - common for a classfile-
-                         * loaded type (e.g. java.nio.channels.FileChannel)
-                         * whose type_t may carry no ->symbol at all, two
-                         * separate resolutions of which produce two
-                         * distinct type_t objects with the same name.
-                         * find_common_ancestor_symbol() below has nothing
-                         * to walk without a symbol on at least one side,
-                         * and would wrongly fall back to Object for what
-                         * is actually an exact match - check by name
-                         * first, before ever needing a symbol at all. */
-                        if (then_type->data.class_type.name && else_type->data.class_type.name &&
-                            strcmp(then_type->data.class_type.name, else_type->data.class_type.name) == 0) {
-                            return then_type;
-                        }
-                        symbol_t *common = find_common_ancestor_symbol(
-                            then_type->data.class_type.symbol, else_type->data.class_type.symbol);
-                        if (common && common->qualified_name) {
-                            return type_new_class(common->qualified_name);
-                        }
-                        return type_object();
-                    }
-
-                    /* Otherwise use the then branch type (could be improved to find LUB) */
-                    return then_type;
+                    return conditional_result_type(sem, then_type, else_type,
+                                                   children->next->data, children->next->next->data);
                 }
                 return type_new_primitive(TYPE_UNKNOWN);
             }
@@ -18887,6 +18987,64 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 /* Switch expression type is inferred from first non-pattern case branch */
                 slist_t *children = expr->data.node.children;
                 if (children) {
+                    /* Without patterns (whose bindings are not in scope here) the
+                     * type is the join of every arm (JLS 15.28.1): each rule's
+                     * expression, and each value a block yields. Arms whose type
+                     * cannot be told yet (they use a local the block declares)
+                     * do not take part. */
+                    bool arms_typed = true;
+                    for (slist_t *c = children->next; c && arms_typed; c = c->next) {
+                        ast_node_t *rule = (ast_node_t *)c->data;
+                        for (slist_t *rc = rule->data.node.children; rc; rc = rc->next) {
+                            ast_node_t *item = (ast_node_t *)rc->data;
+                            if (item->type == AST_TYPE_PATTERN || item->type == AST_GUARDED_PATTERN ||
+                                item->type == AST_UNNAMED_PATTERN || item->type == AST_RECORD_PATTERN) {
+                                arms_typed = false;
+                                break;
+                            }
+                        }
+                    }
+                    if (arms_typed) {
+                        type_t *joined = NULL;
+                        ast_node_t *joined_expr = NULL;
+                        for (slist_t *c = children->next; c; c = c->next) {
+                            ast_node_t *rule = (ast_node_t *)c->data;
+                            ast_node_t *body = NULL;
+                            for (slist_t *rc = rule->data.node.children; rc; rc = rc->next) {
+                                body = (ast_node_t *)rc->data;
+                            }
+                            if (!body || body->type == AST_THROW_STMT) {
+                                continue;
+                            }
+                            slist_t *values = NULL;
+                            if (body->type == AST_BLOCK) {
+                                collect_yields(body, &values);
+                            } else {
+                                values = slist_new(body);
+                            }
+                            for (slist_t *v = values; v; v = v->next) {
+                                ast_node_t *value = (ast_node_t *)v->data;
+                                type_t *t = value->sem_type;
+                                if (!t || t->kind == TYPE_UNKNOWN) {
+                                    /* Not walked yet: a name the block declares is not in
+                                     * scope here, which is no error. */
+                                    bool saved_quiet = sem->loading_dependency;
+                                    sem->loading_dependency = true;
+                                    t = get_expression_type(sem, value);
+                                    sem->loading_dependency = saved_quiet;
+                                }
+                                if (!t || t->kind == TYPE_UNKNOWN) {
+                                    continue;
+                                }
+                                joined = joined ? conditional_result_type(sem, joined, t, joined_expr, value) : t;
+                                joined_expr = value;
+                            }
+                            slist_free(values);
+                        }
+                        if (joined) {
+                            return joined;
+                        }
+                    }
                     /* Skip selector, look at first switch rule */
                     for (slist_t *c = children->next; c; c = c->next) {
                         ast_node_t *rule = (ast_node_t *)c->data;
@@ -19498,6 +19656,7 @@ static void fi_count_abstract_with_sigs(scope_t *members, fi_validation_t *valid
             if (method && method->kind == SYM_METHOD) {
                 /* Check if method is abstract (not static, not default) */
                 if (!(method->modifiers & MOD_STATIC) &&
+                    !(method->modifiers & MOD_PRIVATE) &&
                     !(method->modifiers & MOD_DEFAULT)) {
                     /* Build substituted signature for comparison */
                     char *subst_sig = fi_build_substituted_sig(method, type_args_map);
@@ -19971,6 +20130,59 @@ static type_t *enrich_recv_type_for_subst(semantic_t *sem, type_t *recv_type)
 }
 
 /**
+ * The type in whose terms an inherited method's own type variables are read. A method
+ * declared on a supertype speaks of THAT type's variables: for "MultiValueMap<K, V>
+ * extends Map<K, List<V>>" the V of Map.getOrDefault is List<V>, not the V of the
+ * receiver (matching the two by name or position, as substitute_from_receiver() does,
+ * takes V for the receiver's V). Walks from the receiver's type up through the
+ * superclass or the interface's extends type, substituting at each step, until the
+ * class that declares the method; the receiver's own type if it declares the method or
+ * the path cannot be followed.
+ */
+static type_t *receiver_as_declaring(semantic_t *sem, type_t *recv, scope_t *decl_scope, int depth)
+{
+    if (!recv || recv->kind != TYPE_CLASS || depth > 12) {
+        return NULL;
+    }
+    symbol_t *sym = recv->data.class_type.symbol;
+    if (!sym && recv->data.class_type.name) {
+        sym = load_external_class(sem, recv->data.class_type.name);
+        if (sym) {
+            recv->data.class_type.symbol = sym;
+        }
+    }
+    if (!sym) {
+        return NULL;
+    }
+    if (sym->data.class_data.members == decl_scope) {
+        return recv;
+    }
+    ensure_interface_parameterized_extends(sem, sym);
+    type_t *up = sym->data.class_data.superclass_type;
+    if (!up || up->kind != TYPE_CLASS || !up->data.class_type.type_args) {
+        up = sym->kind == SYM_INTERFACE ? interface_extends_type_for_subst(sem, sym) : NULL;
+    }
+    if (!up || up->kind != TYPE_CLASS) {
+        return NULL;
+    }
+    return receiver_as_declaring(sem, substitute_from_receiver(up, recv), decl_scope, depth + 1);
+}
+
+static type_t *receiver_for_method(semantic_t *sem, type_t *recv_type, symbol_t *method)
+{
+    type_t *recv = enrich_recv_type_for_subst(sem, recv_type);
+    if (recv && method && method->scope && recv->kind == TYPE_CLASS &&
+        recv->data.class_type.type_args && recv->data.class_type.symbol &&
+        recv->data.class_type.symbol->data.class_data.members != method->scope) {
+        type_t *up = receiver_as_declaring(sem, recv, method->scope, 0);
+        if (up) {
+            return up;
+        }
+    }
+    return recv;
+}
+
+/**
  * "<T> T[] toArray(T[] a)": a method type variable that appears as BOTH the
  * element of the return array and the element of one of the parameters is
  * fixed by that ARGUMENT (JLS 18.5), not by the receiver's own type
@@ -20375,6 +20587,19 @@ static type_t *substitute_type_args(type_t *type, symbol_t *iface_sym, slist_t *
 //     }
 // }
 
+/* The key a method goes by when the abstract methods of an interface hierarchy are
+ * counted: its name and the number of its parameters, so that "default bind(a, b)"
+ * does not cancel out "abstract bind(a, b, c)" (the same arity is taken as the same
+ * method: an override with other parameter types, as a generic interface's, is). */
+static void sam_method_key(const symbol_t *sym, char *buf, size_t size)
+{
+    int arity = 0;
+    for (slist_t *p = sym->data.method_data.parameters; p; p = p->next) {
+        arity++;
+    }
+    snprintf(buf, size, "%s/%d", sym->name ? sym->name : "", arity);
+}
+
 /* Helper to recursively collect abstract methods from interface hierarchy */
 static void collect_sam_from_interface(symbol_t *iface, hashtable_t *seen_methods, 
                                        hashtable_t *default_methods,
@@ -20398,8 +20623,10 @@ static void collect_sam_from_interface(symbol_t *iface, hashtable_t *seen_method
                 symbol_t *sym = (symbol_t *)e->value;
                 if (sym && sym->kind == SYM_METHOD && (sym->modifiers & MOD_DEFAULT)) {
                     /* This is a default method - record it to "cancel out" abstract versions */
-                    if (sym->name && !hashtable_lookup(default_methods, sym->name)) {
-                        hashtable_insert(default_methods, sym->name, sym);
+                    char key[320];
+                    sam_method_key(sym, key, sizeof(key));
+                    if (sym->name && !hashtable_lookup(default_methods, key)) {
+                        hashtable_insert(default_methods, key, sym);
                     }
                 }
             }
@@ -20431,6 +20658,7 @@ static void collect_sam_from_interface(symbol_t *iface, hashtable_t *seen_method
                 }
                 if (sym && sym->kind == SYM_METHOD &&
                     !(sym->modifiers & MOD_STATIC) &&
+                    !(sym->modifiers & MOD_PRIVATE) &&   /* a private interface method has a body */
                     !(sym->modifiers & MOD_DEFAULT)) {
                 if (debug) {
                     fprintf(stderr, "DEBUG collect_sam: candidate method '%s' (count before: %d) params=%p\n",
@@ -20451,19 +20679,21 @@ static void collect_sam_from_interface(symbol_t *iface, hashtable_t *seen_method
                     }
                     
                     /* Skip if a default method with this name exists (overrides abstract) */
-                    if (name && hashtable_lookup(default_methods, name)) {
+                    char key[320];
+                    sam_method_key(sym, key, sizeof(key));
+                    if (name && hashtable_lookup(default_methods, key)) {
                         continue;
                     }
                     
                     /* Check if we've already seen a method with this name
                      * (handles diamond inheritance) */
-                    void *existing = hashtable_lookup(seen_methods, name);
+                    void *existing = hashtable_lookup(seen_methods, key);
                     if (debug) {
                         fprintf(stderr, "DEBUG collect_sam: lookup '%s' in seen_methods -> %p\n",
                                 name ? name : "<null>", existing);
                     }
                     if (name && !existing) {
-                        hashtable_insert(seen_methods, name, sym);
+                        hashtable_insert(seen_methods, key, sym);
                         (*count)++;
                         if (debug) {
                             fprintf(stderr, "DEBUG collect_sam: added '%s', count now=%d\n", name, *count);
@@ -21593,6 +21823,48 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
      * the method resolution to find the correct matching method. */
     (void)sam;  /* SAM is validated but not directly used here */
     
+    /* A qualified type name as the target ("Map.Entry::getKey", "java.util.Objects::isNull")
+     * reads as a field access, but names a type unless its first part is a variable. */
+    if (target_node->type == AST_FIELD_ACCESS) {
+        char dotted[512];
+        size_t used = 0;
+        bool names_only = true;
+        ast_node_t *part = target_node;
+        const char *segments[32];
+        int nsegments = 0;
+        while (part && names_only) {
+            if (part->type == AST_FIELD_ACCESS && part->data.node.children && nsegments < 31 &&
+                part->data.node.name) {
+                segments[nsegments++] = part->data.node.name;
+                part = (ast_node_t *)part->data.node.children->data;
+            } else if (part->type == AST_IDENTIFIER && nsegments < 32) {
+                segments[nsegments++] = part->data.leaf.name;
+                break;
+            } else {
+                names_only = false;
+            }
+        }
+        if (names_only && nsegments >= 2) {
+            symbol_t *first = scope_lookup(sem->current_scope, segments[nsegments - 1]);
+            bool first_is_variable = first && (first->kind == SYM_LOCAL_VAR || first->kind == SYM_PARAMETER ||
+                                               first->kind == SYM_FIELD);
+            if (!first_is_variable) {
+                for (int i = nsegments - 1; i >= 0 && used + strlen(segments[i]) + 2 < sizeof(dotted); i--) {
+                    used += (size_t)snprintf(dotted + used, sizeof(dotted) - used, "%s%s",
+                                             used ? "." : "", segments[i]);
+                }
+                ast_node_t *probe = ast_new(AST_CLASS_TYPE, target_node->line, target_node->column);
+                probe->data.node.name = (char *)intern(dotted);
+                type_t *named = semantic_resolve_type(sem, probe);
+                if (named && named->kind == TYPE_CLASS && named->data.class_type.symbol) {
+                    target_node->type = AST_CLASS_TYPE;
+                    target_node->data.node.name = probe->data.node.name;
+                    target_node->data.node.children = NULL;
+                }
+            }
+        }
+    }
+    
     /* Handle array type references like String[]::new or String[]::clone */
     bool is_array_constructor = false;
     
@@ -21858,6 +22130,17 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
                 }
             }
             
+            /* A qualified or nested name resolve_import() does not know */
+            if (!target_class_type) {
+                ast_node_t *probe = ast_new(AST_CLASS_TYPE, ref->line, ref->column);
+                probe->data.node.name = (char *)intern(name);
+                type_t *named = semantic_resolve_type(sem, probe);
+                if (named && named->kind == TYPE_CLASS && named->data.class_type.symbol) {
+                    target_class_type = named;
+                    target_class_sym = named->data.class_type.symbol;
+                }
+            }
+            
             if (!target_class_type) {
                 semantic_error(sem, ref->line, ref->column,
                     "Cannot resolve type '%s' for method reference", name);
@@ -21875,7 +22158,8 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
                 if (target_class_sym->data.class_data.members) {
                     /* For source-defined constructors, try key format name(N) */
                     char ctor_key[256];
-                    snprintf(ctor_key, sizeof(ctor_key), "%s(%d)", name, sam_param_count);
+                    const char *dot = strrchr(name, '.');
+                    snprintf(ctor_key, sizeof(ctor_key), "%s(%d)", dot ? dot + 1 : name, sam_param_count);
                     resolved_method = scope_lookup_local(target_class_sym->data.class_data.members, ctor_key);
                     if (!resolved_method || resolved_method->kind != SYM_CONSTRUCTOR) {
                         /* Try <init>(N) for classfile-loaded constructors */
@@ -21884,7 +22168,8 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
                     }
                     /* If still not found, try to find constructor with matching param count */
                     if (!resolved_method || resolved_method->kind != SYM_CONSTRUCTOR) {
-                        slist_t *ctors = scope_find_all_methods(target_class_sym->data.class_data.members, name);
+                        slist_t *ctors = scope_find_all_methods(target_class_sym->data.class_data.members,
+                                                                dot ? dot + 1 : name);
                         if (ctors) {
                             for (slist_t *c = ctors; c; c = c->next) {
                                 symbol_t *ctor = (symbol_t *)c->data;
@@ -23115,6 +23400,484 @@ static void fold_annotation_constants(semantic_t *sem, ast_node_t *decl)
     if (decl->annotation_default) {
         fold_annotation_element(sem, decl->annotation_default);
     }
+}
+
+/**
+ * Resolves the labels of a switch: an enum constant to its ordinal, a named
+ * constant to its value, a constant expression to a literal; and checks for
+ * duplicate labels. children is the selector followed by AST_CASE_LABELs, whose
+ * first child is the label expression (none for default). Shared by switch
+ * statements and the constant labels of switch expressions.
+ */
+static void resolve_switch_labels(semantic_t *sem, ast_node_t *node, slist_t *children)
+{
+    ast_node_t *selector = (ast_node_t *)children->data;
+    type_t *sel_type = get_expression_type(sem, selector);
+    
+    /* Track seen case values for duplicate detection */
+    hashtable_t *seen_cases = hashtable_new();
+    bool seen_default = false;
+
+    /* Check if selector is an enum type */
+    /* If the type doesn't have a symbol yet, try to load it */
+    if (sel_type && sel_type->kind == TYPE_CLASS &&
+        !sel_type->data.class_type.symbol &&
+        sel_type->data.class_type.name) {
+        symbol_t *sym = load_external_class(sem, sel_type->data.class_type.name);
+        if (sym) {
+            sel_type->data.class_type.symbol = sym;
+        }
+    }
+
+    /* Per JLS 14.11.1, a bare case label in a switch over an
+     * enum type is ALWAYS resolved as an enum constant of
+     * that exact type - never via general scope, class-
+     * member, or static-import lookup, even when a same-
+     * named constant is separately visible through one of
+     * those (e.g. a static-imported "byte" constant with the
+     * same name as one of the enum's own constants). Used
+     * below to skip the GENERIC "duplicate case label" loop's
+     * own identifier resolution for an enum switch - it
+     * doesn't know about this rule and, given such a name
+     * collision, OVERWRITES the correct ordinal (already
+     * resolved by the enum-specific block right below) with
+     * the unrelated same-named constant's own value. */
+    bool is_enum_switch = (sel_type && sel_type->kind == TYPE_CLASS &&
+        sel_type->data.class_type.symbol &&
+        sel_type->data.class_type.symbol->kind == SYM_ENUM);
+
+    /* A String switch's named-constant case
+     * labels (bare or qualified) need their
+     * own resolution: a literal case label
+     * ("case \"basic\":") already works, but
+     * nothing resolved a CONSTANT REFERENCE
+     * ("case BASIC:"/"case Foo.BASIC:") to its
+     * own String value at all before this -
+     * every branch below this point assumed
+     * int, silently leaving such a case label
+     * unresolved (never matching anything at
+     * runtime, with no compile error for a
+     * same-batch constant, or a "Cannot
+     * resolve type" error for a classfile-
+     * loaded one once the unresolved node fell
+     * through to a later, unrelated pass).
+     * Confirmed against gumdrop's own
+     * HttpAuthenticationProvider.generateChallenge()'s
+     * "switch (authMethod) { case
+     * HttpServletRequest.DIGEST_AUTH: ... }". */
+    bool is_string_switch = (sel_type && sel_type->kind == TYPE_CLASS &&
+        sel_type->data.class_type.name &&
+        strcmp(sel_type->data.class_type.name, "java.lang.String") == 0);
+
+    if (sel_type && sel_type->kind == TYPE_CLASS &&
+        sel_type->data.class_type.symbol &&
+        sel_type->data.class_type.symbol->kind == SYM_ENUM) {
+        symbol_t *enum_sym = sel_type->data.class_type.symbol;
+        
+        /* Store enum symbol on switch node for codegen */
+        node->sem_type = sel_type;
+        
+        /* Process case labels */
+        for (slist_t *cnode = children->next; cnode; cnode = cnode->next) {
+            ast_node_t *case_label = (ast_node_t *)cnode->data;
+            if (case_label->type == AST_CASE_LABEL) {
+                /* Skip default */
+                if (case_label->data.node.name &&
+                    strcmp(case_label->data.node.name, "default") == 0) {
+                    continue;
+                }
+                
+                /* Get case expression (first child) */
+                slist_t *case_children = case_label->data.node.children;
+                if (case_children) {
+                    ast_node_t *case_expr = (ast_node_t *)case_children->data;
+                    
+                    /* If case expression is identifier, resolve as enum constant */
+                    if (case_expr->type == AST_IDENTIFIER) {
+                        const char *const_name = case_expr->data.leaf.name;
+                        
+                        /* Look up enum constant in the enum's member scope first */
+                        bool found = false;
+                        int ordinal = -1;
+                        
+                        if (enum_sym->data.class_data.members) {
+                            symbol_t *const_sym = scope_lookup(enum_sym->data.class_data.members, const_name);
+                            if (const_sym && const_sym->kind == SYM_FIELD &&
+                                const_sym->data.var_data.is_enum_constant) {
+                                /* Found in symbol table - get ordinal from symbol */
+                                ordinal = const_sym->data.var_data.enum_ordinal;
+                                found = true;
+                            }
+                        }
+
+                        /* Fallback: try looking through AST if symbol table didn't work */
+                        if (!found) {
+                        ast_node_t *enum_decl = enum_sym->ast;
+                        if (enum_decl) {
+                                ordinal = 0;
+                            slist_t *enum_children = ast_get_children(enum_decl);
+                            for (slist_t *ec = enum_children; ec; ec = ec->next) {
+                                ast_node_t *enum_member = (ast_node_t *)ec->data;
+                                if (enum_member->type == AST_ENUM_CONSTANT) {
+                                    const char *member_name = enum_member->data.node.name;
+                                    if (member_name && strcmp(member_name, const_name) == 0) {
+                                        found = true;
+                                        break;
+                                    }
+                                    ordinal++;
+                                }
+                            }
+                        }
+                        }
+                        
+                        if (found) {
+                            /* Store ordinal on case expression */
+                            case_expr->sem_type = sel_type;
+                            case_expr->data.leaf.value.int_val = ordinal;
+                        } else {
+                            semantic_error(sem, case_expr->line, case_expr->column,
+                                "Cannot resolve symbol: %s", const_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    /* Check for duplicate case labels and constant expression requirement */
+    for (slist_t *cnode = children->next; cnode; cnode = cnode->next) {
+        ast_node_t *case_label = (ast_node_t *)cnode->data;
+        if (case_label->type == AST_CASE_LABEL) {
+            /* Check for duplicate default */
+            if (case_label->data.node.name &&
+                strcmp(case_label->data.node.name, "default") == 0) {
+                if (seen_default) {
+                    semantic_error(sem, case_label->line, case_label->column,
+                        "duplicate default label");
+                }
+                seen_default = true;
+                continue;
+            }
+            
+            /* Get case expression */
+            slist_t *case_children = case_label->data.node.children;
+            if (case_children) {
+                ast_node_t *case_expr = (ast_node_t *)case_children->data;
+                if (case_expr && case_expr->type == AST_LITERAL) {
+                    /* Use the literal value as key */
+                    const char *val = case_expr->data.leaf.name;
+                    if (val) {
+                        if (hashtable_lookup(seen_cases, val)) {
+                            semantic_error(sem, case_label->line, case_label->column,
+                                "duplicate case label");
+                        } else {
+                            hashtable_insert(seen_cases, val, (void *)1);
+                        }
+                    }
+                } else if (case_expr && case_expr->type == AST_IDENTIFIER && !is_enum_switch) {
+                    /* Must be a constant (final static field, imported
+                     * via static import, or inherited). Skipped entirely
+                     * for an enum switch - see is_enum_switch's own
+                     * comment above: its case labels are ALREADY
+                     * correctly resolved as enum constants by the
+                     * dedicated block above, and re-resolving them here
+                     * via general scope/static-import lookup is not just
+                     * redundant but wrong whenever a same-named constant
+                     * happens to be visible some other way (e.g. a
+                     * statically-imported "byte" constant sharing a name
+                     * with one of the enum's own constants) - it would
+                     * silently overwrite the correct ordinal with that
+                     * unrelated constant's own value. Confirmed against
+                     * gumdrop's own SocksProtocolHandler.receive()'s
+                     * "switch (state)": its State enum's own
+                     * SOCKS5_AUTH_USERNAME_PASSWORD/SOCKS5_AUTH_GSSAPI
+                     * share names with two unrelated "byte" constants on
+                     * SocksConstants, brought in via this same file's
+                     * "import static ...SocksConstants.*;" - both
+                     * ordinals got silently overwritten (3->2, 4->1),
+                     * colliding with SOCKS5_METHOD_NEGOTIATION/
+                     * SOCKS4_REQUEST: VerifyError/ClassFormatError "Bad
+                     * lookupswitch instruction". */
+                    if (is_string_switch) {
+                        /* See is_string_switch's own doc comment
+                         * above for why this needs a completely
+                         * separate resolution from the int-only
+                         * logic below. Set BOTH .name (interned -
+                         * codegen_string_switch()'s own case-value
+                         * extraction reads ONLY this field, not
+                         * value.str_val) and value.str_val/str_len
+                         * (what a genuinely-parsed string literal
+                         * ALSO always carries - see
+                         * ast_new_literal_from_lexer()'s identical
+                         * dual assignment for TOK_STRING_LITERAL),
+                         * so this transformed node is
+                         * indistinguishable from a real one to every
+                         * consumer, not just codegen's. */
+                        char *resolved_str = NULL;
+                        if (resolve_named_string_constant(sem, case_expr->data.leaf.name, &resolved_str)) {
+                            case_expr->type = AST_LITERAL;
+                            case_expr->data.leaf.name = (char *)intern(resolved_str);
+                            case_expr->data.leaf.token_type = TOK_STRING_LITERAL;
+                            case_expr->data.leaf.value.str_val = resolved_str;
+                            case_expr->data.leaf.str_len = strlen(resolved_str);
+                        }
+                        continue;
+                    }
+                    const char *name = case_expr->data.leaf.name;
+                    symbol_t *sym = scope_lookup(sem->current_scope, name);
+
+                    /* If not found in scope, try current class members (for interface constants) */
+                    if (!sym && sem->current_class && sem->current_class->data.class_data.members) {
+                        sym = scope_lookup_local(sem->current_class->data.class_data.members, name);
+                    }
+
+                    /* Also check implemented interfaces and, walking
+                     * upward, every superclass - a bare case label can
+                     * inherit its constant from EITHER, not just an
+                     * interface. See resolve_named_int_constant()'s
+                     * identical walk (used for the same constant
+                     * appearing as an OPERAND rather than the whole
+                     * case label) for the full explanation; confirmed
+                     * against gumdrop's own test-only MockPageContext,
+                     * whose inherited "case PAGE_SCOPE:" (from
+                     * javax.servlet.jsp.PageContext, an ABSTRACT
+                     * SUPERCLASS, not an interface) needed exactly
+                     * this. */
+                    for (symbol_t *cls = sem->current_class; cls && !sym; cls = cls->data.class_data.superclass) {
+                        symbol_complete(cls);
+                        slist_t *ifaces = cls->data.class_data.interfaces;
+                        for (slist_t *i = ifaces; i && !sym; i = i->next) {
+                            symbol_t *iface = (symbol_t *)i->data;
+                            if (iface && iface->data.class_data.members) {
+                                sym = scope_lookup_local(iface->data.class_data.members, name);
+                            }
+                        }
+                        if (!sym && cls != sem->current_class && cls->data.class_data.members) {
+                            sym = scope_lookup_local(cls->data.class_data.members, name);
+                        }
+                    }
+
+                    /* A bare case label can also name a
+                     * constant brought in via a static
+                     * import - see
+                     * resolve_named_int_constant()'s
+                     * identical fallback (used for the
+                     * same constant as an OPERAND rather
+                     * than the whole case label) for the
+                     * full explanation. Confirmed against
+                     * gumdrop's own
+                     * SocksProtocolHandler.handleSOCKS5Request()'s
+                     * "switch (atyp)", whose three case
+                     * labels are all brought in via
+                     * "import static
+                     * org.bluezoo.gumdrop.socks.SocksConstants.*;". */
+                    if (!sym) {
+                        symbol_t *field_sym = NULL;
+                        if (resolve_static_import_field(sem, name, &field_sym) && field_sym) {
+                            sym = field_sym;
+                        }
+                    }
+
+                    if (sym && sym->kind == SYM_FIELD) {
+                        /* Check if it's final (constant expression).
+                         * Interface fields are implicitly final but may not have MOD_FINAL
+                         * if declared in a source file that's not fully processed. */
+                        bool is_interface_field = (sem->current_class &&
+                                                  sem->current_class->kind == SYM_INTERFACE);
+                        if (!is_interface_field && !(sym->modifiers & MOD_FINAL)) {
+                            semantic_error(sem, case_expr->line, case_expr->column,
+                                "constant expression required");
+                        }
+
+                        /* Resolve and store this constant's own value on
+                         * the case label, exactly like the enum-switch
+                         * branch above already does for an enum constant's
+                         * ordinal - codegen's lookupswitch needs an actual
+                         * match value per case, and for a plain (non-enum)
+                         * switch over int/char/byte/short, nothing else
+                         * ever resolves a named "static final int FOO = n;"
+                         * case label back to its value n.
+                         * eval_case_constant_operand() handles a simple
+                         * literal initializer directly, as well as a
+                         * compound expression (e.g. "= CONSTRUCTED | 0x10")
+                         * or a qualified reference to ANOTHER class's own
+                         * constant (e.g. "= Other.EXTENSION_TYPE:", matching
+                         * gumdrop's own HandshakeMessages.
+                         * EXT_ENCRYPTED_CLIENT_HELLO) - a bare literal
+                         * initializer used to be handled inline right here
+                         * instead, missing both of those. */
+                        if (sym->data.var_data.has_const_value) {
+                            /* Classfile-loaded field (e.g. an
+                             * inherited "case PAGE_SCOPE:" from
+                             * javax.servlet.jsp.PageContext) - no
+                             * AST declarator to read an initializer
+                             * from; its value already came from its
+                             * own ConstantValue attribute when the
+                             * classfile's fields were loaded. See
+                             * resolve_named_int_constant()'s
+                             * identical fallback for the same
+                             * constant used as an OPERAND rather
+                             * than the whole case label. */
+                            case_expr->data.leaf.value.int_val =
+                                (int32_t)sym->data.var_data.const_value;
+                        } else {
+                            /* sym->ast is the field's own
+                             * AST_VAR_DECLARATOR when registered
+                             * by the main same-batch member-
+                             * registration pass, but the whole
+                             * AST_FIELD_DECL (one declarator per
+                             * comma-separated name) when
+                             * registered via the interface/
+                             * classpath completion path -
+                             * resolve_static_import_field()'s own
+                             * member lookup (used just above for a
+                             * statically-imported constant) returns
+                             * exactly this latter shape even for a
+                             * same-batch class. See
+                             * resolve_named_int_constant()'s
+                             * identical unwrapping. */
+                            ast_node_t *declarator = NULL;
+                            if (sym->ast && sym->ast->type == AST_VAR_DECLARATOR) {
+                                declarator = sym->ast;
+                            } else if (sym->ast && sym->ast->type == AST_FIELD_DECL) {
+                                for (slist_t *dc = sym->ast->data.node.children; dc; dc = dc->next) {
+                                    ast_node_t *cand = (ast_node_t *)dc->data;
+                                    if (cand && cand->type == AST_VAR_DECLARATOR &&
+                                        cand->data.node.name && strcmp(cand->data.node.name, name) == 0) {
+                                        declarator = cand;
+                                        break;
+                                    }
+                                }
+                            }
+                            if (declarator && declarator->data.node.children) {
+                                ast_node_t *init_expr =
+                                    (ast_node_t *)declarator->data.node.children->data;
+                                int32_t resolved_value;
+                                if (eval_case_constant_operand(sem, init_expr, &resolved_value)) {
+                                    case_expr->data.leaf.value.int_val = resolved_value;
+                                }
+                            }
+                        }
+                    }
+                } else if (case_expr && case_expr->type == AST_FIELD_ACCESS) {
+                    /* Qualified constant reference, e.g.
+                     * "case AmqpMethod.CONNECTION_START:" - the
+                     * exact same "named static final int
+                     * constant" need as the bare-identifier
+                     * case just above, just referenced through
+                     * an explicit Type.CONSTANT qualifier
+                     * instead of a plain name (e.g. via static
+                     * import or same-class access). See
+                     * resolve_qualified_constant_case_value()'s
+                     * own doc comment for why this is resolved
+                     * directly rather than via
+                     * get_expression_type().
+                     *
+                     * Once resolved, TRANSFORM this case_expr
+                     * node in place into a plain AST_LITERAL
+                     * carrying the resolved value, rather than
+                     * adding a parallel AST_FIELD_ACCESS branch
+                     * to codegen_stmt.c's own case-value
+                     * extraction (which only recognizes
+                     * AST_LITERAL/AST_IDENTIFIER there) - safe
+                     * because a case label's own constant
+                     * expression is never consulted again for
+                     * anything but its value once semantic
+                     * analysis is done with it. */
+                    if (is_string_switch) {
+                        /* See is_string_switch's own comment
+                         * above, and the bare-identifier
+                         * branch's own comment (just above
+                         * in this same function) for why
+                         * BOTH .name and value.str_val/
+                         * str_len are set. */
+                        char *resolved_str = NULL;
+                        if (resolve_qualified_constant_case_string_value(sem, case_expr, &resolved_str)) {
+                            case_expr->type = AST_LITERAL;
+                            case_expr->data.leaf.name = (char *)intern(resolved_str);
+                            case_expr->data.leaf.token_type = TOK_STRING_LITERAL;
+                            case_expr->data.leaf.value.str_val = resolved_str;
+                            case_expr->data.leaf.str_len = strlen(resolved_str);
+                        }
+                        continue;
+                    }
+                    long long resolved_value = 0;
+                    if (resolve_qualified_constant_case_value(sem, case_expr, &resolved_value)) {
+                        case_expr->type = AST_LITERAL;
+                        case_expr->data.leaf.name = NULL;
+                        case_expr->data.leaf.token_type = TOK_INTEGER_LITERAL;
+                        case_expr->data.leaf.value.int_val = resolved_value;
+                    }
+                } else if (is_string_switch && case_expr &&
+                           (case_expr->type == AST_BINARY_EXPR ||
+                            case_expr->type == AST_PARENTHESIZED)) {
+                    /* A constant String expression as the label
+                     * itself ("case PREFIX + "x":"). Rewritten
+                     * to its literal value exactly like the
+                     * identifier/qualified-name labels above. */
+                    char *resolved_str = NULL;
+                    if (eval_string_constant_expr(sem, case_expr, &resolved_str)) {
+                        case_expr->type = AST_LITERAL;
+                        case_expr->data.leaf.name = (char *)intern(resolved_str);
+                        case_expr->data.leaf.token_type = TOK_STRING_LITERAL;
+                        case_expr->data.leaf.value.str_val = resolved_str;
+                        case_expr->data.leaf.str_len = strlen(resolved_str);
+                    }
+                    continue;
+                } else if (case_expr && case_expr->type == AST_CAST_EXPR) {
+                    /* A qualified (or, in principle, bare) constant
+                     * narrowed by an explicit cast, e.g.
+                     * "case (int) Performative.DESCRIPTOR_OPEN:"
+                     * where DESCRIPTOR_OPEN is declared as a wider
+                     * "long" constant - matches gumdrop's own AMQP
+                     * 1.0 PerformativeCodec, whose descriptor
+                     * constants are all longs switched on as ints.
+                     * AST_CAST_EXPR's children are [type_node,
+                     * operand] (see its own semantic-analysis case
+                     * just above in this file); unwrap to the
+                     * operand and resolve THAT the same way the
+                     * AST_FIELD_ACCESS branch just above does, then
+                     * narrow to a plain (32-bit) int the same way a
+                     * real Java (int) cast of a long constant would
+                     * - only int-width case labels are reachable
+                     * here to begin with (a switch selector can only
+                     * be char/byte/short/int), so the cast's own
+                     * target type doesn't need to be separately
+                     * inspected. */
+                    slist_t *cast_children = case_expr->data.node.children;
+                    ast_node_t *cast_operand = (cast_children && cast_children->next) ?
+                        (ast_node_t *)cast_children->next->data : NULL;
+                    long long resolved_value = 0;
+                    if (cast_operand && cast_operand->type == AST_FIELD_ACCESS &&
+                        resolve_qualified_constant_case_value(sem, cast_operand, &resolved_value)) {
+                        case_expr->type = AST_LITERAL;
+                        case_expr->data.leaf.name = NULL;
+                        case_expr->data.leaf.token_type = TOK_INTEGER_LITERAL;
+                        case_expr->data.leaf.value.int_val = (int32_t)resolved_value;
+                    }
+                } else if (case_expr &&
+                           (case_expr->type == AST_BINARY_EXPR ||
+                            case_expr->type == AST_UNARY_EXPR ||
+                            case_expr->type == AST_PARENTHESIZED)) {
+                    /* A constant EXPRESSION combining named
+                     * constants, e.g. "case SEQUENCE & TAG_MASK:"
+                     * - see eval_case_constant_operand()'s own
+                     * doc comment. Transform in place into a
+                     * plain AST_LITERAL, matching the
+                     * AST_FIELD_ACCESS/AST_CAST_EXPR branches
+                     * just above. */
+                    int32_t resolved_value = 0;
+                    if (eval_case_constant_operand(sem, case_expr, &resolved_value)) {
+                        case_expr->type = AST_LITERAL;
+                        case_expr->data.leaf.name = NULL;
+                        case_expr->data.leaf.token_type = TOK_INTEGER_LITERAL;
+                        case_expr->data.leaf.value.int_val = resolved_value;
+                    }
+                }
+            }
+        }
+    }
+    hashtable_free(seen_cases);
 }
 
 static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
@@ -24751,476 +25514,7 @@ define_local_var:
                             /* Switch statement: check if selector is enum type
                              * If so, resolve case label identifiers as enum constants.
                              * Also check for duplicate case labels. */
-                            slist_t *children = node->data.node.children;
-                            if (children) {
-                                ast_node_t *selector = (ast_node_t *)children->data;
-                                type_t *sel_type = get_expression_type(sem, selector);
-                                
-                                /* Track seen case values for duplicate detection */
-                                hashtable_t *seen_cases = hashtable_new();
-                                bool seen_default = false;
-
-                                /* Check if selector is an enum type */
-                                /* If the type doesn't have a symbol yet, try to load it */
-                                if (sel_type && sel_type->kind == TYPE_CLASS &&
-                                    !sel_type->data.class_type.symbol &&
-                                    sel_type->data.class_type.name) {
-                                    symbol_t *sym = load_external_class(sem, sel_type->data.class_type.name);
-                                    if (sym) {
-                                        sel_type->data.class_type.symbol = sym;
-                                    }
-                                }
-
-                                /* Per JLS 14.11.1, a bare case label in a switch over an
-                                 * enum type is ALWAYS resolved as an enum constant of
-                                 * that exact type - never via general scope, class-
-                                 * member, or static-import lookup, even when a same-
-                                 * named constant is separately visible through one of
-                                 * those (e.g. a static-imported "byte" constant with the
-                                 * same name as one of the enum's own constants). Used
-                                 * below to skip the GENERIC "duplicate case label" loop's
-                                 * own identifier resolution for an enum switch - it
-                                 * doesn't know about this rule and, given such a name
-                                 * collision, OVERWRITES the correct ordinal (already
-                                 * resolved by the enum-specific block right below) with
-                                 * the unrelated same-named constant's own value. */
-                                bool is_enum_switch = (sel_type && sel_type->kind == TYPE_CLASS &&
-                                    sel_type->data.class_type.symbol &&
-                                    sel_type->data.class_type.symbol->kind == SYM_ENUM);
-
-                                /* A String switch's named-constant case
-                                 * labels (bare or qualified) need their
-                                 * own resolution: a literal case label
-                                 * ("case \"basic\":") already works, but
-                                 * nothing resolved a CONSTANT REFERENCE
-                                 * ("case BASIC:"/"case Foo.BASIC:") to its
-                                 * own String value at all before this -
-                                 * every branch below this point assumed
-                                 * int, silently leaving such a case label
-                                 * unresolved (never matching anything at
-                                 * runtime, with no compile error for a
-                                 * same-batch constant, or a "Cannot
-                                 * resolve type" error for a classfile-
-                                 * loaded one once the unresolved node fell
-                                 * through to a later, unrelated pass).
-                                 * Confirmed against gumdrop's own
-                                 * HttpAuthenticationProvider.generateChallenge()'s
-                                 * "switch (authMethod) { case
-                                 * HttpServletRequest.DIGEST_AUTH: ... }". */
-                                bool is_string_switch = (sel_type && sel_type->kind == TYPE_CLASS &&
-                                    sel_type->data.class_type.name &&
-                                    strcmp(sel_type->data.class_type.name, "java.lang.String") == 0);
-
-                                if (sel_type && sel_type->kind == TYPE_CLASS &&
-                                    sel_type->data.class_type.symbol &&
-                                    sel_type->data.class_type.symbol->kind == SYM_ENUM) {
-                                    symbol_t *enum_sym = sel_type->data.class_type.symbol;
-                                    
-                                    /* Store enum symbol on switch node for codegen */
-                                    node->sem_type = sel_type;
-                                    
-                                    /* Process case labels */
-                                    for (slist_t *cnode = children->next; cnode; cnode = cnode->next) {
-                                        ast_node_t *case_label = (ast_node_t *)cnode->data;
-                                        if (case_label->type == AST_CASE_LABEL) {
-                                            /* Skip default */
-                                            if (case_label->data.node.name &&
-                                                strcmp(case_label->data.node.name, "default") == 0) {
-                                                continue;
-                                            }
-                                            
-                                            /* Get case expression (first child) */
-                                            slist_t *case_children = case_label->data.node.children;
-                                            if (case_children) {
-                                                ast_node_t *case_expr = (ast_node_t *)case_children->data;
-                                                
-                                                /* If case expression is identifier, resolve as enum constant */
-                                                if (case_expr->type == AST_IDENTIFIER) {
-                                                    const char *const_name = case_expr->data.leaf.name;
-                                                    
-                                                    /* Look up enum constant in the enum's member scope first */
-                                                    bool found = false;
-                                                    int ordinal = -1;
-                                                    
-                                                    if (enum_sym->data.class_data.members) {
-                                                        symbol_t *const_sym = scope_lookup(enum_sym->data.class_data.members, const_name);
-                                                        if (const_sym && const_sym->kind == SYM_FIELD &&
-                                                            const_sym->data.var_data.is_enum_constant) {
-                                                            /* Found in symbol table - get ordinal from symbol */
-                                                            ordinal = const_sym->data.var_data.enum_ordinal;
-                                                            found = true;
-                                                        }
-                                                    }
-
-                                                    /* Fallback: try looking through AST if symbol table didn't work */
-                                                    if (!found) {
-                                                    ast_node_t *enum_decl = enum_sym->ast;
-                                                    if (enum_decl) {
-                                                            ordinal = 0;
-                                                        slist_t *enum_children = ast_get_children(enum_decl);
-                                                        for (slist_t *ec = enum_children; ec; ec = ec->next) {
-                                                            ast_node_t *enum_member = (ast_node_t *)ec->data;
-                                                            if (enum_member->type == AST_ENUM_CONSTANT) {
-                                                                const char *member_name = enum_member->data.node.name;
-                                                                if (member_name && strcmp(member_name, const_name) == 0) {
-                                                                    found = true;
-                                                                    break;
-                                                                }
-                                                                ordinal++;
-                                                            }
-                                                        }
-                                                    }
-                                                    }
-                                                    
-                                                    if (found) {
-                                                        /* Store ordinal on case expression */
-                                                        case_expr->sem_type = sel_type;
-                                                        case_expr->data.leaf.value.int_val = ordinal;
-                                                    } else {
-                                                        semantic_error(sem, case_expr->line, case_expr->column,
-                                                            "Cannot resolve symbol: %s", const_name);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                
-                                /* Check for duplicate case labels and constant expression requirement */
-                                for (slist_t *cnode = children->next; cnode; cnode = cnode->next) {
-                                    ast_node_t *case_label = (ast_node_t *)cnode->data;
-                                    if (case_label->type == AST_CASE_LABEL) {
-                                        /* Check for duplicate default */
-                                        if (case_label->data.node.name &&
-                                            strcmp(case_label->data.node.name, "default") == 0) {
-                                            if (seen_default) {
-                                                semantic_error(sem, case_label->line, case_label->column,
-                                                    "duplicate default label");
-                                            }
-                                            seen_default = true;
-                                            continue;
-                                        }
-                                        
-                                        /* Get case expression */
-                                        slist_t *case_children = case_label->data.node.children;
-                                        if (case_children) {
-                                            ast_node_t *case_expr = (ast_node_t *)case_children->data;
-                                            if (case_expr && case_expr->type == AST_LITERAL) {
-                                                /* Use the literal value as key */
-                                                const char *val = case_expr->data.leaf.name;
-                                                if (val) {
-                                                    if (hashtable_lookup(seen_cases, val)) {
-                                                        semantic_error(sem, case_label->line, case_label->column,
-                                                            "duplicate case label");
-                                                    } else {
-                                                        hashtable_insert(seen_cases, val, (void *)1);
-                                                    }
-                                                }
-                                            } else if (case_expr && case_expr->type == AST_IDENTIFIER && !is_enum_switch) {
-                                                /* Must be a constant (final static field, imported
-                                                 * via static import, or inherited). Skipped entirely
-                                                 * for an enum switch - see is_enum_switch's own
-                                                 * comment above: its case labels are ALREADY
-                                                 * correctly resolved as enum constants by the
-                                                 * dedicated block above, and re-resolving them here
-                                                 * via general scope/static-import lookup is not just
-                                                 * redundant but wrong whenever a same-named constant
-                                                 * happens to be visible some other way (e.g. a
-                                                 * statically-imported "byte" constant sharing a name
-                                                 * with one of the enum's own constants) - it would
-                                                 * silently overwrite the correct ordinal with that
-                                                 * unrelated constant's own value. Confirmed against
-                                                 * gumdrop's own SocksProtocolHandler.receive()'s
-                                                 * "switch (state)": its State enum's own
-                                                 * SOCKS5_AUTH_USERNAME_PASSWORD/SOCKS5_AUTH_GSSAPI
-                                                 * share names with two unrelated "byte" constants on
-                                                 * SocksConstants, brought in via this same file's
-                                                 * "import static ...SocksConstants.*;" - both
-                                                 * ordinals got silently overwritten (3->2, 4->1),
-                                                 * colliding with SOCKS5_METHOD_NEGOTIATION/
-                                                 * SOCKS4_REQUEST: VerifyError/ClassFormatError "Bad
-                                                 * lookupswitch instruction". */
-                                                if (is_string_switch) {
-                                                    /* See is_string_switch's own doc comment
-                                                     * above for why this needs a completely
-                                                     * separate resolution from the int-only
-                                                     * logic below. Set BOTH .name (interned -
-                                                     * codegen_string_switch()'s own case-value
-                                                     * extraction reads ONLY this field, not
-                                                     * value.str_val) and value.str_val/str_len
-                                                     * (what a genuinely-parsed string literal
-                                                     * ALSO always carries - see
-                                                     * ast_new_literal_from_lexer()'s identical
-                                                     * dual assignment for TOK_STRING_LITERAL),
-                                                     * so this transformed node is
-                                                     * indistinguishable from a real one to every
-                                                     * consumer, not just codegen's. */
-                                                    char *resolved_str = NULL;
-                                                    if (resolve_named_string_constant(sem, case_expr->data.leaf.name, &resolved_str)) {
-                                                        case_expr->type = AST_LITERAL;
-                                                        case_expr->data.leaf.name = (char *)intern(resolved_str);
-                                                        case_expr->data.leaf.token_type = TOK_STRING_LITERAL;
-                                                        case_expr->data.leaf.value.str_val = resolved_str;
-                                                        case_expr->data.leaf.str_len = strlen(resolved_str);
-                                                    }
-                                                    continue;
-                                                }
-                                                const char *name = case_expr->data.leaf.name;
-                                                symbol_t *sym = scope_lookup(sem->current_scope, name);
-
-                                                /* If not found in scope, try current class members (for interface constants) */
-                                                if (!sym && sem->current_class && sem->current_class->data.class_data.members) {
-                                                    sym = scope_lookup_local(sem->current_class->data.class_data.members, name);
-                                                }
-
-                                                /* Also check implemented interfaces and, walking
-                                                 * upward, every superclass - a bare case label can
-                                                 * inherit its constant from EITHER, not just an
-                                                 * interface. See resolve_named_int_constant()'s
-                                                 * identical walk (used for the same constant
-                                                 * appearing as an OPERAND rather than the whole
-                                                 * case label) for the full explanation; confirmed
-                                                 * against gumdrop's own test-only MockPageContext,
-                                                 * whose inherited "case PAGE_SCOPE:" (from
-                                                 * javax.servlet.jsp.PageContext, an ABSTRACT
-                                                 * SUPERCLASS, not an interface) needed exactly
-                                                 * this. */
-                                                for (symbol_t *cls = sem->current_class; cls && !sym; cls = cls->data.class_data.superclass) {
-                                                    symbol_complete(cls);
-                                                    slist_t *ifaces = cls->data.class_data.interfaces;
-                                                    for (slist_t *i = ifaces; i && !sym; i = i->next) {
-                                                        symbol_t *iface = (symbol_t *)i->data;
-                                                        if (iface && iface->data.class_data.members) {
-                                                            sym = scope_lookup_local(iface->data.class_data.members, name);
-                                                        }
-                                                    }
-                                                    if (!sym && cls != sem->current_class && cls->data.class_data.members) {
-                                                        sym = scope_lookup_local(cls->data.class_data.members, name);
-                                                    }
-                                                }
-
-                                                /* A bare case label can also name a
-                                                 * constant brought in via a static
-                                                 * import - see
-                                                 * resolve_named_int_constant()'s
-                                                 * identical fallback (used for the
-                                                 * same constant as an OPERAND rather
-                                                 * than the whole case label) for the
-                                                 * full explanation. Confirmed against
-                                                 * gumdrop's own
-                                                 * SocksProtocolHandler.handleSOCKS5Request()'s
-                                                 * "switch (atyp)", whose three case
-                                                 * labels are all brought in via
-                                                 * "import static
-                                                 * org.bluezoo.gumdrop.socks.SocksConstants.*;". */
-                                                if (!sym) {
-                                                    symbol_t *field_sym = NULL;
-                                                    if (resolve_static_import_field(sem, name, &field_sym) && field_sym) {
-                                                        sym = field_sym;
-                                                    }
-                                                }
-
-                                                if (sym && sym->kind == SYM_FIELD) {
-                                                    /* Check if it's final (constant expression).
-                                                     * Interface fields are implicitly final but may not have MOD_FINAL
-                                                     * if declared in a source file that's not fully processed. */
-                                                    bool is_interface_field = (sem->current_class &&
-                                                                              sem->current_class->kind == SYM_INTERFACE);
-                                                    if (!is_interface_field && !(sym->modifiers & MOD_FINAL)) {
-                                                        semantic_error(sem, case_expr->line, case_expr->column,
-                                                            "constant expression required");
-                                                    }
-
-                                                    /* Resolve and store this constant's own value on
-                                                     * the case label, exactly like the enum-switch
-                                                     * branch above already does for an enum constant's
-                                                     * ordinal - codegen's lookupswitch needs an actual
-                                                     * match value per case, and for a plain (non-enum)
-                                                     * switch over int/char/byte/short, nothing else
-                                                     * ever resolves a named "static final int FOO = n;"
-                                                     * case label back to its value n.
-                                                     * eval_case_constant_operand() handles a simple
-                                                     * literal initializer directly, as well as a
-                                                     * compound expression (e.g. "= CONSTRUCTED | 0x10")
-                                                     * or a qualified reference to ANOTHER class's own
-                                                     * constant (e.g. "= Other.EXTENSION_TYPE:", matching
-                                                     * gumdrop's own HandshakeMessages.
-                                                     * EXT_ENCRYPTED_CLIENT_HELLO) - a bare literal
-                                                     * initializer used to be handled inline right here
-                                                     * instead, missing both of those. */
-                                                    if (sym->data.var_data.has_const_value) {
-                                                        /* Classfile-loaded field (e.g. an
-                                                         * inherited "case PAGE_SCOPE:" from
-                                                         * javax.servlet.jsp.PageContext) - no
-                                                         * AST declarator to read an initializer
-                                                         * from; its value already came from its
-                                                         * own ConstantValue attribute when the
-                                                         * classfile's fields were loaded. See
-                                                         * resolve_named_int_constant()'s
-                                                         * identical fallback for the same
-                                                         * constant used as an OPERAND rather
-                                                         * than the whole case label. */
-                                                        case_expr->data.leaf.value.int_val =
-                                                            (int32_t)sym->data.var_data.const_value;
-                                                    } else {
-                                                        /* sym->ast is the field's own
-                                                         * AST_VAR_DECLARATOR when registered
-                                                         * by the main same-batch member-
-                                                         * registration pass, but the whole
-                                                         * AST_FIELD_DECL (one declarator per
-                                                         * comma-separated name) when
-                                                         * registered via the interface/
-                                                         * classpath completion path -
-                                                         * resolve_static_import_field()'s own
-                                                         * member lookup (used just above for a
-                                                         * statically-imported constant) returns
-                                                         * exactly this latter shape even for a
-                                                         * same-batch class. See
-                                                         * resolve_named_int_constant()'s
-                                                         * identical unwrapping. */
-                                                        ast_node_t *declarator = NULL;
-                                                        if (sym->ast && sym->ast->type == AST_VAR_DECLARATOR) {
-                                                            declarator = sym->ast;
-                                                        } else if (sym->ast && sym->ast->type == AST_FIELD_DECL) {
-                                                            for (slist_t *dc = sym->ast->data.node.children; dc; dc = dc->next) {
-                                                                ast_node_t *cand = (ast_node_t *)dc->data;
-                                                                if (cand && cand->type == AST_VAR_DECLARATOR &&
-                                                                    cand->data.node.name && strcmp(cand->data.node.name, name) == 0) {
-                                                                    declarator = cand;
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-                                                        if (declarator && declarator->data.node.children) {
-                                                            ast_node_t *init_expr =
-                                                                (ast_node_t *)declarator->data.node.children->data;
-                                                            int32_t resolved_value;
-                                                            if (eval_case_constant_operand(sem, init_expr, &resolved_value)) {
-                                                                case_expr->data.leaf.value.int_val = resolved_value;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            } else if (case_expr && case_expr->type == AST_FIELD_ACCESS) {
-                                                /* Qualified constant reference, e.g.
-                                                 * "case AmqpMethod.CONNECTION_START:" - the
-                                                 * exact same "named static final int
-                                                 * constant" need as the bare-identifier
-                                                 * case just above, just referenced through
-                                                 * an explicit Type.CONSTANT qualifier
-                                                 * instead of a plain name (e.g. via static
-                                                 * import or same-class access). See
-                                                 * resolve_qualified_constant_case_value()'s
-                                                 * own doc comment for why this is resolved
-                                                 * directly rather than via
-                                                 * get_expression_type().
-                                                 *
-                                                 * Once resolved, TRANSFORM this case_expr
-                                                 * node in place into a plain AST_LITERAL
-                                                 * carrying the resolved value, rather than
-                                                 * adding a parallel AST_FIELD_ACCESS branch
-                                                 * to codegen_stmt.c's own case-value
-                                                 * extraction (which only recognizes
-                                                 * AST_LITERAL/AST_IDENTIFIER there) - safe
-                                                 * because a case label's own constant
-                                                 * expression is never consulted again for
-                                                 * anything but its value once semantic
-                                                 * analysis is done with it. */
-                                                if (is_string_switch) {
-                                                    /* See is_string_switch's own comment
-                                                     * above, and the bare-identifier
-                                                     * branch's own comment (just above
-                                                     * in this same function) for why
-                                                     * BOTH .name and value.str_val/
-                                                     * str_len are set. */
-                                                    char *resolved_str = NULL;
-                                                    if (resolve_qualified_constant_case_string_value(sem, case_expr, &resolved_str)) {
-                                                        case_expr->type = AST_LITERAL;
-                                                        case_expr->data.leaf.name = (char *)intern(resolved_str);
-                                                        case_expr->data.leaf.token_type = TOK_STRING_LITERAL;
-                                                        case_expr->data.leaf.value.str_val = resolved_str;
-                                                        case_expr->data.leaf.str_len = strlen(resolved_str);
-                                                    }
-                                                    continue;
-                                                }
-                                                long long resolved_value = 0;
-                                                if (resolve_qualified_constant_case_value(sem, case_expr, &resolved_value)) {
-                                                    case_expr->type = AST_LITERAL;
-                                                    case_expr->data.leaf.name = NULL;
-                                                    case_expr->data.leaf.token_type = TOK_INTEGER_LITERAL;
-                                                    case_expr->data.leaf.value.int_val = resolved_value;
-                                                }
-                                            } else if (is_string_switch && case_expr &&
-                                                       (case_expr->type == AST_BINARY_EXPR ||
-                                                        case_expr->type == AST_PARENTHESIZED)) {
-                                                /* A constant String expression as the label
-                                                 * itself ("case PREFIX + "x":"). Rewritten
-                                                 * to its literal value exactly like the
-                                                 * identifier/qualified-name labels above. */
-                                                char *resolved_str = NULL;
-                                                if (eval_string_constant_expr(sem, case_expr, &resolved_str)) {
-                                                    case_expr->type = AST_LITERAL;
-                                                    case_expr->data.leaf.name = (char *)intern(resolved_str);
-                                                    case_expr->data.leaf.token_type = TOK_STRING_LITERAL;
-                                                    case_expr->data.leaf.value.str_val = resolved_str;
-                                                    case_expr->data.leaf.str_len = strlen(resolved_str);
-                                                }
-                                                continue;
-                                            } else if (case_expr && case_expr->type == AST_CAST_EXPR) {
-                                                /* A qualified (or, in principle, bare) constant
-                                                 * narrowed by an explicit cast, e.g.
-                                                 * "case (int) Performative.DESCRIPTOR_OPEN:"
-                                                 * where DESCRIPTOR_OPEN is declared as a wider
-                                                 * "long" constant - matches gumdrop's own AMQP
-                                                 * 1.0 PerformativeCodec, whose descriptor
-                                                 * constants are all longs switched on as ints.
-                                                 * AST_CAST_EXPR's children are [type_node,
-                                                 * operand] (see its own semantic-analysis case
-                                                 * just above in this file); unwrap to the
-                                                 * operand and resolve THAT the same way the
-                                                 * AST_FIELD_ACCESS branch just above does, then
-                                                 * narrow to a plain (32-bit) int the same way a
-                                                 * real Java (int) cast of a long constant would
-                                                 * - only int-width case labels are reachable
-                                                 * here to begin with (a switch selector can only
-                                                 * be char/byte/short/int), so the cast's own
-                                                 * target type doesn't need to be separately
-                                                 * inspected. */
-                                                slist_t *cast_children = case_expr->data.node.children;
-                                                ast_node_t *cast_operand = (cast_children && cast_children->next) ?
-                                                    (ast_node_t *)cast_children->next->data : NULL;
-                                                long long resolved_value = 0;
-                                                if (cast_operand && cast_operand->type == AST_FIELD_ACCESS &&
-                                                    resolve_qualified_constant_case_value(sem, cast_operand, &resolved_value)) {
-                                                    case_expr->type = AST_LITERAL;
-                                                    case_expr->data.leaf.name = NULL;
-                                                    case_expr->data.leaf.token_type = TOK_INTEGER_LITERAL;
-                                                    case_expr->data.leaf.value.int_val = (int32_t)resolved_value;
-                                                }
-                                            } else if (case_expr &&
-                                                       (case_expr->type == AST_BINARY_EXPR ||
-                                                        case_expr->type == AST_UNARY_EXPR ||
-                                                        case_expr->type == AST_PARENTHESIZED)) {
-                                                /* A constant EXPRESSION combining named
-                                                 * constants, e.g. "case SEQUENCE & TAG_MASK:"
-                                                 * - see eval_case_constant_operand()'s own
-                                                 * doc comment. Transform in place into a
-                                                 * plain AST_LITERAL, matching the
-                                                 * AST_FIELD_ACCESS/AST_CAST_EXPR branches
-                                                 * just above. */
-                                                int32_t resolved_value = 0;
-                                                if (eval_case_constant_operand(sem, case_expr, &resolved_value)) {
-                                                    case_expr->type = AST_LITERAL;
-                                                    case_expr->data.leaf.name = NULL;
-                                                    case_expr->data.leaf.token_type = TOK_INTEGER_LITERAL;
-                                                    case_expr->data.leaf.value.int_val = resolved_value;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                hashtable_free(seen_cases);
-                            }
+                            resolve_switch_labels(sem, node, node->data.node.children);
                         }
                         break;
                     
@@ -25239,8 +25533,58 @@ define_local_var:
                                 ast_node_t *selector = (ast_node_t *)children->data;
                                 type_t *sel_type = get_expression_type(sem, selector);
                                 
-                                /* Store selector type on switch node for codegen */
-                                node->sem_type = sel_type;
+                                /* The selector's type goes on the selector, and the type of
+                                 * the whole expression on the switch node, for codegen. */
+                                if (sel_type && !selector->sem_type) {
+                                    selector->sem_type = sel_type;
+                                }
+                                
+                                /* Constant labels (no patterns anywhere): resolved like a
+                                 * switch statement's, through a throwaway list of case
+                                 * labels that share the rules' own label expressions. */
+                                bool constant_labels = true;
+                                for (slist_t *cnode = children->next; cnode && constant_labels; cnode = cnode->next) {
+                                    ast_node_t *rule = (ast_node_t *)cnode->data;
+                                    for (slist_t *rc = rule->data.node.children; rc; rc = rc->next) {
+                                        ast_node_t *item = (ast_node_t *)rc->data;
+                                        if (item->type == AST_TYPE_PATTERN || item->type == AST_GUARDED_PATTERN ||
+                                            item->type == AST_UNNAMED_PATTERN || item->type == AST_RECORD_PATTERN) {
+                                            constant_labels = false;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (constant_labels) {
+                                    slist_t *labels = slist_new(selector);
+                                    slist_t *made = NULL;
+                                    for (slist_t *cnode = children->next; cnode; cnode = cnode->next) {
+                                        ast_node_t *rule = (ast_node_t *)cnode->data;
+                                        bool is_default = rule->data.node.name &&
+                                                          strcmp(rule->data.node.name, "default") == 0;
+                                        if (is_default) {
+                                            ast_node_t *l = ast_new(AST_CASE_LABEL, rule->line, rule->column);
+                                            l->data.node.name = rule->data.node.name;
+                                            slist_append(labels, l);
+                                            made = slist_prepend(made, l);
+                                            continue;
+                                        }
+                                        for (slist_t *rc = rule->data.node.children; rc && rc->next; rc = rc->next) {
+                                            ast_node_t *l = ast_new(AST_CASE_LABEL, rule->line, rule->column);
+                                            ast_add_child(l, (ast_node_t *)rc->data);
+                                            slist_append(labels, l);
+                                            made = slist_prepend(made, l);
+                                        }
+                                    }
+                                    resolve_switch_labels(sem, node, labels);
+                                    for (slist_t *m = made; m; m = m->next) {
+                                        ast_node_t *l = (ast_node_t *)m->data;
+                                        slist_free(l->data.node.children);
+                                        l->data.node.children = NULL;
+                                        ast_free(l);
+                                    }
+                                    slist_free(made);
+                                    slist_free(labels);
+                                }
                                 
                                 /* Process switch rules */
                                 for (slist_t *cnode = children->next; cnode; cnode = cnode->next) {
@@ -25296,7 +25640,7 @@ define_local_var:
                                                 }
                                             }
                                             /* Handle enum constant identifiers */
-                                            else if (case_item->type == AST_IDENTIFIER &&
+                                            else if (!constant_labels && case_item->type == AST_IDENTIFIER &&
                                                      sel_type && sel_type->kind == TYPE_CLASS &&
                                                      sel_type->data.class_type.symbol &&
                                                      sel_type->data.class_type.symbol->kind == SYM_ENUM) {
@@ -25330,6 +25674,13 @@ define_local_var:
                                         }
                                     }
                                 }
+                            }
+                            
+                            /* Leave the type of the whole expression on the node
+                             * (resolve_switch_labels left the selector's there). */
+                            type_t *switch_type = get_expression_type(sem, node);
+                            if (switch_type && switch_type->kind != TYPE_UNKNOWN) {
+                                node->sem_type = switch_type;
                             }
                         }
                         break;
@@ -25578,6 +25929,16 @@ define_local_var:
                         /* Restore scope from before the switch */
                         if (frame->saved_scope) {
                             sem->current_scope = frame->saved_scope;
+                        }
+                        break;
+                    
+                    case AST_SWITCH_EXPR:
+                        {
+                            /* The arms have all been walked: what a block yields is typed now */
+                            type_t *switch_type = get_expression_type(sem, node);
+                            if (switch_type && switch_type->kind != TYPE_UNKNOWN) {
+                                node->sem_type = switch_type;
+                            }
                         }
                         break;
                     

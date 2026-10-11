@@ -346,6 +346,23 @@ static int compare_by_hashcode(const void *a, const void *b)
     return 0;
 }
 
+bool switch_label_int_value(ast_node_t *case_expr, int32_t *out)
+{
+    if (case_expr->type == AST_LITERAL) {
+        if (case_expr->data.leaf.token_type == TOK_CHAR_LITERAL) {
+            *out = (int32_t)char_literal_value(case_expr->data.leaf.value.str_val);
+        } else {
+            *out = (int32_t)case_expr->data.leaf.value.int_val;
+        }
+        return true;
+    }
+    if (case_expr->type == AST_IDENTIFIER) {
+        *out = (int32_t)case_expr->data.leaf.value.int_val;
+        return true;
+    }
+    return eval_int_constant_expr(case_expr, out);
+}
+
 /**
  * Generate code for switch statement on String (Java 7+).
  * 
@@ -4761,6 +4778,24 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* Generate yield value */
                 if (!codegen_expr(mg, (ast_node_t *)children->data, mg->cp)) {
                     return false;
+                }
+                
+                if (mg->yield_to_label) {
+                    ast_node_t *value = (ast_node_t *)children->data;
+                    if (mg->yield_type) {
+                        type_kind_t from_kind;
+                        const char *from_class;
+                        value_kind_and_class(mg, value, &from_kind, &from_class);
+                        coerce_stack_value(mg, mg->cp, from_kind, from_class,
+                                           mg->yield_type->kind,
+                                           mg->yield_type->kind == TYPE_CLASS ?
+                                               mg->yield_type->data.class_type.name : NULL);
+                    }
+                    cond_emit_jump(mg, OP_GOTO, 0, &mg->yield_label);
+                    mg_pop_typed(mg, (mg->yield_type && (mg->yield_type->kind == TYPE_LONG ||
+                                                       mg->yield_type->kind == TYPE_DOUBLE)) ? 2 : 1);  /* the value travels with the jump */
+                    mg->last_opcode = OP_GOTO;
+                    return true;
                 }
                 
                 /* Emit goto - will be patched by enclosing switch expression */

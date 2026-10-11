@@ -12,7 +12,8 @@ import java.util.function.Function;
 /* Regression test: type-use annotations (JSR 308; JSpecify's @Nullable is
  * everywhere in Spring Boot) in the positions that failed to parse: after a
  * method's type parameters, as the first type argument of a parameter, in a
- * cast, on a for or enhanced-for variable, and on a lambda parameter. */
+ * cast, on a for or enhanced-for variable, on a lambda parameter, and on a
+ * nested type named through its outer one (Outer.@Nullable Inner). */
 public class TypeUseAnnotationPositionsTest {
     @Target({ElementType.TYPE_USE, ElementType.TYPE_PARAMETER})
     @Retention(RetentionPolicy.RUNTIME)
@@ -33,6 +34,23 @@ public class TypeUseAnnotationPositionsTest {
 
     static String typeArgument(Callable<@Nullable Object> c, Map<@Nullable String, Object> m) throws Exception {
         return String.valueOf(c.call()) + m.size();
+    }
+
+    // an annotation inside a qualified type name, in a field, a constructor and a method parameter
+    static class Outer {
+        static class Inner {
+        }
+    }
+
+    Outer.@Nullable Inner inner;
+
+    TypeUseAnnotationPositionsTest(int unused, Outer.@Nullable Inner inner) {
+        this.inner = inner;
+        this.callable = null;
+    }
+
+    static int nested(List<Outer.@Nullable Inner> list, java.util.@Nullable List<String> other) {
+        return list.size() + (other == null ? 0 : other.size());
     }
 
     // a cast to an annotated type
@@ -69,6 +87,8 @@ public class TypeUseAnnotationPositionsTest {
         check(cast("abc"), "abc");
         check(loops(new ArrayList<>(Arrays.asList("ab", "c"))), 1000 + 3 + 2);
         check(lambda("x"), "x!");
+        check(nested(List.of(new Outer.Inner()), null), 1);
+        check(new TypeUseAnnotationPositionsTest(1, new Outer.Inner()).inner != null, true);
         System.out.println("TypeUseAnnotationPositionsTest passed!");
     }
 

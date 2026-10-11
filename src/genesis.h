@@ -555,6 +555,7 @@ typedef struct parser
     int error_column;               /* Error column number */
     token_type_t pending_token;     /* Pending token from split >> or >>> (0 if none) */
     ast_node_t *record_decl;        /* Record whose body is being parsed (compact constructors) */
+    int in_case_label;              /* Parsing a case label: "X ->" is the rule arrow, not a lambda */
 } parser_t;
 
 /* Parser API */

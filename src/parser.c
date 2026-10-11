@@ -1296,7 +1296,7 @@ static ast_node_t *parse_primary(parser_t *parser)
                 parser_advance(parser);
                 
                 /* Check for lambda: identifier -> body */
-                if (parser_check(parser, TOK_ARROW)) {
+                if (!parser->in_case_label && parser_check(parser, TOK_ARROW)) {
                     parser_advance(parser);
                     ast_node_t *lambda = ast_new(AST_LAMBDA_EXPR, line, col);
                     ast_add_child(lambda, node);  /* Parameter */
@@ -1923,7 +1923,9 @@ static ast_node_t *parse_primary(parser_t *parser)
                                     if (pattern) {
                                         /* Check for when guard */
                                         if (parser_match(parser, TOK_WHEN)) {
+                                            parser->in_case_label++;
                                             ast_node_t *guard = parse_expression(parser);
+                                            parser->in_case_label--;
                                             ast_node_t *guarded = ast_new(AST_GUARDED_PATTERN, pattern_line, pattern_col);
                                             ast_add_child(guarded, pattern);
                                             if (guard) {
@@ -1935,14 +1937,18 @@ static ast_node_t *parse_primary(parser_t *parser)
                                         }
                                     } else {
                                         /* Not a pattern, parse as expression */
+                                        parser->in_case_label++;
                                         ast_node_t *case_expr = parse_expression(parser);
+                                        parser->in_case_label--;
                                         if (case_expr) {
                                             ast_add_child(rule, case_expr);
                                         }
                                     }
                                 } else {
                                     /* Regular expression */
+                                    parser->in_case_label++;
                                     ast_node_t *case_expr = parse_expression(parser);
+                                    parser->in_case_label--;
                                     if (case_expr) {
                                         ast_add_child(rule, case_expr);
                                     }
@@ -2489,7 +2495,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     if (parser_check(parser, TOK_NEW)) {
                         ref->data.node.name = (char *)intern("new");
                         parser_advance(parser);
-                    } else if (parser_check(parser, TOK_IDENTIFIER)) {
+                    } else if (parser_check_identifier_or_contextual(parser)) {
                         ref->data.node.name = (char *)intern(parser_current_text(parser));
                         parser_advance(parser);
                     } else {
@@ -2795,6 +2801,15 @@ ast_node_t *parse_type(parser_t *parser)
             lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
             parser_advance(parser);
             
+            /* An annotation on a nested type: Outer.@Nullable Inner */
+            if (parser_check(parser, TOK_AT)) {
+                slist_t *nested_annotations = parse_type_annotations(parser);
+                for (slist_t *a = nested_annotations; a; a = a->next) {
+                    ast_free((ast_node_t *)a->data);
+                }
+                slist_free(nested_annotations);
+            }
+            
             if (parser_check(parser, TOK_IDENTIFIER)) {
                 string_append_c(name, '.');
                 string_append(name, parser_current_text(parser));
@@ -3024,6 +3039,36 @@ ast_node_t *parse_block(parser_t *parser)
 /**
  * Parse a statement.
  */
+/**
+ * Whether control cannot continue past the end of a statement written as the
+ * body of a switch rule: a throw, or a block ending in a statement that leaves
+ * it. A break after such a statement would be unreachable.
+ */
+static bool statement_ends_abruptly(ast_node_t *stmt)
+{
+    if (stmt->type == AST_BLOCK) {
+        slist_t *c = stmt->data.node.children;
+        if (!c) {
+            return false;
+        }
+        while (c->next) {
+            c = c->next;
+        }
+        return statement_ends_abruptly((ast_node_t *)c->data);
+    }
+    if (stmt->type == AST_IF_STMT) {
+        /* children: condition, then, else */
+        slist_t *c = stmt->data.node.children;
+        if (c && c->next && c->next->next) {
+            return statement_ends_abruptly((ast_node_t *)c->next->data) &&
+                   statement_ends_abruptly((ast_node_t *)c->next->next->data);
+        }
+        return false;
+    }
+    return stmt->type == AST_THROW_STMT || stmt->type == AST_RETURN_STMT ||
+           stmt->type == AST_BREAK_STMT || stmt->type == AST_CONTINUE_STMT;
+}
+
 static ast_node_t *parse_statement(parser_t *parser)
 {
     token_type_t tok_type = parser_current_type(parser);
@@ -3455,41 +3500,91 @@ static ast_node_t *parse_statement(parser_t *parser)
                     return NULL;
                 }
                 
-                /* Parse cases */
+                /* Parse cases. A rule "case A, B -> body" is the old form with
+                 * the labels laid out one after another and the body ending in
+                 * a break: "case A: case B: body; break;". */
                 while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
                     if (parser_check(parser, TOK_CASE) || parser_check(parser, TOK_DEFAULT)) {
-                        ast_node_t *case_label = ast_new(AST_CASE_LABEL,
-                                                         parser_current_line(parser),
-                                                         parser_current_column(parser));
+                        int label_line = parser_current_line(parser);
+                        int label_col = parser_current_column(parser);
+                        slist_t *labels = NULL;   /* of AST_CASE_LABEL, in source order */
                         
                         if (parser_match(parser, TOK_DEFAULT)) {
+                            ast_node_t *case_label = ast_new(AST_CASE_LABEL, label_line, label_col);
                             case_label->data.node.name = (char *)intern("default");
+                            labels = slist_new(case_label);
                         } else {
                             parser_advance(parser);  /* consume 'case' */
-                            ast_node_t *case_expr = parse_expression(parser);
-                            if (case_expr) {
-                                ast_add_child(case_label, case_expr);
+                            do {
+                                ast_node_t *case_label = ast_new(AST_CASE_LABEL,
+                                                                 parser_current_line(parser),
+                                                                 parser_current_column(parser));
+                                parser->in_case_label++;
+                                ast_node_t *case_expr = parse_expression(parser);
+                                parser->in_case_label--;
+                                if (case_expr) {
+                                    ast_add_child(case_label, case_expr);
+                                }
+                                if (labels) {
+                                    slist_append(labels, case_label);
+                                } else {
+                                    labels = slist_new(case_label);
+                                }
+                            } while (parser_match(parser, TOK_COMMA));
+                        }
+                        
+                        /* The label that carries the statements */
+                        slist_t *last = labels;
+                        while (last->next) {
+                            last = last->next;
+                        }
+                        ast_node_t *body_label = (ast_node_t *)last->data;
+                        
+                        if (parser_match(parser, TOK_ARROW)) {
+                            int body_line = parser_current_line(parser);
+                            int body_col = parser_current_column(parser);
+                            ast_node_t *body;
+                            if (parser_check(parser, TOK_LBRACE) || parser_check(parser, TOK_THROW)) {
+                                body = parse_statement(parser);
+                            } else {
+                                ast_node_t *expr = parse_expression(parser);
+                                parser_expect(parser, TOK_SEMICOLON);
+                                body = ast_new(AST_EXPR_STMT, body_line, body_col);
+                                if (expr) {
+                                    ast_add_child(body, expr);
+                                }
+                            }
+                            if (body) {
+                                ast_add_child(body_label, body);
+                                if (!statement_ends_abruptly(body)) {
+                                    ast_add_child(body_label, ast_new(AST_BREAK_STMT, body_line, body_col));
+                                }
+                            }
+                        } else {
+                            if (!parser_expect(parser, TOK_COLON)) {
+                                for (slist_t *l = labels; l; l = l->next) {
+                                    ast_free((ast_node_t *)l->data);
+                                }
+                                ast_free(node);
+                                return NULL;
+                            }
+                            
+                            /* Parse statements until next case or end */
+                            while (!parser_check(parser, TOK_CASE) &&
+                                   !parser_check(parser, TOK_DEFAULT) &&
+                                   !parser_check(parser, TOK_RBRACE) &&
+                                   !parser_check(parser, TOK_EOF)) {
+                                ast_node_t *stmt = parse_statement(parser);
+                                if (stmt) {
+                                    ast_add_child(body_label, stmt);
+                                }
                             }
                         }
                         
-                        if (!parser_expect(parser, TOK_COLON)) {
-                            ast_free(case_label);
-                            ast_free(node);
-                            return NULL;
+                        for (slist_t *l = labels; l; l = l->next) {
+                            ast_add_child(node, (ast_node_t *)l->data);
                         }
-                        
-                        /* Parse statements until next case or end */
-                        while (!parser_check(parser, TOK_CASE) &&
-                               !parser_check(parser, TOK_DEFAULT) &&
-                               !parser_check(parser, TOK_RBRACE) &&
-                               !parser_check(parser, TOK_EOF)) {
-                            ast_node_t *stmt = parse_statement(parser);
-                            if (stmt) {
-                                ast_add_child(case_label, stmt);
-                            }
-                        }
-                        
-                        ast_add_child(node, case_label);
+                        slist_free(labels);
                     } else {
                         parser_error(parser, "Expected 'case' or 'default'");
                         ast_free(node);

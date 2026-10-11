@@ -270,6 +270,11 @@ bool codegen_cond_jump(method_gen_t *mg, const_pool_t *cp, ast_node_t *expr, boo
                        slist_t **label);
 bool codegen_cond_value(method_gen_t *mg, const_pool_t *cp, ast_node_t *expr);
 void cond_bind_label(method_gen_t *mg, slist_t **label, bool fallthrough_reachable);
+void cond_emit_jump(method_gen_t *mg, uint8_t opcode, int pops, slist_t **label);
+
+/* The int a case label stands for (codegen_stmt.c): a literal, a resolved constant or enum
+ * ordinal, or a constant expression. False if it is none of these. */
+bool switch_label_int_value(ast_node_t *case_expr, int32_t *out);
 void cond_patch_label_back(method_gen_t *mg, slist_t **label, size_t target);
 
 /* Autoboxing/unboxing code generation */

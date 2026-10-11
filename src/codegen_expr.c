@@ -3243,7 +3243,7 @@ bool cond_has_binding(ast_node_t *expr)
 }
 
 /** Emits a jump whose target is not known yet; it is recorded on the label with the state it carries. */
-static void cond_emit_jump(method_gen_t *mg, uint8_t opcode, int pops, slist_t **label)
+void cond_emit_jump(method_gen_t *mg, uint8_t opcode, int pops, slist_t **label)
 {
     size_t pos = mg->code->length;
     bc_emit(mg->code, opcode);
@@ -10263,6 +10263,324 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
  * ======================================================================== */
 
 /**
+ * A switch expression whose labels are constants (an int, char or boxed value, an
+ * enum constant, a String), in either form. The selector is dispatched on once:
+ * an int or an enum's ordinal through a lookupswitch, a String through equals
+ * tests. Every arm then leaves its value (converted to the type of the whole
+ * expression) on the stack and jumps to the end, where the frame is the merge of
+ * what each jump carried, with the type of the expression on top of the stack. A
+ * switch over an enum with no default throws MatchException for a constant it did
+ * not see (one added to the enum after this class was compiled).
+ */
+static bool codegen_constant_switch_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
+{
+    slist_t *children = expr->data.node.children;
+    ast_node_t *selector = (ast_node_t *)children->data;
+
+    type_t *result = expr->sem_type;
+    if (!result || result->kind == TYPE_UNKNOWN || result->kind == TYPE_NULL || result->kind == TYPE_VOID) {
+        result = type_object();
+    }
+
+    type_t *sel_type = selector->sem_type;
+    const char *sel_class = (sel_type && sel_type->kind == TYPE_CLASS) ? sel_type->data.class_type.name : NULL;
+    bool is_enum = sel_type && sel_type->kind == TYPE_CLASS &&
+                   sel_type->data.class_type.symbol &&
+                   sel_type->data.class_type.symbol->kind == SYM_ENUM;
+    bool is_string = sel_class && strcmp(sel_class, "java.lang.String") == 0;
+
+    /* The rules, and their labels */
+    int nrules = 0;
+    for (slist_t *c = children->next; c; c = c->next) {
+        nrules++;
+    }
+    ast_node_t **rules = calloc(nrules ? nrules : 1, sizeof(*rules));
+    int default_rule = -1;
+    int nlabels = 0;
+    int r = 0;
+    for (slist_t *c = children->next; c; c = c->next, r++) {
+        ast_node_t *rule = (ast_node_t *)c->data;
+        rules[r] = rule;
+        if (rule->data.node.name && strcmp(rule->data.node.name, "default") == 0) {
+            default_rule = r;
+        } else {
+            for (slist_t *l = rule->data.node.children; l && l->next; l = l->next) {
+                nlabels++;
+            }
+        }
+    }
+    bool synthetic_default = default_rule < 0;
+    int total = nrules + (synthetic_default ? 1 : 0);   /* the synthetic default is the last */
+    if (synthetic_default) {
+        default_rule = nrules;
+    }
+
+    uint16_t saved_slot = mg->next_slot;
+    uint16_t saved_locals = mg->stackmap ? mg_save_locals_count(mg) : 0;
+    int base_depth = mg->stack_depth;
+
+    /* The previous switch expression's yield context, restored at the end */
+    bool outer_to_label = mg->yield_to_label;
+    slist_t *outer_label = mg->yield_label;
+    type_t *outer_type = mg->yield_type;
+
+    if (!codegen_expr(mg, selector, cp)) {
+        free(rules);
+        return false;
+    }
+
+    slist_t **rule_jumps = calloc(total, sizeof(*rule_jumps));    /* String: jumps to each rule */
+    size_t *rule_pos = calloc(total, sizeof(size_t));
+    int32_t *label_values = calloc(nlabels ? nlabels : 1, sizeof(int32_t));
+    int *label_rule = calloc(nlabels ? nlabels : 1, sizeof(int));
+    size_t *label_patch = calloc(nlabels ? nlabels : 1, sizeof(size_t));
+    size_t switch_pos = 0;
+    size_t default_patch = 0;
+
+    if (is_string) {
+        uint16_t tmp = mg->next_slot++;
+        if (mg->next_slot > mg->max_locals) {
+            mg->max_locals = mg->next_slot;
+        }
+        bc_emit(mg->code, OP_ASTORE);
+        bc_emit_u1(mg->code, (uint8_t)tmp);
+        mg_pop_typed(mg, 1);
+        if (mg->stackmap) {
+            stackmap_set_local_object(mg->stackmap, tmp, mg->cp, "java/lang/String");
+        }
+        uint16_t equals_ref = cp_add_methodref(cp, "java/lang/String", "equals", "(Ljava/lang/Object;)Z");
+        for (int i = 0; i < nrules; i++) {
+            if (i == default_rule && !synthetic_default) {
+                continue;
+            }
+            for (slist_t *l = rules[i]->data.node.children; l && l->next; l = l->next) {
+                bc_emit(mg->code, OP_ALOAD);
+                bc_emit_u1(mg->code, (uint8_t)tmp);
+                mg_push_object(mg, "java/lang/String");
+                if (!codegen_expr(mg, (ast_node_t *)l->data, cp)) {
+                    return false;
+                }
+                bc_emit(mg->code, OP_INVOKEVIRTUAL);
+                bc_emit_u2(mg->code, equals_ref);
+                mg_pop_typed(mg, 2);
+                mg_push_int(mg);
+                cond_emit_jump(mg, OP_IFNE, 1, &rule_jumps[i]);
+            }
+        }
+        cond_emit_jump(mg, OP_GOTO, 0, &rule_jumps[default_rule]);
+    } else {
+        if (sel_class && !is_enum) {
+            /* a boxed Integer, Character, Short or Byte */
+            coerce_stack_value(mg, cp, TYPE_CLASS, sel_class, TYPE_INT, NULL);
+        }
+        if (is_enum) {
+            uint16_t ordinal_ref = cp_add_methodref(cp, "java/lang/Enum", "ordinal", "()I");
+            bc_emit(mg->code, OP_INVOKEVIRTUAL);
+            bc_emit_u2(mg->code, ordinal_ref);
+        }
+        int n = 0;
+        for (int i = 0; i < nrules; i++) {
+            if (i == default_rule && !synthetic_default) {
+                continue;
+            }
+            for (slist_t *l = rules[i]->data.node.children; l && l->next; l = l->next) {
+                int32_t v = 0;
+                switch_label_int_value((ast_node_t *)l->data, &v);
+                label_values[n] = v;
+                label_rule[n] = i;
+                n++;
+            }
+        }
+        for (int i = 0; i < n - 1; i++) {
+            for (int j = 0; j < n - i - 1; j++) {
+                if (label_values[j] > label_values[j + 1]) {
+                    int32_t tv = label_values[j];
+                    label_values[j] = label_values[j + 1];
+                    label_values[j + 1] = tv;
+                    int tr = label_rule[j];
+                    label_rule[j] = label_rule[j + 1];
+                    label_rule[j + 1] = tr;
+                }
+            }
+        }
+        switch_pos = mg->code->length;
+        bc_emit(mg->code, OP_LOOKUPSWITCH);
+        mg_pop_typed(mg, 1);
+        while (mg->code->length % 4 != 0) {
+            bc_emit_u1(mg->code, 0);
+        }
+        default_patch = mg->code->length;
+        bc_emit_u4(mg->code, 0);
+        bc_emit_u4(mg->code, (uint32_t)n);
+        for (int i = 0; i < n; i++) {
+            bc_emit_u4(mg->code, (uint32_t)label_values[i]);
+            label_patch[i] = mg->code->length;
+            bc_emit_u4(mg->code, 0);
+        }
+        nlabels = n;
+    }
+
+    stackmap_state_t *entry_state = mg->stackmap ? stackmap_save_state(mg->stackmap) : NULL;
+    uint16_t entry_slot = mg->next_slot;
+
+    mg->yield_to_label = true;
+    mg->yield_label = NULL;
+    mg->yield_type = result;
+
+    bool ok = true;
+    for (int i = 0; i < total && ok; i++) {
+        /* Each rule is reached only by the dispatch */
+        mg->stack_depth = base_depth;
+        mg->next_slot = entry_slot;
+        if (entry_state && mg->stackmap) {
+            stackmap_restore_state(mg->stackmap, entry_state);
+        }
+        rule_pos[i] = mg->code->length;
+        if (is_string) {
+            cond_bind_label(mg, &rule_jumps[i], false);
+        } else {
+            mg_record_frame(mg);
+        }
+        mg->last_opcode = 0;
+
+        if (i == nrules) {
+            /* No default: no label matched */
+            int cls = cp_add_class(cp, is_enum ? "java/lang/MatchException" : "java/lang/IncompatibleClassChangeError");
+            bc_emit(mg->code, OP_NEW);
+            bc_emit_u2(mg->code, (uint16_t)cls);
+            mg_push_object(mg, is_enum ? "java/lang/MatchException" : "java/lang/IncompatibleClassChangeError");
+            bc_emit(mg->code, OP_DUP);
+            mg_dup(mg);
+            if (is_enum) {
+                bc_emit(mg->code, OP_ACONST_NULL);
+                mg_push_null(mg);
+                bc_emit(mg->code, OP_ACONST_NULL);
+                mg_push_null(mg);
+                uint16_t init = cp_add_methodref(cp, "java/lang/MatchException", "<init>",
+                                                 "(Ljava/lang/String;Ljava/lang/Throwable;)V");
+                bc_emit(mg->code, OP_INVOKESPECIAL);
+                bc_emit_u2(mg->code, init);
+                mg_pop_typed(mg, 3);
+            } else {
+                uint16_t init = cp_add_methodref(cp, "java/lang/IncompatibleClassChangeError", "<init>", "()V");
+                bc_emit(mg->code, OP_INVOKESPECIAL);
+                bc_emit_u2(mg->code, init);
+                mg_pop_typed(mg, 1);
+            }
+            bc_emit(mg->code, OP_ATHROW);
+            mg_pop_typed(mg, 1);
+            mg->last_opcode = OP_ATHROW;
+            continue;
+        }
+
+        ast_node_t *body = NULL;
+        for (slist_t *c = rules[i]->data.node.children; c; c = c->next) {
+            body = (ast_node_t *)c->data;
+        }
+        if (!body) {
+            continue;
+        }
+        if (body->type == AST_BLOCK || body->type == AST_THROW_STMT) {
+            ok = codegen_statement(mg, body);
+        } else {
+            ok = codegen_expr(mg, body, cp);
+            if (ok) {
+                type_kind_t from_kind;
+                const char *from_class;
+                value_kind_and_class(mg, body, &from_kind, &from_class);
+                coerce_stack_value(mg, cp, from_kind, from_class, result->kind,
+                                   result->kind == TYPE_CLASS ? result->data.class_type.name : NULL);
+                cond_emit_jump(mg, OP_GOTO, 0, &mg->yield_label);
+                mg_pop_typed(mg, (result->kind == TYPE_LONG || result->kind == TYPE_DOUBLE) ? 2 : 1);
+                mg->last_opcode = OP_GOTO;
+            }
+        }
+    }
+
+    slist_t *end_label = mg->yield_label;
+    mg->yield_to_label = outer_to_label;
+    mg->yield_label = outer_label;
+    mg->yield_type = outer_type;
+
+    if (ok && !is_string) {
+        for (int i = 0; i < nlabels; i++) {
+            int32_t off = (int32_t)(rule_pos[label_rule[i]] - switch_pos);
+            for (int b = 0; b < 4; b++) {
+                mg->code->code[label_patch[i] + b] = (uint8_t)(off >> (24 - 8 * b));
+            }
+        }
+        int32_t off = (int32_t)(rule_pos[default_rule] - switch_pos);
+        for (int b = 0; b < 4; b++) {
+            mg->code->code[default_patch + b] = (uint8_t)(off >> (24 - 8 * b));
+        }
+    }
+
+    free(rules);
+    free(rule_jumps);
+    free(rule_pos);
+    free(label_values);
+    free(label_rule);
+    free(label_patch);
+    if (!ok) {
+        stackmap_state_free(entry_state);
+        return false;
+    }
+
+    /* The value of the switch on the stack, as the frame at the end declares it */
+    mg->stack_depth = base_depth;
+    mg->next_slot = saved_slot;
+    if (entry_state && mg->stackmap) {
+        stackmap_restore_state(mg->stackmap, entry_state);
+    }
+    stackmap_state_free(entry_state);
+    switch (result->kind) {
+        case TYPE_LONG:
+            mg_push_long(mg);
+            break;
+        case TYPE_FLOAT:
+            mg_push_float(mg);
+            break;
+        case TYPE_DOUBLE:
+            mg_push_double(mg);
+            break;
+        case TYPE_CLASS:
+        case TYPE_ARRAY:
+        case TYPE_TYPEVAR: {
+            char *desc = type_to_descriptor(result);
+            if (desc && desc[0] == 'L') {
+                mg_push_object_from_descriptor(mg, desc);
+            } else if (desc && desc[0] == '[') {
+                mg_push_object_from_descriptor(mg, desc);
+            } else {
+                mg_push_object(mg, "java/lang/Object");
+            }
+            free(desc);
+            break;
+        }
+        default:
+            mg_push_int(mg);
+            break;
+    }
+    if (end_label) {
+        if (mg->stackmap && mg->stackmap->current_stack_size > 0) {
+            verification_type_t top = mg->stackmap->current_stack[mg->stackmap->current_stack_size - 1];
+            for (slist_t *e = end_label; e; e = e->next) {
+                pending_condition_branch_t *pe = (pending_condition_branch_t *)e->data;
+                if (pe->state && pe->state->stack_size > 0) {
+                    pe->state->stack[pe->state->stack_size - 1] = top;
+                }
+            }
+        }
+        cond_bind_label(mg, &end_label, false);
+        mg->last_opcode = 0;
+    }
+    if (saved_locals > 0) {
+        mg_restore_locals_count(mg, saved_locals);
+    }
+    return true;
+}
+
+/**
  * Generate code for switch expression with type patterns.
  * Uses instanceof checks instead of lookupswitch.
  */
@@ -12545,304 +12863,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     return codegen_pattern_switch_expr(mg, expr, cp);
                 }
                 
-                /* Generate selector expression */
-                ast_node_t *selector = (ast_node_t *)children->data;
-                if (!codegen_expr(mg, selector, cp)) {
-                    return false;
-                }
-                
-                /* Count case rules (excluding default) */
-                /* The body is the LAST child of each rule. All other children are case constants. */
-                int num_cases = 0;
-                for (slist_t *node = children->next; node; node = node->next) {
-                    ast_node_t *rule = (ast_node_t *)node->data;
-                    if (rule->type == AST_SWITCH_RULE) {
-                        if (!(rule->data.node.name && 
-                              strcmp(rule->data.node.name, "default") == 0)) {
-                            /* Count children minus 1 (last child is the body) */
-                            slist_t *rule_children = rule->data.node.children;
-                            int child_count = 0;
-                            for (slist_t *rc = rule_children; rc; rc = rc->next) {
-                                child_count++;
-                            }
-                            num_cases += (child_count > 0) ? (child_count - 1) : 0;
-                        }
-                    }
-                }
-                
-                /* Check if this is an enum switch */
-                bool is_enum_switch = (selector->sem_type && 
-                                       selector->sem_type->kind == TYPE_CLASS &&
-                                       selector->sem_type->data.class_type.symbol &&
-                                       selector->sem_type->data.class_type.symbol->kind == SYM_ENUM);
-                
-                /* For enum switch, call ordinal() */
-                if (is_enum_switch) {
-                    uint16_t methodref = cp_add_methodref(cp, "java/lang/Enum", "ordinal", "()I");
-                    bc_emit(mg->code, OP_INVOKEVIRTUAL);
-                    bc_emit_u2(mg->code, methodref);
-                }
-                
-                /* Emit lookupswitch */
-                size_t switch_pos = mg->code->length;
-                bc_emit(mg->code, OP_LOOKUPSWITCH);
-                mg_pop_typed(mg, 1);  /* Selector consumed */
-                
-                /* Pad to 4-byte alignment */
-                while ((mg->code->length) % 4 != 0) {
-                    bc_emit_u1(mg->code, 0);
-                }
-                
-                /* Default offset placeholder */
-                size_t default_offset_pos = mg->code->length;
-                bc_emit_u4(mg->code, 0);
-                
-                /* Number of pairs */
-                bc_emit_u4(mg->code, (uint32_t)num_cases);
-                
-                /* Collect case values and emit sorted pairs */
-                int32_t *case_values = calloc(num_cases, sizeof(int32_t));
-                size_t *case_offset_positions = calloc(num_cases, sizeof(size_t));
-                ast_node_t **case_rules = calloc(num_cases, sizeof(ast_node_t *));
-                int case_idx = 0;
-                
-                for (slist_t *node = children->next; node; node = node->next) {
-                    ast_node_t *rule = (ast_node_t *)node->data;
-                    if (rule->type == AST_SWITCH_RULE) {
-                        if (rule->data.node.name && 
-                            strcmp(rule->data.node.name, "default") == 0) {
-                            continue;  /* Skip default */
-                        }
-                        
-                        /* All children except the last are case constants */
-                        slist_t *rule_children = rule->data.node.children;
-                        for (slist_t *rc = rule_children; rc && rc->next; rc = rc->next) {
-                            ast_node_t *child = (ast_node_t *)rc->data;
-                            
-                            if (child->type == AST_LITERAL) {
-                                case_values[case_idx] = (int32_t)child->data.leaf.value.int_val;
-                            } else if (child->type == AST_IDENTIFIER && is_enum_switch) {
-                                case_values[case_idx] = (int32_t)child->data.leaf.value.int_val;
-                            }
-                            case_rules[case_idx] = rule;
-                            case_idx++;
-                        }
-                    }
-                }
-                
-                /* Sort by value */
-                for (int i = 0; i < num_cases - 1; i++) {
-                    for (int j = 0; j < num_cases - i - 1; j++) {
-                        if (case_values[j] > case_values[j + 1]) {
-                            int32_t tmp_val = case_values[j];
-                            case_values[j] = case_values[j + 1];
-                            case_values[j + 1] = tmp_val;
-                            ast_node_t *tmp_rule = case_rules[j];
-                            case_rules[j] = case_rules[j + 1];
-                            case_rules[j + 1] = tmp_rule;
-                        }
-                    }
-                }
-                
-                /* Emit sorted pairs with offset placeholders */
-                for (int i = 0; i < num_cases; i++) {
-                    bc_emit_u4(mg->code, (uint32_t)case_values[i]);
-                    case_offset_positions[i] = mg->code->length;
-                    bc_emit_u4(mg->code, 0);
-                }
-                
-                /* Track gotos to patch at end */
-                slist_t *end_gotos = NULL;
-                
-                /* Find default rule */
-                ast_node_t *default_rule = NULL;
-                for (slist_t *node = children->next; node; node = node->next) {
-                    ast_node_t *rule = (ast_node_t *)node->data;
-                    if (rule->type == AST_SWITCH_RULE &&
-                        rule->data.node.name && 
-                        strcmp(rule->data.node.name, "default") == 0) {
-                        default_rule = rule;
-                        break;
-                    }
-                }
-                
-                /* Generate code for each unique rule */
-                ast_node_t *last_rule = NULL;
-                size_t default_code_pos = 0;
-                
-                for (int i = 0; i < num_cases; i++) {
-                    if (case_rules[i] == last_rule) {
-                        /* Same rule as previous - just patch offset to same location */
-                        continue;
-                    }
-                    
-                    size_t code_pos = mg->code->length;
-                    mg_record_frame(mg);
-                    
-                    /* Patch all cases pointing to this rule */
-                    for (int j = i; j < num_cases; j++) {
-                        if (case_rules[j] == case_rules[i]) {
-                            int32_t offset = (int32_t)(code_pos - switch_pos);
-                            mg->code->code[case_offset_positions[j] + 0] = (offset >> 24) & 0xFF;
-                            mg->code->code[case_offset_positions[j] + 1] = (offset >> 16) & 0xFF;
-                            mg->code->code[case_offset_positions[j] + 2] = (offset >> 8) & 0xFF;
-                            mg->code->code[case_offset_positions[j] + 3] = offset & 0xFF;
-                        }
-                    }
-                    
-                    last_rule = case_rules[i];
-                    
-                    /* Generate rule body - the body is the last child of the rule */
-                    slist_t *rule_children = case_rules[i]->data.node.children;
-                    ast_node_t *body = NULL;
-                    for (slist_t *rc = rule_children; rc; rc = rc->next) {
-                        body = (ast_node_t *)rc->data;
-                    }
-                    
-                    if (body) {
-                        if (body->type == AST_BLOCK) {
-                            /* Block with yield - set up yield patch context */
-                            slist_t *saved_yield = mg->yield_patches;
-                            mg->yield_patches = NULL;
-                            
-                            /* Generate block statements */
-                            slist_t *stmts = body->data.node.children;
-                            for (slist_t *s = stmts; s; s = s->next) {
-                                if (!codegen_statement(mg, (ast_node_t *)s->data)) {
-                                    free(case_values);
-                                    free(case_offset_positions);
-                                    free(case_rules);
-                                    slist_free(end_gotos);
-                                    return false;
-                                }
-                            }
-                            
-                            /* Collect yield patches as end gotos */
-                            for (slist_t *yp = mg->yield_patches; yp; yp = yp->next) {
-                                end_gotos = slist_prepend(end_gotos, yp->data);
-                            }
-                            slist_free(mg->yield_patches);
-                            mg->yield_patches = saved_yield;
-                        } else if (body->type == AST_THROW_STMT) {
-                            /* throw statement */
-                            if (!codegen_statement(mg, body)) {
-                                free(case_values);
-                                free(case_offset_positions);
-                                free(case_rules);
-                                slist_free(end_gotos);
-                                return false;
-                            }
-                            /* No need for goto - throw doesn't fall through */
-                            continue;
-                        } else {
-                            /* Expression - generate it */
-                            if (!codegen_expr(mg, body, cp)) {
-                                free(case_values);
-                                free(case_offset_positions);
-                                free(case_rules);
-                                slist_free(end_gotos);
-                                return false;
-                            }
-                            
-                            /* Emit goto to end */
-                            size_t goto_pos = mg->code->length;
-                            bc_emit(mg->code, OP_GOTO);
-                            bc_emit_u2(mg->code, 0);
-                            end_gotos = slist_prepend(end_gotos, (void *)(uintptr_t)goto_pos);
-                            mg_pop_typed(mg, 1);  /* Result will be restored at merge point */
-                        }
-                    }
-                }
-                
-                /* Generate default if present */
-                if (default_rule) {
-                    default_code_pos = mg->code->length;
-                    mg_record_frame(mg);
-                    
-                    /* The body is the last (and only for default) child */
-                    slist_t *rule_children = default_rule->data.node.children;
-                    ast_node_t *body = NULL;
-                    for (slist_t *rc = rule_children; rc; rc = rc->next) {
-                        body = (ast_node_t *)rc->data;
-                    }
-                    
-                    if (body) {
-                        if (body->type == AST_BLOCK) {
-                            slist_t *saved_yield = mg->yield_patches;
-                            mg->yield_patches = NULL;
-                            
-                            slist_t *stmts = body->data.node.children;
-                            for (slist_t *s = stmts; s; s = s->next) {
-                                if (!codegen_statement(mg, (ast_node_t *)s->data)) {
-                                    free(case_values);
-                                    free(case_offset_positions);
-                                    free(case_rules);
-                                    slist_free(end_gotos);
-                                    return false;
-                                }
-                            }
-                            
-                            for (slist_t *yp = mg->yield_patches; yp; yp = yp->next) {
-                                end_gotos = slist_prepend(end_gotos, yp->data);
-                            }
-                            slist_free(mg->yield_patches);
-                            mg->yield_patches = saved_yield;
-                        } else if (body->type == AST_THROW_STMT) {
-                            if (!codegen_statement(mg, body)) {
-                                free(case_values);
-                                free(case_offset_positions);
-                                free(case_rules);
-                                slist_free(end_gotos);
-                                return false;
-                            }
-                        } else {
-                            if (!codegen_expr(mg, body, cp)) {
-                                free(case_values);
-                                free(case_offset_positions);
-                                free(case_rules);
-                                slist_free(end_gotos);
-                                return false;
-                            }
-                            size_t goto_pos = mg->code->length;
-                            bc_emit(mg->code, OP_GOTO);
-                            bc_emit_u2(mg->code, 0);
-                            end_gotos = slist_prepend(end_gotos, (void *)(uintptr_t)goto_pos);
-                            mg_pop_typed(mg, 1);
-                        }
-                    }
-                }
-                
-                /* Patch default offset */
-                size_t switch_end = mg->code->length;
-                int32_t default_offset;
-                if (default_code_pos != 0) {
-                    default_offset = (int32_t)(default_code_pos - switch_pos);
-                } else {
-                    default_offset = (int32_t)(switch_end - switch_pos);
-                }
-                mg->code->code[default_offset_pos + 0] = (default_offset >> 24) & 0xFF;
-                mg->code->code[default_offset_pos + 1] = (default_offset >> 16) & 0xFF;
-                mg->code->code[default_offset_pos + 2] = (default_offset >> 8) & 0xFF;
-                mg->code->code[default_offset_pos + 3] = default_offset & 0xFF;
-                
-                /* Patch all gotos to end */
-                mg_record_frame(mg);
-                for (slist_t *g = end_gotos; g; g = g->next) {
-                    size_t goto_pos = (size_t)(uintptr_t)g->data;
-                    int16_t offset = (int16_t)(switch_end - goto_pos);
-                    mg->code->code[goto_pos + 1] = (offset >> 8) & 0xFF;
-                    mg->code->code[goto_pos + 2] = offset & 0xFF;
-                }
-                
-                slist_free(end_gotos);
-                free(case_values);
-                free(case_offset_positions);
-                free(case_rules);
-                
-                /* Result is on stack from whichever branch was taken */
-                mg_push(mg, 1);
-                
-                return true;
+                return codegen_constant_switch_expr(mg, expr, cp);
             }
         
         case AST_LAMBDA_EXPR:
@@ -13972,15 +13993,18 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     actual_method_name = "<init>";
                 } else if (is_static) {
                     handle_kind = REF_invokeStatic;
+                } else if (target_class_sym->kind == SYM_INTERFACE) {
+                    handle_kind = REF_invokeInterface;
                 } else {
                     /* For both bound and unbound instance methods, use invokeVirtual */
                     handle_kind = REF_invokeVirtual;
                 }
                 
-                /* Create method reference in constant pool */
-                uint16_t method_ref = cp_add_methodref(cp, target_internal,
-                                                        actual_method_name,
-                                                        method_descriptor);
+                /* Create method reference in constant pool; a method named through an
+                 * interface is an InterfaceMethodref, whatever its kind */
+                uint16_t method_ref = (!is_constructor && target_class_sym->kind == SYM_INTERFACE) ?
+                    cp_add_interface_methodref(cp, target_internal, actual_method_name, method_descriptor) :
+                    cp_add_methodref(cp, target_internal, actual_method_name, method_descriptor);
                 if (method_ref == 0) {
                     fprintf(stderr, "codegen: failed to add method ref to constant pool\n");
                     free(target_internal);
@@ -14028,7 +14052,20 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                  */
                 uint16_t erased_type = cp_add_method_type(cp, sam_descriptor);
                 const char *spec_desc_str = specialized_sam_desc ? specialized_sam_desc : sam_descriptor;
+                /* An unbound instance method takes its receiver as the first argument, which
+                 * must be a subtype of the class that declares it: with a wildcard or a raw
+                 * interface the specialized type still says Object there. */
+                char *receiver_desc = NULL;
+                if (!is_constructor && !is_static && !is_bound &&
+                    strncmp(spec_desc_str, "(Ljava/lang/Object;", 19) == 0 &&
+                    strcmp(target_internal, "java/lang/Object") != 0) {
+                    size_t n = strlen(target_internal) + strlen(spec_desc_str) + 4;
+                    receiver_desc = malloc(n);
+                    snprintf(receiver_desc, n, "(L%s;%s", target_internal, spec_desc_str + 19);
+                    spec_desc_str = receiver_desc;
+                }
                 uint16_t specialized_type = cp_add_method_type(cp, spec_desc_str);
+                free(receiver_desc);
                 if (erased_type == 0 || specialized_type == 0) {
                     fprintf(stderr, "codegen: failed to add method types\n");
                     free(target_internal);
