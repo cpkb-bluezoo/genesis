@@ -38,9 +38,6 @@ DEFERRED / WILL NOT IMPLEMENT
       More sophisticated recovery (multiple errors, smarter sync points)
       would be useful for IDE integration but not critical for CLI use.
 
-  [ ] Type path for nested type annotations (generics, arrays)
-      Low priority - rarely used in practice.
-
 
 ================================================================================
 KNOWN BUGS
@@ -79,45 +76,12 @@ KNOWN BUGS
    Consumers such as the functional interface lookup deduplicate by name;
    the double registration itself should be removed.
 
-9. [FIXED] Primitive conversions (widening in assignments/returns/array
-   stores, compound assignment for every type and String, binary numeric
-   promotion, println overload selection, ternary promotion, boxing to
-   Object) were incomplete in codegen. Fixed via coerce_stack_value and
-   codegen_compound_rhs in codegen_expr.c, used at every assignment,
-   declaration, return and compound-assignment site. Two bugs found and
-   fixed along the way: pass2_check_types (semantic.c) did not persist
-   sem_type for AST_BINARY_EXPR/AST_UNARY_EXPR/AST_CONDITIONAL_EXPR nodes,
-   which is what left codegen guessing; and >>= / >>>= were silently
-   dropped by the parser (parser_classify_gt_sequence in parser.c), since
-   the lexer's normal '>' + '=' -> GE merge combines the *last* '>' of the
-   run with a following '=', which the old reconstruction did not expect.
-
-10. [FIXED] A nested record's toString() printed the binary name
-    ("T$P[x=1]") rather than the simple name ("P[x=1]"): the class file's
-    own internal name has package and enclosing-class separators ('/' and
-    '$') that look alike once stripped only up to the last '/'. Now taken
-    from the class symbol's own (already-simple) name instead of parsed
-    out of the internal name at all.
-
-11. A boxed-LHS compound assignment (Integer i; i += 1;) unboxes, promotes
+9. A boxed-LHS compound assignment (Integer i; i += 1;) unboxes, promotes
     and reboxes correctly for a local variable, field or array element, but
     only because codegen_compound_rhs handles it generically; it has not
     been separately tested with a wrapper of every primitive type.
 
-12. Same-batch TOP-LEVEL annotation retention gap: a method annotation
-    applied and used entirely within one compile, where the annotation
-    TYPE ITSELF is also top-level (not nested) and declared elsewhere in
-    the same file/batch, can silently end up with no
-    RuntimeVisibleAnnotations entry at all. semantic_resolve_annotation_
-    retention() (semantic.c) only reads @Retention from an already-
-    compiled classfile on the classpath, or from a type nested under the
-    current class's own enclosing/superclass chain, or (same-batch, via
-    import) from the shared type registry - none of those paths cover an
-    unrelated top-level type in the same batch with no import connecting
-    it. Not hit by gumdrop (only ever uses external, classfile-loaded
-    annotations like JUnit's own).
-
-13. -sourcepath compiles more files than javac would, for a real (not
+10. -sourcepath compiles more files than javac would, for a real (not
     cosmetic) reason: scan_package_for_type() (semantic.c) - the fallback
     used to find a same-package type referenced by simple name with no
     import - scans and loads every .java file in the matching package
@@ -142,18 +106,7 @@ KNOWN BUGS
     Needs either auditing all the duplicate resolution paths individually,
     or consolidating them to all go through lookup_same_package_type().
 
-14. An annotation element of a type narrower or wider than its literal's own
-    (byte, short, char, float) is tagged by the literal ("I") when the
-    annotation type is declared in the same compilation batch, so reading it
-    reflectively fails with AnnotationTypeMismatchException ("@Opts(small =
-    12)" for "short small()"). The writer takes the element's declared type
-    from the annotation's class file (declared_element_type() in
-    classwriter.c), which a same-batch source annotation does not have yet.
-    With the annotation compiled first (-cp), or an int/long/double/String/
-    boolean element, it is right. Fix: read the declared type from the
-    annotation's AST when there is no class file.
-
-15. A JDK with no jmods directory (JDK 24+ builds such as Eclipse Temurin 25,
+11. A JDK with no jmods directory (JDK 24+ builds such as Eclipse Temurin 25,
     JEP 493) cannot be used: jdk_detect_from_path() in classpath.c accepts
     lib/modules as the module source, but nothing reads it (it is a jimage
     file, not a directory of .jmod archives), so every java.* type is
@@ -163,40 +116,23 @@ KNOWN BUGS
     Until then the README states the requirement, and CI uses a JDK that
     ships jmods.
 
-16. [FIXED] Pattern matching for instanceof (JLS 15.20.2, 6.3.1). A binding is
-    now in scope wherever the test is known to have succeeded: right of &&,
-    right of || (negated), branches of ?: and if, loop bodies and a for's
-    update, and after an if, while or for that cannot complete the other way
-    ("if (!(o instanceof T t)) return;"). A condition that tests with a
-    binding is compiled to jumps (the cast and store on the edge where the
-    test succeeded, the source evaluated once) in if, while, for, do, ?: and
-    as a value; every other condition compiles as before. Not done: the
-    binding after a do-while (javac itself rejects it), and the record
-    patterns and switch patterns of Java 21 (the latter have their own code).
-
-17. -parameters is accepted but no MethodParameters attribute is written, so
+12. -parameters is accepted but no MethodParameters attribute is written, so
     reflection reports arg0, arg1... for genesis-compiled classes. Spring
     (6.1 and later) finds parameter names only that way; code compiled with
     genesis loses @RequestParam-style name inference.
 
-18. make smoke-spring-boot (bench/spring-boot/): with javac, all of core/,
+13. make smoke-spring-boot (bench/spring-boot/): with javac, all of core/,
     module/ and test-support/ of Spring Boot v4.1.1 compiles except
     spring-boot-gradle-test-support (it needs Gradle TestKit) and 15,055 of
     15,700 tests pass (the rest need annotation processing, a container or a
-    port). Genesis has five root failures, with everything that depends on
-    them skipped: spring-boot-autoconfigure-processor (3 errors),
-    spring-boot-configuration-metadata (46), spring-boot-test-support (9),
-    spring-boot-configuration-processor (74) and spring-boot (785, mostly
-    cascades of unresolved types from files that fail to parse: 8 remain,
-    among them ConfigurationPropertyName, ConfigDataEnvironmentContributor,
-    PropertyMapper and SslInfo).
-    Fixed on the way: compact record constructors, records declared in
-    another file, @Override on a record accessor, static members through a
-    record's name, records declaring their own equals/hashCode/toString or
-    another constructor, pattern bindings (item 16), type-use annotations
-    (JSpecify @Nullable) after a method's type parameters, as a leading type
-    argument, in a cast, on a for variable and on a lambda parameter, and a
-    lambda using a local named like an instance field.
+    port). Genesis compiles every source set, but only 12,205 of those
+    15,055 tests pass. Left: Spring application contexts that fail to start
+    (the largest group, each from some underlying codegen or annotation bug),
+    ClassCastException Long -> Integer in PropertyMapper users, missing
+    parameter names (item 12), type-use annotations written in modifier
+    position ("@Nullable String") not emitted as type annotations, and
+    NoSuchMethodError on constructors of nested classes. Iterate with
+    SB_COMPILERS=genesis SB_KEEP=1 and compare against the javac reports.
 
 ================================================================================
 OPTIONAL IMPROVEMENTS
