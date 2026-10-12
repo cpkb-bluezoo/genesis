@@ -675,6 +675,7 @@ void mg_finalize_local_var(method_gen_t *mg, const char *name, uint16_t end_pc);
 class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym);
 void class_gen_free(class_gen_t *cg);
 void class_gen_set_target_version(class_gen_t *cg, int major_version);
+void class_gen_register_anonymous_inner(class_gen_t *host, symbol_t *anon_sym);
 
 /* Generate bytecode for a class */
 bool codegen_class(class_gen_t *cg, ast_node_t *class_decl);

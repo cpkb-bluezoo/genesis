@@ -8305,6 +8305,7 @@ static bool codegen_new_object(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                     slist_append(mg->class_gen->anonymous_classes, anon_sym);
                 }
             }
+            class_gen_register_anonymous_inner(mg->class_gen, anon_sym);
         }
     }
     

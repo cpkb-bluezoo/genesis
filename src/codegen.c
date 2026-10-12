@@ -374,6 +374,57 @@ static uint16_t member_type_modifiers(uint16_t mods, symbol_t *enclosing)
     return mods;
 }
 
+/**
+ * Record a method-local or block-local anonymous class on its host classfile's
+ * InnerClasses attribute (and NestMembers when this class is the nest host).
+ * The anonymous classfile's own InnerClasses entry uses outer_class_info = 0;
+ * the host must still list the anonymous class with outer_class_info = host.
+ */
+void class_gen_register_anonymous_inner(class_gen_t *host, symbol_t *anon_sym)
+{
+    if (!host || !anon_sym || !anon_sym->qualified_name) {
+        return;
+    }
+    char *nested_internal = class_to_internal_name(anon_sym->qualified_name);
+    if (!nested_internal) {
+        return;
+    }
+    uint16_t nested_class_idx = cp_add_class(host->cp, nested_internal);
+    for (slist_t *node = host->inner_class_entries; node; node = node->next) {
+        inner_class_entry_t *existing = (inner_class_entry_t *)node->data;
+        if (existing && existing->inner_class_info == nested_class_idx) {
+            free(nested_internal);
+            return;
+        }
+    }
+    inner_class_entry_t *entry = calloc(1, sizeof(inner_class_entry_t));
+    entry->inner_class_info = nested_class_idx;
+    entry->outer_class_info = host->this_class;
+    entry->inner_name = 0;
+    entry->access_flags = inner_class_access_flags(
+        member_type_modifiers(anon_sym->modifiers,
+                              host->class_sym ? host->class_sym : anon_sym->data.class_data.enclosing_class),
+        anon_sym->kind);
+    if (anon_sym->data.class_data.is_anonymous_class) {
+        entry->access_flags |= ACC_SYNTHETIC;
+    }
+    if (!host->inner_class_entries) {
+        host->inner_class_entries = slist_new(entry);
+    } else {
+        slist_append(host->inner_class_entries, entry);
+    }
+    if (host->nest_host == 0) {
+        uint16_t *nest_member_idx = malloc(sizeof(uint16_t));
+        *nest_member_idx = nested_class_idx;
+        if (!host->nest_members) {
+            host->nest_members = slist_new(nest_member_idx);
+        } else {
+            slist_append(host->nest_members, nest_member_idx);
+        }
+    }
+    free(nested_internal);
+}
+
 /* ========================================================================
  * Method Generation Implementation
  * ======================================================================== */
@@ -2630,8 +2681,11 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
             inner_class_entry_t *entry = calloc(1, sizeof(inner_class_entry_t));
             entry->inner_class_info = cg->this_class;
             
-            /* Local classes have outer_class_info = 0 in InnerClasses attribute */
-            if (class_sym->data.class_data.is_local_class) {
+            /* Local and method-local anonymous classes use outer_class_info = 0
+             * in their own classfile's InnerClasses entry (JVMS 4.7.6). */
+            if (class_sym->data.class_data.is_local_class ||
+                (class_sym->data.class_data.is_anonymous_class &&
+                 class_sym->data.class_data.enclosing_method)) {
                 entry->outer_class_info = 0;
             } else {
                 entry->outer_class_info = cp_add_class(cg->cp, cg->outer_class_internal ? 
@@ -6765,6 +6819,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     if (!already_added) {
                         slist_append(cg->anonymous_classes, anon_sym);
                     }
+                }
+                if (anon_sym) {
+                    class_gen_register_anonymous_inner(cg, anon_sym);
                 }
 
                 /* new EnumClass (or the constant's own anonymous subclass) */
