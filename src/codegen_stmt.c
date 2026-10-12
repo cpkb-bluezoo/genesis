@@ -5186,8 +5186,14 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 stackmap_state_free(sync_body_exit_state);
                 stackmap_state_free(sync_entry_state);
 
-                /* Add exception handler entry (catch-all: catch_type = 0) */
-                mg_add_exception_handler(mg, sync_start, sync_end, handler_pc, 0);
+                /* Add exception handler entry (catch-all: catch_type = 0). An empty body leaves
+                 * nothing to protect, and an empty range is a ClassFormatError: javac's range then
+                 * runs to the end of the monitor release that follows. */
+                uint16_t protected_end = sync_end;
+                if (protected_end == sync_start && !body_ends_with_return) {
+                    protected_end = (uint16_t)goto_pos;
+                }
+                mg_add_exception_handler(mg, sync_start, protected_end, handler_pc, 0);
 
                 return true;
             }

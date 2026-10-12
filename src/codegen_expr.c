@@ -1027,6 +1027,11 @@ type_kind_t get_expr_type_kind(method_gen_t *mg, ast_node_t *expr)
         return TYPE_CLASS;
     }
 
+    /* "x instanceof T" is a boolean: boxing it by the int fallback below gave an Integer */
+    if (expr->type == AST_INSTANCEOF_EXPR) {
+        return TYPE_BOOLEAN;
+    }
+
     /* A chained/nested assignment used as a VALUE, e.g. the inner
      * "h = compute()" in "hex = h = compute();" - per JLS 15.26, an
      * assignment expression's own type/value is that of its target

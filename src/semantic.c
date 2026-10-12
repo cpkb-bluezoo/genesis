@@ -3248,6 +3248,7 @@ static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_n
  */
 static bool eval_case_constant_operand(semantic_t *sem, ast_node_t *expr, int32_t *out);
 static symbol_t *lookup_named_constant_field(semantic_t *sem, const char *name);
+static void fold_string_constant_expr(semantic_t *sem, ast_node_t *expr);
 
 /**
  * True if every NAMED operand of a constant expression is a final field (or a
@@ -16674,6 +16675,130 @@ static symbol_t *find_common_ancestor_symbol(symbol_t *a, symbol_t *b)
     return result;
 }
 
+/** True if the expression is, or contains, a lambda or a method reference. */
+static bool expr_holds_lambda(ast_node_t *expr)
+{
+    if (!expr) {
+        return false;
+    }
+    if (expr->type == AST_LAMBDA_EXPR || expr->type == AST_METHOD_REF) {
+        return true;
+    }
+    switch (expr->type) {
+        case AST_METHOD_CALL:
+        case AST_FIELD_ACCESS:
+        case AST_BINARY_EXPR:
+        case AST_UNARY_EXPR:
+        case AST_PARENTHESIZED:
+        case AST_CAST_EXPR:
+        case AST_CONDITIONAL_EXPR:
+        case AST_NEW_OBJECT:
+        case AST_ARRAY_ACCESS:
+            break;
+        default:
+            return false;
+    }
+    for (slist_t *c = expr->data.node.children; c; c = c->next) {
+        if (expr_holds_lambda((ast_node_t *)c->data)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * True if a call of "method" with these arguments needs no boxing or unboxing (the strict phase of
+ * JLS 15.12.2): every argument is a primitive where the parameter is, and a reference where it is.
+ * Only fixed-arity methods with matching counts are judged; anything else counts as strict.
+ */
+static bool call_is_strict_for_args(semantic_t *sem, symbol_t *method, slist_t *args)
+{
+    if (!method || method->kind != SYM_METHOD || (method->modifiers & MOD_VARARGS)) {
+        return true;
+    }
+    slist_t *pn = method->data.method_data.parameters;
+    slist_t *an = args;
+    while (pn && an) {
+        symbol_t *param = (symbol_t *)pn->data;
+        ast_node_t *arg = (ast_node_t *)an->data;
+        /* (what holds a lambda or method reference is typed by the parameter it fills: asking
+         * for its type here, with no target, would report errors the real typing does not) */
+        if (!arg || expr_holds_lambda(arg)) {
+            pn = pn->next;
+            an = an->next;
+            continue;
+        }
+        type_t *arg_type = get_expression_type(sem, arg);
+        if (!param || !param->type || !arg_type || arg_type->kind == TYPE_UNKNOWN) {
+            return true;
+        }
+        bool param_prim = param->type->kind >= TYPE_BOOLEAN && param->type->kind <= TYPE_DOUBLE;
+        bool arg_prim = arg_type->kind >= TYPE_BOOLEAN && arg_type->kind <= TYPE_DOUBLE;
+        if (param_prim != arg_prim && arg_type->kind != TYPE_NULL) {
+            return false;
+        }
+        pn = pn->next;
+        an = an->next;
+    }
+    return true;
+}
+
+/**
+ * A method of the receiver's class that is applicable only by boxing or unboxing ("isEqualTo(int)"
+ * for an Integer) loses to an inherited one applicable as it is ("isEqualTo(Object)"): the strict
+ * phase of overload resolution (JLS 15.12.2.2) looks at every method of the receiver, inherited or
+ * not, before the loose phase (15.12.2.3) does. Returns the method to use.
+ */
+static symbol_t *prefer_strict_inherited_method(semantic_t *sem, symbol_t *recv_class, symbol_t *method,
+                                                const char *name, slist_t *args, type_t *recv_for_subst)
+{
+    if (!recv_class || !method || method->kind != SYM_METHOD || call_is_strict_for_args(sem, method, args)) {
+        return method;
+    }
+    for (symbol_t *up = recv_class->data.class_data.superclass; up; up = up->data.class_data.superclass) {
+        if (!up->data.class_data.members && up->qualified_name) {
+            symbol_t *loaded = load_external_class(sem, up->qualified_name);
+            if (loaded && loaded->data.class_data.members) {
+                up = loaded;
+            }
+        }
+        symbol_t *inherited = up->data.class_data.members ?
+            scope_lookup_method_with_types_and_recv(sem, up->data.class_data.members, name, args,
+                                                    recv_for_subst) : NULL;
+        if (inherited && inherited->kind == SYM_METHOD && call_is_strict_for_args(sem, inherited, args)) {
+            return inherited;
+        }
+    }
+    return method;
+}
+
+/**
+ * What a method's type variable is when several arguments bind it ("Stream.of(root, max, flag)"):
+ * a type both arguments' types are assignable to, as the least upper bound is. Only plain (not
+ * parameterized) class types are merged; anything else keeps what was inferred first.
+ */
+static type_t *widen_inferred_type_arg(type_t *have, type_t *next)
+{
+    if (!have || !next || have->kind != TYPE_CLASS || next->kind != TYPE_CLASS ||
+        !have->data.class_type.name || !next->data.class_type.name ||
+        have->data.class_type.type_args || next->data.class_type.type_args ||
+        strcmp(have->data.class_type.name, next->data.class_type.name) == 0) {
+        return have;
+    }
+    symbol_t *common = find_common_ancestor_symbol(have->data.class_type.symbol,
+                                                    next->data.class_type.symbol);
+    if (common && common->qualified_name) {
+        if (strcmp(common->qualified_name, have->data.class_type.name) == 0) {
+            return have;
+        }
+        if (strcmp(common->qualified_name, next->data.class_type.name) == 0) {
+            return next;
+        }
+        return type_new_class(common->qualified_name);
+    }
+    return type_object();
+}
+
 /* ========================================================================
  * Pattern bindings (JLS 6.3.1)
  *
@@ -18003,6 +18128,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 if (strcmp(op, "+") == 0) {
                     if (type_equals(left_type, type_string()) ||
                         type_equals(right_type, type_string())) {
+                        /* a concatenation of constants is one: the interned string */
+                        fold_string_constant_expr(sem, expr);
                         return type_string();
                     }
                 }
@@ -18639,6 +18766,9 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     }
                                     }
                                     
+                                    method = prefer_strict_inherited_method(sem, recv_class, method, method_name,
+                                                                            args, recv_type_for_subst);
+
                                     /* Check superclass chain */
                                     if (!method || method->kind != SYM_METHOD) {
                                         symbol_t *super = recv_class->data.class_data.superclass;
@@ -18910,6 +19040,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 }
                             }
                             
+                            method = prefer_strict_inherited_method(sem, recv_class, method, method_name, args, NULL);
+
                             /* Check superclass chain */
                             if (recv_class && (!method || method->kind != SYM_METHOD)) {
                                 /* Walk up the superclass chain to find the method */
@@ -19358,12 +19490,14 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     }
                     const char *type_param_names[n_type_params > 0 ? n_type_params : 1];
                     type_t *inferred_types[n_type_params > 0 ? n_type_params : 1];
+                    bool from_args[n_type_params > 0 ? n_type_params : 1];   /* bound by an argument */
                     {
                         int tpi = 0;
                         for (slist_t *tp = found_method->data.method_data.type_params; tp; tp = tp->next) {
                             symbol_t *ps = (symbol_t *)tp->data;
                             type_param_names[tpi] = (ps && ps->name) ? ps->name : "";
                             inferred_types[tpi] = NULL;
+                            from_args[tpi] = false;
                             tpi++;
                         }
                         /* "Type.<A, B>method(...)": the type variables are what was written */
@@ -19647,6 +19781,14 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 if (!inferred_types[tpi]) {
                                     inferred_types[tpi] = infer_type_arg_from_expression(
                                         sem, infer_from, arg, arg_type, type_param_names[tpi]);
+                                    from_args[tpi] = inferred_types[tpi] != NULL;
+                                } else if (from_args[tpi] && infer_from->kind == TYPE_TYPEVAR &&
+                                           infer_from->data.type_var.name &&
+                                           strcmp(infer_from->data.type_var.name, type_param_names[tpi]) == 0) {
+                                    /* a second argument of the bare variable's type: the bound of both */
+                                    type_t *more = infer_type_arg_from_expression(
+                                        sem, infer_from, arg, arg_type, type_param_names[tpi]);
+                                    inferred_types[tpi] = widen_inferred_type_arg(inferred_types[tpi], more);
                                 }
                             }
                         }
@@ -24720,8 +24862,15 @@ static void scan_lambda_body_for_this_capture(semantic_t *sem, ast_node_t *node,
                     }
                 }
                 (void)this_before;
-                if (anonymous_body && sem->current_method && !(sem->current_method->modifiers & MOD_STATIC) &&
+                /* (an instance field initializer has no method: it is an instance context unless
+                 * it is static or the class is an interface, whose fields are static) */
+                bool instance_context = sem->current_method
+                    ? !(sem->current_method->modifiers & MOD_STATIC)
+                    : (!sem->in_static_field_init && sem->current_class &&
+                       sem->current_class->kind != SYM_INTERFACE);
+                if (anonymous_body && instance_context &&
                     sem->current_class && !(sem->current_class->kind == SYM_INTERFACE &&
+                                            sem->current_method &&
                                             (sem->current_method->modifiers & MOD_STATIC))) {
                     /* the class's outer instance is the lambda's this */
                     lambda->lambda_captures_this = true;
@@ -28151,6 +28300,31 @@ static void fold_annotation_element(semantic_t *sem, ast_node_t *node)
             node->data.leaf.value.int_val = v.i;
             break;
     }
+}
+
+/**
+ * Replaces a string concatenation whose operands are all compile-time constants (JLS 15.29) by
+ * the literal of its value, as javac does: the result is then the interned string, so "==" with
+ * an equal literal holds, and a static final field's ConstantValue agrees with its initializer.
+ */
+static void fold_string_constant_expr(semantic_t *sem, ast_node_t *expr)
+{
+    if (!expr || expr->type != AST_BINARY_EXPR) {
+        return;
+    }
+    cv_t v;
+    if (!eval_annotation_constant(sem, expr, &v, 0)) {
+        return;
+    }
+    if (v.kind != CV_STRING || !v.s) {
+        free(v.s);
+        return;
+    }
+    expr->type = AST_LITERAL;
+    memset(&expr->data, 0, sizeof(expr->data));
+    expr->data.leaf.token_type = TOK_STRING_LITERAL;
+    expr->data.leaf.value.str_val = v.s;
+    expr->data.leaf.str_len = strlen(v.s);
 }
 
 /**

@@ -117,50 +117,18 @@ KNOWN BUGS
     ships jmods.
 
 12. make smoke-spring-boot (bench/spring-boot/): Spring Boot v4.1.1, core/,
-    module/ and test-support/. Javac baseline workdir
-    genesis-spring-boot.57l0jva8: 15,109 tests pass. Parity is that set, not a
-    matching count. A javac failure that genesis passes is a separate mismatch.
-    Compare with bench/spring-boot/triage-regressions.py (merges duplicate test
+    module/ and test-support/. PARITY REACHED, keep it: javac baseline workdir
+    genesis-spring-boot.57l0jva8 passes 15,109 tests, and genesis workdir
+    genesis-spring-boot.75ki261j (12 Oct 2026) passes exactly that set, with no
+    test passing on genesis that fails on javac. Parity is the set, not a count:
+    compare with bench/spring-boot/triage-regressions.py (merges duplicate test
     ids without letting a later pass overwrite a failure). A test that passes
     on javac and is absent from the genesis reports counts as a regression
-    ("<no failure element>"), which is how an unloadable class disappears
-    instead of failing.
-
-    Latest genesis smoke genesis-spring-boot.jsjr3cb9 (12 Oct 2026): 139 main
-    and 132 test source sets compile, 15,698 tests run. Of the 15,109 javac
-    passes, genesis passes 15,098. Gap: 11. Previous best was bxqi78qf at
-    15,083 (gap 26). This run gained those 17 and lost 2 (ThreadDump, below).
-    Zero tests fail on javac and pass on genesis. The smoke's own counter
-    (15,018 passed, 607 failed) includes tests javac also fails, so it is not
-    the parity figure. Iterate with SB_COMPILERS=genesis SB_KEEP=1.
-
-    The 11 to concentrate on, each a different cause:
-
-    - ThreadDumpEndpointTests.dumpThreads and dumpThreadsAsText. Absent from
-      the reports. They passed on bxqi78qf, so this is the only regression
-      against the previous best. The class is compiled; find why JUnit does
-      not report the methods.
-    - MeterRegistryCustomizerTests, three methods (commonTagsAreAppliedTo
-      AutoConfiguredBinders, commonTagsAreAppliedBeforeRegistryIsInjectable
-      Elsewhere, customizersCanBeAppliedToSpecificRegistryTypes). An anonymous
-      AtlasConfig or PrometheusConfig is created inside a lambda in an instance
-      field initializer. The lambda method is static and calls $1.<init>() /
-      $2.<init>() with no enclosing instance. codegen_expr.c sets
-      enclosing_is_static from mg->is_static on that path; deleting that alone
-      would aload_0 in a static method. The lambda has to capture the enclosing
-      instance and pass it.
-    - JettyReactive, NettyReactive and TomcatReactive
-      whenServerIsShuttingDownGracefullyThenNewConnectionsCannotBeMade.
-      Integer cannot be cast to Boolean. The two Tomcat servlet shutdown tests
-      of this shape now pass.
-    - StructuredLoggingJsonPropertiesTests$StackTraceTests
-      .createPrinterWhenStandardWithHashesPrintsHash. Boolean cannot be cast
-      to StructuredLoggingJsonProperties$StackTrace$Root.
-    - InfluxPropertiesTests.defaultValuesAreConsistent.
-      InfluxConfig.retentionReplicationFactor() returns null and is unboxed.
-    - DataSourceHealthContributorAutoConfigurationTests
-      .runWithProxyBeanPostProcessorRoutingAndEmbeddedDataSourceShouldInclude
-      RoutingDataSource. Application context does not start.
+    ("<no failure element>"), which is how an unloadable class (a
+    ClassFormatError at load) disappears instead of failing. The smoke's own
+    counter (passed/failed) includes tests javac also fails, so it is not the
+    parity figure. Iterate with SB_COMPILERS=genesis SB_KEEP=1. When a change
+    loses a test, add the cause here until it is fixed, then remove it.
 
 ================================================================================
 OPTIONAL IMPROVEMENTS
