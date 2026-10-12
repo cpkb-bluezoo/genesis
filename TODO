@@ -66,11 +66,6 @@ KNOWN BUGS
 6. Generic constructor Signature attribute:
    - Uses return type instead of V
 
-7. Arrays of type variables from class files (N[] fields):
-   - A field or parameter typed N[] where N extends Number, loaded from a
-     class file rather than source, is referenced as Object[] instead of
-     Number[]. Bare type variables are handled.
-
 8. Nested interface methods are registered twice in semantic analysis
    (once without and once with the implicit public abstract modifiers).
    Consumers such as the functional interface lookup deduplicate by name;
@@ -129,6 +124,13 @@ KNOWN BUGS
     counter (passed/failed) includes tests javac also fails, so it is not the
     parity figure. Iterate with SB_COMPILERS=genesis SB_KEEP=1. When a change
     loses a test, add the cause here until it is fixed, then remove it.
+    REGRESSED (12 Oct 2026, present at a7ccb6e before any later change): 23
+    tests pass on javac and fail on genesis, e.g. RestTemplateBuilderTests.
+    defaultMessageConvertersShouldSetDefaultList ("Expecting an array but
+    was: [...]": assertThat(List).hasSameSizeAs(List) bound to the Object
+    overload instead of Iterable), BinderTests, ValueObjectBinderTests,
+    CacheAutoConfigurationTests.*WithCustomizers; the full list is the
+    smoke's "passes on javac, failed on genesis" output.
 
 ================================================================================
 OPTIONAL IMPROVEMENTS

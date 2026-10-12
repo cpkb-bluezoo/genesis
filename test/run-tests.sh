@@ -197,6 +197,19 @@ else
     failed=$((failed + 1))
 fi
 
+printf "%-30s ... " "TypeVarArrayField"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$ejc_lib" "$TEST_SRC"/external/javaclib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ejc_lib" -d "$ejc_out" \
+       "$TEST_SRC/external/TypeVarArrayFieldTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ejc_out:$ejc_lib" TypeVarArrayFieldTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 printf "%-30s ... " "CrossModuleConstantSwitch"
 cmc_lib="$TEST_BUILD/cross-module-const-lib"
 cmc_out="$TEST_BUILD/cross-module-const-out"

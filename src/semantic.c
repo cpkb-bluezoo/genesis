@@ -6520,6 +6520,26 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
                 }
             }
             
+            /* N[] (or N[][]): the element variable's bound is the erasure of
+             * the whole array, which the descriptor spells out. */
+            if (field_sym->type && field_sym->type->kind == TYPE_ARRAY && fi->descriptor) {
+                type_t *elem = field_sym->type;
+                while (elem->kind == TYPE_ARRAY) {
+                    elem = elem->data.array_type.element_type;
+                }
+                type_descriptor_t *td = descriptor_parse_field(fi->descriptor);
+                if (td) {
+                    if (elem->kind == TYPE_TYPEVAR && !elem->data.type_var.bound) {
+                        td->array_dimensions = 0;
+                        type_t *erased = type_from_descriptor(td);
+                        if (erased && erased->kind == TYPE_CLASS) {
+                            elem->data.type_var.bound = erased;
+                        }
+                    }
+                    type_descriptor_free(td);
+                }
+            }
+
             scope_define(class_scope, field_sym);
         }
     }

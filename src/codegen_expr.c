@@ -11893,8 +11893,36 @@ static void checkcast_generic_field(method_gen_t *mg, const_pool_t *cp, ast_node
             }
         }
     }
-    if (!field || field->kind != SYM_FIELD || !field->type ||
-        field->type->kind != TYPE_TYPEVAR || !expr->sem_type) {
+    if (!field || field->kind != SYM_FIELD || !field->type || !expr->sem_type) {
+        return;
+    }
+    /* A field typed N[] (or N[][]) is erased to an array of N's bound, so it
+     * needs the same cast back to the use-site array type (Integer[]). */
+    type_t *field_base = field->type;
+    while (field_base->kind == TYPE_ARRAY) {
+        field_base = field_base->data.array_type.element_type;
+    }
+    if (field_base->kind != TYPE_TYPEVAR) {
+        return;
+    }
+    if (field->type->kind == TYPE_ARRAY) {
+        if (expr->sem_type->kind != TYPE_ARRAY) {
+            return;
+        }
+        char *use_desc = type_to_descriptor(expr->sem_type);
+        char *decl_desc = type_to_descriptor(field->type);
+        bool same = use_desc && decl_desc && strcmp(use_desc, decl_desc) == 0;
+        free(decl_desc);
+        if (!use_desc || same) {
+            free(use_desc);
+            return;
+        }
+        uint16_t class_idx = cp_add_class(cp, use_desc);
+        bc_emit(mg->code, OP_CHECKCAST);
+        bc_emit_u2(mg->code, class_idx);
+        mg_pop_typed(mg, 1);
+        mg_push_object_from_descriptor(mg, use_desc);
+        free(use_desc);
         return;
     }
 
