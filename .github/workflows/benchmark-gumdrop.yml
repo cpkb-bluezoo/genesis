@@ -5,7 +5,7 @@
 # The result table goes to the job summary and the full log is kept as an
 # artifact. Run it from the Actions tab (Run workflow), or push a v* tag.
 
-name: Benchmark
+name: Benchmark gumdrop
 
 on:
   workflow_dispatch:
@@ -24,7 +24,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: benchmark
+  group: benchmark-gumdrop
   cancel-in-progress: false
 
 jobs:
@@ -84,5 +84,5 @@ jobs:
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: benchmark-log
+          name: benchmark-gumdrop-log
           path: bench.log

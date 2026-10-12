@@ -144,10 +144,26 @@ Testing
                                        variables (BENCH_ITERATIONS,
                                        BENCH_WARMUP, etc).
 
-   The Benchmark workflow (.github/workflows/benchmark.yml) runs make bench
-   on a clean GitHub-hosted runner against a gumdrop tag (v3.0.0 by default),
-   so the numbers do not depend on what else a developer machine is doing.
-   Start it from the Actions tab; the results table is in the job summary.
+   make bench-spring-boot           - Performance: genesis (-j1, and with its
+                                       default jobs) vs javac on every Spring
+                                       Boot main, testFixtures and test source
+                                       set, one compiler invocation per source
+                                       set, one set at a time, no tests. The
+                                       first pass is untimed warm-up and checks
+                                       genesis compiles whatever javac does.
+                                       Clones Spring Boot (SB_REF, SB_DIR)
+                                       when ../spring-boot is missing; the jars
+                                       come as for smoke-spring-boot. See
+                                       bench/spring-boot-bench.sh
+                                       (BENCH_ITERATIONS, SB_PROJECTS, ...).
+
+   The Benchmark gumdrop workflow (.github/workflows/benchmark-gumdrop.yml)
+   runs make bench on a clean GitHub-hosted runner against a gumdrop tag
+   (v3.0.0 by default), and Benchmark Spring Boot
+   (.github/workflows/benchmark-spring-boot.yml) runs make bench-spring-boot
+   against a Spring Boot tag (v4.1.1 by default), so the numbers do not depend
+   on what else a developer machine is doing. Start either from the Actions
+   tab; the results table is in the job summary.
 
    The CI workflow (.github/workflows/ci.yml) builds genesis with GCC and
    clang on Linux for every push and fails on any compiler warning, so

@@ -23,16 +23,21 @@
 #   SB_REF          tag or commit to build (default: v4.1.1)
 #   SB_CACHE        jar and pom cache (default: ~/.cache/genesis-bench/maven)
 #   SB_PROJECTS     regular expression: only the projects whose path matches
-#   SB_COMPILERS    comma separated: javac, genesis (default: both)
+#   SB_COMPILERS    comma separated: javac, genesis (-j1, one process), genesis-par
+#                   (genesis with its default jobs) (default: javac,genesis)
 #   SB_JOBS         projects handled at once (default: number of processors)
 #   SB_TEST_TIMEOUT seconds a project's tests may run (default: 900)
 #   SB_NO_TESTS     if set, compile only
 #   SB_KEEP         if set, keep the work directory
+#   SB_BENCH_ITERATIONS  if set, benchmark: compile only, one source set at a time, and
+#                   time that many further passes of every compiler (the first pass is the
+#                   untimed warm-up); see bench/spring-boot-bench.sh
 #   GENESIS         genesis binary (default: ../src/genesis from this directory)
 #   JAVA_HOME       JDK 25 that ships jmods (required)
 
 import concurrent.futures
 import datetime
+import glob
 import os
 import re
 import shutil
@@ -53,7 +58,9 @@ TOP = os.path.abspath(os.path.join(HERE, "..", ".."))
 SB_DIR = os.path.abspath(os.environ.get("SB_DIR", os.path.join(TOP, "..", "spring-boot")))
 SB_REF = os.environ.get("SB_REF", "v4.1.1")
 SB_VERSION = SB_REF[1:] if SB_REF.startswith("v") else SB_REF
-JOBS = int(os.environ.get("SB_JOBS", os.cpu_count() or 2))
+BENCH_ITERATIONS = int(os.environ.get("SB_BENCH_ITERATIONS", "0"))
+# A benchmark times one compile at a time: concurrent ones would time each other.
+JOBS = 1 if BENCH_ITERATIONS else int(os.environ.get("SB_JOBS", os.cpu_count() or 2))
 TEST_TIMEOUT = int(os.environ.get("SB_TEST_TIMEOUT", "900"))
 COMPILERS = os.environ.get("SB_COMPILERS", "javac,genesis").split(",")
 PROJECTS_RE = re.compile(os.environ["SB_PROJECTS"]) if os.environ.get("SB_PROJECTS") else None
@@ -194,6 +201,7 @@ class Compiler:
     def __init__(self, name, work):
         self.name = name
         self.exe = JAVAC if name == "javac" else GENESIS
+        self.single = name == "genesis"      # "genesis-par" keeps genesis's default jobs
         self.out = Out(work, name)
         self.work = work
         self.version = model.gradle_properties(os.path.join(work, "src")).get("version", SB_VERSION)
@@ -254,14 +262,14 @@ class Compiler:
         with open(argfile, "w") as f:
             flags = ["-d", out] + (["-cp", os.pathsep.join(cp)] if cp else [])
             # -j1: avoid worker subprocesses (see genesis.c thread_count > 1 gate)
-            extra = ["-j1"] if self.name == "genesis" else []
+            extra = ["-j1"] if self.single else []
             for a in flags + extra + ["--release", RELEASE, "-parameters", "-proc:none", "-g", "-nowarn",
                               "-encoding", "UTF-8"] + sources:
                 f.write(a + "\n")
         logfile = os.path.join(self.work, "logs", self.name, "%s.%s.compile.log" % (project.name, sset))
         os.makedirs(os.path.dirname(logfile), exist_ok=True)
         cmd = [self.exe]
-        if self.name == "genesis":
+        if self.single:
             cmd.append("-j1")
         cmd.append("@" + argfile)
         status, secs = run(cmd, logfile)
@@ -392,9 +400,10 @@ def run_tests(build, comp, p, console):
 def main():
     if not JAVA_HOME or not os.path.exists(JAVAC):
         die("JAVA_HOME must name a JDK 25 (it needs javac and, for genesis, jmods)")
-    if not os.path.isdir(os.path.join(JAVA_HOME, "jmods")) and "genesis" in COMPILERS:
+    uses_genesis = any(c.startswith("genesis") for c in COMPILERS)
+    if not os.path.isdir(os.path.join(JAVA_HOME, "jmods")) and uses_genesis:
         die("%s has no jmods directory, which genesis needs (see the README)" % JAVA_HOME)
-    if "genesis" in COMPILERS and not os.access(GENESIS, os.X_OK):
+    if uses_genesis and not os.access(GENESIS, os.X_OK):
         die("genesis not found at %s (build it or set GENESIS)" % GENESIS)
     if not os.path.isdir(os.path.join(SB_DIR, ".git")):
         die("%s is not a git checkout of spring-boot (set SB_DIR)" % SB_DIR)
@@ -528,7 +537,7 @@ def smoke(work):
         ))
 
     tests = {}
-    if not os.environ.get("SB_NO_TESTS"):
+    if not os.environ.get("SB_NO_TESTS") and not BENCH_ITERATIONS:
         for name, comp in comps.items():
             tests[name] = {}
             start = time.time()
@@ -540,7 +549,70 @@ def smoke(work):
             total = sum(len(v) for v in tests[name].values() if isinstance(v, dict))
             log("%-8s tests run: %d (%.0fs)" % (name, total, time.time() - start))
 
-    return report(build, paths, selected, comps, tests)
+    rc = report(build, paths, selected, comps, tests)
+    if BENCH_ITERATIONS and rc == 0:
+        rc = bench(build, paths, selected, comps, work)
+    return rc
+
+
+def _source_size(work, name):
+    """(source sets, files, lines) of what a compiler was given, from its argument files."""
+    sets = files = lines = 0
+    for argfile in sorted(glob.glob(os.path.join(work, "args", name, "*.args"))):
+        sets += 1
+        with open(argfile) as f:
+            for line in f:
+                line = line.strip()
+                if line.endswith(".java"):
+                    files += 1
+                    with open(line, "rb") as src:
+                        lines += src.read().count(b"\n")
+    return sets, files, lines
+
+
+def bench(build, paths, selected, comps, work):
+    """Time SB_BENCH_ITERATIONS further passes over every source set with every compiler
+    (the first pass, run above, was the warm-up). The passes alternate between the compilers
+    so that drift on the machine falls on all of them alike. Only the compile invocations are
+    timed: no tests, one source set at a time."""
+    log()
+    log("=== Benchmark: %d timed pass(es) ===" % BENCH_ITERATIONS)
+    samples = {name: [] for name in COMPILERS}
+    for i in range(BENCH_ITERATIONS):
+        for name in COMPILERS:
+            comp = Compiler(name, work)
+            cpu0 = os.times()
+            start = time.time()
+            schedule(build, comp, paths)
+            compile_tests(build, comp, paths, selected)
+            wall = time.time() - start
+            cpu1 = os.times()
+            bad = [k for k, r in comp.results.items() if r["status"] not in ("ok", "none")]
+            if bad:
+                log("%s: %d source set(s) did not compile in a timed pass, e.g. %s %s" % (
+                    name, len(bad), bad[0][0], bad[0][1]))
+                return 1
+            invoked = sum(r["seconds"] for r in comp.results.values())
+            cpu = (cpu1.children_user - cpu0.children_user) + (cpu1.children_system - cpu0.children_system)
+            samples[name].append((invoked, cpu, wall))
+            log("pass %d  %-12s compile %7.2fs  cpu %7.2fs" % (i + 1, name, invoked, cpu))
+
+    sets, files, lines = _source_size(work, COMPILERS[0])
+    log()
+    log("=== Results (seconds, average of %d pass(es)) ===" % BENCH_ITERATIONS)
+    log("%d source sets, %d source files, %d lines, --release %s -g, one compiler invocation per source set"
+        % (sets, files, lines, RELEASE))
+    log("(compile = time in the compiler invocations, process start included; cpu = user+sys of those processes)")
+    log("%-14s %6s %10s %10s %10s" % ("Compiler", "Runs", "compile", "cpu", "vs javac"))
+    log("%-14s %6s %10s %10s %10s" % ("--------", "----", "-------", "---", "--------"))
+    avg = {name: [sum(x[k] for x in v) / len(v) for k in range(3)] for name, v in samples.items()}
+    base = avg["javac"][0] if "javac" in avg else 0.0
+    labels = {"javac": "javac", "genesis": "genesis -j1", "genesis-par": "genesis"}
+    for name in COMPILERS:
+        c, cpu, _wall = avg[name]
+        speed = "%.1fx" % (base / c) if base and c else "-"
+        log("%-14s %6d %10.2f %10.2f %10s" % (labels.get(name, name), BENCH_ITERATIONS, c, cpu, speed))
+    return 0
 
 
 def _error_lines(logfile):

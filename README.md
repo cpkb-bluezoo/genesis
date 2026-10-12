@@ -64,7 +64,7 @@ Compiling all of [gumdrop](https://github.com/cpkb-bluezoo/gumdrop) 3.0.0 in
 one invocation (1457 source files, about 364,000 lines, 15 jars on the
 classpath, `--release 25 -g`, output to an empty directory), genesis against
 javac 25.0.4 (Oracle JDK) on a GitHub-hosted Ubuntu runner (4 vCPUs), average
-of 10 runs. The numbers come from the Benchmark workflow, so anyone can
+of 10 runs. The numbers come from the Benchmark gumdrop workflow, so anyone can
 reproduce them:
 
 | Compiler | Wall clock | CPU time (user+sys) | Speedup vs javac |
@@ -80,8 +80,11 @@ time in total; `-jN` limits the number of jobs to N. Batches of fewer than 32
 files, and JAR output, are analysed in the compiler process itself.
 
 Run `make bench` (see CONTRIBUTING) for numbers on your own machine; the
-Benchmark workflow in `.github/workflows` runs the same comparison on a clean
-GitHub-hosted runner against a gumdrop release tag.
+Benchmark gumdrop workflow in `.github/workflows` runs the same comparison on a
+clean GitHub-hosted runner against a gumdrop release tag. `make bench-spring-boot`
+and the Benchmark Spring Boot workflow do the same for Spring Boot: every one of
+its source sets compiled with javac, `genesis -j1` and genesis with its default
+jobs, one compiler invocation per source set.
 
 ## Building
 

@@ -1,0 +1,105 @@
+# Compiler benchmark: genesis against javac on Spring Boot.
+#
+# Runs bench/spring-boot-bench.sh on a fresh GitHub-hosted runner: every main,
+# testFixtures and test source set of Spring Boot is compiled with javac, with
+# genesis -j1 and with genesis's default jobs, one source set at a time, and the
+# compiler invocations are timed. The tests are not run (the smoke does that).
+# The result table goes to the job summary and the full log is kept as an
+# artifact. Run it from the Actions tab (Run workflow), or push a v* tag.
+
+name: Benchmark Spring Boot
+
+on:
+  workflow_dispatch:
+    inputs:
+      spring_boot_ref:
+        description: Tag or branch of Spring Boot to compile
+        default: v4.1.1
+      iterations:
+        description: Timed passes per compiler
+        default: "3"
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: benchmark-spring-boot
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      SB_REF: ${{ inputs.spring_boot_ref || 'v4.1.1' }}
+      BENCH_ITERATIONS: ${{ inputs.iterations || '3' }}
+      SB_DIR: ${{ github.workspace }}/spring-boot
+      SB_CACHE: ${{ github.workspace }}/.cache/maven
+    steps:
+      - uses: actions/checkout@v7
+
+      # Genesis reads the platform classes from the JDK's jmods directory, which
+      # Eclipse Temurin 25 does not ship; Oracle JDK does (see the README).
+      - uses: actions/setup-java@v6
+        with:
+          distribution: oracle
+          java-version: "25"
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf automake zlib1g-dev
+
+      - name: Build genesis
+        run: |
+          autoreconf -fi
+          ./configure
+          make -j"$(nproc)"
+
+      # The jars (Maven Central, checked against bench/spring-boot/*.lock) and
+      # the Gradle distribution's jars (SB_DIR/.gradle) that Spring Boot's
+      # source sets compile against: downloaded once, then restored.
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.SB_CACHE }}
+            ${{ env.SB_DIR }}/.gradle
+          key: spring-boot-deps-${{ env.SB_REF }}-${{ hashFiles('bench/spring-boot/*.lock', 'bench/spring-boot/*.py') }}
+          restore-keys: |
+            spring-boot-deps-${{ env.SB_REF }}-
+
+      - name: Run benchmark
+        run: |
+          set -o pipefail
+          make bench-spring-boot 2>&1 | tee bench.log
+
+      - name: Publish results
+        if: always()
+        run: |
+          {
+            echo "## genesis vs javac on Spring Boot ${SB_REF}"
+            echo
+            echo "Runner: $(nproc) processors, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
+            echo "javac: $(javac -version 2>&1)"
+            echo "Timed passes per compiler: ${BENCH_ITERATIONS}"
+            echo
+            echo '```'
+            if [ -f bench.log ] && grep -q '^=== Results (seconds' bench.log; then
+              sed -n '/^=== Results (seconds/,$p' bench.log
+            else
+              echo "(the benchmark did not finish; see the failed step above)"
+            fi
+            echo '```'
+            echo
+            echo "javac is started once per source set here, so its JVM start-up is in every"
+            echo "measurement; Spring Boot's own Gradle build compiles inside a long-running daemon."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: benchmark-spring-boot-log
+          path: bench.log
