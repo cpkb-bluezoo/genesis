@@ -701,6 +701,7 @@ struct symbol
             hashtable_t *local_class_name_counts; /* name -> count for local class naming */
             slist_t *captured_vars;     /* Captured local variables (for local classes) */
             ast_node_t *anonymous_body; /* AST body for anonymous classes */
+            type_t *anonymous_super_signature_type; /* Parameterized supertype for Signature (diamond) */
             slist_t *super_ctor_args;   /* Constructor args to pass to superclass (anonymous classes) */
             symbol_t *resolved_super_ctor; /* The superclass SYM_CONSTRUCTOR overload
                                          * chosen for super_ctor_args (anonymous classes) -

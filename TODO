@@ -120,8 +120,9 @@ KNOWN BUGS
     module/ and test-support/ of Spring Boot v4.1.1 compiles except
     spring-boot-gradle-test-support (it needs Gradle TestKit) and 15,055 of
     15,700 tests pass (the rest need annotation processing, a container or a
-    port). Genesis compiles every source set, but only 14,809 of those
-    15,055 tests pass. Left: Spring application contexts that fail to start
+    port). Genesis compiles every source set, but only 14,852 of those
+    15,055 tests pass (203 regressions vs javac baseline). Left: Spring
+    application contexts that fail to start
     (the largest group, each from some underlying codegen or annotation bug),
     type-use annotations written in modifier
     position ("@Nullable String") not emitted as type annotations, and

@@ -16891,6 +16891,68 @@ static slist_t *pack_anonymous_varargs(semantic_t *sem, ast_node_t *creation, as
     return new_args;
 }
 
+static type_t *diamond_instantiation_type(semantic_t *sem, ast_node_t *type_node, type_t *raw_base)
+{
+    if (!sem || !type_node || !raw_base || raw_base->kind != TYPE_CLASS ||
+        !(type_node->data.node.flags & 0x1000) ||
+        !sem->target_type || sem->target_type->kind != TYPE_CLASS ||
+        !sem->target_type->data.class_type.type_args) {
+        return raw_base;
+    }
+    const char *raw_name = raw_base->data.class_type.name;
+    const char *tgt_name = sem->target_type->data.class_type.name;
+    if (!raw_name || !tgt_name || strcmp(raw_name, tgt_name) != 0) {
+        return raw_base;
+    }
+    type_t *diamond = type_new_class(raw_name);
+    diamond->data.class_type.symbol = raw_base->data.class_type.symbol ?
+        raw_base->data.class_type.symbol : sem->target_type->data.class_type.symbol;
+    for (slist_t *ta = sem->target_type->data.class_type.type_args; ta; ta = ta->next) {
+        if (!diamond->data.class_type.type_args) {
+            diamond->data.class_type.type_args = slist_new(ta->data);
+        } else {
+            slist_append(diamond->data.class_type.type_args, ta->data);
+        }
+    }
+    return diamond;
+}
+
+static void reinfer_anonymous_diamond_super(semantic_t *sem, ast_node_t *new_expr, type_t *target)
+{
+    if (!sem || !new_expr || new_expr->type != AST_NEW_OBJECT || !target) {
+        return;
+    }
+    slist_t *children = new_expr->data.node.children;
+    if (!children) {
+        return;
+    }
+    ast_node_t *type_node = (ast_node_t *)children->data;
+    ast_node_t *anon_body = NULL;
+    for (slist_t *c = children->next; c; c = c->next) {
+        ast_node_t *child = (ast_node_t *)c->data;
+        if (child && child->type == AST_BLOCK && !c->next) {
+            anon_body = child;
+            break;
+        }
+    }
+    type_t *saved = sem->target_type;
+    sem->target_type = target;
+    type_t *raw = type_node->sem_type;
+    if (!raw) {
+        raw = semantic_resolve_type(sem, type_node);
+    }
+    type_t *instantiated = diamond_instantiation_type(sem, type_node, raw);
+    sem->target_type = saved;
+    if (instantiated) {
+        type_node->sem_type = instantiated;
+        new_expr->sem_type = instantiated;
+        if (anon_body && anon_body->sem_symbol &&
+            anon_body->sem_symbol->data.class_data.is_anonymous_class) {
+            anon_body->sem_symbol->data.class_data.anonymous_super_signature_type = instantiated;
+        }
+    }
+}
+
 type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
 {
     if (!expr) {
@@ -19062,8 +19124,13 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                          * variables known so far make of the parameter, not the bare parameter) */
                         if (bind_type_for_lambda && is_poly_functional_expr(arg)) {
                             sem->target_type = bind_type_for_lambda;
+                        } else if (bind_type_for_lambda && arg->type == AST_NEW_OBJECT) {
+                            sem->target_type = bind_type_for_lambda;
                         }
                         type_t *arg_type = get_expression_type(sem, arg);
+                        if (arg->type == AST_NEW_OBJECT && sem->target_type) {
+                            reinfer_anonymous_diamond_super(sem, arg, sem->target_type);
+                        }
                         sem->target_type = saved_arg_target;
                         
                         /* Infer type arguments from argument types for generic methods */
@@ -20694,24 +20761,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     base_type = semantic_resolve_type(sem, type_node);
                 }
                 
-                /* "new Condition<>(..)" of a nested class: the diamond's arguments are the target's,
-                 * when the target is that same class */
-                if (base_type && type_node && base_type->kind == TYPE_CLASS &&
-                    !base_type->data.class_type.type_args && (type_node->data.node.flags & 0x1000) &&
-                    sem->target_type && sem->target_type->kind == TYPE_CLASS &&
-                    sem->target_type->data.class_type.type_args &&
-                    sem->target_type->data.class_type.name && base_type->data.class_type.name &&
-                    strcmp(sem->target_type->data.class_type.name, base_type->data.class_type.name) == 0) {
-                    type_t *diamond = type_new_class(base_type->data.class_type.name);
-                    diamond->data.class_type.symbol = base_type->data.class_type.symbol;
-                    for (slist_t *ta = sem->target_type->data.class_type.type_args; ta; ta = ta->next) {
-                        if (!diamond->data.class_type.type_args) {
-                            diamond->data.class_type.type_args = slist_new(ta->data);
-                        } else {
-                            slist_append(diamond->data.class_type.type_args, ta->data);
-                        }
-                    }
-                    base_type = diamond;
+                if (base_type && type_node) {
+                    base_type = diamond_instantiation_type(sem, type_node, base_type);
                 }
 
                 /* Store resolved type on the type node for codegen */
@@ -20759,7 +20810,13 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     if (anon_body->sem_symbol && anon_body->sem_symbol->kind == SYM_CLASS &&
                         anon_body->sem_symbol->data.class_data.is_anonymous_class) {
                         /* Already set up, but may need to bind lambda arguments.
-                         * Collect constructor arguments and bind lambdas to parameter types. */
+                         * Re-apply diamond inference now that a call-site target type
+                         * may be available (ParameterizedTypeReference<> in bodyTo). */
+                        if (sem->target_type) {
+                            reinfer_anonymous_diamond_super(sem, expr, sem->target_type);
+                            base_type = type_node->sem_type;
+                        }
+                        /* Collect constructor arguments and bind lambdas to parameter types. */
                         slist_t *ctor_args = NULL;
                         for (slist_t *c = children->next; c; c = c->next) {
                             ast_node_t *child = (ast_node_t *)c->data;
@@ -21155,6 +21212,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     
                     /* Return the base type (for assignment compatibility) */
                     expr->sem_type = base_type;
+                    if (anon_sym && base_type && base_type->kind == TYPE_CLASS &&
+                        base_type->data.class_type.type_args) {
+                        anon_sym->data.class_data.anonymous_super_signature_type = base_type;
+                    }
                     return base_type;
                 }
                 

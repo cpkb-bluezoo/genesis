@@ -8462,7 +8462,10 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
     if (!cg->signature && anon_sym->ast && anon_sym->ast->type == AST_NEW_OBJECT &&
         anon_sym->ast->data.node.children) {
         ast_node_t *type_node = (ast_node_t *)anon_sym->ast->data.node.children->data;
-        type_t *base = type_node ? type_node->sem_type : NULL;
+        type_t *base = anon_sym->data.class_data.anonymous_super_signature_type;
+        if (!base) {
+            base = type_node ? type_node->sem_type : NULL;
+        }
         if ((!base || base->kind != TYPE_CLASS) && type_node && cg->sem) {
             base = semantic_resolve_type(cg->sem, type_node);
         }
