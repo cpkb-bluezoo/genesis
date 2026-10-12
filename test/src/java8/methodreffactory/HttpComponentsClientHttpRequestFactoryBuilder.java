@@ -1,0 +1,4 @@
+package methodreffactory;
+
+public interface HttpComponentsClientHttpRequestFactoryBuilder extends ClientHttpRequestFactoryBuilder {
+}

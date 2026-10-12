@@ -81,6 +81,124 @@ static char *descriptor_to_class_name(const char *descriptor)
     return NULL;
 }
 
+static bool type_is_java_util_function(type_t *t)
+{
+    return t && t->kind == TYPE_CLASS && t->data.class_type.name &&
+        strncmp(t->data.class_type.name, "java.util.function.", 19) == 0;
+}
+
+static bool supplier_get_sam(symbol_t *sam, type_t *func_interface)
+{
+    if (!sam || !sam->name || strcmp(sam->name, "get") != 0 || !func_interface) {
+        return false;
+    }
+    symbol_t *iface = func_interface->data.class_type.symbol;
+    const char *n = iface ? (iface->qualified_name ? iface->qualified_name : iface->name) : NULL;
+    return n && strstr(n, "Supplier") != NULL;
+}
+
+static type_t *lambda_block_var_decl_type(ast_node_t *stmt, const char *name)
+{
+    if (!stmt || stmt->type != AST_VAR_DECL || !name) {
+        return NULL;
+    }
+    slist_t *ch = stmt->data.node.children;
+    ast_node_t *type_node = ch ? (ast_node_t *)ch->data : NULL;
+    type_t *decl_type = type_node ? type_node->sem_type : NULL;
+    for (slist_t *c = ch ? ch->next : NULL; c; c = c->next) {
+        ast_node_t *d = (ast_node_t *)c->data;
+        if (d && d->type == AST_VAR_DECLARATOR && d->data.node.name &&
+            strcmp(d->data.node.name, name) == 0) {
+            return d->sem_type ? d->sem_type : decl_type;
+        }
+    }
+    return NULL;
+}
+
+/** Supplier&lt;E&gt;.get(): use E from the target type, not the Supplier class itself. */
+static type_t *lambda_block_return_type(semantic_t *sem, ast_node_t *body)
+{
+    if (!body || body->type != AST_BLOCK) {
+        return NULL;
+    }
+    for (slist_t *stmt = body->data.node.children; stmt; stmt = stmt->next) {
+        ast_node_t *s = (ast_node_t *)stmt->data;
+        if (s && s->type == AST_RETURN_STMT && s->data.node.children) {
+            ast_node_t *ret_expr = (ast_node_t *)s->data.node.children->data;
+            if (!ret_expr) {
+                continue;
+            }
+            type_t *t = NULL;
+            if (ret_expr->type == AST_IDENTIFIER && ret_expr->data.leaf.name) {
+                for (slist_t *vs = body->data.node.children; vs; vs = vs->next) {
+                    t = lambda_block_var_decl_type((ast_node_t *)vs->data, ret_expr->data.leaf.name);
+                    if (t) {
+                        break;
+                    }
+                }
+            }
+            if (!t) {
+                t = ret_expr->sem_type;
+            }
+            if (!t && sem) {
+                t = get_expression_type(sem, ret_expr);
+            }
+            if (t) {
+                if (t->kind == TYPE_TYPEVAR && t->data.type_var.bound) {
+                    t = t->data.type_var.bound;
+                }
+                return t;
+            }
+        }
+    }
+    return NULL;
+}
+
+static type_t *lambda_sam_return_for_target(type_t *func_interface, symbol_t *sam, type_t *sam_return)
+{
+    if (!supplier_get_sam(sam, func_interface) || !func_interface->data.class_type.type_args) {
+        return sam_return;
+    }
+    type_t *actual = (type_t *)func_interface->data.class_type.type_args->data;
+    if (actual && actual->kind == TYPE_TYPEVAR && actual->data.type_var.bound) {
+        actual = actual->data.type_var.bound;
+    }
+    if (actual) {
+        return actual;
+    }
+    if (sam_return && type_is_java_util_function(sam_return)) {
+        return sam_return;
+    }
+    return sam_return;
+}
+
+/** After getfield on a generic field (erased to Object in the class file). */
+static void mg_narrow_erased_reference_field(method_gen_t *mg, const_pool_t *cp,
+                                             const char *jvm_field_desc, type_t *semantic_type)
+{
+    if (!mg || !cp || !jvm_field_desc || jvm_field_desc[0] != 'L') {
+        return;
+    }
+    if (strncmp(jvm_field_desc, "Ljava/lang/Object;", 18) != 0) {
+        return;
+    }
+    if (!semantic_type || semantic_type->kind != TYPE_CLASS || !semantic_type->data.class_type.name) {
+        return;
+    }
+    if (strcmp(semantic_type->data.class_type.name, "java.lang.Object") == 0) {
+        return;
+    }
+    char *internal = class_to_internal_name(semantic_type->data.class_type.name);
+    uint16_t class_idx = cp_add_class(cp, internal);
+    bc_emit(mg->code, OP_CHECKCAST);
+    bc_emit_u2(mg->code, class_idx);
+    if (mg->stackmap) {
+        stackmap_pop(mg->stackmap, 1);
+        stackmap_push_object(mg->stackmap, cp, internal);
+    }
+    free(internal);
+}
+
 /**
  * Push an object type to the stackmap based on a field descriptor.
  */
@@ -1601,6 +1719,7 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
                     case '[': mg_push_object_from_descriptor(mg, field->descriptor); break;
                     default:  mg_push_int(mg); break;
                 }
+                mg_narrow_erased_reference_field(mg, mg->cp, field->descriptor, ident->sem_type);
                 return true;
             } else if (!mg->is_static) {
                 /* Instance field - use getfield */
@@ -1624,6 +1743,7 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
                     case '[': mg_push_object_from_descriptor(mg, field->descriptor); break;
                     default:  mg_push_int(mg); break;
                 }
+                mg_narrow_erased_reference_field(mg, mg->cp, field->descriptor, ident->sem_type);
                 return true;
             }
             /* Instance field access in static context - error handled below */
@@ -1689,6 +1809,7 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
                     case '[': mg_push_object_from_descriptor(mg, field_desc); break;
                     default:  mg_push_int(mg); break;
                 }
+                mg_narrow_erased_reference_field(mg, mg->cp, field_desc, ident->sem_type);
 
                 free(class_internal);
                 free(field_desc);
@@ -2761,6 +2882,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                 case '[': mg_push_object_from_descriptor(mg, field_desc); break;
                 default:  mg_push_int(mg); break;
             }
+            mg_narrow_erased_reference_field(mg, cp, field_desc, expr->sem_type);
             
             return true;
         }
@@ -2886,9 +3008,6 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                 owned_field_desc = type_to_descriptor(declared->type);
             }
         }
-        if (!owned_field_desc && expr->sem_type) {
-            owned_field_desc = type_to_descriptor(expr->sem_type);
-        }
         field_desc = owned_field_desc ? owned_field_desc : "Ljava/lang/Object;";
 
         /* A protected field of a superclass in another package, read by a nested class of the
@@ -2950,6 +3069,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
             case '[': mg_push_object_from_descriptor(mg, field_desc); break;
             default:  mg_push_int(mg); break;
         }
+        mg_narrow_erased_reference_field(mg, cp, field_desc, expr->sem_type);
 
         free(owned_field_desc);
         return true;
@@ -2979,6 +3099,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                     case '[': mg_push_object_from_descriptor(mg, field->descriptor); break;
                     default:  mg_push_int(mg); break;
                 }
+                mg_narrow_erased_reference_field(mg, cp, field->descriptor, expr->sem_type);
                 return true;
             }
 
@@ -3016,6 +3137,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                     case '[': mg_push_object_from_descriptor(mg, inherited_desc); break;
                     default:  mg_push_int(mg); break;
                 }
+                mg_narrow_erased_reference_field(mg, cp, inherited_desc, expr->sem_type);
                 free(inherited_desc);
                 return true;
             }
@@ -3032,7 +3154,9 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
     }
     
     /* Receiver is now on stack - emit getfield */
+    char *recv_class_owned = NULL;
     const char *recv_class = "java/lang/Object";
+    char *field_desc_owned = NULL;
     const char *field_desc = "Ljava/lang/Object;";
     symbol_t *recv_class_sym = NULL;
     
@@ -3042,7 +3166,8 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
     
     if (recv_type && recv_type->kind == TYPE_CLASS) {
         if (recv_type->data.class_type.name) {
-            recv_class = class_to_internal_name(recv_type->data.class_type.name);
+            recv_class_owned = class_to_internal_name(recv_type->data.class_type.name);
+            recv_class = recv_class_owned;
         }
         recv_class_sym = recv_type->data.class_type.symbol;
         
@@ -3060,7 +3185,8 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
     if (recv_class_sym) {
         symbol_t *field_sym = lookup_field_with_superclass(recv_class_sym, field_name);
         if (field_sym && field_sym->type) {
-            field_desc = type_to_descriptor(field_sym->type);
+            field_desc_owned = type_to_descriptor(field_sym->type);
+            field_desc = field_desc_owned;
         }
     }
 
@@ -3077,6 +3203,9 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
         case '[': mg_push_object_from_descriptor(mg, field_desc); break;
         default:  mg_push_int(mg); break;
     }
+    mg_narrow_erased_reference_field(mg, cp, field_desc, expr->sem_type);
+    free(field_desc_owned);
+    free(recv_class_owned);
     
     return true;
 }
@@ -7440,22 +7569,40 @@ static bool codegen_method_call(method_gen_t *mg, ast_node_t *expr, const_pool_t
         }
     }
     
-    /* "<T> T mock(T... reified)": T is what the call is typed as, so is what the array the
-     * argument is packed in holds */
+    int call_arg_count = 0;
+    for (slist_t *n = args; n; n = n->next) {
+        call_arg_count++;
+    }
+
+    /* Generic varargs witness arrays for zero-arg calls only (Mockito mock/captor, etc.):
+     * "<T> T mock(T...)" and "<T> ArgumentCaptor<T> captor(T...)" need new T[0] typed from the
+     * call site, not Object[0]. Do not set this when real varargs are passed (Arrays.asList). */
     g_varargs_inferred_element = NULL;
-    if (is_varargs_method && varargs_param && method_sym && method_sym->type &&
-        method_sym->type->kind == TYPE_TYPEVAR && method_sym->type->data.type_var.name && expr->sem_type &&
-        (expr->sem_type->kind == TYPE_CLASS ||
-         (expr->sem_type->kind == TYPE_TYPEVAR && erase_typevar_for_array(expr->sem_type)->kind == TYPE_CLASS &&
-          strcmp(erase_typevar_for_array(expr->sem_type)->data.class_type.name, "java.lang.Object") != 0))) {
+    if (is_varargs_method && varargs_param && method_sym &&
+        call_arg_count == fixed_param_count) {
         type_t *declared_elem = (varargs_param->type && varargs_param->type->kind == TYPE_ARRAY) ?
             varargs_param->type->data.array_type.element_type : NULL;
-        if (declared_elem && declared_elem->kind == TYPE_TYPEVAR && declared_elem->data.type_var.name &&
-            strcmp(declared_elem->data.type_var.name, method_sym->type->data.type_var.name) == 0 &&
+        if (declared_elem && declared_elem->kind == TYPE_TYPEVAR &&
             erase_typevar_for_array(declared_elem)->kind == TYPE_CLASS &&
-            strcmp(erase_typevar_for_array(declared_elem)->data.class_type.name, "java.lang.Object") == 0) {
-            g_varargs_inferred_element = expr->sem_type->kind == TYPE_TYPEVAR ?
-                erase_typevar_for_array(expr->sem_type) : expr->sem_type;
+            strcmp(erase_typevar_for_array(declared_elem)->data.class_type.name,
+                   "java.lang.Object") == 0 && expr->sem_type) {
+            type_t *inferred_t = NULL;
+            if (method_sym->type && method_sym->type->kind == TYPE_TYPEVAR &&
+                method_sym->type->data.type_var.name &&
+                (expr->sem_type->kind == TYPE_CLASS ||
+                 (expr->sem_type->kind == TYPE_TYPEVAR &&
+                  erase_typevar_for_array(expr->sem_type)->kind == TYPE_CLASS &&
+                  strcmp(erase_typevar_for_array(expr->sem_type)->data.class_type.name,
+                         "java.lang.Object") != 0))) {
+                inferred_t = expr->sem_type->kind == TYPE_TYPEVAR ?
+                    erase_typevar_for_array(expr->sem_type) : expr->sem_type;
+            } else if (expr->sem_type->kind == TYPE_CLASS &&
+                       expr->sem_type->data.class_type.type_args) {
+                inferred_t = (type_t *)expr->sem_type->data.class_type.type_args->data;
+            }
+            if (inferred_t) {
+                g_varargs_inferred_element = inferred_t;
+            }
         }
     }
 
@@ -13755,6 +13902,12 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 
                 string_append(impl_desc, ")");
                 
+                slist_t *lambda_child_list = expr->data.node.children;
+                ast_node_t *lambda_body_node = NULL;
+                if (lambda_child_list && lambda_child_list->next) {
+                    lambda_body_node = (ast_node_t *)lambda_child_list->next->data;
+                }
+                
                 /* Add return type. Interface SAMs from class files (or from
                  * another file of the same parallel batch) often still have
                  * method->type NULL here - nothing needed it before codegen.
@@ -13764,6 +13917,25 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 type_t *sam_return = sam->type;
                 if (!sam_return && cg->sem && iface_sym) {
                     sam_return = semantic_ensure_method_result_type(cg->sem, sam, iface_sym);
+                }
+                if (supplier_get_sam(sam, func_interface)) {
+                    type_t *from_target = lambda_sam_return_for_target(func_interface, sam, sam_return);
+                    if (from_target) {
+                        sam_return = from_target;
+                    }
+                    if (lambda_body_node && lambda_body_node->type == AST_BLOCK) {
+                        type_t *block_ret = lambda_block_return_type(cg->sem, lambda_body_node);
+                        if (block_ret && (block_ret->kind < TYPE_BOOLEAN ||
+                                          block_ret->kind > TYPE_DOUBLE)) {
+                            sam_return = block_ret;
+                        }
+                    }
+                } else if (sam_return && type_is_java_util_function(sam_return) &&
+                    lambda_body_node && lambda_body_node->sem_type &&
+                    lambda_body_node->type != AST_BLOCK &&
+                    (lambda_body_node->sem_type->kind == TYPE_CLASS ||
+                     lambda_body_node->sem_type->kind == TYPE_ARRAY)) {
+                    sam_return = lambda_body_node->sem_type;
                 }
                 if (sam_return) {
                     char *ret_desc = type_to_descriptor(sam_return);
@@ -14214,6 +14386,13 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 /* Transfer stackmap to the method info */
                 lambda_method->stackmap = lambda_mg->stackmap;
                 lambda_mg->stackmap = NULL;  /* Transfer ownership */
+
+                /* try/catch inside the lambda body records handlers on the
+                 * generator. Without this the handler bytecode is in the
+                 * method and the exception table is not, so the catch never
+                 * runs (InvalidMimeTypeException from a compression predicate). */
+                lambda_method->exception_handlers = lambda_mg->exception_handlers;
+                lambda_mg->exception_handlers = NULL;
                 
                 if (!cg->methods) {
                     cg->methods = slist_new(lambda_method);
@@ -14289,11 +14468,46 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         /* Substitute type variable with actual type arg */
                         ret_type = (type_t *)type_args->data;
                     }
+                    if (supplier_get_sam(sam, func_interface)) {
+                        type_t *from_target = lambda_sam_return_for_target(func_interface, sam, ret_type);
+                        if (from_target) {
+                            ret_type = from_target;
+                        }
+                        if (lambda_body_node && lambda_body_node->type == AST_BLOCK) {
+                            type_t *block_ret = lambda_block_return_type(cg->sem, lambda_body_node);
+                            if (block_ret && (block_ret->kind < TYPE_BOOLEAN ||
+                                              block_ret->kind > TYPE_DOUBLE)) {
+                                ret_type = block_ret;
+                            }
+                        }
+                    } else if (ret_type && type_is_java_util_function(ret_type)) {
+                        ret_type = lambda_sam_return_for_target(func_interface, sam, ret_type);
+                    }
                     char *ret_desc = type_to_descriptor(ret_type);
                     string_append(spec_desc, ret_desc);
                     free(ret_desc);
                 } else {
                     string_append(spec_desc, "V");
+                }
+                {
+                    const char *impl_ret = strchr(impl_desc->str, ')');
+                    const char *spec_ret = strchr(spec_desc->str, ')');
+                    if (impl_ret && spec_ret) {
+                        impl_ret++;
+                        spec_ret++;
+                        if ((strncmp(spec_ret, "Ljava/lang/Object;", 18) == 0 ||
+                             strncmp(spec_ret, "Ljava/util/function/", 20) == 0) &&
+                            *impl_ret != 'V' &&
+                            strncmp(impl_ret, "Ljava/util/function/", 20) != 0 &&
+                            strcmp(spec_ret, impl_ret) != 0) {
+                            size_t pre = (size_t)(spec_ret - spec_desc->str);
+                            string_t *patched = string_new("");
+                            string_append_len(patched, spec_desc->str, pre);
+                            string_append(patched, impl_ret);
+                            string_free(spec_desc, true);
+                            spec_desc = patched;
+                        }
+                    }
                 }
                 uint16_t spec_mt = cp_add_method_type(cg->cp, spec_desc->str);
                 string_free(spec_desc, true);
@@ -14360,9 +14574,11 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 for (slist_t *cap = captures; cap; cap = cap->next) {
                     symbol_t *var_sym = (symbol_t *)cap->data;
                     if (var_sym && var_sym->name) {
-                        uint16_t var_slot = mg_get_local(mg, var_sym->name);
-                        type_kind_t kind = var_sym->type ? var_sym->type->kind : TYPE_CLASS;
-                        mg_emit_load_local(mg, var_slot, kind);
+                        if (!mg_emit_load_enclosing_variable(mg, var_sym)) {
+                            uint16_t var_slot = mg_get_local(mg, var_sym->name);
+                            type_kind_t kind = var_sym->type ? var_sym->type->kind : TYPE_CLASS;
+                            mg_emit_load_local(mg, var_slot, kind);
+                        }
                     }
                 }
                 
@@ -14745,6 +14961,21 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             }
                             if (actual) {
                                 ret_type = actual;
+                            } else if (resolved_method && resolved_method->type &&
+                                       resolved_method->type->kind != TYPE_VOID) {
+                                /* e.g. HandlerFunction<T>.handle -> T when iface type args missing */
+                                ret_type = resolved_method->type;
+                            }
+                        }
+                        /* Erased SAM returns Object; keep Object in the specialized descriptor. */
+                        if (sam_descriptor) {
+                            const char *erased_ret = strchr(sam_descriptor, ')');
+                            if (erased_ret && strcmp(erased_ret + 1, "Ljava/lang/Object;") == 0 &&
+                                resolved_method && resolved_method->type &&
+                                resolved_method->type->kind == TYPE_CLASS &&
+                                resolved_method->type->data.class_type.name &&
+                                strcmp(resolved_method->type->data.class_type.name, "java.lang.Object") == 0) {
+                                ret_type = resolved_method->type;
                             }
                         }
                         char *ret_desc = type_to_descriptor(ret_type);
@@ -14932,6 +15163,26 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         out += use_len;
                     }
                     strcpy(refined_desc + out, sp);   /* ")" and the return type */
+                    {
+                        const char *spec_ret = strchr(refined_desc, ')');
+                        const char *impl_ret = strchr(method_descriptor, ')');
+                        if (spec_ret && impl_ret && target_class_sym->kind != SYM_INTERFACE) {
+                            spec_ret++;
+                            impl_ret++;
+                            if (strncmp(spec_ret, "Ljava/lang/Object;", 18) == 0 &&
+                                *impl_ret != 'V' &&
+                                strncmp(impl_ret, "Ljava/lang/Object;", 18) != 0) {
+                                size_t pre = (size_t)(spec_ret - refined_desc);
+                                size_t impl_len = strlen(impl_ret);
+                                char *with_ret = malloc(pre + impl_len + 1);
+                                memcpy(with_ret, refined_desc, pre);
+                                memcpy(with_ret + pre, impl_ret, impl_len + 1);
+                                free(refined_desc);
+                                refined_desc = with_ret;
+                                changed = true;
+                            }
+                        }
+                    }
                     if (changed) {
                         spec_desc_str = refined_desc;
                     }

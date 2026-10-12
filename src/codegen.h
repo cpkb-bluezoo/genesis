@@ -641,6 +641,8 @@ void mg_exit_scope(method_gen_t *mg);
 
 /* Emit load/store for local variable with correct opcode for type */
 void mg_emit_load_local(method_gen_t *mg, uint16_t slot, type_kind_t kind);
+/* Load a local from the current method, or val$ field when relayed through a nested class */
+bool mg_emit_load_enclosing_variable(method_gen_t *mg, symbol_t *var_sym);
 void mg_emit_store_local(method_gen_t *mg, uint16_t slot, type_kind_t kind);
 
 void mg_push(method_gen_t *mg, int slots);

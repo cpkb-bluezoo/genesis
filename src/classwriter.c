@@ -48,22 +48,26 @@ static void preadd_annotations_list_cp(const_pool_t *cp, slist_t *annotations,
  * read at class-INIT time. Handles a plain literal initializer (the
  * common case for a real constant declaration) and a unary +/- wrapping
  * one; a field whose initializer is itself a more complex expression
- * (referencing OTHER constants, arithmetic, ...) is intentionally left
- * without a ConstantValue attribute here, matching this file's existing
- * philosophy elsewhere of handling the concrete shape actually needed
- * rather than a fully general constant-expression evaluator - genesis's
- * own <clinit> initialization still runs regardless, so such a field
- * still works correctly for every use except cross-module case-label
- * folding of that specific shape. Confirmed against gumdrop's own
- * PageContext (jakarta.servlet.jsp) - "public static final int
- * PAGE_SCOPE = 1;" and its three siblings, referenced as bare case
- * labels by a DIFFERENT module's ELEvaluatorTest - exactly this shape.
+ * (referencing OTHER constants, arithmetic, ...) is folded by
+ * semantic_eval_constant_expr() when that expression is a compile-time
+ * constant (JLS 15.28). Without the attribute, a later compilation unit
+ * that only sees this class file cannot inline the value: @Order(Props.ORDER)
+ * was written as an enum constant named ORDER, and Spring's annotation
+ * parser threw "SecurityFilterProperties is not an enum class". A plain
+ * literal is still handled here directly (including a string that contains
+ * a NUL, which the general evaluator's strdup would cut short). Confirmed
+ * against gumdrop's own PageContext (jakarta.servlet.jsp) - "public static
+ * final int PAGE_SCOPE = 1;" and its three siblings, referenced as bare
+ * case labels by a DIFFERENT module's ELEvaluatorTest - exactly this shape.
  * Returns a constant pool index (a CONSTANT_Integer/Long/Float/Double/
  * String entry matching the field's own descriptor) for the
  * ConstantValue attribute to reference, or 0 if this field isn't
  * eligible (not static final, not a primitive/String type, or its
- * initializer isn't one of the two shapes handled above).
+ * initializer is not a compile-time constant expression).
  */
+static uint16_t field_constant_expr_index(const_pool_t *cp, char desc0, bool is_string,
+                                         ast_node_t *init);
+
 static uint16_t field_gen_constant_value_index(const_pool_t *cp, field_gen_t *fg)
 {
     if (!fg || !fg->descriptor || !fg->ast) {
@@ -158,7 +162,8 @@ static uint16_t field_gen_constant_value_index(const_pool_t *cp, field_gen_t *fg
                 return 0;
         }
     }
-    return 0;
+    return field_constant_expr_index(cp, desc0, is_string,
+                                     (ast_node_t *)declarator->data.node.children->data);
 }
 
 /* Defined in codegen_expr.c (declared there in codegen_internal.h) - builds
@@ -179,6 +184,68 @@ char *ast_type_to_descriptor(ast_node_t *type_node);
  * semantic.c).
  */
 static __thread semantic_t *g_classwriter_sem = NULL;
+
+/**
+ * ConstantValue index for a static final field whose initializer is a
+ * compile-time constant expression rather than a bare literal. 0 if it
+ * is not one, or the folded value does not match the field's type.
+ */
+static uint16_t field_constant_expr_index(const_pool_t *cp, char desc0, bool is_string,
+                                         ast_node_t *init)
+{
+    if (!g_classwriter_sem || !init) {
+        return 0;
+    }
+    int kind = 0;
+    long long ival = 0;
+    double dval = 0;
+    char *sval = NULL;
+    if (!semantic_eval_constant_expr(g_classwriter_sem, init, &kind, &ival, &dval, &sval)) {
+        return 0;
+    }
+    uint16_t idx = 0;
+    if (is_string) {
+        if (kind == 4 && sval) {
+            idx = cp_add_string(cp, sval);
+        }
+        free(sval);
+        return idx;
+    }
+    free(sval);
+    switch (desc0) {
+        case 'J':
+            if (kind == 1 || kind == 2 || kind == 5) {
+                return cp_add_long(cp, ival);
+            }
+            return 0;
+        case 'F':
+            if (kind == 3) {
+                return cp_add_float(cp, (float)dval);
+            }
+            if (kind == 1 || kind == 2) {
+                return cp_add_float(cp, (float)ival);
+            }
+            return 0;
+        case 'D':
+            if (kind == 3) {
+                return cp_add_double(cp, dval);
+            }
+            if (kind == 1 || kind == 2) {
+                return cp_add_double(cp, (double)ival);
+            }
+            return 0;
+        case 'Z':
+            if (kind == 5 || kind == 1) {
+                return cp_add_integer(cp, ival ? 1 : 0);
+            }
+            return 0;
+        default:
+            if (kind == 1 || kind == 2 || kind == 5) {
+                return cp_add_integer(cp, (int32_t)ival);
+            }
+            return 0;
+    }
+}
 
 /* -parameters: write a MethodParameters attribute naming each parameter */
 static bool g_emit_method_parameters = false;
@@ -516,10 +583,18 @@ static int annotation_value_emit(uint8_t **p, const_pool_t *cp, ast_node_t *valu
         bool declared_enum = decl_desc && decl_desc[0] == 'L' &&
             strcmp(decl_desc, "Ljava/lang/String;") != 0 &&
             strcmp(decl_desc, "Ljava/lang/Class;") != 0;
+        /* A primitive or String element is never an enum constant. A
+         * qualified field that did not fold (Props.ORDER) used to be
+         * written with tag 'e' anyway, and the runtime then called
+         * Enum.valueOf on the declaring class. */
+        bool primitive_element = decl_desc && decl_desc[1] == '\0' &&
+            strchr("BCSIFJDZ", decl_desc[0]) != NULL;
+        bool string_element = decl_desc && strcmp(decl_desc, "Ljava/lang/String;") == 0;
         char *type_desc = NULL;
         if (declared_enum) {
             type_desc = strdup(decl_desc);
-        } else if (value->type == AST_FIELD_ACCESS && value->data.node.children) {
+        } else if (!primitive_element && !string_element &&
+                   value->type == AST_FIELD_ACCESS && value->data.node.children) {
             /* Qualified enum constant (RetentionPolicy.RUNTIME, Ann.Mode.A):
              * the receiver, possibly itself dotted, names the enum type. */
             char *recv = dotted_name_of((ast_node_t *)value->data.node.children->data);

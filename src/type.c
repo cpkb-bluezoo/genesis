@@ -1378,26 +1378,42 @@ bool type_assignable(type_t *target, type_t *source)
         }
     }
     
-    /* Array subtyping */
+    /* Array subtyping. A signature "T[][]" is nested (array of array);
+     * a source "Integer[][]" is one array whose dimension count is 2.
+     * Compare the total depth and the leaf, not the top node's count. */
     if (target->kind == TYPE_ARRAY && source->kind == TYPE_ARRAY) {
-        /* Arrays are covariant for reference element types */
-        if (target->data.array_type.dimensions == source->data.array_type.dimensions) {
-            type_t *te = target->data.array_type.element_type;
-            type_t *se = source->data.array_type.element_type;
+        int target_depth = 0;
+        int source_depth = 0;
+        type_t *te = target;
+        type_t *se = source;
+        while (te && te->kind == TYPE_ARRAY) {
+            int dims = te->data.array_type.dimensions > 0 ? te->data.array_type.dimensions : 1;
+            target_depth += dims;
+            te = te->data.array_type.element_type;
+        }
+        while (se && se->kind == TYPE_ARRAY) {
+            int dims = se->data.array_type.dimensions > 0 ? se->data.array_type.dimensions : 1;
+            source_depth += dims;
+            se = se->data.array_type.element_type;
+        }
+        if (target_depth == source_depth && te && se) {
             if (type_is_reference(te) && type_is_reference(se)) {
                 return type_assignable(te, se);
             }
+            if (te->kind == se->kind && te->kind >= TYPE_BOOLEAN && te->kind <= TYPE_DOUBLE) {
+                return true;
+            }
+        }
+        /* "T[]" takes "long[][]": T is long[], an array, which is a reference. */
+        else if (target_depth < source_depth && te && te->kind == TYPE_TYPEVAR) {
+            return true;
         }
         /* Multi-dimensional array to Object[]: T[][] is assignable to Object[]
          * because T[] is assignable to Object */
-        else if (target->data.array_type.dimensions == 1 &&
-                 source->data.array_type.dimensions > 1) {
-            type_t *te = target->data.array_type.element_type;
-            /* Check if target element is Object */
-            if (te && te->kind == TYPE_CLASS && 
-                strcmp(te->data.class_type.name, "java.lang.Object") == 0) {
-                return true;  /* Any array[][] is assignable to Object[] */
-            }
+        else if (target_depth == 1 && source_depth > 1 && te && te->kind == TYPE_CLASS &&
+                 te->data.class_type.name &&
+                 strcmp(te->data.class_type.name, "java.lang.Object") == 0) {
+            return true;
         }
     }
     

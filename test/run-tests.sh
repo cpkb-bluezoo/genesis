@@ -625,6 +625,43 @@ else
     failed=$((failed + 1))
 fi
 
+# Sub.Mode is Base.Mode. The caller is analyzed before the class that
+# declares getMode(), so the return type is resolved from the other file's
+# stub. Use.java is listed first on purpose.
+printf "%-30s ... " "InheritedMemberTypeCallTest"
+im_lib="$TEST_BUILD/inhm-lib"
+im_out="$TEST_BUILD/inhm-out"
+rm -rf "$im_lib" "$im_out"
+mkdir -p "$im_lib" "$im_out"
+if "$GENESIS" -d "$im_lib" "$TEST_SRC"/external/inhm/Base.java "$TEST_SRC"/external/inhm/Sub.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$im_lib" -d "$im_out" \
+       "$TEST_SRC/external/inhm/Use.java" "$TEST_SRC/external/inhm/Holder.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$im_out:$im_lib" p.Use >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The library field is Integer.MAX_VALUE - 5. Its ConstantValue is what the
+# annotation in a later compilation inlines.
+printf "%-30s ... " "AnnotationConstantFoldTest"
+ac_lib="$TEST_BUILD/annconst-lib"
+ac_out="$TEST_BUILD/annconst-out"
+rm -rf "$ac_lib" "$ac_out"
+mkdir -p "$ac_lib" "$ac_out"
+if "$GENESIS" -d "$ac_lib" "$TEST_SRC"/external/annconstlib/Precedence.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ac_lib" -d "$ac_out" \
+       "$TEST_SRC/external/AnnotationConstantFoldTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ac_out:$ac_lib" AnnotationConstantFoldTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "--- Class file version (-source/-target/-release) ---"
 # With no -target the version is computed from the features used (floor 52,
@@ -955,6 +992,268 @@ if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
        "$TEST_SRC/src/java8/crossfilegenericmethodchain/CrossFileGenericMethodChainVerifyTest.java" \
        >/dev/null 2>&1 && \
    "$JAVA" -cp "$TEST_BUILD" crossfilegenericmethodchain.CrossFileGenericMethodChainVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Static interface factory method reference (cross-file) ---"
+printf "%-30s ... " "MethodRefStaticInterfaceFactory"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" -sourcepath "$TEST_SRC/src/java8" \
+       "$TEST_SRC/src/java8/methodreffactory/HttpComponentsClientHttpRequestFactoryBuilder.java" \
+       "$TEST_SRC/src/java8/methodreffactory/ClientHttpRequestFactoryBuilder.java" \
+       "$TEST_SRC/src/java8/methodreffactory/MethodRefStaticInterfaceFactoryVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" methodreffactory.MethodRefStaticInterfaceFactoryVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Binder ctor: varargs over Iterable for single source ---"
+printf "%-30s ... " "BinderVarargsOverIterable"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/BinderVarargsOverIterableVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" BinderVarargsOverIterableVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "BinderVarargsMockPropertySource"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/BinderVarargsMockPropertySourceVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" BinderVarargsMockPropertySourceVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "IterableOverVarargsContainsOnlyKeys"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/IterableOverVarargsContainsOnlyKeysVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" IterableOverVarargsContainsOnlyKeysVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Generic field chained access (checkcast before 2nd getfield) ---"
+printf "%-30s ... " "GenericFieldChainedAccess"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/GenericFieldChainedAccessVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" GenericFieldChainedAccessVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Paths::get overload for String SAM (not URI) ---"
+printf "%-30s ... " "PathsGetMethodRefOverload"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/PathsGetMethodRefOverloadVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" PathsGetMethodRefOverloadVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Class literal overload (Class vs Object) ---"
+printf "%-30s ... " "ClassLiteralOverload"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/ClassLiteralOverloadVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" ClassLiteralOverloadVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Lambda in anonymous class captures outer locals (invokedynamic args) ---"
+printf "%-30s ... " "LambdaInAnonymousCapturesLocal"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/LambdaInAnonymousClassCapturesLocalVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" LambdaInAnonymousClassCapturesLocalVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Supplier<E extends bound> block lambda SAM return (Flyway) ---"
+printf "%-30s ... " "LambdaSupplierGenericTypeVar"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/LambdaSupplierGenericTypeVarVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" LambdaSupplierGenericTypeVarVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Flyway Extension: local shadows field in Supplier lambda ---"
+printf "%-30s ... " "FlywayExtensionSupplierBlock"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/FlywayExtensionSupplierBlockVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" FlywayExtensionSupplierBlockVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Zero-arg generic varargs witness (ArgumentCaptor.captor) ---"
+printf "%-30s ... " "GenericVarargsWitness"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/GenericVarargsWitnessVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" GenericVarargsWitnessVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Anonymous super ctor int to long widening ---"
+printf "%-30s ... " "AnonSuperLongCtor"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/AnonSuperLongCtorVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" AnonSuperLongCtorVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Constructor ref to Supplier (ArrayList::new) ---"
+printf "%-30s ... " "SupplierArrayListNew"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/SupplierArrayListNewVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" SupplierArrayListNewVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Method ref picks varargs flatExtracting overload ---"
+printf "%-30s ... " "FlatExtractingMethodRefOverload"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/FlatExtractingMethodRefOverloadVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" FlatExtractingMethodRefOverloadVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "BoundMethodRefErasure"
+if "$JAVAC" -source 8 -target 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/selfspec/SelfSpec.java" >/dev/null 2>&1 && \
+   "$GENESIS" -source 8 -cp "$TEST_BUILD" -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/selfspec/BoundMethodRefErasureVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" BoundMethodRefErasureVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "KeyValuesOfEntryMethodRef"
+if MICROMETER_COMMONS_JAR="$(find "$HOME/.cache/genesis-bench/maven/io/micrometer" -name 'micrometer-commons-*.jar' 2>/dev/null | sort -V | tail -1)" && \
+   [ -n "$MICROMETER_COMMONS_JAR" ] && \
+   "$GENESIS" -source 8 -cp "$MICROMETER_COMMONS_JAR" -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/micrometer/KeyValuesOfEntryMethodRefVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD:$MICROMETER_COMMONS_JAR" KeyValuesOfEntryMethodRefVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "EntryMethodRefFunction"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/EntryMethodRefFunctionVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" EntryMethodRefFunctionVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Method ref SAM return stays Object ---"
+printf "%-30s ... " "MethodRefFlatExtractObjectReturn"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/MethodRefFlatExtractObjectReturnVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" MethodRefFlatExtractObjectReturnVerifyTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Generic superclass field chain (checkcast before getfield) ---"
+printf "%-30s ... " "GenericActualFieldChain"
+if "$GENESIS" -source 8 -d "$TEST_BUILD" \
+       "$TEST_SRC/src/java8/GenericActualFieldChainVerifyTest.java" \
+       >/dev/null 2>&1 && \
+   "$JAVA" -cp "$TEST_BUILD" GenericActualFieldChainVerifyTest >/dev/null 2>&1; then
     echo PASS
     passed=$((passed + 1))
 else
@@ -1317,6 +1616,26 @@ if "$GENESIS" -d "$igb_lib" "$TEST_SRC"/external/indirectbridgelib/*.java >/dev/
    "$GENESIS" -cp "$igb_lib" -d "$igb_out" \
        "$TEST_SRC/external/IndirectGenericBridgeFromClassfileTest.java" >/dev/null 2>&1 &&
    "$JAVA" -cp "$igb_out:$igb_lib" IndirectGenericBridgeFromClassfileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
+echo "--- Covariant override bridge when superclass came from a class file ---"
+printf "%-30s ... " "PushCovariantOverrideBridge"
+pcov_lib="$TEST_BUILD/pushcovlib-lib"
+pcov_out="$TEST_BUILD/pushcovlib-out"
+rm -rf "$pcov_lib" "$pcov_out"
+mkdir -p "$pcov_lib" "$pcov_out"
+if "$GENESIS" -d "$pcov_lib" "$TEST_SRC"/external/pushcovlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$pcov_lib" -d "$pcov_out" \
+       "$TEST_SRC/external/pushcovlib/MidTests.java" \
+       "$TEST_SRC/external/pushcovlib/LeafTests.java" \
+       "$TEST_SRC/external/PushCovariantOverrideBridgeFromClassfileTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$pcov_out:$pcov_lib" PushCovariantOverrideBridgeFromClassfileTest >/dev/null 2>&1; then
     echo PASS
     passed=$((passed + 1))
 else
@@ -1963,6 +2282,22 @@ if "$GENESIS" -d "$be_lib" "$TEST_SRC"/external/boundedenumlib/boundedenumlib/*.
    "$GENESIS" -cp "$be_lib" -d "$be_out" \
        "$TEST_SRC/external/BoundedEnumOverloadTest.java" >/dev/null 2>&1 &&
    "$JAVA" -Xverify:all -cp "$be_out:$be_lib" BoundedEnumOverloadTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "OverloadScore"
+os_lib="$TEST_BUILD/ovlpick-lib"
+os_out="$TEST_BUILD/ovlpick-out"
+rm -rf "$os_lib" "$os_out"
+mkdir -p "$os_lib" "$os_out"
+if "$GENESIS" -d "$os_lib" "$TEST_SRC"/external/ovlpick/ovlpick/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$os_lib" -d "$os_out" \
+       "$TEST_SRC/external/OverloadScoreTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -Xverify:all -cp "$os_out:$os_lib" OverloadScoreTest >/dev/null 2>&1; then
     echo PASS
     passed=$((passed + 1))
 else

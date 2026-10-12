@@ -1010,6 +1010,64 @@ void mg_emit_load_local(method_gen_t *mg, uint16_t slot, type_kind_t kind)
     }
 }
 
+bool mg_emit_load_enclosing_variable(method_gen_t *mg, symbol_t *var_sym)
+{
+    if (!mg || !var_sym || !var_sym->name) {
+        return false;
+    }
+
+    local_var_info_t *cap_info = mg_get_local_info(mg, var_sym->name);
+    if (cap_info) {
+        mg_emit_load_local(mg, cap_info->slot, cap_info->kind);
+        return true;
+    }
+
+    if (!mg->class_gen) {
+        return false;
+    }
+
+    char field_name[300];
+    snprintf(field_name, sizeof(field_name), "val$%s", var_sym->name);
+    field_gen_t *cap_field = hashtable_lookup(mg->class_gen->field_map, field_name);
+    if (!cap_field) {
+        return false;
+    }
+
+    bc_emit(mg->code, OP_ALOAD_0);
+    if (mg->class_gen->internal_name) {
+        mg_push_object(mg, mg->class_gen->internal_name);
+    } else {
+        mg_push_null(mg);
+    }
+    uint16_t fieldref = cp_add_fieldref(mg->cp, mg->class_gen->internal_name,
+                                         cap_field->name, cap_field->descriptor);
+    bc_emit(mg->code, OP_GETFIELD);
+    bc_emit_u2(mg->code, fieldref);
+    mg_pop_typed(mg, 1);
+    switch (cap_field->descriptor[0]) {
+        case 'J': mg_push_long(mg); break;
+        case 'D': mg_push_double(mg); break;
+        case 'F': mg_push_float(mg); break;
+        case 'L': {
+            const char *d = cap_field->descriptor;
+            size_t len = strlen(d);
+            if (len > 2 && d[len - 1] == ';') {
+                char *internal = malloc(len - 1);
+                memcpy(internal, d + 1, len - 2);
+                internal[len - 2] = '\0';
+                mg_push_object(mg, internal);
+                free(internal);
+            } else {
+                mg_push_object(mg, "java/lang/Object");
+            }
+            break;
+        }
+        case '[': mg_push_object(mg, "java/lang/Object"); break;
+        default:  mg_push_int(mg); break;
+    }
+    return true;
+}
+
 /* Emit the correct store instruction for a local variable */
 void mg_emit_store_local(method_gen_t *mg, uint16_t slot, type_kind_t kind)
 {
@@ -4919,6 +4977,27 @@ static void generate_interface_bridges(class_gen_t *cg)
  * interface (which also needs parameter checkcasts, reused here for
  * symmetry even though the primary, confirmed bug is return-type-only).
  */
+static symbol_t *superclass_for_covariant_bridges(class_gen_t *cg, symbol_t *super_sym)
+{
+    if (!cg || !super_sym) {
+        return super_sym;
+    }
+    symbol_complete(super_sym);
+    if (!cg->sem || !super_sym->qualified_name) {
+        return super_sym;
+    }
+    bool needs_load = !super_sym->data.class_data.members ||
+        !super_sym->data.class_data.members->symbols ||
+        super_sym->data.class_data.members->symbols->count == 0;
+    if (needs_load) {
+        symbol_t *loaded = load_external_class(cg->sem, super_sym->qualified_name);
+        if (loaded) {
+            return loaded;
+        }
+    }
+    return super_sym;
+}
+
 static void generate_covariant_override_bridges_for(class_gen_t *cg, symbol_t *super_sym)
 {
     if (!cg || !cg->class_sym) {
@@ -4927,6 +5006,7 @@ static void generate_covariant_override_bridges_for(class_gen_t *cg, symbol_t *s
 
     symbol_t *class_sym = cg->class_sym;
 
+    super_sym = superclass_for_covariant_bridges(cg, super_sym);
     if (!super_sym || !super_sym->data.class_data.members) {
         return;
     }
@@ -7553,7 +7633,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
     slist_free(enum_constants);
     
     /* Generate accessor methods, equals(), hashCode(), and toString() for records */
-    if (is_record && record_components) {
+    if (is_record) {
         /* Generate accessor methods for each component (not one the record declares) */
         for (slist_t *comp = record_components; comp; comp = comp->next) {
             ast_node_t *comp_node = (ast_node_t *)comp->data;
@@ -8444,6 +8524,83 @@ static void codegen_enum_constant_anon_constructor(class_gen_t *cg,
     }
 }
 
+static type_t *anon_super_ctor_arg_type(semantic_t *sem, ast_node_t *arg_node)
+{
+    if (!arg_node) {
+        return NULL;
+    }
+    /* "new ByteArrayInputStream(...)" in "new FilterInputStream(bais) { }":
+     * sem_type on the whole new expression may be the super ctor's declared
+     * InputStream, but the synthesized anonymous ctor descriptor must use the
+     * argument's own static type (ByteArrayInputStream), matching codegen_expr.c. */
+    if (arg_node->type == AST_NEW_OBJECT && arg_node->data.node.children) {
+        ast_node_t *type_node = (ast_node_t *)arg_node->data.node.children->data;
+        if (type_node && type_node->sem_type) {
+            return type_node->sem_type;
+        }
+    }
+    if (arg_node->sem_type) {
+        return arg_node->sem_type;
+    }
+    if (sem) {
+        return get_expression_type(sem, arg_node);
+    }
+    return NULL;
+}
+
+static method_descriptor_t *super_ctor_method_descriptor(symbol_t *ctor)
+{
+    if (!ctor) {
+        return NULL;
+    }
+    if (ctor->data.method_data.descriptor) {
+        return descriptor_parse_method(ctor->data.method_data.descriptor);
+    }
+    if (!ctor->data.method_data.parameters) {
+        return NULL;
+    }
+    string_t *s = string_new("(");
+    for (slist_t *pn = ctor->data.method_data.parameters; pn; pn = pn->next) {
+        symbol_t *ps = (symbol_t *)pn->data;
+        if (!ps || !ps->type) {
+            string_free(s, true);
+            return NULL;
+        }
+        char *pd = type_to_descriptor(ps->type);
+        string_append(s, pd);
+        free(pd);
+    }
+    string_append(s, ")V");
+    method_descriptor_t *md = descriptor_parse_method(s->str);
+    string_free(s, true);
+    return md;
+}
+
+static type_kind_t parsed_descriptor_kind(const type_descriptor_t *td)
+{
+    if (!td) {
+        return TYPE_UNKNOWN;
+    }
+    if (td->array_dimensions > 0) {
+        return TYPE_ARRAY;
+    }
+    switch (td->type) {
+        case DESC_BOOLEAN: return TYPE_BOOLEAN;
+        case DESC_BYTE:    return TYPE_BYTE;
+        case DESC_CHAR:    return TYPE_CHAR;
+        case DESC_SHORT:   return TYPE_SHORT;
+        case DESC_INT:     return TYPE_INT;
+        case DESC_LONG:    return TYPE_LONG;
+        case DESC_FLOAT:   return TYPE_FLOAT;
+        case DESC_DOUBLE:  return TYPE_DOUBLE;
+        case DESC_OBJECT:
+        case DESC_ARRAY:
+            return TYPE_CLASS;
+        default:
+            return TYPE_UNKNOWN;
+    }
+}
+
 /**
  * Generate bytecode for an anonymous class.
  * Anonymous classes don't have AST_CLASS_DECL nodes - they have a symbol
@@ -8754,6 +8911,8 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             const char *super_ctor_full_desc = (resolved_super_ctor &&
                 resolved_super_ctor->data.method_data.descriptor) ?
                 resolved_super_ctor->data.method_data.descriptor : NULL;
+            method_descriptor_t *super_md_desc = super_ctor_full_desc ?
+                descriptor_parse_method(super_ctor_full_desc) : NULL;
             const char *super_ctor_close_paren = super_ctor_full_desc ?
                 strrchr(super_ctor_full_desc, ')') : NULL;
             bool super_params_known = false;
@@ -8788,32 +8947,32 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 }
             }
 
-            for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
+            int super_pi = 0;
+            for (slist_t *arg = super_ctor_args; arg; arg = arg->next, super_pi++) {
                 ast_node_t *arg_node = (ast_node_t *)arg->data;
-                /* Use sem_type if available, otherwise try to get expression type */
-                type_t *arg_type = arg_node ? arg_node->sem_type : NULL;
-                if (!arg_type && arg_node && cg->sem) {
-                    arg_type = get_expression_type(cg->sem, arg_node);
-                }
+                type_t *arg_type = anon_super_ctor_arg_type(cg->sem, arg_node);
                 if (arg_type) {
                     char *arg_desc = type_to_descriptor(arg_type);
                     string_append(desc, arg_desc);
                     if (!super_params_known) {
-                        /* No resolved descriptor to fall back on - use the
-                         * argument's own type, as before (correct whenever
-                         * it exactly matches the declared parameter type,
-                         * which is the common case). */
                         string_append(super_desc, arg_desc);
                     }
                     free(arg_desc);
                 }
             }
+            method_descriptor_free(super_md_desc);
         }
 
         string_append(desc, ")V");
         string_append(super_desc, ")V");
         init->descriptor_index = cp_add_utf8(cg->cp, desc->str);
         string_free(desc, true);
+        
+        /* Parsed super ctor params (freed after <init> body is emitted). */
+        symbol_t *resolved_super_ctor_for_body = (cg->class_sym && cg->class_sym->data.class_data.resolved_super_ctor) ?
+            cg->class_sym->data.class_data.resolved_super_ctor : NULL;
+        method_descriptor_t *super_md = super_ctor_args ?
+            super_ctor_method_descriptor(resolved_super_ctor_for_body) : NULL;
         
         /* Create method_gen_t for generating code */
         method_gen_t *mg = calloc(1, sizeof(method_gen_t));
@@ -8862,15 +9021,19 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         /* Account for superclass constructor arguments - these come last */
         uint16_t super_arg_start_slot = mg->next_slot;
         if (super_ctor_args) {
-            for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
+            int super_pi = 0;
+            for (slist_t *arg = super_ctor_args; arg; arg = arg->next, super_pi++) {
                 ast_node_t *arg_node = (ast_node_t *)arg->data;
                 type_t *arg_type = arg_node ? arg_node->sem_type : NULL;
                 if (!arg_type && arg_node && cg->sem) {
                     arg_type = get_expression_type(cg->sem, arg_node);
                 }
-                if (arg_type) {
-                    int size = (arg_type->kind == TYPE_LONG ||
-                               arg_type->kind == TYPE_DOUBLE) ? 2 : 1;
+                type_kind_t kind = arg_type ? arg_type->kind : TYPE_UNKNOWN;
+                if (super_md && super_pi < super_md->param_count) {
+                    kind = parsed_descriptor_kind(&super_md->params[super_pi]);
+                }
+                if (kind != TYPE_UNKNOWN) {
+                    int size = (kind == TYPE_LONG || kind == TYPE_DOUBLE) ? 2 : 1;
                     mg->next_slot += size;
                     mg->max_locals = mg->next_slot;
                 }
@@ -9018,14 +9181,35 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         /* Load superclass constructor arguments */
         if (super_ctor_args) {
             uint16_t slot = super_arg_start_slot;
-            for (slist_t *arg = super_ctor_args; arg; arg = arg->next) {
+            int super_pi = 0;
+            for (slist_t *arg = super_ctor_args; arg; arg = arg->next, super_pi++) {
                 ast_node_t *arg_node = (ast_node_t *)arg->data;
                 type_t *arg_type = arg_node ? arg_node->sem_type : NULL;
                 if (!arg_type && arg_node && cg->sem) {
                     arg_type = get_expression_type(cg->sem, arg_node);
                 }
+                type_kind_t declared = TYPE_UNKNOWN;
+                if (super_md && super_pi < super_md->param_count) {
+                    declared = parsed_descriptor_kind(&super_md->params[super_pi]);
+                }
                 if (arg_type) {
                     type_kind_t kind = arg_type->kind;
+                    if (declared == TYPE_LONG && (kind == TYPE_BOOLEAN || kind == TYPE_BYTE ||
+                            kind == TYPE_CHAR || kind == TYPE_SHORT || kind == TYPE_INT)) {
+                        if (slot <= 3) {
+                            bc_emit(mg->code, OP_ILOAD_0 + slot);
+                        } else {
+                            bc_emit(mg->code, OP_ILOAD);
+                            bc_emit_u1(mg->code, (uint8_t)slot);
+                        }
+                        mg_push(mg, 1);
+                        bc_emit(mg->code, OP_I2L);
+                        mg_pop(mg, 1);
+                        mg_push(mg, 2);
+                        slot += 2;
+                        super_arg_count++;
+                        continue;
+                    }
                     if (kind == TYPE_LONG) {
                         if (slot <= 3) {
                             bc_emit(mg->code, OP_LLOAD_0 + slot);
@@ -9101,6 +9285,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         bc_emit(mg->code, OP_INVOKESPECIAL);
         bc_emit_u2(mg->code, super_init);
         mg_pop(mg, 1 + super_arg_count);
+        method_descriptor_free(super_md);
         
         /* Mark 'this' as initialized in stackmap after super() */
         if (mg->stackmap && cg->internal_name) {

@@ -3460,6 +3460,27 @@ int main(int argc, char **argv)
                         opts->parameters = true;
                         classwriter_set_method_parameters(true);
                     }
+                    else if (strcmp(arg, "-j") == 0 || strncmp(arg, "-j", 2) == 0) {
+                        int jobs = -1;
+                        if (strlen(arg) > 2) {
+                            jobs = atoi(arg + 2);
+                        } else if (j + 1 < file_argc && file_argv[j + 1][0] != '-') {
+                            jobs = atoi(file_argv[++j]);
+                        }
+                        opts->jobs = jobs;
+                    }
+                    else if (strcmp(arg, "--jobs") == 0) {
+                        if (j + 1 >= file_argc) {
+                            fprintf(stderr, "error: --jobs requires a value\n");
+                            for (int k = 0; k < file_argc; k++) {
+                                free(file_argv[k]);
+                            }
+                            free(file_argv);
+                            compiler_options_free(opts);
+                            return 1;
+                        }
+                        opts->jobs = atoi(file_argv[++j]);
+                    }
                     else if (ignored_javac_option(arg) != 0) {
                         if (ignored_javac_option(arg) == 2) {
                             expect_value = true;
@@ -3652,7 +3673,9 @@ int main(int argc, char **argv)
      * -j1 or --serial = single thread, -j or default = auto-detect */
     ast_pool_cleanup();  /* Disable pooled allocation */
     int thread_count = opts->jobs;
-    if (thread_count <= 0) {
+    if (thread_count == 0) {
+        thread_count = 1;  /* -j0 / --serial: no worker subprocesses */
+    } else if (thread_count < 0) {
         thread_count = get_cpu_count();
     }
     int result = compile_parallel(opts, thread_count);

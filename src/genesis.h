@@ -956,6 +956,12 @@ char *semantic_resolve_annotation_element_descriptor(semantic_t *sem,
                                                        const char *annotation_name,
                                                        const char *element_name);
 
+/* A compile-time constant expression. *kind is 1 int, 2 long, 3 double,
+ * 4 string (*sval malloc'd), 5 boolean. Defined in semantic.c; used by
+ * classwriter.c to emit ConstantValue for a static final field. */
+bool semantic_eval_constant_expr(semantic_t *sem, ast_node_t *expr,
+                                 int *kind, long long *ival, double *dval, char **sval);
+
 /* Load an annotation type's own classfile (trying each dot as a possible
  * '$' nesting boundary, not just the plain dotted name - see the static
  * classpath_load_class_with_nested_fallback() this wraps, in semantic.c,

@@ -253,12 +253,18 @@ class Compiler:
         os.makedirs(os.path.dirname(argfile), exist_ok=True)
         with open(argfile, "w") as f:
             flags = ["-d", out] + (["-cp", os.pathsep.join(cp)] if cp else [])
-            for a in flags + ["--release", RELEASE, "-parameters", "-proc:none", "-g", "-nowarn",
+            # -j1: avoid worker subprocesses (see genesis.c thread_count > 1 gate)
+            extra = ["-j1"] if self.name == "genesis" else []
+            for a in flags + extra + ["--release", RELEASE, "-parameters", "-proc:none", "-g", "-nowarn",
                               "-encoding", "UTF-8"] + sources:
                 f.write(a + "\n")
         logfile = os.path.join(self.work, "logs", self.name, "%s.%s.compile.log" % (project.name, sset))
         os.makedirs(os.path.dirname(logfile), exist_ok=True)
-        status, secs = run([self.exe, "@" + argfile], logfile)
+        cmd = [self.exe]
+        if self.name == "genesis":
+            cmd.append("-j1")
+        cmd.append("@" + argfile)
+        status, secs = run(cmd, logfile)
         if status != 0:
             return self._record(key, "failed", "see %s" % logfile, secs, logfile)
         res = os.path.join(project.dir, "src", sset, "resources")
@@ -372,8 +378,9 @@ def run_tests(build, comp, p, console):
             if tc.find("failure") is not None or tc.find("error") is not None:
                 results[ident] = "failed"
             elif tc.find("skipped") is not None:
-                results[ident] = "skipped"
-            else:
+                if results.get(ident) != "failed":
+                    results[ident] = "skipped"
+            elif ident not in results:
                 results[ident] = "passed"
     if not results and status != 0:
         return "no results (exit %d, see %s)" % (status, logfile)
@@ -486,13 +493,39 @@ def smoke(work):
         comps[name] = comp
         start = time.time()
         schedule(build, comp, paths)
-        main_ok = sum(1 for p in paths if comp.results[(p, "main")]["status"] == "ok")
-        log("%-8s main compiled: %d of %d projects (%.0fs)" % (name, main_ok, len(paths), time.time() - start))
+        elapsed = time.time() - start
+        main_counts = {}
+        for p in paths:
+            st = comp.results[(p, "main")]["status"]
+            main_counts[st] = main_counts.get(st, 0) + 1
+        log("%-8s main: %d ok, %d failed, %d skipped, %d none (of %d projects, %.0fs)" % (
+            name,
+            main_counts.get("ok", 0),
+            main_counts.get("failed", 0),
+            main_counts.get("skipped", 0),
+            main_counts.get("none", 0),
+            len(paths),
+            elapsed,
+        ))
         start = time.time()
         compile_tests(build, comp, paths, selected)
-        t_ok = sum(1 for p in selected if comp.results.get((p, "test"), {}).get("status") == "ok")
+        elapsed = time.time() - start
+        t_counts = {}
         t_all = sum(1 for p in selected if build.projects[p].has_source("test"))
-        log("%-8s tests compiled: %d of %d projects (%.0fs)" % (name, t_ok, t_all, time.time() - start))
+        for p in selected:
+            if not build.projects[p].has_source("test"):
+                continue
+            st = comp.results.get((p, "test"), {}).get("status", "missing")
+            t_counts[st] = t_counts.get(st, 0) + 1
+        log("%-8s test sources: %d ok, %d failed, %d skipped, %d none (of %d projects, %.0fs)" % (
+            name,
+            t_counts.get("ok", 0),
+            t_counts.get("failed", 0),
+            t_counts.get("skipped", 0),
+            t_counts.get("none", 0),
+            t_all,
+            elapsed,
+        ))
 
     tests = {}
     if not os.environ.get("SB_NO_TESTS"):
