@@ -24295,6 +24295,7 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
         }
         return false;
     }
+    ensure_method_result_type(sem, sam, iface_sym);
     
     /* Bound before: what its body was typed with is stale */
     if (lambda->sem_type && lambda->data.node.children && lambda->data.node.children->next) {

@@ -13754,9 +13754,18 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 
                 string_append(impl_desc, ")");
                 
-                /* Add return type */
-                if (sam->type) {
-                    char *ret_desc = type_to_descriptor(sam->type);
+                /* Add return type. Interface SAMs from class files (or from
+                 * another file of the same parallel batch) often still have
+                 * method->type NULL here - nothing needed it before codegen.
+                 * Defaulting to void while the body still emits ARETURN gives
+                 * VerifyError: "Method does not expect a return value"
+                 * (Spring Boot GrpcServerSecurityAutoConfiguration). */
+                type_t *sam_return = sam->type;
+                if (!sam_return && cg->sem && iface_sym) {
+                    sam_return = semantic_ensure_method_result_type(cg->sem, sam, iface_sym);
+                }
+                if (sam_return) {
+                    char *ret_desc = type_to_descriptor(sam_return);
                     string_append(impl_desc, ret_desc);
                     free(ret_desc);
                 } else {

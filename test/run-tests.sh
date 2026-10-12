@@ -2155,6 +2155,21 @@ else
     failed=$((failed + 1))
 fi
 
+printf "%-30s ... " "NestedLambdaSamReturn"
+nls_out="$TEST_BUILD/nested-lambda-sam-out"
+rm -rf "$nls_out"
+mkdir -p "$nls_out"
+if (cd "$nls_out" && "$GENESIS" -d "$nls_out" \
+       "$TEST_SRC/external/executorproviderlib/ep/ExecutorProvider.java" \
+       "$TEST_SRC/external/nestedlambdaouter/NestedLambdaOuter.java" >/dev/null 2>&1) &&
+   "$JAVA" -Xverify:all -cp "$nls_out" NestedLambdaOuter >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 printf "%-30s ... " "InheritedFromHiddenSuperclass"
 hs_lib="$TEST_BUILD/hiddensuperlib-lib"
 hs_out="$TEST_BUILD/hiddensuperlib-out"
