@@ -51,10 +51,6 @@ KNOWN BUGS
    - Needs synthetic bridge method to wrap argument in Object[]
    - javac generates lambda$test$N methods that create Object[] wrapper
 
-4. Type constraint violation detection (MethodReference68):
-   - Compile-fail test - Genesis doesn't detect the error
-   - Generates invalid bytecode instead of compile error
-
 8. Nested interface methods are registered twice in semantic analysis
    (once without and once with the implicit public abstract modifiers).
    Consumers such as the functional interface lookup deduplicate by name;

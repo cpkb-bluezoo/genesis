@@ -2730,6 +2730,18 @@ for f in CastToPrimitive CastToArray CastToNonFunctional MethodRefCastToPrimitiv
     fi
 done
 
+printf "%-30s ... " "Rejecting MethodRefInferenceConflict (message)"
+mri_msg=$("$GENESIS" -d "$TEST_BUILD/lambdacast-out" "$TEST_SRC/invalid/MethodRefInferenceConflict.java" 2>&1)
+mri_rc=$?
+if [ $mri_rc -eq 1 ] && echo "$mri_msg" | grep -q "cannot be applied to given types" &&
+   ! echo "$mri_msg" | grep -q "code generation failed"; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

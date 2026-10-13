@@ -11850,6 +11850,165 @@ static bool params_more_specific(symbol_t *a, symbol_t *b)
     return stricter;
 }
 
+static bool expr_holds_lambda(ast_node_t *expr);
+static type_t *unwrap_wildcard(type_t *t);
+
+/**
+ * "Z" is a method type variable that an unbound method reference ("Foo::getName", an instance
+ * method named through its type) fills the first parameter of a functional interface "F<Z>" with:
+ * the reference takes a Foo there, so Z is Foo (OpenJDK's MethodReference68, g(Foo::getName, 1)).
+ * Returns true when another argument that is bound to the same Z cannot be a Foo, so the method
+ * is no candidate for the call. Judges only that shape; anything else is left to the scoring.
+ */
+static bool mref_inference_conflict(semantic_t *sem, symbol_t *method, slist_t *args)
+{
+    int param_count = 0;
+    for (slist_t *p = method->data.method_data.parameters; p; p = p->next) {
+        param_count++;
+    }
+    bool is_varargs = (method->modifiers & MOD_VARARGS) != 0;
+    int arg_index = 0;
+    for (slist_t *a = args; a; a = a->next, arg_index++) {
+        ast_node_t *ref = (ast_node_t *)a->data;
+        if (!ref || ref->type != AST_METHOD_REF || !ref->data.node.name ||
+            strcmp(ref->data.node.name, "new") == 0 || !ref->data.node.children || arg_index >= param_count) {
+            continue;
+        }
+        slist_t *pn = method->data.method_data.parameters;
+        for (int i = 0; i < arg_index; i++) {
+            pn = pn->next;
+        }
+        symbol_t *param = (symbol_t *)pn->data;
+        type_t *fi_type = param ? param->type : NULL;
+        if (!fi_type || fi_type->kind != TYPE_CLASS || !fi_type->data.class_type.type_args) {
+            continue;
+        }
+        symbol_t *iface = fi_type->data.class_type.symbol;
+        if (!iface && fi_type->data.class_type.name) {
+            iface = load_external_class(sem, fi_type->data.class_type.name);
+        }
+        symbol_t *sam = iface && iface->kind == SYM_INTERFACE ? get_functional_interface_sam(iface) : NULL;
+        symbol_t *sam_first = sam && sam->data.method_data.parameters ?
+            (symbol_t *)sam->data.method_data.parameters->data : NULL;
+        if (!sam_first || !sam_first->type || sam_first->type->kind != TYPE_TYPEVAR ||
+            !sam_first->type->data.type_var.name) {
+            continue;
+        }
+
+        /* (a parameter type whose arguments are not all there cannot be read by position) */
+        int param_args = 0;
+        for (slist_t *q = fi_type->data.class_type.type_args; q; q = q->next) {
+            param_args++;
+        }
+        int iface_params = 0;
+        for (slist_t *q = iface->data.class_data.type_params; q; q = q->next) {
+            iface_params++;
+        }
+        if (param_args != iface_params) {
+            continue;
+        }
+
+        /* the method's own type variable standing where the interface's first SAM parameter is */
+        type_t *bound_arg = substitute_type_args(sam_first->type, iface, fi_type->data.class_type.type_args);
+        bound_arg = unwrap_wildcard(bound_arg);
+        if (!bound_arg || bound_arg->kind != TYPE_TYPEVAR || !bound_arg->data.type_var.name ||
+            !lookup_method_type_param(method, bound_arg->data.type_var.name)) {
+            continue;
+        }
+        const char *method_var = bound_arg->data.type_var.name;
+
+        /* the reference must name a type and an instance method of it only */
+        ast_node_t *target = (ast_node_t *)ref->data.node.children->data;
+        if (!target || (target->type != AST_IDENTIFIER && target->type != AST_CLASS_TYPE)) {
+            continue;
+        }
+        const char *tname = target->type == AST_IDENTIFIER ? target->data.leaf.name : target->data.node.name;
+        if (!tname) {
+            continue;
+        }
+        symbol_t *as_variable = scope_lookup(sem->current_scope, tname);
+        if (as_variable && (as_variable->kind == SYM_LOCAL_VAR || as_variable->kind == SYM_PARAMETER ||
+                            as_variable->kind == SYM_FIELD)) {
+            continue;
+        }
+        bool saved_quiet = sem->loading_dependency;
+        sem->loading_dependency = true;
+        ast_node_t *probe = ast_new(AST_CLASS_TYPE, ref->line, ref->column);
+        probe->data.node.name = (char *)intern(tname);
+        type_t *receiver = semantic_resolve_type(sem, probe);
+        sem->loading_dependency = saved_quiet;
+        symbol_t *receiver_sym = receiver && receiver->kind == TYPE_CLASS ? receiver->data.class_type.symbol : NULL;
+        if (!receiver_sym && receiver && receiver->kind == TYPE_CLASS && receiver->data.class_type.name) {
+            receiver_sym = load_external_class(sem, receiver->data.class_type.name);
+        }
+        if (!receiver_sym || !receiver_sym->data.class_data.members) {
+            continue;
+        }
+        slist_t *named = scope_find_all_methods(receiver_sym->data.class_data.members, ref->data.node.name);
+        bool all_instance = named != NULL;
+        for (slist_t *m = named; m; m = m->next) {
+            symbol_t *candidate = (symbol_t *)m->data;
+            if (!candidate || (candidate->modifiers & MOD_STATIC)) {
+                all_instance = false;
+            }
+        }
+        slist_free(named);
+        if (!all_instance) {
+            continue;
+        }
+
+        /* every other argument bound to the same variable must be a Receiver */
+        int other_index = 0;
+        for (slist_t *o = args; o; o = o->next, other_index++) {
+            ast_node_t *other = (ast_node_t *)o->data;
+            if (!other || other == ref || expr_holds_lambda(other) ||
+                other->type == AST_LAMBDA_EXPR || other->type == AST_METHOD_REF) {
+                continue;
+            }
+            type_t *other_param = NULL;
+            if (other_index < param_count) {
+                slist_t *on = method->data.method_data.parameters;
+                for (int i = 0; i < other_index; i++) {
+                    on = on->next;
+                }
+                symbol_t *ops = (symbol_t *)on->data;
+                other_param = ops ? ops->type : NULL;
+                if (is_varargs && other_index == param_count - 1 && other_param &&
+                    other_param->kind == TYPE_ARRAY) {
+                    other_param = other_param->data.array_type.dimensions <= 1 ?
+                        other_param->data.array_type.element_type : NULL;
+                }
+            } else if (is_varargs) {
+                slist_t *last = method->data.method_data.parameters;
+                while (last && last->next) {
+                    last = last->next;
+                }
+                symbol_t *lps = last ? (symbol_t *)last->data : NULL;
+                other_param = lps && lps->type && lps->type->kind == TYPE_ARRAY &&
+                              lps->type->data.array_type.dimensions <= 1 ?
+                    lps->type->data.array_type.element_type : NULL;
+            }
+            if (!other_param || other_param->kind != TYPE_TYPEVAR || !other_param->data.type_var.name ||
+                strcmp(other_param->data.type_var.name, method_var) != 0) {
+                continue;
+            }
+            type_t *other_type = get_expression_type(sem, other);
+            if (other_type && other_type->kind >= TYPE_BOOLEAN && other_type->kind <= TYPE_DOUBLE) {
+                other_type = type_boxed(other_type);
+            }
+            if (!other_type || other_type->kind != TYPE_CLASS) {
+                continue;
+            }
+            ensure_type_symbol_loaded(sem, other_type);
+            ensure_type_symbol_loaded(sem, receiver);
+            if (!type_assignable(receiver, other_type)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates, slist_t *args,
                                            type_t *recv_type, bool allow_iterable_fixup)
 {
@@ -11866,6 +12025,7 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
     symbol_t *best_match = NULL;
     int best_score = -1;
     symbol_t *varargs_match = NULL;
+    symbol_t *inference_conflict_method = NULL;
     /* best_score stays -1 while only varargs candidates match, so comparing
      * a varargs score against it kept the last applicable varargs method
      * (invokeMethod(Object, String, Object...) after invokeMethod(Class, ...)). */
@@ -11975,6 +12135,12 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
 
         if (param_count != arg_count && !(is_varargs && arg_count >= param_count - 1)) {
             continue;  /* Wrong number of arguments */
+        }
+
+        if (mref_inference_conflict(sem, method, args)) {
+            /* the type variable cannot be both what the reference and an argument say */
+            inference_conflict_method = method;
+            continue;
         }
         
         /* Score this method based on how well argument types match */
@@ -12890,6 +13056,13 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
     if (arg_types != arg_types_buf) {
         free(arg_types);
         free(arg_typed);
+    }
+    if (!best_match && !varargs_match && inference_conflict_method && args && !sem->loading_dependency) {
+        /* every candidate was ruled out by a method reference's inference: the call has no method */
+        ast_node_t *first_arg = (ast_node_t *)args->data;
+        semantic_error(sem, first_arg->line, first_arg->column,
+            "method %s cannot be applied to given types: incompatible inference constraints",
+            inference_conflict_method->name);
     }
     return best_match ? best_match : varargs_match;
 }
