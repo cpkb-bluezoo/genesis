@@ -1960,11 +1960,11 @@ static void walk_declarations(semantic_t *sem, ast_node_t *node, const captures_
             }
             return;
 
-        case AST_ENUM_CONSTANT:
-            /* with a class body, whose members are the constant's own children */
-            check_blank_finals(sem, node, false);
-            /* fall through to the members */
         default:
+            if (node->type == AST_ENUM_CONSTANT) {
+                /* with a class body, whose members are the constant's own children */
+                check_blank_finals(sem, node, false);
+            }
             if (is_type_node(node)) {
                 return;
             }
