@@ -4650,6 +4650,13 @@ static ast_node_t *parse_compact_constructor(parser_t *parser, uint32_t modifier
             if (comp->data.node.children) {
                 ast_add_child(param, clone_type_node((const ast_node_t *)comp->data.node.children->data));
             }
+            /* The component's annotations, for the classwriter to cut down to the ones its
+             * @Target lets reach a parameter (JLS 8.10.3). A list of its own: the component
+             * keeps its list. */
+            for (slist_t *a = comp->annotations; a; a = a->next) {
+                param->annotations = param->annotations ?
+                    (slist_append(param->annotations, a->data), param->annotations) : slist_new(a->data);
+            }
             ast_add_child(ctor, param);
             components = components ? (slist_append(components, comp), components) : slist_new(comp);
         }

@@ -466,6 +466,33 @@ char **classfile_get_module_exports(classfile_t *cf, int *count_out);
  */
 char *classfile_get_retention_policy_name(classfile_t *cf);
 
+/* java.lang.annotation.ElementType constants, one bit each, in declaration order */
+enum {
+    ANN_TARGET_TYPE = 1 << 0,
+    ANN_TARGET_FIELD = 1 << 1,
+    ANN_TARGET_METHOD = 1 << 2,
+    ANN_TARGET_PARAMETER = 1 << 3,
+    ANN_TARGET_CONSTRUCTOR = 1 << 4,
+    ANN_TARGET_LOCAL_VARIABLE = 1 << 5,
+    ANN_TARGET_ANNOTATION_TYPE = 1 << 6,
+    ANN_TARGET_PACKAGE = 1 << 7,
+    ANN_TARGET_TYPE_PARAMETER = 1 << 8,
+    ANN_TARGET_TYPE_USE = 1 << 9,
+    ANN_TARGET_MODULE = 1 << 10,
+    ANN_TARGET_RECORD_COMPONENT = 1 << 11,
+    /* An annotation type with no @Target applies in every declaration context, none of the type ones */
+    ANN_TARGET_ALL_DECLARATIONS = 0xFFF & ~(1 << 9)
+};
+
+/* The bit of an ElementType constant name ("FIELD"), 0 when it is not one */
+unsigned annotation_target_bit(const char *constant_name);
+
+/*
+ * The ElementType bits of this annotation type's own @java.lang.annotation.Target, or
+ * ANN_TARGET_ALL_DECLARATIONS when it declares none.
+ */
+unsigned classfile_get_annotation_targets(classfile_t *cf);
+
 /* The internal name of the container annotation type a repeatable one names, or NULL */
 char *classfile_get_repeatable_container(classfile_t *cf);
 

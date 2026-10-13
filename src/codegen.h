@@ -587,6 +587,10 @@ struct class_gen
     /* Nest-based access control (Java 11+) */
     slist_t *nest_members;          /* List of uint16_t* class CP indices (for nest host) */
     uint16_t nest_host;             /* CP class index of nest host (for nested classes), 0 if host */
+    uint16_t enclosing_method_class; /* EnclosingMethod: CP class index of the immediately enclosing
+                                      * class, 0 when this is not a local or anonymous class */
+    uint16_t enclosing_method_nat;  /* EnclosingMethod: CP NameAndType of the enclosing method, 0 when
+                                      * the class sits in an initializer (or a constructor) */
     
     /* Generic signature (if class has type parameters) */
     char *signature;
@@ -677,6 +681,7 @@ void mg_finalize_local_var(method_gen_t *mg, const char *name, uint16_t end_pc);
 class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym);
 void class_gen_free(class_gen_t *cg);
 void class_gen_set_target_version(class_gen_t *cg, int major_version);
+slist_t *record_component_annotations(class_gen_t *cg, ast_node_t *comp, unsigned decl_bit);
 void class_gen_register_anonymous_inner(class_gen_t *host, symbol_t *anon_sym);
 
 /* Generate bytecode for a class */

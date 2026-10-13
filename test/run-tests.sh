@@ -210,6 +210,19 @@ else
     failed=$((failed + 1))
 fi
 
+printf "%-30s ... " "MostSpecificOverloadClassFile"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$ejc_lib" "$TEST_SRC"/external/javaclib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ejc_lib" -d "$ejc_out" \
+       "$TEST_SRC/external/MostSpecificOverloadClassFileTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ejc_out:$ejc_lib" MostSpecificOverloadClassFileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 printf "%-30s ... " "CrossModuleConstantSwitch"
 cmc_lib="$TEST_BUILD/cross-module-const-lib"
 cmc_out="$TEST_BUILD/cross-module-const-out"
@@ -234,6 +247,22 @@ if "$GENESIS" -d "$wipt_out" "$TEST_SRC/external/wcimport/server/ConnectHandler.
        "$TEST_SRC/external/wcimport/Handler.java" \
        "$TEST_SRC/external/wcimport/server/WildcardImportParamTypeTest.java" >/dev/null 2>&1 &&
    "$JAVA" -cp "$wipt_out" wcimport.server.WildcardImportParamTypeTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+printf "%-30s ... " "ImportShadowNestedType"
+isnt_out="$TEST_BUILD/import-shadow-nested-type-out"
+rm -rf "$isnt_out"
+mkdir -p "$isnt_out"
+if "$GENESIS" -d "$isnt_out" "$TEST_SRC/external/importshadow/other/Encoding.java" \
+       "$TEST_SRC/external/importshadow/app/Marker.java" \
+       "$TEST_SRC/external/importshadow/app/Props.java" \
+       "$TEST_SRC/external/importshadow/app/ImportShadowNestedTypeTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$isnt_out" importshadow.app.ImportShadowNestedTypeTest >/dev/null 2>&1; then
     echo PASS
     passed=$((passed + 1))
 else

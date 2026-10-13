@@ -1164,6 +1164,98 @@ char *classfile_get_retention_policy_name(classfile_t *cf)
     return NULL;
 }
 
+unsigned annotation_target_bit(const char *name)
+{
+    static const char *const names[] = {
+        "TYPE", "FIELD", "METHOD", "PARAMETER", "CONSTRUCTOR", "LOCAL_VARIABLE",
+        "ANNOTATION_TYPE", "PACKAGE", "TYPE_PARAMETER", "TYPE_USE", "MODULE", "RECORD_COMPONENT"
+    };
+    for (unsigned i = 0; name && i < sizeof(names) / sizeof(names[0]); i++) {
+        if (strcmp(name, names[i]) == 0) {
+            return 1u << i;
+        }
+    }
+    return 0;
+}
+
+unsigned classfile_get_annotation_targets(classfile_t *cf)
+{
+    if (!cf) {
+        return ANN_TARGET_ALL_DECLARATIONS;
+    }
+    attribute_info_t *annots_attr = NULL;
+    for (uint16_t i = 0; i < cf->attributes_count; i++) {
+        char *aname = classfile_get_utf8(cf, cf->attributes[i].attribute_name_index);
+        bool match = aname && strcmp(aname, "RuntimeVisibleAnnotations") == 0;
+        free(aname);
+        if (match) {
+            annots_attr = &cf->attributes[i];
+            break;
+        }
+    }
+    if (!annots_attr || !annots_attr->info) {
+        return ANN_TARGET_ALL_DECLARATIONS;
+    }
+    const uint8_t *p = annots_attr->info;
+    const uint8_t *end = p + annots_attr->attribute_length;
+    uint16_t num_annotations;
+    if (!cf_read_u2(&p, end, &num_annotations)) {
+        return ANN_TARGET_ALL_DECLARATIONS;
+    }
+    for (uint16_t i = 0; i < num_annotations; i++) {
+        uint16_t type_index, num_pairs;
+        if (!cf_read_u2(&p, end, &type_index) || !cf_read_u2(&p, end, &num_pairs)) {
+            break;
+        }
+        char *type_desc = classfile_get_utf8(cf, type_index);
+        bool is_target = type_desc && strcmp(type_desc, "Ljava/lang/annotation/Target;") == 0;
+        free(type_desc);
+        unsigned mask = 0;
+        for (uint16_t j = 0; j < num_pairs; j++) {
+            uint16_t name_idx;
+            if (!cf_read_u2(&p, end, &name_idx)) {
+                return ANN_TARGET_ALL_DECLARATIONS;
+            }
+            if (!is_target) {
+                if (!skip_element_value(&p, end)) {
+                    return ANN_TARGET_ALL_DECLARATIONS;
+                }
+                continue;
+            }
+            /* value = ElementType or ElementType[] */
+            uint8_t tag;
+            if (!cf_read_u1(&p, end, &tag)) {
+                return ANN_TARGET_ALL_DECLARATIONS;
+            }
+            uint16_t count = 1;
+            if (tag == '[') {
+                if (!cf_read_u2(&p, end, &count)) {
+                    return ANN_TARGET_ALL_DECLARATIONS;
+                }
+                if (count > 0 && !cf_read_u1(&p, end, &tag)) {
+                    return ANN_TARGET_ALL_DECLARATIONS;
+                }
+            }
+            for (uint16_t k = 0; k < count; k++) {
+                if (k > 0 && !cf_read_u1(&p, end, &tag)) {
+                    return ANN_TARGET_ALL_DECLARATIONS;
+                }
+                uint16_t etype, econst;
+                if (tag != 'e' || !cf_read_u2(&p, end, &etype) || !cf_read_u2(&p, end, &econst)) {
+                    return ANN_TARGET_ALL_DECLARATIONS;
+                }
+                char *cname = classfile_get_utf8(cf, econst);
+                mask |= annotation_target_bit(cname);
+                free(cname);
+            }
+        }
+        if (is_target) {
+            return mask;
+        }
+    }
+    return ANN_TARGET_ALL_DECLARATIONS;
+}
+
 /**
  * The container annotation type this annotation type's own @java.lang.annotation.Repeatable
  * names, as an internal class name ("org/x/WithResources"); NULL if it is not repeatable.

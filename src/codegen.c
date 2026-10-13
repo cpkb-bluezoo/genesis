@@ -374,11 +374,101 @@ static uint16_t member_type_modifiers(uint16_t mods, symbol_t *enclosing)
     return mods;
 }
 
+/* Annotation targets of a component annotation, with the class being written as the scope to
+ * find a nested annotation type from */
+static unsigned record_annotation_targets(class_gen_t *cg, ast_node_t *annot)
+{
+    if (!cg->sem || !annot || annot->type != AST_ANNOTATION || !annot->data.node.name) {
+        return ANN_TARGET_ALL_DECLARATIONS;
+    }
+    symbol_t *saved = cg->sem->current_class;
+    cg->sem->current_class = cg->class_sym;
+    unsigned targets = semantic_resolve_annotation_targets(cg->sem, annot->data.node.name);
+    cg->sem->current_class = saved;
+    return targets;
+}
+
+/**
+ * An annotation on a record component is propagated to the members the record derives from it
+ * that its @Target allows (JLS 8.10.3): the field, the accessor, the canonical constructor's
+ * parameter and the record component itself. A fresh list, to free with slist_free() (not the
+ * annotations).
+ */
+slist_t *record_component_annotations(class_gen_t *cg, ast_node_t *comp, unsigned decl_bit)
+{
+    slist_t *out = NULL;
+    for (slist_t *n = comp ? comp->annotations : NULL; n; n = n->next) {
+        ast_node_t *annot = (ast_node_t *)n->data;
+        if (record_annotation_targets(cg, annot) & decl_bit) {
+            out = out ? (slist_append(out, annot), out) : slist_new(annot);
+        }
+    }
+    return out;
+}
+
+/* An annotation that allows TYPE_USE and none of the declarations a component's annotations
+ * propagate to is a type annotation on the component's type, and only that */
+static void record_component_move_type_use(class_gen_t *cg, ast_node_t *comp)
+{
+    ast_node_t *type = comp->data.node.children ? (ast_node_t *)comp->data.node.children->data : NULL;
+    if (!type || !comp->annotations) {
+        return;
+    }
+    ast_node_t *leaf = type;
+    while (leaf->type == AST_ARRAY_TYPE && leaf->data.node.children) {
+        leaf = (ast_node_t *)leaf->data.node.children->data;
+    }
+    const unsigned declarations = ANN_TARGET_FIELD | ANN_TARGET_METHOD | ANN_TARGET_PARAMETER |
+                                  ANN_TARGET_RECORD_COMPONENT;
+    slist_t *prev = NULL;
+    for (slist_t *n = comp->annotations; n;) {
+        slist_t *next = n->next;
+        unsigned targets = record_annotation_targets(cg, (ast_node_t *)n->data);
+        if ((targets & ANN_TARGET_TYPE_USE) && !(targets & declarations)) {
+            if (prev) {
+                prev->next = next;
+            } else {
+                comp->annotations = next;
+            }
+            n->next = NULL;
+            if (!leaf->annotations) {
+                leaf->annotations = n;
+            } else {
+                slist_t *tail = leaf->annotations;
+                while (tail->next) {
+                    tail = tail->next;
+                }
+                tail->next = n;
+            }
+        } else {
+            prev = n;
+        }
+        n = next;
+    }
+}
+
+/* A stand-in for a member of the record, shaped like what the member would be if written in
+ * the source: the component's type, carrying the component's annotations that apply to it */
+static ast_node_t *record_member_view(class_gen_t *cg, ast_node_t *comp, ast_node_type_t kind,
+                                      unsigned decl_bit)
+{
+    ast_node_t *view = ast_new(kind, comp->line, comp->column);
+    view->data.node.name = comp->data.node.name;
+    view->annotations = record_component_annotations(cg, comp, decl_bit);
+    ast_node_t *type = comp->data.node.children ? (ast_node_t *)comp->data.node.children->data : NULL;
+    if (kind == AST_METHOD_DECL) {
+        view->data.node.extra = type;
+    } else if (type) {
+        ast_add_child(view, type);
+    }
+    return view;
+}
+
 /**
  * Record a method-local or block-local anonymous class on its host classfile's
  * InnerClasses attribute (and NestMembers when this class is the nest host).
- * The anonymous classfile's own InnerClasses entry uses outer_class_info = 0;
- * the host must still list the anonymous class with outer_class_info = host.
+ * The anonymous classfile's own InnerClasses entry and the host's agree: no
+ * outer class, no name, no flags.
  */
 void class_gen_register_anonymous_inner(class_gen_t *host, symbol_t *anon_sym)
 {
@@ -399,15 +489,12 @@ void class_gen_register_anonymous_inner(class_gen_t *host, symbol_t *anon_sym)
     }
     inner_class_entry_t *entry = calloc(1, sizeof(inner_class_entry_t));
     entry->inner_class_info = nested_class_idx;
-    entry->outer_class_info = host->this_class;
+    /* JVMS 4.7.6, and what javac writes: an anonymous class has no outer class, no name
+     * and no flags in the host's entry, matching its own. A mismatch between the two makes
+     * Class.getDeclaringClass() throw IncompatibleClassChangeError. */
+    entry->outer_class_info = 0;
     entry->inner_name = 0;
-    entry->access_flags = inner_class_access_flags(
-        member_type_modifiers(anon_sym->modifiers,
-                              host->class_sym ? host->class_sym : anon_sym->data.class_data.enclosing_class),
-        anon_sym->kind);
-    if (anon_sym->data.class_data.is_anonymous_class) {
-        entry->access_flags |= ACC_SYNTHETIC;
-    }
+    entry->access_flags = 0;
     if (!host->inner_class_entries) {
         host->inner_class_entries = slist_new(entry);
     } else {
@@ -2749,10 +2836,37 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
                 entry->outer_class_info = cp_add_class(cg->cp, cg->outer_class_internal ? 
                     cg->outer_class_internal : class_to_internal_name(enclosing->qualified_name));
             }
-            entry->inner_name = cp_add_utf8(cg->cp, class_sym->name);
-            entry->access_flags = inner_class_access_flags(
-                member_type_modifiers(class_sym->modifiers, enclosing), class_sym->kind);
-            
+            if (class_sym->data.class_data.is_anonymous_class) {
+                /* JVMS 4.7.6: an anonymous class has neither an outer class nor a name
+                 * (that is what Class.isAnonymousClass() tests), and is never static. */
+                entry->outer_class_info = 0;
+                entry->inner_name = 0;
+                entry->access_flags = 0;
+            } else {
+                entry->inner_name = cp_add_utf8(cg->cp, class_sym->name);
+                entry->access_flags = inner_class_access_flags(
+                    member_type_modifiers(class_sym->modifiers, enclosing), class_sym->kind);
+            }
+
+            /* EnclosingMethod (JVMS 4.7.7) for a local or anonymous class. A class in an
+             * initializer or a constructor names no method; a constructor's descriptor
+             * carries synthetic parameters this does not reproduce. */
+            if (class_sym->data.class_data.is_local_class ||
+                class_sym->data.class_data.is_anonymous_class) {
+                char *enc_internal = class_to_internal_name(enclosing->qualified_name);
+                cg->enclosing_method_class = cp_add_class(cg->cp, enc_internal);
+                free(enc_internal);
+                symbol_t *enc_method = class_sym->data.class_data.enclosing_method;
+                if (enc_method && enc_method->kind == SYM_METHOD && enc_method->name) {
+                    char *enc_desc = method_to_descriptor(enc_method);
+                    if (enc_desc) {
+                        cg->enclosing_method_nat = cp_add_name_and_type(cg->cp, enc_method->name, enc_desc);
+                        free(enc_desc);
+                    }
+                }
+                cp_add_utf8(cg->cp, "EnclosingMethod");
+            }
+
             cg->inner_class_entries = slist_new(entry);
             
             /* NestHost attribute (Java 11+): Find the top-level enclosing class */
@@ -5768,6 +5882,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             }
             children_iter = children_iter->next;
         }
+        for (slist_t *comp = record_components; comp; comp = comp->next) {
+            record_component_move_type_use(cg, (ast_node_t *)comp->data);
+        }
     }
     
     /* Process class members in two passes:
@@ -5983,7 +6100,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         /* Create private final field for the component */
                         field_gen_t *fg = calloc(1, sizeof(field_gen_t));
                         fg->access_flags = ACC_PRIVATE | ACC_FINAL;
-                        fg->ast = member;
+                        fg->ast = record_member_view(cg, member, AST_FIELD_DECL, ANN_TARGET_FIELD);
                         fg->name = strdup(comp_name);
                         fg->descriptor = comp_type ? ast_type_to_descriptor(comp_type) : strdup("Ljava/lang/Object;");
                         fg->signature = (comp_type && comp_type->sem_type) ?
@@ -6076,10 +6193,18 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                             member_type_modifiers(member->data.node.flags, cg->class_sym),
                             nested_kind);
                         
-                        if (!cg->inner_class_entries) {
-                            cg->inner_class_entries = slist_new(entry);
+                        /* javac lists the member classes in reverse declaration order, after the
+                         * class's own entry; Class.getDeclaredClasses() reports them in that
+                         * order and Spring creates beans accordingly. */
+                        slist_t *own = cg->inner_class_entries;
+                        if (own && ((inner_class_entry_t *)own->data)->inner_class_info == cg->this_class) {
+                            slist_t *cell = slist_new(entry);
+                            cell->next = own->next;
+                            own->next = cell;
                         } else {
-                            slist_append(cg->inner_class_entries, entry);
+                            slist_t *cell = slist_new(entry);
+                            cell->next = cg->inner_class_entries;
+                            cg->inner_class_entries = cell;
                         }
                         
                         /* NestMembers attribute (Java 11+): Add this nested class as a nest member
@@ -6144,11 +6269,20 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
          * For regular classes: public <init>()V or (LOuterClass;captured...)V */
         method_info_gen_t *init = calloc(1, sizeof(method_info_gen_t));
         
-        /* Enum constructors are private */
+        /* Enum constructors are private; any other default constructor has the access of
+         * its class (JLS 8.8.9), a member type of an interface being public. */
         if (is_enum) {
             init->access_flags = ACC_PRIVATE;
         } else {
-            init->access_flags = ACC_PUBLIC;
+            uint16_t class_mods = cg->class_sym ? cg->class_sym->modifiers : MOD_PUBLIC;
+            symbol_t *enc = cg->class_sym ? cg->class_sym->data.class_data.enclosing_class : NULL;
+            if (enc && !cg->class_sym->data.class_data.is_local_class &&
+                !cg->class_sym->data.class_data.is_anonymous_class &&
+                (enc->kind == SYM_INTERFACE || enc->kind == SYM_ANNOTATION)) {
+                class_mods |= MOD_PUBLIC;
+            }
+            init->access_flags = mods_to_access_flags(class_mods &
+                                                      (MOD_PUBLIC | MOD_PROTECTED | MOD_PRIVATE));
         }
         
         init->name_index = cp_add_utf8(cg->cp, "<init>");
@@ -6184,6 +6318,11 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             /* the implicit canonical constructor: its Signature and its (mandated) parameter names */
             init->parameters_from = class_decl;
             init->mandated_parameters = true;
+            init->ast = ast_new(AST_CONSTRUCTOR_DECL, class_decl->line, class_decl->column);
+            for (slist_t *comp = record_components; comp; comp = comp->next) {
+                ast_add_child(init->ast,
+                              record_member_view(cg, (ast_node_t *)comp->data, AST_PARAMETER, ANN_TARGET_PARAMETER));
+            }
             if (generic_components && !cg->is_inner_class) {
                 init->signature = strdup(ctor_signature->str);
             }
@@ -7653,6 +7792,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             
             method_info_gen_t *accessor = calloc(1, sizeof(method_info_gen_t));
             accessor->access_flags = ACC_PUBLIC;
+            accessor->ast = record_member_view(cg, comp_node, AST_METHOD_DECL, ANN_TARGET_METHOD);
             accessor->name_index = cp_add_utf8(cg->cp, comp_name);
             accessor->descriptor_index = cp_add_utf8(cg->cp, accessor_desc->str);
             string_free(accessor_desc, true);

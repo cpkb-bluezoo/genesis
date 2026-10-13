@@ -115,7 +115,10 @@ KNOWN BUGS
     module/ and test-support/. PARITY REACHED, keep it: javac baseline workdir
     genesis-spring-boot.57l0jva8 passes 15,109 tests, and genesis workdir
     genesis-spring-boot.75ki261j (12 Oct 2026) passes exactly that set, with no
-    test passing on genesis that fails on javac. Parity is the set, not a count:
+    test passing on genesis that fails on javac. (A later run, workdir
+    genesis-spring-boot.gmhws3vg, has both compilers at 15,055: a few dozen
+    tests are flaky, e.g. ConditionalOnPropertyTests.notAllPropertiesAreDefined
+    when the working directory is busy; compare sets, not counts.) Parity is the set, not a count:
     compare with bench/spring-boot/triage-regressions.py (merges duplicate test
     ids without letting a later pass overwrite a failure). A test that passes
     on javac and is absent from the genesis reports counts as a regression
@@ -124,13 +127,6 @@ KNOWN BUGS
     counter (passed/failed) includes tests javac also fails, so it is not the
     parity figure. Iterate with SB_COMPILERS=genesis SB_KEEP=1. When a change
     loses a test, add the cause here until it is fixed, then remove it.
-    REGRESSED (12 Oct 2026, present at a7ccb6e before any later change): 23
-    tests pass on javac and fail on genesis, e.g. RestTemplateBuilderTests.
-    defaultMessageConvertersShouldSetDefaultList ("Expecting an array but
-    was: [...]": assertThat(List).hasSameSizeAs(List) bound to the Object
-    overload instead of Iterable), BinderTests, ValueObjectBinderTests,
-    CacheAutoConfigurationTests.*WithCustomizers; the full list is the
-    smoke's "passes on javac, failed on genesis" output.
 
 ================================================================================
 OPTIONAL IMPROVEMENTS

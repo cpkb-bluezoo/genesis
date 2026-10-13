@@ -8734,6 +8734,25 @@ static symbol_t *load_external_class_impl(semantic_t *sem, const char *name);
  * re-runs the same nested-name loop, and recurses forever instead of
  * simply failing this one lookup.
  */
+/* True when the file has "import pkg.Name;" for exactly this simple name (not a static or
+ * on-demand import) */
+static bool has_single_type_import(semantic_t *sem, const char *simple)
+{
+    size_t slen = strlen(simple);
+    for (slist_t *node = sem->imports; node; node = node->next) {
+        ast_node_t *import = (ast_node_t *)node->data;
+        const char *import_name = import && import->type == AST_IMPORT_DECL ? import->data.node.name : NULL;
+        if (!import_name || (import->data.node.flags & MOD_STATIC)) {
+            continue;
+        }
+        size_t len = strlen(import_name);
+        if (len > slen && import_name[len - slen - 1] == '.' && strcmp(import_name + len - slen, simple) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 symbol_t *load_external_class(semantic_t *sem, const char *name)
 {
     if (!sem || !name) {
@@ -8990,6 +9009,11 @@ static symbol_t *load_external_class_impl(semantic_t *sem, const char *name)
                     if (nested_sym && nested_sym->type && 
                         !hashtable_lookup(sem->unit_types, simple)) {
                         if (lookup_same_package_type(sem, simple)) {
+                            continue;
+                        }
+                        /* A single-type import of that name is what the file means by it (JLS
+                         * 6.4.1): another class's nested type does not shadow it */
+                        if (has_single_type_import(sem, simple)) {
                             continue;
                         }
                         hashtable_insert(sem->unit_types, simple, nested_sym->type);
@@ -9893,6 +9917,102 @@ static retention_policy_t resolve_annotation_retention_same_batch(symbol_t *star
         }
     }
     return RETENTION_CLASS;
+}
+
+/**
+ * The ElementType bits of a @Target in a source annotation type's own annotations (a single
+ * constant, or an array of them, written qualified or by static import), or
+ * ANN_TARGET_ALL_DECLARATIONS when it declares none.
+ */
+static unsigned source_annotation_targets(slist_t *annotations)
+{
+    for (slist_t *n = annotations; n; n = n->next) {
+        ast_node_t *annot = (ast_node_t *)n->data;
+        if (!annot || annot->type != AST_ANNOTATION || !annot->data.node.name) {
+            continue;
+        }
+        const char *simple = strrchr(annot->data.node.name, '.');
+        simple = simple ? simple + 1 : annot->data.node.name;
+        if (strcmp(simple, "Target") != 0) {
+            continue;
+        }
+        unsigned mask = 0;
+        ast_node_t *pair = annot->data.node.children ? (ast_node_t *)annot->data.node.children->data : NULL;
+        ast_node_t *value = pair && pair->data.node.children ? (ast_node_t *)pair->data.node.children->data : NULL;
+        if (!value) {
+            return 0;
+        }
+        slist_t single = { value, NULL };
+        slist_t *elements = value->type == AST_ARRAY_INIT ? value->data.node.children : &single;
+        for (slist_t *e = elements; e; e = e->next) {
+            ast_node_t *el = (ast_node_t *)e->data;
+            const char *cname = NULL;
+            if (el && el->type == AST_FIELD_ACCESS) {
+                cname = el->data.node.name;
+            } else if (el && el->type == AST_IDENTIFIER) {
+                cname = el->data.leaf.name;
+            }
+            mask |= annotation_target_bit(cname);
+        }
+        return mask;
+    }
+    return ANN_TARGET_ALL_DECLARATIONS;
+}
+
+unsigned semantic_resolve_annotation_targets(semantic_t *sem, const char *annotation_name)
+{
+    if (!sem || !annotation_name) {
+        return ANN_TARGET_ALL_DECLARATIONS;
+    }
+
+    /* Same-batch nested annotation type of the current class or one of its enclosing or
+     * super classes */
+    if (!strchr(annotation_name, '.')) {
+        for (symbol_t *enc = sem->current_class; enc; enc = enc->data.class_data.enclosing_class) {
+            for (symbol_t *search = enc; search; search = search->data.class_data.superclass) {
+                if (!search->data.class_data.members) {
+                    continue;
+                }
+                symbol_t *nested = scope_lookup_local(search->data.class_data.members, annotation_name);
+                if (nested && nested->kind == SYM_ANNOTATION && nested->ast) {
+                    return source_annotation_targets(nested->ast->annotations);
+                }
+            }
+        }
+    }
+
+    char *qualified = NULL;
+    if (strchr(annotation_name, '.') && annotation_name[0] >= 'A' && annotation_name[0] <= 'Z') {
+        qualified = semantic_resolve_annotation_type_name(sem, annotation_name);
+    }
+    if (!qualified) {
+        qualified = (strchr(annotation_name, '.') || strchr(annotation_name, '$')) ?
+            strdup(annotation_name) : resolve_import(sem, annotation_name);
+    }
+    if (!qualified) {
+        qualified = strdup(annotation_name);
+    }
+    if (!qualified) {
+        return ANN_TARGET_ALL_DECLARATIONS;
+    }
+
+    if (sem->shared_registry) {
+        ast_node_t *reg_ast = type_registry_get_ast(sem->shared_registry, qualified);
+        if (reg_ast && reg_ast->type == AST_ANNOTATION_DECL) {
+            free(qualified);
+            return source_annotation_targets(reg_ast->annotations);
+        }
+    }
+
+    unsigned result = ANN_TARGET_ALL_DECLARATIONS;
+    if (sem->classpath) {
+        classfile_t *cf = classpath_load_class_with_nested_fallback(sem, qualified);
+        if (cf) {
+            result = classfile_get_annotation_targets(cf);
+        }
+    }
+    free(qualified);
+    return result;
 }
 
 retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const char *annotation_name)
@@ -12622,6 +12742,16 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
         } else if ((param_count == arg_count || is_direct_array_to_varargs) && score > best_score) {
             best_match = method;
             best_score = score;
+        } else if ((param_count == arg_count || is_direct_array_to_varargs) && score == best_score && best_match &&
+                   params_more_specific(best_match, method) && !params_more_specific(method, best_match)) {
+            /* Same score, and the current best's parameters are all at least as
+             * specific (JLS 15.12.2.5): keep it, whatever the return types say. */
+        } else if ((param_count == arg_count || is_direct_array_to_varargs) && score == best_score && best_match &&
+                   params_more_specific(method, best_match) && !params_more_specific(best_match, method)) {
+            /* Same score, but the new method's parameters are more specific
+             * (Iterable<?> over Object): the order the members were stored in
+             * must not decide. */
+            best_match = method;
         } else if ((param_count == arg_count || is_direct_array_to_varargs) && score == best_score && best_match) {
             /* Same score - prefer method with more specific return type.
              * This handles bridge methods where the override returns a more specific type.
@@ -17456,6 +17586,69 @@ static slist_t *pack_anonymous_varargs(semantic_t *sem, ast_node_t *creation, as
     return new_args;
 }
 
+/* The part of a (possibly qualified or nested) type name after its last '.' or '$'. */
+static const char *simple_type_name(const char *name)
+{
+    const char *cut = name;
+    for (const char *c = name; *c; c++) {
+        if (*c == '.' || *c == '$') {
+            cut = c + 1;
+        }
+    }
+    return cut;
+}
+
+/**
+ * "Cust<String> c = new Plain<>() { }" where "class Plain<T> implements Cust<T>":
+ * the target names a supertype of the diamond's class, not the class itself.
+ * Each of the class's own type parameters is whatever the target passes in the
+ * position where the class's extends/implements clause uses that parameter.
+ * Returns raw_base unchanged when a parameter cannot be found that way.
+ */
+static type_t *diamond_instantiation_via_supertype(type_t *raw_base, type_t *target)
+{
+    symbol_t *raw_sym = raw_base->data.class_type.symbol;
+    if (!raw_sym || !raw_sym->ast || !raw_sym->data.class_data.type_params) {
+        return raw_base;
+    }
+    const char *tgt_simple = simple_type_name(target->data.class_type.name);
+    ast_node_t *super_node = NULL;
+    for (slist_t *c = raw_sym->ast->data.node.children; c && !super_node; c = c->next) {
+        ast_node_t *n = (ast_node_t *)c->data;
+        if (n && n->type == AST_CLASS_TYPE && (n->data.node.flags == 1 || n->data.node.flags == 2) &&
+            n->data.node.name && n->data.node.children &&
+            strcmp(simple_type_name(n->data.node.name), tgt_simple) == 0) {
+            super_node = n;
+        }
+    }
+    if (!super_node) {
+        return raw_base;
+    }
+    type_t *diamond = type_new_class(raw_base->data.class_type.name);
+    diamond->data.class_type.symbol = raw_sym;
+    for (slist_t *tp = raw_sym->data.class_data.type_params; tp; tp = tp->next) {
+        const char *pname = ((symbol_t *)tp->data)->name;
+        type_t *found = NULL;
+        slist_t *targ = target->data.class_type.type_args;
+        for (slist_t *sa = super_node->data.node.children; sa && targ && !found; sa = sa->next, targ = targ->next) {
+            ast_node_t *an = (ast_node_t *)sa->data;
+            if (an && pname && an->data.node.name && !an->data.node.children &&
+                strcmp(an->data.node.name, pname) == 0) {
+                found = (type_t *)targ->data;
+            }
+        }
+        if (!found) {
+            return raw_base;
+        }
+        if (!diamond->data.class_type.type_args) {
+            diamond->data.class_type.type_args = slist_new(found);
+        } else {
+            slist_append(diamond->data.class_type.type_args, found);
+        }
+    }
+    return diamond;
+}
+
 static type_t *diamond_instantiation_type(semantic_t *sem, ast_node_t *type_node, type_t *raw_base)
 {
     if (!sem || !type_node || !raw_base || raw_base->kind != TYPE_CLASS ||
@@ -17466,7 +17659,10 @@ static type_t *diamond_instantiation_type(semantic_t *sem, ast_node_t *type_node
     }
     const char *raw_name = raw_base->data.class_type.name;
     const char *tgt_name = sem->target_type->data.class_type.name;
-    if (!raw_name || !tgt_name || strcmp(raw_name, tgt_name) != 0) {
+    if (raw_name && tgt_name && strcmp(raw_name, tgt_name) != 0) {
+        return diamond_instantiation_via_supertype(raw_base, sem->target_type);
+    }
+    if (!raw_name || !tgt_name) {
         return raw_base;
     }
     type_t *diamond = type_new_class(raw_name);

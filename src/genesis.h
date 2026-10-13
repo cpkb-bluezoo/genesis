@@ -945,6 +945,8 @@ char *semantic_resolve_annotation_type_name(semantic_t *sem, const char *simple_
  * @Retention meta-annotation. Returns RETENTION_CLASS if unresolvable or
  * unannotated. Defined in semantic.c; used by classwriter.c. */
 retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const char *annotation_name);
+/* The ElementType bits (ANN_TARGET_* in classfile.h) an annotation type may be applied to */
+unsigned semantic_resolve_annotation_targets(semantic_t *sem, const char *annotation_name);
 
 /* Look up the declared return type descriptor of an annotation element
  * (e.g. "timeout" on org.junit.Test -> "()J") by resolving the

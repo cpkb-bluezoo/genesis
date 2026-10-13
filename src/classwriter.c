@@ -1103,6 +1103,138 @@ static int get_method_parameter_type_nodes(ast_node_t *method_decl, ast_node_t *
 }
 
 /**
+ * An annotation written in front of a declaration applies to the declaration when its @Target
+ * allows that (decl_bit), and to the declared type when its @Target says TYPE_USE; an annotation
+ * that allows only TYPE_USE ("@Nullable String f") is a type annotation and no declaration
+ * annotation, so reflection sees it on the type and not on the field, method or parameter. Move
+ * those onto the type node, where the type annotation writers find them: on the element type
+ * of an array.
+ */
+static void move_type_use_annotations(slist_t **decl_annotations, ast_node_t *type_node, unsigned decl_bit)
+{
+    if (!decl_annotations || !*decl_annotations || !type_node || !g_classwriter_sem) {
+        return;
+    }
+    ast_node_t *leaf = type_node;
+    while (leaf->type == AST_ARRAY_TYPE && leaf->data.node.children) {
+        leaf = (ast_node_t *)leaf->data.node.children->data;
+    }
+    slist_t *prev = NULL;
+    slist_t *n = *decl_annotations;
+    while (n) {
+        slist_t *next = n->next;
+        ast_node_t *annot = (ast_node_t *)n->data;
+        bool move = false;
+        if (annot && annot->type == AST_ANNOTATION && annot->data.node.name) {
+            unsigned targets = semantic_resolve_annotation_targets(g_classwriter_sem, annot->data.node.name);
+            move = (targets & ANN_TARGET_TYPE_USE) && !(targets & decl_bit);
+        }
+        if (move) {
+            if (prev) {
+                prev->next = next;
+            } else {
+                *decl_annotations = next;
+            }
+            n->next = NULL;
+            if (!leaf->annotations) {
+                leaf->annotations = n;
+            } else {
+                slist_t *tail = leaf->annotations;
+                while (tail->next) {
+                    tail = tail->next;
+                }
+                tail->next = n;
+            }
+        } else {
+            prev = n;
+        }
+        n = next;
+    }
+}
+
+static void reclassify_type_use_annotations(class_gen_t *cg);
+
+/* A compact canonical constructor's parameters carry every annotation of their record component:
+ * keep the ones a parameter can have, make a TYPE_USE-only one a type annotation, drop the rest */
+static void narrow_compact_ctor_parameter_annotations(ast_node_t *ctor)
+{
+    const unsigned declarations = ANN_TARGET_FIELD | ANN_TARGET_METHOD | ANN_TARGET_PARAMETER |
+                                  ANN_TARGET_RECORD_COMPONENT;
+    for (slist_t *n = ctor->data.node.children; n; n = n->next) {
+        ast_node_t *param = (ast_node_t *)n->data;
+        if (!param || param->type != AST_PARAMETER || !param->annotations || !param->data.node.children) {
+            continue;
+        }
+        ast_node_t *type = (ast_node_t *)param->data.node.children->data;
+        ast_node_t *leaf = type;
+        while (leaf->type == AST_ARRAY_TYPE && leaf->data.node.children) {
+            leaf = (ast_node_t *)leaf->data.node.children->data;
+        }
+        slist_t *kept = NULL;
+        for (slist_t *a = param->annotations; a;) {
+            slist_t *next = a->next;
+            ast_node_t *annot = (ast_node_t *)a->data;
+            unsigned targets = annot && annot->type == AST_ANNOTATION && annot->data.node.name ?
+                semantic_resolve_annotation_targets(g_classwriter_sem, annot->data.node.name) :
+                ANN_TARGET_ALL_DECLARATIONS;
+            a->next = NULL;
+            slist_t **home = NULL;
+            if (targets & ANN_TARGET_PARAMETER) {
+                home = &kept;
+            } else if ((targets & ANN_TARGET_TYPE_USE) && !(targets & declarations)) {
+                home = &leaf->annotations;
+            }
+            if (home) {
+                if (!*home) {
+                    *home = a;
+                } else {
+                    slist_t *tail = *home;
+                    while (tail->next) {
+                        tail = tail->next;
+                    }
+                    tail->next = a;
+                }
+            } else {
+                free(a);
+            }
+            a = next;
+        }
+        param->annotations = kept;
+    }
+}
+
+static void reclassify_type_use_annotations(class_gen_t *cg)
+{
+    for (slist_t *node = cg->fields; node; node = node->next) {
+        field_gen_t *fg = (field_gen_t *)node->data;
+        if (fg && fg->ast && fg->ast->annotations) {
+            move_type_use_annotations(&fg->ast->annotations, get_field_type_node(fg->ast), ANN_TARGET_FIELD);
+        }
+    }
+    for (slist_t *node = cg->methods; node; node = node->next) {
+        method_info_gen_t *mi = (method_info_gen_t *)node->data;
+        if (!mi || !mi->ast ||
+            (mi->ast->type != AST_METHOD_DECL && mi->ast->type != AST_CONSTRUCTOR_DECL)) {
+            continue;
+        }
+        if (mi->ast->type == AST_CONSTRUCTOR_DECL && (mi->ast->data.node.flags & MOD_COMPACT_CTOR)) {
+            narrow_compact_ctor_parameter_annotations(mi->ast);
+        }
+        if (mi->ast->type == AST_METHOD_DECL) {
+            ast_node_t *ret = get_method_return_type_node(mi->ast);
+            move_type_use_annotations(&mi->ast->annotations, ret, ANN_TARGET_METHOD);
+        }
+        for (slist_t *n = mi->ast->data.node.children; n; n = n->next) {
+            ast_node_t *param = (ast_node_t *)n->data;
+            if (param && param->type == AST_PARAMETER && param->annotations && param->data.node.children) {
+                move_type_use_annotations(&param->annotations, (ast_node_t *)param->data.node.children->data,
+                                          ANN_TARGET_PARAMETER);
+            }
+        }
+    }
+}
+
+/**
  * Count type annotations on method (return type and parameters).
  */
 static int count_method_type_annotations(ast_node_t *method_ast, retention_policy_t retention)
@@ -1431,6 +1563,12 @@ static void preadd_record_attribute_cp(const_pool_t *cp, class_gen_t *cg)
                     cp_add_utf8(cp, field->signature);
                 }
             }
+            slist_t *annotations = record_component_annotations(cg, m, ANN_TARGET_RECORD_COMPONENT);
+            if (count_annotations_with_retention(annotations, RETENTION_RUNTIME) > 0) {
+                cp_add_utf8(cp, "RuntimeVisibleAnnotations");
+                preadd_annotations_list_cp(cp, annotations, RETENTION_RUNTIME);
+            }
+            slist_free(annotations);
         }
     }
 }
@@ -1451,14 +1589,18 @@ static void write_record_attribute(uint8_t **p, class_gen_t *cg)
         field_gen_t *field = hashtable_lookup(cg->field_map, m->data.node.name);
         write_be_u2(p, cp_add_utf8(cg->cp, m->data.node.name));
         write_be_u2(p, cp_add_utf8(cg->cp, field ? field->descriptor : "Ljava/lang/Object;"));
+        slist_t *annotations = record_component_annotations(cg, m, ANN_TARGET_RECORD_COMPONENT);
+        bool annotated = count_annotations_with_retention(annotations, RETENTION_RUNTIME) > 0;
+        write_be_u2(p, (uint16_t)((field && field->signature ? 1 : 0) + (annotated ? 1 : 0)));
         if (field && field->signature) {
-            write_be_u2(p, 1);
             write_be_u2(p, cp_add_utf8(cg->cp, "Signature"));
             write_be_u4(p, 2);
             write_be_u2(p, cp_add_utf8(cg->cp, field->signature));
-        } else {
-            write_be_u2(p, 0);
         }
+        if (annotated) {
+            write_annotations_attribute(p, cg->cp, annotations, true);
+        }
+        slist_free(annotations);
     }
     uint32_t len = (uint32_t)((*p - len_pos) - 4);
     uint8_t *save = *p;
@@ -1807,6 +1949,8 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         }
     }
     
+    reclassify_type_use_annotations(cg);
+
     /* Pre-add annotation constant pool entries for class */
     if (cg->class_ast && cg->class_ast->annotations) {
         cp_add_utf8(cg->cp, "RuntimeVisibleAnnotations");
@@ -2516,6 +2660,9 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
     if (write_record) {
         class_attr_count++;
     }
+    if (cg->enclosing_method_class) {
+        class_attr_count++;
+    }
     
     /* Check for class-level annotations with RUNTIME retention */
     int runtime_annot_count = 0;
@@ -2555,6 +2702,15 @@ uint8_t *write_class_bytes(class_gen_t *cg, size_t *size)
         write_record_attribute(&p, cg);
     }
     
+    /* EnclosingMethod attribute: a local or anonymous class's immediately enclosing class and,
+     * when it sits in a method, that method */
+    if (cg->enclosing_method_class) {
+        write_be_u2(&p, cp_add_utf8(cg->cp, "EnclosingMethod"));
+        write_be_u4(&p, 4);
+        write_be_u2(&p, cg->enclosing_method_class);
+        write_be_u2(&p, cg->enclosing_method_nat);
+    }
+
     /* InnerClasses attribute */
     if (cg->inner_class_entries) {
         uint16_t ic_attr_name = cp_add_utf8(cg->cp, "InnerClasses");
