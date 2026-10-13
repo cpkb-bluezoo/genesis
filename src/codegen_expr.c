@@ -2286,6 +2286,50 @@ static bool codegen_classfile_constant(method_gen_t *mg, const_pool_t *cp, symbo
     return ok;
 }
 
+/* The class, interface, enum or record a type-name expression denotes: a
+ * simple name, or a chain of member types (Outer.Inner.Deep). NULL when the
+ * expression is not a type name, such as a variable. */
+static symbol_t *resolve_type_receiver(method_gen_t *mg, ast_node_t *recv)
+{
+    if (!recv) {
+        return NULL;
+    }
+    if (recv->type == AST_IDENTIFIER) {
+        symbol_t *sym = recv->sem_symbol;
+        if (!sym && mg->class_gen && mg->class_gen->sem) {
+            const char *internal = resolve_class_name(mg, recv->data.leaf.name);
+            if (internal) {
+                char qualified[512];
+                snprintf(qualified, sizeof(qualified), "%s", internal);
+                for (char *p = qualified; *p; p++) {
+                    if (*p == '/') {
+                        *p = '.';
+                    }
+                }
+                sym = load_external_class(mg->class_gen->sem, qualified);
+            }
+        }
+        if (sym && (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE ||
+                    sym->kind == SYM_ENUM || sym->kind == SYM_RECORD)) {
+            return sym;
+        }
+        return NULL;
+    }
+    if (recv->type == AST_FIELD_ACCESS && recv->data.node.name &&
+        recv->data.node.children) {
+        symbol_t *outer = resolve_type_receiver(mg, (ast_node_t *)recv->data.node.children->data);
+        if (!outer || !outer->data.class_data.members) {
+            return NULL;
+        }
+        symbol_t *nested = lookup_member_inherited(outer, recv->data.node.name, 0);
+        if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
+                       nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
+            return nested;
+        }
+    }
+    return NULL;
+}
+
 static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
 {
     if (!expr || expr->type != AST_FIELD_ACCESS) {
@@ -2615,57 +2659,35 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
         return false;
     }
 
-    /* Enum constant on a nested enum: Outer.Nested.CONST */
+    /* Static field of a member type: Outer.Nested.FIELD */
     if (receiver->type == AST_FIELD_ACCESS) {
-        slist_t *rch = receiver->data.node.children;
-        const char *nested_simple = receiver->data.node.name;
-        if (rch && nested_simple) {
-            ast_node_t *outer_recv = (ast_node_t *)rch->data;
-            if (outer_recv->type == AST_IDENTIFIER) {
-                symbol_t *outer_sym = outer_recv->sem_symbol;
-                if (!outer_sym && mg->class_gen && mg->class_gen->sem) {
-                    const char *outer_internal = resolve_class_name(mg, outer_recv->data.leaf.name);
-                    if (outer_internal) {
-                        char qualified[512];
-                        snprintf(qualified, sizeof(qualified), "%s", outer_internal);
-                        for (char *p = qualified; *p; p++) {
-                            if (*p == '/') {
-                                *p = '.';
-                            }
-                        }
-                        outer_sym = load_external_class(mg->class_gen->sem, qualified);
-                    }
+        symbol_t *nested_sym = resolve_type_receiver(mg, receiver);
+        if (nested_sym && nested_sym->data.class_data.members) {
+            symbol_t *const_sym = lookup_field_with_superclass(nested_sym, field_name);
+            if (codegen_classfile_constant(mg, cp, const_sym)) {
+                return true;
+            }
+            if (const_sym && const_sym->kind == SYM_FIELD &&
+                (const_sym->modifiers & MOD_STATIC) && const_sym->type) {
+                char *owner_internal = class_to_internal_name(
+                    nested_sym->qualified_name ? nested_sym->qualified_name
+                                                 : nested_sym->name);
+                char *field_desc = type_to_descriptor(const_sym->type);
+                uint16_t fieldref = cp_add_fieldref(cp, owner_internal,
+                                                    field_name, field_desc);
+                bc_emit(mg->code, OP_GETSTATIC);
+                bc_emit_u2(mg->code, fieldref);
+                switch (field_desc[0]) {
+                case 'J': mg_push_long(mg); break;
+                case 'D': mg_push_double(mg); break;
+                case 'F': mg_push_float(mg); break;
+                case 'L':
+                case '[': mg_push_object_from_descriptor(mg, field_desc); break;
+                default: mg_push_int(mg); break;
                 }
-                if (outer_sym && outer_sym->data.class_data.members) {
-                    symbol_t *nested_sym = lookup_member_inherited(outer_sym, nested_simple, 0);
-                    if (nested_sym && nested_sym->kind == SYM_ENUM &&
-                        nested_sym->data.class_data.members) {
-                        symbol_t *const_sym = scope_lookup_local(
-                            nested_sym->data.class_data.members, field_name);
-                        if (const_sym && const_sym->kind == SYM_FIELD &&
-                            (const_sym->modifiers & MOD_STATIC) && const_sym->type) {
-                            char *owner_internal = class_to_internal_name(
-                                nested_sym->qualified_name ? nested_sym->qualified_name
-                                                             : nested_sym->name);
-                            char *field_desc = type_to_descriptor(const_sym->type);
-                            uint16_t fieldref = cp_add_fieldref(cp, owner_internal,
-                                                                field_name, field_desc);
-                            bc_emit(mg->code, OP_GETSTATIC);
-                            bc_emit_u2(mg->code, fieldref);
-                            switch (field_desc[0]) {
-                            case 'J': mg_push_long(mg); break;
-                            case 'D': mg_push_double(mg); break;
-                            case 'F': mg_push_float(mg); break;
-                            case 'L':
-                            case '[': mg_push_object_from_descriptor(mg, field_desc); break;
-                            default: mg_push_int(mg); break;
-                            }
-                            free(owner_internal);
-                            free(field_desc);
-                            return true;
-                        }
-                    }
-                }
+                free(owner_internal);
+                free(field_desc);
+                return true;
             }
         }
     }
@@ -10517,9 +10539,12 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
         ast_node_t *receiver = (ast_node_t *)target_children->data;
         
         /* Check if this is a static field assignment (receiver is a class name) */
-        if (receiver->type == AST_IDENTIFIER) {
-            const char *recv_name = receiver->data.leaf.name;
-            const char *class_name = resolve_class_name(mg, recv_name);
+        symbol_t *nested_recv = receiver->type == AST_FIELD_ACCESS ?
+            resolve_type_receiver(mg, receiver) : NULL;
+        if (receiver->type == AST_IDENTIFIER || nested_recv) {
+            const char *recv_name = nested_recv ? nested_recv->name : receiver->data.leaf.name;
+            symbol_t *recv_sym = nested_recv ? nested_recv : receiver->sem_symbol;
+            const char *class_name = nested_recv ? NULL : resolve_class_name(mg, recv_name);
 
             /* resolve_class_name() only knows a handful of well-known JDK
              * classes, the current class, and a nested class of the
@@ -10528,7 +10553,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
              * analysis's own resolution, the same way the READ side of a
              * static field access (the AST_IDENTIFIER branch of
              * codegen_field_access, a few hundred lines above) already
-             * does: receiver->sem_symbol is set to the imported class's
+             * does: recv_sym is set to the imported class's
              * real symbol regardless of which package it's in. Without
              * this, assigning to a static field of an imported class not
              * in resolve_class_name()'s whitelist (e.g. "StorageExecutor.
@@ -10542,13 +10567,13 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
              * or short stack (VerifyError: "Operand stack underflow" /
              * "Attempt to pop empty stack") - confirmed against gumdrop's
              * own ZoneFilePersistenceTest, which does exactly this. */
-            if (!class_name && receiver->sem_symbol &&
-                (receiver->sem_symbol->kind == SYM_CLASS ||
-                 receiver->sem_symbol->kind == SYM_INTERFACE ||
-                 receiver->sem_symbol->kind == SYM_ENUM || receiver->sem_symbol->kind == SYM_RECORD)) {
+            if (!class_name && recv_sym &&
+                (recv_sym->kind == SYM_CLASS ||
+                 recv_sym->kind == SYM_INTERFACE ||
+                 recv_sym->kind == SYM_ENUM || recv_sym->kind == SYM_RECORD)) {
                 static __thread char external_class_name[256];
-                if (receiver->sem_symbol->qualified_name) {
-                    char *internal = class_to_internal_name(receiver->sem_symbol->qualified_name);
+                if (recv_sym->qualified_name) {
+                    char *internal = class_to_internal_name(recv_sym->qualified_name);
                     strncpy(external_class_name, internal, sizeof(external_class_name) - 1);
                     external_class_name[sizeof(external_class_name) - 1] = '\0';
                     free(internal);
@@ -10571,12 +10596,12 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                  * imported class's field isn't in either lookup above
                  * (it's neither "well-known" nor the current class), but
                  * its symbol - and members - are available via
-                 * receiver->sem_symbol once semantic analysis has run. */
-                if (!field_desc && receiver->sem_symbol &&
-                    (receiver->sem_symbol->kind == SYM_CLASS ||
-                     receiver->sem_symbol->kind == SYM_INTERFACE ||
-                     receiver->sem_symbol->kind == SYM_ENUM || receiver->sem_symbol->kind == SYM_RECORD)) {
-                    symbol_t *ext_class = receiver->sem_symbol;
+                 * recv_sym once semantic analysis has run. */
+                if (!field_desc && recv_sym &&
+                    (recv_sym->kind == SYM_CLASS ||
+                     recv_sym->kind == SYM_INTERFACE ||
+                     recv_sym->kind == SYM_ENUM || recv_sym->kind == SYM_RECORD)) {
+                    symbol_t *ext_class = recv_sym;
                     if (ext_class->data.class_data.members) {
                         symbol_t *field_sym = scope_lookup_local(
                             ext_class->data.class_data.members, field_name);
