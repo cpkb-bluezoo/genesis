@@ -22773,6 +22773,35 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             }
                         }
                         
+                        /* A lambda or method reference takes the type of a functional interface (JLS
+                         * 15.27, 15.13): "(int) () -> 1" and "(String) () -> 1" have none. */
+                        ast_node_t *functional_operand = operand;
+                        while (functional_operand && functional_operand->type == AST_PARENTHESIZED &&
+                               functional_operand->data.node.children) {
+                            functional_operand = (ast_node_t *)functional_operand->data.node.children->data;
+                        }
+                        if (functional_operand && (functional_operand->type == AST_LAMBDA_EXPR ||
+                                                   functional_operand->type == AST_METHOD_REF)) {
+                            bool not_functional = false;
+                            if (target_for_lambda->kind == TYPE_ARRAY ||
+                                (target_for_lambda->kind >= TYPE_BOOLEAN && target_for_lambda->kind <= TYPE_DOUBLE)) {
+                                not_functional = true;
+                            } else if (target_for_lambda->kind == TYPE_CLASS) {
+                                symbol_t *target_sym = target_for_lambda->data.class_type.symbol;
+                                if (!target_sym && target_for_lambda->data.class_type.name) {
+                                    target_sym = load_external_class(sem, target_for_lambda->data.class_type.name);
+                                }
+                                not_functional = target_sym && !get_functional_interface_sam(target_sym);
+                            }
+                            if (not_functional) {
+                                char *shown = type_to_string(target_for_lambda);
+                                semantic_error(sem, functional_operand->line, functional_operand->column,
+                                    "incompatible types: %s is not a functional interface", shown);
+                                free(shown);
+                                return cast_type;
+                            }
+                        }
+
                         if (target_for_lambda->kind == TYPE_CLASS) {
                             if (operand && operand->type == AST_LAMBDA_EXPR) {
                                 bind_lambda_to_target_type(sem, operand, target_for_lambda);

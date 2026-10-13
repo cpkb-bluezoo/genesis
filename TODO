@@ -55,9 +55,6 @@ KNOWN BUGS
    - Compile-fail test - Genesis doesn't detect the error
    - Generates invalid bytecode instead of compile error
 
-5. Lambda cast to primitive type (TargetType17):
-   - Compile-fail test - should error but doesn't
-
 8. Nested interface methods are registered twice in semantic analysis
    (once without and once with the implicit public abstract modifiers).
    Consumers such as the functional interface lookup deduplicate by name;

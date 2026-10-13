@@ -2711,6 +2711,25 @@ else
     failed=$((failed + 1))
 fi
 
+echo "--- A lambda or method reference cast to a type that is no functional interface ---"
+for f in CastToPrimitive CastToArray CastToNonFunctional MethodRefCastToPrimitive; do
+    printf "%-30s ... " "Rejecting $f"
+    lc_out="$TEST_BUILD/lambdacast-out"
+    rm -rf "$lc_out"
+    mkdir -p "$lc_out"
+    # A diagnostic from semantic analysis, not code generation failing on a lambda nothing typed
+    lc_msg=$("$GENESIS" -d "$lc_out" "$TEST_SRC/external/lambdacast/$f.java" 2>&1)
+    lc_rc=$?
+    if [ $lc_rc -eq 1 ] && echo "$lc_msg" | grep -q "is not a functional interface" &&
+       ! echo "$lc_msg" | grep -q "code generation failed"; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]
