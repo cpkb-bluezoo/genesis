@@ -38,6 +38,9 @@
 #include <signal.h>    /* For SIGPIPE */
 #include <pthread.h>   /* For parallel compilation */
 
+/* The highest language level genesis accepts, and its default -source */
+#define GENESIS_DEFAULT_SOURCE "25"
+
 /* ========================================================================
  * Phase timing (GENESIS_DEBUG_TIMING)
  * ======================================================================== */
@@ -101,7 +104,7 @@ compiler_options_t *compiler_options_new(void)
         return NULL;
     }
     
-    opts->source_version = strdup("25");
+    opts->source_version = strdup(GENESIS_DEFAULT_SOURCE);
     opts->target_version = NULL;  /* Unset: computed per class from its features */
     opts->output_dir = NULL;
     opts->output_jar = NULL;
@@ -3289,6 +3292,10 @@ static char **read_argument_file(const char *filename, int *arg_count)
 void print_version(void)
 {
     printf("%s %s\n", PACKAGE_NAME, GENESIS_VERSION);
+    /* Build tools that run a compiler executable with -version (the Maven
+     * compiler plugin) look for a "javac <version>" line to learn which
+     * options it takes; this is the language level genesis implements. */
+    printf("javac %s (language level supported by %s)\n", GENESIS_DEFAULT_SOURCE, PACKAGE_NAME);
     printf("Copyright (C) 2016, 2020, 2026 Chris Burdess <" PACKAGE_BUGREPORT ">\n");
     printf("License GPLv3+: GNU GPL version 3 or later <https://gnu.org/licenses/gpl.html>\n");
     printf("This is free software: you are free to change and redistribute it.\n");
