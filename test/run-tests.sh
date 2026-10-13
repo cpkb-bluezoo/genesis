@@ -1979,6 +1979,35 @@ else
 fi
 
 echo
+echo "--- An @argfile is read as javac reads it: quoted tokens, several to a line, escapes, comments ---"
+printf "%-30s ... " "ArgfileJavacSyntax"
+af_out="$TEST_BUILD/argfile-out"
+af_dir="$TEST_BUILD/argfile dir"
+rm -rf "$af_out" "$af_dir"
+mkdir -p "$af_out/q" "$af_out/s" "$af_dir"
+cp "$TEST_SRC/external/javacoptions/Hello.java" "$af_dir/Hello.java"
+af_quoted="$TEST_BUILD/argfile-quoted.args"
+af_mixed="$TEST_BUILD/argfile-mixed.args"
+printf '"%s"\n' -d "$af_out/q" -source 8 -target 8 "$af_dir/Hello.java" >"$af_quoted"
+{
+    echo "# a comment line"
+    echo "-source 8 -target 8"
+    echo "-d '$af_out/s'"
+    echo "\"$af_dir/Hello.java\""
+} >"$af_mixed"
+af_msgs=$("$GENESIS" "@$af_quoted" 2>&1; "$GENESIS" "@$af_mixed" 2>&1)
+if [ -z "$af_msgs" ] &&
+   "$JAVA" -cp "$af_out/q" Hello >/dev/null 2>&1 &&
+   "$JAVA" -cp "$af_out/s" Hello >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    echo "$af_msgs" | head -3
+    failed=$((failed + 1))
+fi
+
+echo
 echo "--- Records declared in another file of the batch (accessors, constructors) ---"
 for rc_order in "RecordCrossFileTest Resource Named" "Named RecordCrossFileTest Resource" "Resource Named RecordCrossFileTest"; do
     set -- $rc_order
