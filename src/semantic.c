@@ -1214,7 +1214,12 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
                 
                 /* Set field type using AST to preserve type arguments (generics) */
                 if (ftype) {
-                    field_sym->data.var_data.unresolved_type = unresolved_type_from_ast(ftype);
+                    unresolved_type_t *fut = unresolved_type_from_ast(ftype);
+                    /* C-style dimensions on the declarator (String names[]) */
+                    if (fut) {
+                        fut->array_dims += (int)declarator->data.node.flags;
+                    }
+                    field_sym->data.var_data.unresolved_type = fut;
                 }
                 
                 scope_define(sym->data.class_data.members, field_sym);
@@ -2477,6 +2482,19 @@ static type_t *resolve_unresolved_type_impl(const char *name, type_registry_t *r
 
     /* Simple name that couldn't be resolved - return NULL */
     return NULL;
+}
+
+/* The type of a field or variable declarator: the declared type wrapped in
+ * any C-style dimensions written after the name (String names[]). */
+static type_t *declarator_type(type_t *t, const ast_node_t *decl)
+{
+    if (!t || !decl) {
+        return t;
+    }
+    for (uint32_t i = 0; i < decl->data.node.flags; i++) {
+        t = type_new_array(t, 1);
+    }
+    return t;
 }
 
 static bool field_type_has_unresolved_typevar(type_t *t)
@@ -8430,7 +8448,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                     if (var->type == AST_VAR_DECLARATOR && var->data.node.name) {
                                         symbol_t *field_sym = symbol_new(SYM_FIELD, var->data.node.name);
                                         field_sym->modifiers = m->data.node.flags;
-                                        field_sym->type = field_type;
+                                        field_sym->type = declarator_type(field_type, var);
                                         field_sym->ast = var;
                                         scope_define(class_scope, field_sym);
                                     }
@@ -15702,7 +15720,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                         } else if (field_type &&
                                             (!existing->type ||
                                              field_type_has_unresolved_typevar(existing->type))) {
-                                            existing->type = field_type;
+                                            existing->type = declarator_type(field_type, decl);
                                         }
                                         children = children->next;
                                         continue;
@@ -15710,7 +15728,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                     
                                     symbol_t *sym = symbol_new(SYM_FIELD, name);
                                     sym->modifiers = node->data.node.flags;
-                                    sym->type = field_type;
+                                    sym->type = declarator_type(field_type, decl);
                                     sym->ast = decl;
                                     sym->line = decl->line;
                                     sym->column = decl->column;
@@ -21541,7 +21559,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                                             symbol_t *fsym = symbol_new(SYM_FIELD, fname);
                                                             fsym->modifiers = member->data.node.flags;
                                                             fsym->ast = child;
-                                                            fsym->type = semantic_resolve_type(sem, type_node);
+                                                            fsym->type = declarator_type(semantic_resolve_type(sem, type_node), child);
                                                             scope_define(class_members, fsym);
                                                         }
                                                     }
@@ -21759,7 +21777,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                                 symbol_t *fsym = symbol_new(SYM_FIELD, fname);
                                                 fsym->modifiers = member->data.node.flags;
                                                 fsym->ast = child;
-                                                fsym->type = semantic_resolve_type(sem, type_node);
+                                                fsym->type = declarator_type(semantic_resolve_type(sem, type_node), child);
                                                 scope_define(class_members, fsym);
                                                 populated = true;
                                             } else if (strcmp(fname, field_name) == 0 &&
@@ -21775,7 +21793,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                                         sem->shared_registry, sem->classpath, search_class) :
                                                     NULL;
                                                 if (fresh_type) {
-                                                    existing_fsym->type = fresh_type;
+                                                    existing_fsym->type = declarator_type(fresh_type, child);
                                                     populated = true;
                                                 }
                                             }
@@ -22362,7 +22380,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     const char *fname = decl->data.node.name;
                                     symbol_t *field_sym = symbol_new(SYM_FIELD, fname);
                                     field_sym->modifiers = member->data.node.flags;
-                                    field_sym->type = field_type;
+                                    field_sym->type = declarator_type(field_type, decl);
                                     field_sym->ast = decl;
                                     scope_define(class_scope, field_sym);
                                 }
@@ -29722,7 +29740,7 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                             /* Field initializer type checking - deferred from pass1
                              * to allow forward references to methods */
                             slist_t *children = node->data.node.children;
-                            type_t *field_type = NULL;
+                            type_t *base_field_type = NULL;
                             
                             /* Track if we're in a static field initializer.
                              * This affects whether anonymous classes created here are static. */
@@ -29730,13 +29748,14 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                             sem->in_static_field_init = (node->data.node.flags & MOD_STATIC) != 0;
                             
                             if (children && ((ast_node_t *)children->data)->type != AST_VAR_DECLARATOR) {
-                                field_type = semantic_resolve_type(sem, children->data);
+                                base_field_type = semantic_resolve_type(sem, children->data);
                                 children = children->next;
                             }
                             
                             while (children) {
                                 ast_node_t *decl = children->data;
                                 if (decl->type == AST_VAR_DECLARATOR && decl->data.node.children) {
+                                    type_t *field_type = declarator_type(base_field_type, decl);
                                     ast_node_t *init_expr = (ast_node_t *)decl->data.node.children->data;
                                     
                                     /* Unwrap parentheses for lambda/method-ref */
