@@ -3175,10 +3175,10 @@ static int compile_parallel(compiler_options_t *opts, int thread_count)
  * Read arguments from a file (javac @file syntax).
  * 
  * Format:
- *   - One argument per line
- *   - Lines starting with # are comments
- *   - Whitespace is trimmed
- *   - Empty lines are ignored
+ *   - Arguments are separated by white space, on one line or several
+ *   - An argument may be quoted with ' or " to hold white space; inside
+ *     quotes a backslash escapes the next character
+ *   - A # at the start of an argument comments out the rest of the line
  * 
  * Returns a dynamically allocated array of arguments (NULL-terminated).
  * Caller must free the array and each string.
@@ -3195,74 +3195,90 @@ static char **read_argument_file(const char *filename, int *arg_count)
         return NULL;
     }
     
-    /* Count lines and allocate array (overestimate) */
     int max_args = 100;
     char **args = malloc(sizeof(char *) * (max_args + 1));
-    if (!args) {
+    char *token = malloc(file_size + 1);
+    if (!args || !token) {
+        free(args);
+        free(token);
         free(contents);
         return NULL;
     }
     
-    /* Parse line by line */
-    char *line = contents;
-    char *end = contents + file_size;
+    /* Tokenize as javac does: arguments are separated by white space, a
+     * token may be quoted with ' or " (and then holds white space), a
+     * backslash inside quotes escapes the next character, and a # that
+     * begins a token comments out the rest of the line. */
+    const char *p = contents;
+    const char *end = contents + file_size;
     
-    while (line < end) {
-        /* Find end of line */
-        char *line_end = line;
-        while (line_end < end && *line_end != '\n' && *line_end != '\r') {
-            line_end++;
+    while (p < end) {
+        while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f')) {
+            p++;
         }
-        
-        /* Null-terminate line */
-        char saved = *line_end;
-        *line_end = '\0';
-        
-        /* Trim leading whitespace */
-        while (*line == ' ' || *line == '\t') {
-            line++;
+        if (p >= end) {
+            break;
         }
-        
-        /* Trim trailing whitespace */
-        char *trim_end = line_end - 1;
-        while (trim_end >= line && (*trim_end == ' ' || *trim_end == '\t')) {
-            *trim_end = '\0';
-            trim_end--;
-        }
-        
-        /* Skip empty lines and comments */
-        if (*line != '\0' && *line != '#') {
-            /* Grow array if needed */
-            if (*arg_count >= max_args) {
-                max_args *= 2;
-                char **new_args = realloc(args, sizeof(char *) * (max_args + 1));
-                if (!new_args) {
-                    for (int i = 0; i < *arg_count; i++) {
-                        free(args[i]);
-                    }
-                    free(args);
-                    free(contents);
-                    return NULL;
-                }
-                args = new_args;
+        if (*p == '#') {
+            while (p < end && *p != '\n' && *p != '\r') {
+                p++;
             }
-            
-            /* Add argument */
-            args[(*arg_count)++] = strdup(line);
+            continue;
         }
         
-        /* Move to next line */
-        *line_end = saved;
-        if (line_end < end && *line_end == '\r') {
-            line_end++;
+        size_t len = 0;
+        char quote = '\0';
+        while (p < end) {
+            char c = *p;
+            if (quote) {
+                if (c == quote) {
+                    quote = '\0';
+                    p++;
+                } else if (c == '\\' && p + 1 < end) {
+                    p++;
+                    switch (*p) {
+                        case 'n': token[len++] = '\n'; break;
+                        case 't': token[len++] = '\t'; break;
+                        case 'r': token[len++] = '\r'; break;
+                        case 'f': token[len++] = '\f'; break;
+                        default:  token[len++] = *p; break;
+                    }
+                    p++;
+                } else {
+                    token[len++] = c;
+                    p++;
+                }
+            } else if (c == '"' || c == '\'') {
+                quote = c;
+                p++;
+            } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f') {
+                break;
+            } else {
+                token[len++] = c;
+                p++;
+            }
         }
-        if (line_end < end && *line_end == '\n') {
-            line_end++;
+        token[len] = '\0';
+        
+        if (*arg_count >= max_args) {
+            max_args *= 2;
+            char **new_args = realloc(args, sizeof(char *) * (max_args + 1));
+            if (!new_args) {
+                for (int i = 0; i < *arg_count; i++) {
+                    free(args[i]);
+                }
+                free(args);
+                free(token);
+                free(contents);
+                return NULL;
+            }
+            args = new_args;
         }
-        line = line_end;
+        args[(*arg_count)++] = strdup(token);
     }
     
     args[*arg_count] = NULL;
+    free(token);
     free(contents);
     return args;
 }
