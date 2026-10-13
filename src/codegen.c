@@ -5734,6 +5734,27 @@ static bool class_declares_method(ast_node_t *class_decl, const char *name, int 
     return false;
 }
 
+
+/* Field descriptor with any C-style dimensions written after the name
+ * (String names[]). */
+static char *declarator_descriptor(ast_node_t *type_node, const ast_node_t *decl)
+{
+    char *desc = ast_type_to_descriptor(type_node);
+    uint32_t dims = decl->data.node.flags;
+    if (!desc || dims == 0) {
+        return desc;
+    }
+    size_t len = strlen(desc);
+    char *out = malloc(dims + len + 1);
+    if (!out) {
+        return desc;
+    }
+    memset(out, '[', dims);
+    memcpy(out + dims, desc, len + 1);
+    free(desc);
+    return out;
+}
+
 bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
 {
     if (!cg || !class_decl) {
@@ -5922,10 +5943,10 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     
                     /* Store name and descriptor */
                     fg->name = strdup(child->data.node.name);
-                    fg->descriptor = ast_type_to_descriptor(field_type);
+                    fg->descriptor = declarator_descriptor(field_type, child);
                     
                     /* Generate field signature if type uses type variables */
-                    if (field_type && field_type->sem_type) {
+                    if (field_type && field_type->sem_type && child->data.node.flags == 0) {
                         fg->signature = generate_field_signature(field_type->sem_type);
                     }
                     
@@ -8829,7 +8850,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                             
                             /* Store name and descriptor */
                             fg->name = strdup(child->data.node.name);
-                            fg->descriptor = ast_type_to_descriptor(field_type);
+                            fg->descriptor = declarator_descriptor(field_type, child);
                             
                             fg->name_index = cp_add_utf8(cg->cp, fg->name);
                             fg->descriptor_index = cp_add_utf8(cg->cp, fg->descriptor);
