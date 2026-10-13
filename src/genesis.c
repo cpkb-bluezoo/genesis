@@ -1248,6 +1248,7 @@ static void populate_interface_stub_methods(symbol_t *sym, ast_node_t *decl)
     if (!sym->data.class_data.members) {
         return;
     }
+    sym->data.class_data.members->owner = sym;
     
     /* Walk AST children looking for method declarations */
     for (slist_t *child = decl->data.node.children; child; child = child->next) {
@@ -1367,6 +1368,7 @@ static symbol_t *create_type_stub(const char *qname, ast_node_t *decl,
     if (sym->kind == SYM_ENUM && decl->data.node.children) {
         sym->data.class_data.members = scope_new(SCOPE_CLASS, NULL);
         if (sym->data.class_data.members) {
+            sym->data.class_data.members->owner = sym;
             int enum_ordinal = 0;
             for (slist_t *child = decl->data.node.children; child; child = child->next) {
                 ast_node_t *member = (ast_node_t *)child->data;
