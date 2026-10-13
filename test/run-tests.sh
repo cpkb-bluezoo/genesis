@@ -2757,6 +2757,21 @@ for f in "$TEST_SRC"/external/localshadow/*.java; do
     fi
 done
 
+echo "--- A local read before it is definitely assigned (JLS 16) ---"
+for f in "$TEST_SRC"/external/definiteassign/*.java; do
+    t=$(basename "$f" .java)
+    printf "%-30s ... " "Rejecting $t"
+    da_msg=$("$GENESIS" -d "$TEST_BUILD/definiteassign-out" "$f" 2>&1)
+    da_rc=$?
+    if [ $da_rc -eq 1 ] && echo "$da_msg" | grep -q "might not have been initialized"; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

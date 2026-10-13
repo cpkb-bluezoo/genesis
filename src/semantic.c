@@ -24,6 +24,7 @@
 #endif
 
 #include "genesis.h"
+#include "flow.h"
 #include "classpath.h"
 #include "classfile.h"
 #include <dirent.h>
@@ -31784,6 +31785,11 @@ bool semantic_analyze(semantic_t *sem, ast_node_t *ast, source_file_t *source)
     
     /* Pass 2: Resolve names and check types */
     pass2_check_types(sem, ast);
+
+    /* Definite assignment (JLS 16), once the rest of the file is known to be well formed */
+    if (sem->error_count == 0) {
+        flow_check_definite_assignment(sem, ast);
+    }
     
     /* Clear global */
     g_current_semantic = NULL;

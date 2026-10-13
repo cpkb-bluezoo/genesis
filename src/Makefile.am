@@ -21,6 +21,8 @@ genesis_SOURCES = \
 	constpool.h \
 	encoding.c \
 	encoding.h \
+	flow.c \
+	flow.h \
 	genesis.c \
 	genesis.h \
 	indy.c \

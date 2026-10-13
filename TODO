@@ -43,13 +43,30 @@ DEFERRED / WILL NOT IMPLEMENT
 KNOWN BUGS
 ================================================================================
 
-2. Definite assignment (JLS 16) is not checked at all:
-   - "int y; ... use(y);" with y not assigned on every path compiles, and
-     switch (i) { case 0: int y = 1; break; default: use(y); } (y is in
-     scope in the default group but unassigned there) does too.
-   - javac reports "variable y might not have been initialized"; likewise
-     for final fields, "might already have been assigned" and a lambda
-     capturing a variable that is not definitely assigned.
+2. Definite assignment (JLS 16) covers local variables only (src/flow.c). Not done:
+   - definite UNassignment: "variable x might already have been assigned" for
+     a blank final local assigned twice or in a loop;
+   - blank final fields: "variable x not initialized in the default
+     constructor" / "might not have been initialized" at the end of a
+     constructor, and a read of one before it is assigned;
+   - a local read by a local or anonymous class, which is not checked against
+     the enclosing method (a lambda's body is);
+   - constants other than true and false (a "final boolean" name or a
+     comparison of literals) do not make a condition constant for the analysis.
+
+2a. A "break label;" out of a labelled block that is not a loop or a switch is
+    rejected ("'break' outside switch or loop"); javac accepts it.
+
+2b. Code generation produces a VerifyError ("Bad local variable type") for a
+    local declared without an initializer and assigned only inside a loop or a
+    condition, then read after it:
+      int x; while (true) { if (c) { x = 1; break; } } use(x);
+      int x; for (;;) { x = f(); if (x > 0) break; } use(x);
+      int x; if (a && (x = f()) > 0) { use(x); }
+      int x; while (true) { try { if (c) { x = 1; break; } } finally { } } use(x);
+    The frame recorded at the loop exit or the branch target does not carry the
+    local's type. (All four compile with javac and are accepted by the
+    definite assignment analysis.)
 
 3. Varargs method reference with primitive array (MethodReference36):
    - Needs synthetic bridge method to wrap argument in Object[]
