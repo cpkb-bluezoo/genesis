@@ -2742,6 +2742,21 @@ else
     failed=$((failed + 1))
 fi
 
+echo "--- A local may not hide another local of its method ---"
+for f in "$TEST_SRC"/external/localshadow/*.java; do
+    t=$(basename "$f" .java)
+    printf "%-30s ... " "Rejecting $t"
+    ls_msg=$("$GENESIS" -d "$TEST_BUILD/localshadow-out" "$f" 2>&1)
+    ls_rc=$?
+    if [ $ls_rc -eq 1 ] && echo "$ls_msg" | grep -q "already defined"; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

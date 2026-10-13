@@ -3310,6 +3310,29 @@ static bool local_constant_shape(ast_node_t *expr)
     }
 }
 
+/**
+ * A local variable, parameter or lambda parameter may not have the name of a local variable or
+ * parameter that is in scope in the same method (JLS 6.4): not in a nested block, not in a lambda
+ * body, not as a lambda parameter. A class declared in the method starts afresh, which is where
+ * the walk up the scopes ends. "start" is the innermost scope to look in.
+ */
+static bool name_is_local_in_enclosing(scope_t *start, const char *name)
+{
+    if (!name) {
+        return false;
+    }
+    for (scope_t *s = start; s; s = s->parent) {
+        if (s->type == SCOPE_CLASS || s->type == SCOPE_GLOBAL || s->type == SCOPE_PACKAGE) {
+            break;
+        }
+        symbol_t *found = scope_lookup_local(s, name);
+        if (found && (found->kind == SYM_LOCAL_VAR || found->kind == SYM_PARAMETER)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool narrowing_constant_allowed_primitive(semantic_t *sem, type_t *target_type, ast_node_t *init_expr, type_t *init_type);
 
 static bool narrowing_constant_allowed(semantic_t *sem, type_t *target_type, ast_node_t *init_expr, type_t *init_type)
@@ -30121,6 +30144,10 @@ define_local_var:
                                     }
                                     if (sem->source_version >= 22 && is_unnamed_name(name)) {
                                         decl->sem_symbol = sym;
+                                    } else if (name_is_local_in_enclosing(sem->current_scope->parent, name)) {
+                                        semantic_error(sem, decl->line, decl->column,
+                                                      "Variable '%s' already defined", name);
+                                        decl->sem_symbol = sym;
                                     } else if (!scope_define(sem->current_scope, sym)) {
                                         semantic_error(sem, decl->line, decl->column,
                                                       "Variable '%s' already defined", name);
@@ -30845,6 +30872,10 @@ define_local_var:
                                             param_sym->type = params->sem_type ? params->sem_type : type_new_primitive(TYPE_UNKNOWN);
                                             param_sym->line = params->line;
                                             param_sym->column = params->column;
+                                            if (name_is_local_in_enclosing(frame->saved_scope, pname)) {
+                                                semantic_error(sem, params->line, params->column,
+                                                              "Variable '%s' already defined", pname);
+                                            }
                                             scope_define(lambda_scope, param_sym);
                                             params->sem_symbol = param_sym;
                                         }
@@ -30866,6 +30897,10 @@ define_local_var:
                                                     param_sym->type = n->sem_type ? n->sem_type : type_new_primitive(TYPE_UNKNOWN);
                                                     param_sym->line = n->line;
                                                     param_sym->column = n->column;
+                                                    if (name_is_local_in_enclosing(frame->saved_scope, n->data.leaf.name)) {
+                                                        semantic_error(sem, n->line, n->column,
+                                                                      "Variable '%s' already defined", n->data.leaf.name);
+                                                    }
                                                     scope_define(lambda_scope, param_sym);
                                                     n->sem_symbol = param_sym;
                                                 }
@@ -30886,6 +30921,10 @@ define_local_var:
                                                     param_sym->type = param_node->sem_type ? param_node->sem_type : type_new_primitive(TYPE_UNKNOWN);
                                                     param_sym->line = param_node->line;
                                                     param_sym->column = param_node->column;
+                                                    if (name_is_local_in_enclosing(frame->saved_scope, pname)) {
+                                                        semantic_error(sem, param_node->line, param_node->column,
+                                                                      "Variable '%s' already defined", pname);
+                                                    }
                                                     scope_define(lambda_scope, param_sym);
                                                     param_node->sem_symbol = param_sym;
                                                 }
