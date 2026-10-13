@@ -2670,10 +2670,18 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
         /* Annotations implicitly extend java.lang.annotation.Annotation */
         if (is_annotation) {
             uint16_t annot_iface = cp_add_class(cg->cp, "java/lang/annotation/Annotation");
-            if (!cg->interfaces) {
-                cg->interfaces = slist_new((void *)(uintptr_t)annot_iface);
-            } else {
-                slist_append(cg->interfaces, (void *)(uintptr_t)annot_iface);
+            bool listed = false;
+            for (slist_t *l = cg->interfaces; l; l = l->next) {
+                if ((uint16_t)(uintptr_t)l->data == annot_iface) {
+                    listed = true;
+                }
+            }
+            if (!listed) {
+                if (!cg->interfaces) {
+                    cg->interfaces = slist_new((void *)(uintptr_t)annot_iface);
+                } else {
+                    slist_append(cg->interfaces, (void *)(uintptr_t)annot_iface);
+                }
             }
         }
         

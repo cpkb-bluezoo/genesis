@@ -3070,7 +3070,8 @@ slist_t *symbol_get_interfaces(symbol_t *sym)
     if (!sym) {
         return NULL;
     }
-    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM || sym->kind == SYM_RECORD) {
+    if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM ||
+        sym->kind == SYM_RECORD || sym->kind == SYM_ANNOTATION) {
         return sym->data.class_data.interfaces;
     }
     return NULL;
@@ -3090,12 +3091,13 @@ void ensure_interfaces_resolved(void *sem_ptr, symbol_t *sym)
     semantic_t *sem = (semantic_t *)sem_ptr;
     
     /* Only process class-like symbols */
-    if (sym->kind != SYM_CLASS && sym->kind != SYM_INTERFACE && sym->kind != SYM_ENUM) {
+    if (sym->kind != SYM_CLASS && sym->kind != SYM_INTERFACE && sym->kind != SYM_ENUM &&
+        sym->kind != SYM_ANNOTATION) {
         return;
     }
 
     /* Interface extends clauses may not be in unresolved_interfaces yet (nested types). */
-    if (sym->kind == SYM_INTERFACE) {
+    if (sym->kind == SYM_INTERFACE || sym->kind == SYM_ANNOTATION) {
         ast_node_t *decl = sym->ast;
         if (!decl && sem->shared_registry && sym->qualified_name) {
             decl = type_registry_get_ast(sem->shared_registry, sym->qualified_name);
@@ -7372,8 +7374,26 @@ typedef struct nested_type_info {
  */
 static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_node_t *decl)
 {
-    if (!sem || !sym || !decl || sym->kind != SYM_INTERFACE) {
+    if (!sem || !sym || (sym->kind != SYM_INTERFACE && sym->kind != SYM_ANNOTATION)) {
         return;
+    }
+    /* An annotation type implicitly extends java.lang.annotation.Annotation
+     * (JLS 9.6), so a class implementing one inherits annotationType(). */
+    if (decl->type == AST_ANNOTATION_DECL) {
+        symbol_t *annotation = load_external_class(sem, "java.lang.annotation.Annotation");
+        bool present = false;
+        for (slist_t *i = sym->data.class_data.interfaces; i; i = i->next) {
+            if (i->data == annotation) {
+                present = true;
+            }
+        }
+        if (annotation && annotation != sym && !present) {
+            if (!sym->data.class_data.interfaces) {
+                sym->data.class_data.interfaces = slist_new(annotation);
+            } else {
+                slist_append(sym->data.class_data.interfaces, annotation);
+            }
+        }
     }
     for (slist_t *member = decl->data.node.children; member; member = member->next) {
         ast_node_t *m = (ast_node_t *)member->data;
