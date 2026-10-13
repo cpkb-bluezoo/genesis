@@ -3284,7 +3284,64 @@ static bool constant_names_are_final(semantic_t *sem, ast_node_t *expr)
     }
 }
 
+/* A local's constant initializer is made of literals, operators and simple names: not of a
+ * qualified name, which the folder would try to resolve as a type, reporting an error for the
+ * "f.lb.sentToServer" of an ordinary final local that is no constant at all */
+static bool local_constant_shape(ast_node_t *expr)
+{
+    if (!expr) {
+        return false;
+    }
+    switch (expr->type) {
+        case AST_LITERAL:
+        case AST_IDENTIFIER:
+            return true;
+        case AST_PARENTHESIZED:
+        case AST_UNARY_EXPR:
+        case AST_BINARY_EXPR:
+            for (slist_t *c = expr->data.node.children; c; c = c->next) {
+                if (!local_constant_shape((ast_node_t *)c->data)) {
+                    return false;
+                }
+            }
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool narrowing_constant_allowed_primitive(semantic_t *sem, type_t *target_type, ast_node_t *init_expr, type_t *init_type);
+
 static bool narrowing_constant_allowed(semantic_t *sem, type_t *target_type, ast_node_t *init_expr, type_t *init_type)
+{
+    if (!target_type || !init_expr || !init_type) {
+        return false;
+    }
+
+    /* Narrowing and then boxing (JLS 5.2): "Byte b = 1;" is the constant narrowed to byte
+     * and boxed, so a Byte, Short or Character target takes what its primitive would. The
+     * expression then has the narrowed type, which is what the boxing code selects the
+     * wrapper by. */
+    if (target_type->kind == TYPE_CLASS && target_type->data.class_type.name) {
+        const char *wrapper = target_type->data.class_type.name;
+        type_t *primitive = NULL;
+        if (strcmp(wrapper, "java.lang.Byte") == 0) {
+            primitive = type_byte();
+        } else if (strcmp(wrapper, "java.lang.Short") == 0) {
+            primitive = type_short();
+        } else if (strcmp(wrapper, "java.lang.Character") == 0) {
+            primitive = type_char();
+        }
+        if (!primitive || !narrowing_constant_allowed_primitive(sem, primitive, init_expr, init_type)) {
+            return false;
+        }
+        init_expr->sem_type = primitive;
+        return true;
+    }
+    return narrowing_constant_allowed_primitive(sem, target_type, init_expr, init_type);
+}
+
+static bool narrowing_constant_allowed_primitive(semantic_t *sem, type_t *target_type, ast_node_t *init_expr, type_t *init_type)
 {
     if (!target_type || !init_expr || !init_type) {
         return false;
@@ -25147,6 +25204,14 @@ static void bind_array_init_elements(semantic_t *sem, ast_node_t *init, type_t *
             sem->target_type = immediate_elem_type;
             get_expression_type(sem, elem);
             sem->target_type = saved_target;
+        } else if ((elem->type == AST_LITERAL || elem->type == AST_UNARY_EXPR) && immediate_elem_type &&
+                   immediate_elem_type->kind == TYPE_CLASS) {
+            /* "Byte[] b = { 1 };": an element is an assignment context, so the constant narrows
+             * and boxes as "Byte b = 1;" does */
+            type_t *given = get_expression_type(sem, elem);
+            if (given && !type_assignable(immediate_elem_type, given)) {
+                narrowing_constant_allowed(sem, immediate_elem_type, elem, given);
+            }
         } else if (elem->type == AST_CLASS_LITERAL) {
             /* Nothing else types an initializer element on its own, and a
              * class literal's resolved type (what codegen reads for the
@@ -27956,7 +28021,10 @@ static symbol_t *lookup_named_constant_field(semantic_t *sem, const char *name)
             sym = field_sym;
         }
     }
-    return (sym && sym->kind == SYM_FIELD) ? sym : NULL;
+    /* a final local ("final int k = 100;") is a constant variable when its initializer is
+     * a constant expression, which the caller folds from the declarator */
+    return (sym && (sym->kind == SYM_FIELD ||
+                    (sym->kind == SYM_LOCAL_VAR && sym->data.var_data.has_const_value))) ? sym : NULL;
 }
 
 static bool resolve_named_int_constant(semantic_t *sem, const char *name, int32_t *out_value)
@@ -29834,6 +29902,21 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                                     }
 
 define_local_var:
+                                    /* "final int k = 100;" is a constant variable (JLS 4.12.4): record
+                                     * its value, so it narrows ("byte b = k;") */
+                                    if ((node->data.node.flags & MOD_FINAL) && actual_type &&
+                                        (actual_type->kind == TYPE_INT || actual_type->kind == TYPE_SHORT ||
+                                         actual_type->kind == TYPE_BYTE || actual_type->kind == TYPE_CHAR) &&
+                                        decl->data.node.children) {
+                                        ast_node_t *const_init = (ast_node_t *)decl->data.node.children->data;
+                                        int32_t const_value;
+                                        if (local_constant_shape(const_init) &&
+                                            constant_names_are_final(sem, const_init) &&
+                                            eval_case_constant_operand(sem, const_init, &const_value)) {
+                                            sym->data.var_data.has_const_value = true;
+                                            sym->data.var_data.const_value = const_value;
+                                        }
+                                    }
                                     if (sem->source_version >= 22 && is_unnamed_name(name)) {
                                         decl->sem_symbol = sym;
                                     } else if (!scope_define(sem->current_scope, sym)) {

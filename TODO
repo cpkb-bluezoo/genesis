@@ -43,11 +43,6 @@ DEFERRED / WILL NOT IMPLEMENT
 KNOWN BUGS
 ================================================================================
 
-1. Ternary boxing in varargs (Conditional01-03):
-   - Ternary expression results in varargs arrays get spurious Integer.valueOf()
-   - Stack: [array, idx, String] but then calls Integer.valueOf expecting int
-   - Issue in codegen_expr.c array element storage
-
 2. Switch variable scoping (LambdaScope04 testSwitchLocal* tests):
    - Variables declared in case 0 used in default case
    - Genesis doesn't check for possibly-uninitialized variables
@@ -63,18 +58,10 @@ KNOWN BUGS
 5. Lambda cast to primitive type (TargetType17):
    - Compile-fail test - should error but doesn't
 
-6. Generic constructor Signature attribute:
-   - Uses return type instead of V
-
 8. Nested interface methods are registered twice in semantic analysis
    (once without and once with the implicit public abstract modifiers).
    Consumers such as the functional interface lookup deduplicate by name;
    the double registration itself should be removed.
-
-9. A boxed-LHS compound assignment (Integer i; i += 1;) unboxes, promotes
-    and reboxes correctly for a local variable, field or array element, but
-    only because codegen_compound_rhs handles it generically; it has not
-    been separately tested with a wrapper of every primitive type.
 
 10. -sourcepath compiles more files than javac would, for a real (not
     cosmetic) reason: scan_package_for_type() (semantic.c) - the fallback

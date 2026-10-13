@@ -4655,14 +4655,18 @@ static bool codegen_binary_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t
                     }
                     
                     /* Check if one side is primitive and other is wrapper - do unboxing compare */
-                    bool left_is_prim = (left->type == AST_LITERAL && 
-                                        left->data.leaf.token_type >= TOK_INTEGER_LITERAL &&
-                                        left->data.leaf.token_type <= TOK_DOUBLE_LITERAL) ||
+                    bool left_is_prim = (left->type == AST_LITERAL &&
+                                        ((left->data.leaf.token_type >= TOK_INTEGER_LITERAL &&
+                                          left->data.leaf.token_type <= TOK_CHAR_LITERAL) ||
+                                         left->data.leaf.token_type == TOK_TRUE ||
+                                         left->data.leaf.token_type == TOK_FALSE)) ||
                                        (left->sem_type && left->sem_type->kind >= TYPE_BOOLEAN &&
                                         left->sem_type->kind <= TYPE_DOUBLE);
-                    bool right_is_prim = (right->type == AST_LITERAL && 
-                                         right->data.leaf.token_type >= TOK_INTEGER_LITERAL &&
-                                         right->data.leaf.token_type <= TOK_DOUBLE_LITERAL) ||
+                    bool right_is_prim = (right->type == AST_LITERAL &&
+                                         ((right->data.leaf.token_type >= TOK_INTEGER_LITERAL &&
+                                           right->data.leaf.token_type <= TOK_CHAR_LITERAL) ||
+                                          right->data.leaf.token_type == TOK_TRUE ||
+                                          right->data.leaf.token_type == TOK_FALSE)) ||
                                         (right->sem_type && right->sem_type->kind >= TYPE_BOOLEAN &&
                                          right->sem_type->kind <= TYPE_DOUBLE);
                     
@@ -10971,6 +10975,17 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
             coerce_stack_value(mg, cp, val_kind, val_class, store_elem_kind, store_elem_class);
         }
         
+        if (mg->keep_assign_value == expr) {
+            /* Keep a copy of the stored value below arrayref and index */
+            if (store_elem_kind == TYPE_LONG || store_elem_kind == TYPE_DOUBLE) {
+                bc_emit(mg->code, OP_DUP2_X2);
+                mg_dup2_x2(mg);
+            } else {
+                bc_emit(mg->code, OP_DUP_X2);
+                mg_dup_x2(mg);
+            }
+        }
+
         switch (store_elem_kind) {
             case TYPE_BOOLEAN:
             case TYPE_BYTE:
@@ -11862,6 +11877,97 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
  * ======================================================================== */
 
 /**
+ * ++ and -- on a variable of a wrapper type (JLS 15.14, 15.15): unbox, add or subtract one,
+ * convert back to the wrapper's own type and store it, once for a local, a field or an array
+ * element. That is what "x += 1" does for a boxed x, so it is generated as exactly that. The
+ * value of a prefix expression is the new one, left by the assignment; a postfix one is the old
+ * value, which is the new one stepped back (exact for the integral types, where it wraps like
+ * the update did) unless nobody reads it. Sets *handled to false, generating nothing, when the
+ * operand is not a wrapper.
+ */
+static bool codegen_boxed_incdec(method_gen_t *mg, const_pool_t *cp, ast_node_t *expr,
+                                 ast_node_t *operand, bool is_post, bool is_inc, bool *handled)
+{
+    type_kind_t kind;
+    const char *wrapper;
+    value_kind_and_class(mg, operand, &kind, &wrapper);
+    type_kind_t prim = (kind == TYPE_CLASS && wrapper) ? get_primitive_for_wrapper(wrapper) : TYPE_UNKNOWN;
+    *handled = (prim != TYPE_UNKNOWN && prim != TYPE_BOOLEAN);
+    if (!*handled) {
+        return true;
+    }
+
+    ast_node_t one;
+    memset(&one, 0, sizeof(one));
+    one.type = AST_LITERAL;
+    one.line = expr->line;
+    one.column = expr->column;
+    one.data.leaf.token_type = TOK_INTEGER_LITERAL;
+    one.data.leaf.value.int_val = 1;
+    one.sem_type = type_int();
+    slist_t second = { &one, NULL };
+    slist_t first = { operand, &second };
+    ast_node_t assignment;
+    memset(&assignment, 0, sizeof(assignment));
+    assignment.type = AST_ASSIGNMENT_EXPR;
+    assignment.line = expr->line;
+    assignment.column = expr->column;
+    assignment.data.node.op_token = is_inc ? TOK_PLUS_ASSIGN : TOK_MINUS_ASSIGN;
+    assignment.data.node.children = &first;
+    assignment.sem_type = operand->sem_type;
+    ast_node_t *saved_keep = mg->keep_assign_value;
+    if (mg->value_unused != expr) {
+        mg->keep_assign_value = &assignment;
+    }
+    bool generated = codegen_assignment(mg, &assignment, cp);
+    mg->keep_assign_value = saved_keep;
+    if (!generated) {
+        return false;
+    }
+
+    if (is_post && mg->value_unused != expr) {
+        char *internal = class_to_internal_name(wrapper);
+        emit_unboxing(mg, cp, prim, internal);
+        free(internal);
+        switch (prim) {
+            case TYPE_LONG:
+                bc_emit(mg->code, OP_LCONST_1);
+                push_incdec_one(mg, prim);
+                bc_emit(mg->code, is_inc ? OP_LSUB : OP_LADD);
+                mg_pop_typed(mg, 2);
+                break;
+            case TYPE_FLOAT:
+                bc_emit(mg->code, OP_FCONST_1);
+                push_incdec_one(mg, prim);
+                bc_emit(mg->code, is_inc ? OP_FSUB : OP_FADD);
+                mg_pop_typed(mg, 1);
+                break;
+            case TYPE_DOUBLE:
+                bc_emit(mg->code, OP_DCONST_1);
+                push_incdec_one(mg, prim);
+                bc_emit(mg->code, is_inc ? OP_DSUB : OP_DADD);
+                mg_pop_typed(mg, 2);
+                break;
+            default:
+                bc_emit(mg->code, OP_ICONST_1);
+                push_incdec_one(mg, prim);
+                bc_emit(mg->code, is_inc ? OP_ISUB : OP_IADD);
+                mg_pop_typed(mg, 1);
+                if (prim == TYPE_BYTE) {
+                    bc_emit(mg->code, OP_I2B);
+                } else if (prim == TYPE_SHORT) {
+                    bc_emit(mg->code, OP_I2S);
+                } else if (prim == TYPE_CHAR) {
+                    bc_emit(mg->code, OP_I2C);
+                }
+                break;
+        }
+        emit_boxing(mg, cp, prim);
+    }
+    return true;
+}
+
+/**
  * A field declared with a type-variable type (T value) is erased to its bound
  * in the class file. When the use site's type is more specific (a field of a
  * Box<Integer>), the loaded value must be cast back, as is done for methods
@@ -12121,6 +12227,14 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             bool is_post = (expr->data.node.flags == 1);
                             bool is_inc = (op == TOK_INC);
                             int delta = is_inc ? 1 : -1;
+
+                            bool boxed;
+                            if (!codegen_boxed_incdec(mg, cp, expr, operand, is_post, is_inc, &boxed)) {
+                                return false;
+                            }
+                            if (boxed) {
+                                return true;
+                            }
                             
                             if (operand->type == AST_IDENTIFIER) {
                                 /* Local variable increment/decrement */

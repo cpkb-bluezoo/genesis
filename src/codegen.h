@@ -428,6 +428,14 @@ typedef struct method_gen
     bool is_static;
     bool is_constructor;
     
+    /* The expression an expression statement is generating, whose value nobody reads
+     * (x++ as a statement): lets a postfix ++/-- on a wrapper skip rebuilding the old value */
+    ast_node_t *value_unused;
+
+    /* An assignment whose value the caller reads: an array element assignment leaves nothing
+     * on the stack otherwise, being written for statements */
+    ast_node_t *keep_assign_value;
+
     /* Pending label for labeled statements (set by AST_LABELED_STMT, used by loops) */
     const char *pending_label;
     

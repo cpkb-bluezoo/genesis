@@ -1772,9 +1772,11 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     /* Track stack depth before expression */
                     uint16_t stack_before = mg->stack_depth;
                     
+                    mg->value_unused = expr;
                     if (!codegen_expr(mg, expr, mg->cp)) {
                         return false;
                     }
+                    mg->value_unused = NULL;
                     
                     /* Pop the result if expression left a value on stack */
                     /* Note: Assignment expressions leave their value for chaining */
@@ -3306,9 +3308,11 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                          * rest of the stack (VerifyError: "Bad type on operand
                          * stack", a stray long_2nd left behind). */
                         uint16_t stack_before = mg->stack_depth;
+                        mg->value_unused = update;
                         if (!codegen_expr(mg, update, mg->cp)) {
                             return false;
                         }
+                        mg->value_unused = NULL;
                         uint16_t slots_to_pop = mg->stack_depth - stack_before;
                         if (slots_to_pop >= 2) {
                             bc_emit(mg->code, OP_POP2);
