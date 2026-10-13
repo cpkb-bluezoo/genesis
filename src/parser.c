@@ -2540,6 +2540,23 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                     ast_node_t *ref = ast_new(AST_METHOD_REF, line, col);
                     ast_add_child(ref, expr);
                     
+                    /* Explicit type arguments: Type::<A, B>method */
+                    if (parser_match(parser, TOK_LT)) {
+                        ast_node_t *type_args_node = ast_new(AST_TYPE_ARGS, line, col);
+                        do {
+                            ast_node_t *type_arg = parse_type(parser);
+                            if (type_arg) {
+                                ast_add_child(type_args_node, type_arg);
+                            }
+                        } while (parser_match(parser, TOK_COMMA));
+                        if (!parser_expect(parser, TOK_GT)) {
+                            ast_free(type_args_node);
+                            ast_free(ref);
+                            return NULL;
+                        }
+                        ref->data.node.extra = type_args_node;
+                    }
+                    
                     if (parser_check(parser, TOK_NEW)) {
                         ref->data.node.name = (char *)intern("new");
                         parser_advance(parser);
