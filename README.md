@@ -163,6 +163,19 @@ genesis -version
 | `-version` | Display version information |
 | `-help` | Print usage information |
 
+### Using genesis from Maven
+
+`maven-compiler-plugin` can run genesis as a forked compiler:
+
+```
+mvn compile -Dmaven.compiler.fork=true -Dmaven.compiler.executable=/usr/local/bin/genesis
+```
+
+The plugin first runs the executable with `-version` and looks for a line
+beginning `javac <version>`, so `genesis -version` prints one (the language
+level genesis supports) after its own version line. The plugin then passes its
+arguments in an `@argfile` in javac's format, which genesis reads.
+
 ## Known Limitations
 
 - **Nested classes and `-target` below 11**: nested classes reach each other's

@@ -2008,6 +2008,21 @@ else
 fi
 
 echo
+echo "--- -version has a javac-style line a build tool can parse (maven-compiler-plugin's version probe) ---"
+printf "%-30s ... " "VersionProbe"
+vp_out=$("$GENESIS" -version 2>&1)
+vp_line=$(printf '%s\n' "$vp_out" | grep '^javac [0-9]' | head -1)
+if [ -n "$vp_line" ] && printf '%s\n' "$vp_out" | grep -q '^genesis [0-9]' &&
+   [ "$("$GENESIS" --version 2>&1 | grep -c '^javac [0-9]')" = 1 ]; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    echo "$vp_out" | head -2
+    failed=$((failed + 1))
+fi
+
+echo
 echo "--- Records declared in another file of the batch (accessors, constructors) ---"
 for rc_order in "RecordCrossFileTest Resource Named" "Named RecordCrossFileTest Resource" "Resource Named RecordCrossFileTest"; do
     set -- $rc_order
