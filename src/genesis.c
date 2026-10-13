@@ -1264,16 +1264,10 @@ static void populate_interface_stub_methods(symbol_t *sym, ast_node_t *decl)
                 if (method_sym) {
                     method_sym->kind = SYM_METHOD;
                     method_sym->name = strdup(name);
-                    method_sym->modifiers = member->data.node.flags;
+                    /* Interface methods are implicitly public abstract (unless static/default/private) */
+                    method_sym->modifiers = member_implicit_modifiers(SYM_INTERFACE, AST_METHOD_DECL,
+                                                                      member->data.node.flags);
                     method_sym->ast = member;  /* Keep AST for type resolution */
-                    /* Interface methods are implicitly public abstract (unless static/default) */
-                    if (!(method_sym->modifiers & MOD_PRIVATE)) {
-                        method_sym->modifiers |= MOD_PUBLIC;
-                    }
-                    if (!(method_sym->modifiers & MOD_STATIC) && 
-                        !(method_sym->modifiers & MOD_DEFAULT)) {
-                        method_sym->modifiers |= MOD_ABSTRACT;
-                    }
                     scope_define(sym->data.class_data.members, method_sym);
                 }
             }

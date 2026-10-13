@@ -899,6 +899,9 @@ typedef struct semantic
     int source_version;         /* Source version (e.g., 8, 11, 17, 21) */
     int loop_depth;             /* Current loop nesting depth (for break/continue validation) */
     int switch_depth;           /* Current switch nesting depth (for break validation) */
+    const char *labels[64];     /* The labels of the labelled statements around the code, innermost
+                                 * last (for "break label"); label_count may exceed the room for them */
+    int label_count;
     bool in_early_construction; /* True in constructor prologue before super()/this() (JEP 513) */
     
     source_file_t *source;      /* Current source file */
@@ -945,6 +948,10 @@ char *semantic_resolve_annotation_type_name(semantic_t *sem, const char *simple_
  * @Retention meta-annotation. Returns RETENTION_CLASS if unresolvable or
  * unannotated. Defined in semantic.c; used by classwriter.c. */
 retention_policy_t semantic_resolve_annotation_retention(semantic_t *sem, const char *annotation_name);
+/* The modifiers a member of an interface or annotation type has whatever is written on it (JLS 9.3,
+ * 9.4): a method is public, and abstract unless it is static, default or private; a field is public
+ * static final. "written" is returned for a member of any other kind of type. */
+uint32_t member_implicit_modifiers(symbol_kind_t owner_kind, ast_node_type_t member_type, uint32_t written);
 /* The ElementType bits (ANN_TARGET_* in classfile.h) an annotation type may be applied to */
 unsigned semantic_resolve_annotation_targets(semantic_t *sem, const char *annotation_name);
 

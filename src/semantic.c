@@ -1018,14 +1018,8 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
             /* For interfaces, methods are implicitly public abstract
              * (interfaces cannot declare constructors, so is_ctor is
              * always false here in valid Java, but guard anyway). */
-            if (!is_ctor && sym->kind == SYM_INTERFACE) {
-                if (!(method_sym->modifiers & MOD_PRIVATE)) {
-                    method_sym->modifiers |= MOD_PUBLIC;
-                }
-                if (!(method_sym->modifiers & MOD_STATIC) && 
-                    !(method_sym->modifiers & MOD_DEFAULT)) {
-                    method_sym->modifiers |= MOD_ABSTRACT;
-                }
+            if (!is_ctor) {
+                method_sym->modifiers = member_implicit_modifiers(sym->kind, AST_METHOD_DECL, method_sym->modifiers);
             }
             
             /* Extract parameters - they are direct children of method decl with type AST_PARAMETER */
@@ -3312,6 +3306,17 @@ static bool local_constant_shape(ast_node_t *expr)
 }
 
 /**
+ * True when the code being analysed is in a method or constructor of the current class itself:
+ * in the instance initializer of an anonymous class, sem->current_method is still the method
+ * the class is declared in.
+ */
+static bool in_own_method(semantic_t *sem)
+{
+    return sem->current_method && sem->current_method->scope &&
+           sem->current_method->scope->owner == sem->current_class;
+}
+
+/**
  * A local variable, parameter or lambda parameter may not have the name of a local variable or
  * parameter that is in scope in the same method (JLS 6.4): not in a nested block, not in a lambda
  * body, not as a lambda parameter. A class declared in the method starts afresh, which is where
@@ -4112,6 +4117,27 @@ static void append_method_key_descriptor_fragment(char **pk, char *buf_end, type
     }
 }
 
+uint32_t member_implicit_modifiers(symbol_kind_t owner_kind, ast_node_type_t member_type, uint32_t written)
+{
+    if (owner_kind != SYM_INTERFACE && owner_kind != SYM_ANNOTATION) {
+        return written;
+    }
+    if (member_type == AST_METHOD_DECL) {
+        if (owner_kind == SYM_ANNOTATION) {
+            return written | MOD_PUBLIC | MOD_ABSTRACT;
+        }
+        if (!(written & MOD_PRIVATE)) {
+            written |= MOD_PUBLIC;
+        }
+        if (!(written & (MOD_STATIC | MOD_DEFAULT | MOD_PRIVATE))) {
+            written |= MOD_ABSTRACT;
+        }
+    } else if (member_type == AST_FIELD_DECL) {
+        written |= MOD_PUBLIC | MOD_STATIC | MOD_FINAL;
+    }
+    return written;
+}
+
 /**
  * Define a symbol in a scope.
  * Returns false if symbol already exists.
@@ -4155,8 +4181,10 @@ bool scope_define(scope_t *scope, symbol_t *symbol)
         snprintf(key, key_len, "%s%s", symbol->name, param_sig);
         
         if (debug_getenv("GENESIS_DEBUG_SCOPE_DEFINE")) {
-            fprintf(stderr, "DEBUG scope_define: method key='%s' modifiers=0x%x\n",
-                key, symbol->modifiers);
+            fprintf(stderr, "DEBUG scope_define: method key='%s' modifiers=0x%x scope=%p owner=%s sym=%p\n",
+                key, symbol->modifiers, (void *)scope, scope->owner && scope->owner->name ? scope->owner->name : "?",
+                (void *)symbol);
+
         }
     } else {
         /* Check for duplicate in local scope only (non-methods) */
@@ -7606,7 +7634,8 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
                 const char *mname = nmember->data.node.name;
                 if (mname) {
                     symbol_t *method_sym = symbol_new(SYM_METHOD, mname);
-                    method_sym->modifiers = nmember->data.node.flags;
+                    method_sym->modifiers = member_implicit_modifiers(nested_sym->kind, AST_METHOD_DECL,
+                                                                      nmember->data.node.flags);
                     method_sym->ast = nmember;
                     
                     /* Process method-level type parameters first */
@@ -7688,7 +7717,8 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
                 const char *fname = nmember->data.node.name;
                 if (fname) {
                     symbol_t *field_sym = symbol_new(SYM_FIELD, fname);
-                    field_sym->modifiers = nmember->data.node.flags;
+                    field_sym->modifiers = member_implicit_modifiers(nested_sym->kind, AST_FIELD_DECL,
+                                                                     nmember->data.node.flags);
                     field_sym->ast = nmember;
                     /* Resolve type if possible */
                     slist_t *fchildren = nmember->data.node.children;
@@ -8701,19 +8731,8 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                     method_sym->ast = member;
                                     
                                     /* Interface methods are implicitly public (and abstract unless default/static/private) */
-                                    if (all_kind == SYM_INTERFACE) {
-                                        bool is_private = (method_sym->modifiers & MOD_PRIVATE) != 0;
-                                        bool is_static = (method_sym->modifiers & MOD_STATIC) != 0;
-                                        bool is_default = (method_sym->modifiers & MOD_DEFAULT) != 0;
-                                        if (!is_private) {
-                                            method_sym->modifiers |= MOD_PUBLIC;
-                                        }
-                                        if (!is_default && !is_static && !is_private) {
-                                            method_sym->modifiers |= MOD_ABSTRACT;
-                                        }
-                                    } else if (all_kind == SYM_ANNOTATION) {
-                                        method_sym->modifiers |= MOD_PUBLIC | MOD_ABSTRACT;
-                                    }
+                                    method_sym->modifiers = member_implicit_modifiers(all_kind, AST_METHOD_DECL,
+                                                                                      method_sym->modifiers);
                                     
                                     /* Get return type */
                                     if (member->data.node.extra) {
@@ -13173,6 +13192,64 @@ static symbol_t *resolve_static_import_method(semantic_t *sem, const char *metho
  * ======================================================================== */
 
 /**
+ * Whether the Java source file at "path" may declare a type called "type_name": the name occurs
+ * as a whole word right after class, interface, enum or record. A cheap text test, so that a
+ * package scan parses only files that can matter; a false positive merely loads one extra file.
+ */
+static bool source_may_declare_type(const char *path, const char *type_name)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size <= 0) {
+        fclose(f);
+        return false;
+    }
+    char *buf = malloc((size_t)size + 1);
+    if (!buf) {
+        fclose(f);
+        return true;
+    }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    size_t nlen = strlen(type_name);
+    bool found = false;
+    for (const char *p = buf; (p = strstr(p, type_name)) != NULL; p += nlen) {
+        char after = p[nlen];
+        if (after == '_' || after == '$' || isalnum((unsigned char)after)) {
+            continue;
+        }
+        const char *q = p;
+        while (q > buf && isspace((unsigned char)q[-1])) {
+            q--;
+        }
+        if (q == p) {
+            continue;
+        }
+        static const char *const keywords[] = { "class", "interface", "enum", "record" };
+        for (size_t k = 0; k < sizeof(keywords) / sizeof(keywords[0]); k++) {
+            size_t klen = strlen(keywords[k]);
+            if ((size_t)(q - buf) >= klen && strncmp(q - klen, keywords[k], klen) == 0 &&
+                ((size_t)(q - buf) == klen || !(isalnum((unsigned char)q[-(long)klen - 1]) || q[-(long)klen - 1] == '_'))) {
+                found = true;
+                break;
+            }
+        }
+        if (found) {
+            break;
+        }
+    }
+    free(buf);
+    return found;
+}
+
+/**
  * Scan the package directory and preregister all classes found.
  * This enables resolution of package-private types defined in other files
  * within the same package (like javac does in ClassFinder.fillIn).
@@ -13195,7 +13272,9 @@ static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, c
      * -sourcepath compile: one such scan per unresolved simple name, and
      * a file's analysis meets thousands of those (type variables, nested
      * types, names still being resolved). */
-    if (sem->scanned_packages && hashtable_contains(sem->scanned_packages, package_name)) {
+    char miss_key[768];
+    snprintf(miss_key, sizeof(miss_key), "%s.%s", package_name, type_name);
+    if (sem->scanned_packages && hashtable_contains(sem->scanned_packages, miss_key)) {
         return NULL;
     }
 
@@ -13251,6 +13330,18 @@ static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, c
                 continue;
             }
 
+            /* A file is loaded (and so compiled, as a dependency) only if it can declare the type
+             * sought: a name like "System", which no file of the package declares, must not drag
+             * every file of the package into the compilation. The file named after the type is
+             * always taken, as javac would. */
+            if (strcmp(primary_class, type_name) != 0) {
+                char file_path[1536];
+                snprintf(file_path, sizeof(file_path), "%s/%s", dir_path, entry->d_name);
+                if (!source_may_declare_type(file_path, type_name)) {
+                    continue;
+                }
+            }
+
             if (debug_getenv("GENESIS_DEBUG_PKG_SCAN")) {
                 fprintf(stderr, "DEBUG scan_package: loading '%s'\n", qualified);
             }
@@ -13294,7 +13385,7 @@ static symbol_t *scan_package_for_type(semantic_t *sem, const char *type_name, c
     if (!sem->scanned_packages) {
         sem->scanned_packages = hashtable_new();
     }
-    hashtable_insert(sem->scanned_packages, package_name, (void *)1);
+    hashtable_insert(sem->scanned_packages, miss_key, (void *)1);
 
     return NULL;
 }
@@ -15839,11 +15930,15 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             /* Store symbol on AST node for pass2 lookup (handles overloads) */
                             node->sem_symbol = sym;
                             
-                            /* Annotation methods are implicitly public abstract */
+                            /* Interface and annotation methods are implicitly public (and abstract unless
+                             * default, static or private) */
+                            if (kind == SYM_METHOD && sem->current_class) {
+                                sym->modifiers = member_implicit_modifiers(sem->current_class->kind,
+                                                                           AST_METHOD_DECL, sym->modifiers);
+                            }
                             if (kind == SYM_METHOD && 
                                 sem->current_class && 
                                 sem->current_class->kind == SYM_ANNOTATION) {
-                                sym->modifiers |= MOD_PUBLIC | MOD_ABSTRACT;
                                 
                                 /* Annotation methods cannot have throws clause */
                                 for (slist_t *child = node->data.node.children; child; child = child->next) {
@@ -15854,25 +15949,6 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                             "throws clause not allowed in @interface members");
                                         break;
                                     }
-                                }
-                            }
-                            
-                            /* Interface methods are implicitly public (and abstract unless default/static/private) */
-                            if (kind == SYM_METHOD && 
-                                sem->current_class && 
-                                sem->current_class->kind == SYM_INTERFACE) {
-                                bool is_private = (sym->modifiers & MOD_PRIVATE) != 0;
-                                bool is_static = (sym->modifiers & MOD_STATIC) != 0;
-                                bool is_default = (sym->modifiers & MOD_DEFAULT) != 0;
-                                
-                                /* Non-private interface methods are implicitly public */
-                                if (!is_private) {
-                                    sym->modifiers |= MOD_PUBLIC;
-                                }
-                                
-                                /* Non-default, non-static, non-private interface methods are implicitly abstract */
-                                if (!is_default && !is_static && !is_private) {
-                                    sym->modifiers |= MOD_ABSTRACT;
                                 }
                             }
                             
@@ -27368,6 +27444,20 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
             type_t *last_arg = (sam_count > 0 && sam_count <= 8) ? sam_ptypes[sam_count - 1] : NULL;
             bool direct = passed == nparams && (!last_arg || last_arg->kind == TYPE_ARRAY ||
                                                 last_arg->kind == TYPE_NULL);
+            /* An array of a primitive type is not an array of references: "m(Object...)" given an
+             * int[] is given one element, so the call packs it (JLS 15.12.2.4). Only an array of
+             * the very primitive the parameter is of goes through as it is. */
+            if (direct && last_arg && last_arg->kind == TYPE_ARRAY && last_param->type &&
+                last_param->type->kind == TYPE_ARRAY) {
+                type_t *given = last_arg->data.array_type.element_type;
+                type_t *taken = last_param->type->data.array_type.element_type;
+                bool given_primitive = last_arg->data.array_type.dimensions <= 1 && given &&
+                                       given->kind >= TYPE_BOOLEAN && given->kind <= TYPE_DOUBLE;
+                if (given_primitive && !(last_param->type->data.array_type.dimensions <= 1 && taken &&
+                                         taken->kind == given->kind)) {
+                    direct = false;
+                }
+            }
             ast_node_t *recv_expr = NULL;
             if (!direct && passed >= nparams - 1 && (!unbound || sam_count > 0)) {
                 if (is_static) {
@@ -30540,8 +30630,18 @@ define_local_var:
                     
                     case AST_BREAK_STMT:
                         {
-                            /* Break must be inside a loop or switch */
-                            if (sem->loop_depth == 0 && sem->switch_depth == 0) {
+                            /* An unlabelled break must be inside a loop or switch; one with a label
+                             * leaves the labelled statement of that name, whatever it is */
+                            if (node->data.node.name) {
+                                bool found = sem->label_count > 64;     /* (more than are kept) */
+                                for (int i = 0; !found && i < sem->label_count && i < 64; i++) {
+                                    found = sem->labels[i] && strcmp(sem->labels[i], node->data.node.name) == 0;
+                                }
+                                if (!found) {
+                                    semantic_error(sem, node->line, node->column,
+                                        "undefined label: %s", node->data.node.name);
+                                }
+                            } else if (sem->loop_depth == 0 && sem->switch_depth == 0) {
                                 semantic_error(sem, node->line, node->column,
                                     "'break' outside switch or loop");
                             }
@@ -30710,7 +30810,7 @@ define_local_var:
                                                 "final parameter '%s' may not be assigned", name);
                                         } else if (sym->kind == SYM_FIELD) {
                                             /* Final field - can only assign in constructor/initializer */
-                                            bool in_constructor = sem->current_method && 
+                                            bool in_constructor = in_own_method(sem) &&
                                                 sem->current_method->kind == SYM_CONSTRUCTOR;
                                             bool is_static_field = (sym->modifiers & MOD_STATIC) != 0;
                                             
@@ -30718,13 +30818,13 @@ define_local_var:
                                                Instance final fields can only be assigned in constructor */
                                             if (is_static_field) {
                                                 /* Static final - only in <clinit> (no current_method) */
-                                                if (sem->current_method) {
+                                                if (in_own_method(sem)) {
                                                     semantic_error(sem, node->line, node->column,
                                                         "Cannot assign to static final field '%s'", name);
                                                 }
                                             } else {
                                                 /* Instance final - only in constructor or instance initializer */
-                                                if (!in_constructor && sem->current_method) {
+                                                if (!in_constructor && in_own_method(sem)) {
                                                     semantic_error(sem, node->line, node->column,
                                                         "Cannot assign to final field '%s'", name);
                                                 }
@@ -30746,7 +30846,7 @@ define_local_var:
                                                     class_sym->data.class_data.members, field_name);
                                                 if (field && (field->modifiers & MOD_FINAL)) {
                                                     /* Check context - same rules as above */
-                                                    bool in_constructor = sem->current_method && 
+                                                    bool in_constructor = in_own_method(sem) &&
                                                         sem->current_method->kind == SYM_CONSTRUCTOR;
                                                     bool is_static_field = (field->modifiers & MOD_STATIC) != 0;
                                                     /* (one class can be two symbols: the registry's and the one a
@@ -30758,12 +30858,12 @@ define_local_var:
                                                                 sem->current_class->qualified_name) == 0);
                                                     
                                                     if (is_static_field) {
-                                                        if (sem->current_method) {
+                                                        if (in_own_method(sem)) {
                                                             semantic_error(sem, node->line, node->column,
                                                                 "Cannot assign to static final field '%s'", field_name);
                                                         }
                                                     } else if (is_same_class) {
-                                                        if (!in_constructor && sem->current_method) {
+                                                        if (!in_constructor && in_own_method(sem)) {
                                                             semantic_error(sem, node->line, node->column,
                                                                 "Cannot assign to final field '%s'", field_name);
                                                         }
@@ -31214,6 +31314,13 @@ define_local_var:
                         }
                         break;
                     
+                    case AST_LABELED_STMT:
+                        if (sem->label_count < 64) {
+                            sem->labels[sem->label_count] = node->data.node.name;
+                        }
+                        sem->label_count++;
+                        break;
+
                     case AST_DO_STMT:
                         {
                             /* Check that do-while condition is boolean */
@@ -31682,6 +31789,10 @@ define_local_var:
                     case AST_WHILE_STMT:
                     case AST_DO_STMT:
                         sem->loop_depth--;
+                        break;
+
+                    case AST_LABELED_STMT:
+                        sem->label_count--;
                         break;
                     
                     case AST_SWITCH_STMT:

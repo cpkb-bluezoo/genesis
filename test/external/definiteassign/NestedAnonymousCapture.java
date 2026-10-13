@@ -1,0 +1,1 @@
+class NestedAnonymousCapture { Runnable m() { int x; return new Runnable() { public void run() { Runnable inner = new Runnable() { public void run() { System.out.println(x); } }; inner.run(); } }; } }

@@ -775,6 +775,15 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
  * ======================================================================== */
 
 /* Forward declaration */
+/* The label of the labelled statement a loop is the body of: this loop's alone, so the loops nested
+ * in it must not find it pending */
+static const char *take_pending_label(method_gen_t *mg)
+{
+    const char *label = mg->pending_label;
+    mg->pending_label = NULL;
+    return label;
+}
+
 bool codegen_statement(method_gen_t *mg, ast_node_t *stmt);
 
 /* The resources of a try-with-resources statement, for the code that closes them where the
@@ -2431,55 +2440,73 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                 }
                             }
                             
-                            /* Store to local variable with correct opcode for type */
-                            mg_emit_store_local(mg, slot, var_kind);
-                            
-                            /* Update stackmap for this local variable */
-                            if (mg->stackmap) {
-                                if (is_array_type) {
-                                    /* Build proper array descriptor like [I, [[Ljava/lang/String; */
-                                    char arr_desc[256];
-                                    int i;
-                                    for (i = 0; i < array_dims && i < 250; i++) {
-                                        arr_desc[i] = '[';
-                                    }
-                                    if (array_elem_kind == TYPE_CLASS && class_name) {
-                                        snprintf(arr_desc + i, sizeof(arr_desc) - i, "L%s;", class_name);
-                                    } else {
-                                        /* Primitive element: map type_kind_t to descriptor char
-                                         * TYPE_VOID=0='V', TYPE_BOOLEAN=1='Z', TYPE_BYTE=2='B', TYPE_CHAR=3='C',
-                                         * TYPE_SHORT=4='S', TYPE_INT=5='I', TYPE_LONG=6='J', TYPE_FLOAT=7='F', TYPE_DOUBLE=8='D' */
-                                        static const char prims[] = "VZBCSIJFD";
-                                        if (array_elem_kind <= TYPE_DOUBLE) {
-                                            arr_desc[i] = prims[array_elem_kind];
-                                        } else {
-                                            arr_desc[i] = 'I';  /* Default to int */
-                                        }
-                                        arr_desc[i + 1] = '\0';
-                                    }
-                                    stackmap_set_local_object(mg->stackmap, slot, mg->cp, arr_desc);
-                                } else if (is_ref_type && class_name) {
-                                    stackmap_set_local_object(mg->stackmap, slot, mg->cp, class_name);
-                                } else {
-                                    switch (var_kind) {
-                                        case TYPE_LONG:   stackmap_set_local_long(mg->stackmap, slot); break;
-                                        case TYPE_DOUBLE: stackmap_set_local_double(mg->stackmap, slot); break;
-                                        case TYPE_FLOAT:  stackmap_set_local_float(mg->stackmap, slot); break;
-                                        default:          stackmap_set_local_int(mg->stackmap, slot); break;
-                                    }
-                                }
-                            }
                         } else {
-                            /* Declaration without initializer (e.g., "String value;").
-                             * Track the slot in the stackmap as uninitialized (Top type).
-                             * This is important for try-catch blocks where the variable
-                             * might be assigned in both try and catch paths - we need to
-                             * know the slot exists even before it's initialized. */
-                            if (mg->stackmap) {
-                                /* For uninitialized locals, just increment locals count.
-                                 * The slot will be Top until a value is assigned. */
-                                if (slot >= mg->stackmap->current_locals_count) {
-                                    stackmap_set_local(mg->stackmap, slot, vtype_top());
+                            /* A declaration without an initializer ("String value;"). The slot gets a default
+                             * value of its kind: definite assignment guarantees nothing reads it, and the
+                             * local is then in every stack map frame from here on, including the frame where
+                             * the paths that assign it (in a loop, in a condition) join those that do not.
+                             * The frame says the declared type, which null is. */
+                            switch (var_kind) {
+                                case TYPE_LONG:
+                                    bc_emit(mg->code, OP_LCONST_0);
+                                    mg_push_long(mg);
+                                    break;
+                                case TYPE_DOUBLE:
+                                    bc_emit(mg->code, OP_DCONST_0);
+                                    mg_push_double(mg);
+                                    break;
+                                case TYPE_FLOAT:
+                                    bc_emit(mg->code, OP_FCONST_0);
+                                    mg_push_float(mg);
+                                    break;
+                                case TYPE_CLASS:
+                                case TYPE_ARRAY:
+                                case TYPE_TYPEVAR:
+                                    bc_emit(mg->code, OP_ACONST_NULL);
+                                    mg_push_null(mg);
+                                    break;
+                                default:
+                                    bc_emit(mg->code, OP_ICONST_0);
+                                    mg_push_int(mg);
+                                    break;
+                            }
+                        }
+
+                        /* Store to local variable with correct opcode for type */
+                        mg_emit_store_local(mg, slot, var_kind);
+                        
+                        /* Update stackmap for this local variable */
+                        if (mg->stackmap) {
+                            if (is_array_type) {
+                                /* Build proper array descriptor like [I, [[Ljava/lang/String; */
+                                char arr_desc[256];
+                                int i;
+                                for (i = 0; i < array_dims && i < 250; i++) {
+                                    arr_desc[i] = '[';
+                                }
+                                if (array_elem_kind == TYPE_CLASS && class_name) {
+                                    snprintf(arr_desc + i, sizeof(arr_desc) - i, "L%s;", class_name);
+                                } else {
+                                    /* Primitive element: map type_kind_t to descriptor char
+                                     * TYPE_VOID=0='V', TYPE_BOOLEAN=1='Z', TYPE_BYTE=2='B', TYPE_CHAR=3='C',
+                                     * TYPE_SHORT=4='S', TYPE_INT=5='I', TYPE_LONG=6='J', TYPE_FLOAT=7='F', TYPE_DOUBLE=8='D' */
+                                    static const char prims[] = "VZBCSIJFD";
+                                    if (array_elem_kind <= TYPE_DOUBLE) {
+                                        arr_desc[i] = prims[array_elem_kind];
+                                    } else {
+                                        arr_desc[i] = 'I';  /* Default to int */
+                                    }
+                                    arr_desc[i + 1] = '\0';
+                                }
+                                stackmap_set_local_object(mg->stackmap, slot, mg->cp, arr_desc);
+                            } else if (is_ref_type && class_name) {
+                                stackmap_set_local_object(mg->stackmap, slot, mg->cp, class_name);
+                            } else {
+                                switch (var_kind) {
+                                    case TYPE_LONG:   stackmap_set_local_long(mg->stackmap, slot); break;
+                                    case TYPE_DOUBLE: stackmap_set_local_double(mg->stackmap, slot); break;
+                                    case TYPE_FLOAT:  stackmap_set_local_float(mg->stackmap, slot); break;
+                                    default:          stackmap_set_local_int(mg->stackmap, slot); break;
                                 }
                             }
                         }
@@ -2836,7 +2863,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 mg_record_frame(mg);
                 
                 /* Push loop context for break/continue */
-                mg_push_loop(mg, loop_start, mg->pending_label);
+                mg_push_loop(mg, loop_start, take_pending_label(mg));
                 
                 /* Generate condition as a direct branch to loop_end on
                  * false, rather than materializing a 0/1 value and doing
@@ -3039,7 +3066,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 
                 /* continue_target is after body, before condition check */
                 /* We'll set it after body generation */
-                mg_push_loop(mg, loop_start, mg->pending_label);  /* Temp value, updated below */
+                mg_push_loop(mg, loop_start, take_pending_label(mg));  /* Temp value, updated below */
                 
                 /* Reset last_opcode before generating the body - see the
                  * identical reset (and its full reasoning) in AST_WHILE_STMT
@@ -3233,7 +3260,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* Continue target is where update starts (or loop_start if no update) */
                 /* We need to know where update will be, so use a placeholder */
                 size_t continue_target = loop_start;  /* Will be updated */
-                mg_push_loop(mg, continue_target, mg->pending_label);
+                mg_push_loop(mg, continue_target, take_pending_label(mg));
                 
                 /* Reset last_opcode before generating the body - see the
                  * identical reset (and its full reasoning) in AST_WHILE_STMT
@@ -3632,7 +3659,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * it's only initialized inside the loop body */
                     mg_record_frame(mg);
                     
-                    mg_push_loop(mg, loop_start, mg->pending_label);
+                    mg_push_loop(mg, loop_start, take_pending_label(mg));
                     
                     /* if (__idx >= __arr.length) goto loop_end */
                     mg_emit_load_local(mg, idx_slot, TYPE_INT);
@@ -3914,7 +3941,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * it's only initialized inside the loop body */
                     mg_record_frame(mg);
                     
-                    mg_push_loop(mg, loop_start, mg->pending_label);
+                    mg_push_loop(mg, loop_start, take_pending_label(mg));
                     
                     /* if (!__iter.hasNext()) goto loop_end */
                     mg_emit_load_local(mg, iter_slot, TYPE_CLASS);
@@ -6282,6 +6309,12 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     mg_push_break_scope(mg, label);  /* no continue target */
                     
                     bool result = codegen_statement(mg, inner_stmt);
+
+                    /* A "break label" leaves for the end of the statement, a branch target that needs
+                     * a frame */
+                    if (mg->loop_stack && ((loop_context_t *)mg->loop_stack->data)->break_offsets) {
+                        mg_record_frame(mg);
+                    }
                     
                     /* Pop loop context and patch breaks to after the statement */
                     mg_pop_loop(mg, mg->code->length);

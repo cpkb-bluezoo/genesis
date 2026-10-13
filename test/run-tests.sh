@@ -1486,6 +1486,23 @@ check_sourcepath() {
 check_sourcepath SamePackageSourcepath spdep/SamePackageSourcepathTest.java spdep.SamePackageSourcepathTest
 check_sourcepath ImportSourcepath spuser/ImportSourcepathTest.java spuser.ImportSourcepathTest
 
+# Only the files a compilation reaches are compiled: spdep/Unrelated.java sits in the same
+# package as the types the test uses, but nothing names it, so (as with javac) it must not be
+# loaded as a dependency and written out.
+printf "%-30s ... " "SourcepathUnreachedNotCompiled"
+sp_out="$TEST_BUILD/sourcepath-out"
+rm -rf "$sp_out"
+mkdir -p "$sp_out"
+if (cd "$sp_out" && "$GENESIS" -source 8 -d "$sp_out" -sourcepath "$TEST_SRC/sourcepath/lib" \
+       "$TEST_SRC/sourcepath/src/spdep/SamePackageSourcepathTest.java" >/dev/null 2>&1) && \
+   [ -f "$sp_out/spdep/Impl.class" ] && [ ! -f "$sp_out/spdep/Unrelated.class" ]; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "--- A qualified reference to a genuinely nonexistent package must fail to compile ---"
 # "pkg2.Foo" doesn't exist anywhere under this sourcepath - only an
@@ -2771,6 +2788,72 @@ for f in "$TEST_SRC"/external/definiteassign/*.java; do
         failed=$((failed + 1))
     fi
 done
+
+echo "--- A final local assigned where it may already have been (JLS 16) ---"
+for f in "$TEST_SRC"/external/finalassign/*.java; do
+    t=$(basename "$f" .java)
+    printf "%-30s ... " "Rejecting $t"
+    fa_expect=$(sed -n '1s|^// error: ||p' "$f")
+    fa_msg=$("$GENESIS" -d "$TEST_BUILD/finalassign-out" "$f" 2>&1)
+    fa_rc=$?
+    if [ $fa_rc -eq 1 ] && [ -n "$fa_expect" ] && echo "$fa_msg" | grep -q "$fa_expect"; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+echo "--- A constant expression as a condition makes a variable assigned (JLS 15.29, 16) ---"
+for f in "$TEST_SRC"/external/constcond/*.java; do
+    t=$(basename "$f" .java)
+    printf "%-30s ... " "Accepting $t"
+    if "$GENESIS" -d "$TEST_BUILD/constcond-out" "$f" >/dev/null 2>&1; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+for f in "$TEST_SRC"/external/constcond-rejected/*.java; do
+    t=$(basename "$f" .java)
+    printf "%-30s ... " "Rejecting $t"
+    cc_msg=$("$GENESIS" -d "$TEST_BUILD/constcond-out" "$f" 2>&1)
+    cc_rc=$?
+    if [ $cc_rc -eq 1 ] && echo "$cc_msg" | grep -q "might not have been initialized"; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+done
+
+echo "--- The members of a nested interface are registered with the modifiers they have (JLS 9.3, 9.4) ---"
+printf "%-30s ... " "NestedInterfaceModifiers"
+im_log=$(GENESIS_DEBUG_SCOPE_DEFINE=1 "$GENESIS" -d "$TEST_BUILD/ifacemods-out" "$TEST_SRC/external/ifacemods/Outer.java" 2>&1 | grep "scope_define: method")
+# done and count abstract+public (0x21), twice default+public (0x801), none static+public (0x9), hidden private
+# (0x2): each in both registrations of the interface, the compiler's own and the registry's
+im_ok=true
+for want in "done(.*)' modifiers=0x21 " "count()' modifiers=0x21 " "twice()' modifiers=0x801 " \
+            "none()' modifiers=0x9 " "hidden()' modifiers=0x2 " "value()' modifiers=0x21 "; do
+    if [ "$(echo "$im_log" | grep -c "$want")" -lt 2 ]; then
+        im_ok=false
+    fi
+done
+# no registration of the same method without them
+if echo "$im_log" | grep -q "key='done(java.lang.String)' modifiers=0x0\|key='count()' modifiers=0x0\|key='twice()' modifiers=0x800\|key='value()' modifiers=0x0\|key='hidden()' modifiers=0x22"; then
+    im_ok=false
+fi
+if $im_ok; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
 
 echo
 echo "=== Results: $passed passed, $failed failed ==="

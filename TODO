@@ -43,65 +43,6 @@ DEFERRED / WILL NOT IMPLEMENT
 KNOWN BUGS
 ================================================================================
 
-2. Definite assignment (JLS 16) covers local variables only (src/flow.c). Not done:
-   - definite UNassignment: "variable x might already have been assigned" for
-     a blank final local assigned twice or in a loop;
-   - blank final fields: "variable x not initialized in the default
-     constructor" / "might not have been initialized" at the end of a
-     constructor, and a read of one before it is assigned;
-   - a local read by a local or anonymous class, which is not checked against
-     the enclosing method (a lambda's body is);
-   - constants other than true and false (a "final boolean" name or a
-     comparison of literals) do not make a condition constant for the analysis.
-
-2a. A "break label;" out of a labelled block that is not a loop or a switch is
-    rejected ("'break' outside switch or loop"); javac accepts it.
-
-2b. Code generation produces a VerifyError ("Bad local variable type") for a
-    local declared without an initializer and assigned only inside a loop or a
-    condition, then read after it:
-      int x; while (true) { if (c) { x = 1; break; } } use(x);
-      int x; for (;;) { x = f(); if (x > 0) break; } use(x);
-      int x; if (a && (x = f()) > 0) { use(x); }
-      int x; while (true) { try { if (c) { x = 1; break; } } finally { } } use(x);
-    The frame recorded at the loop exit or the branch target does not carry the
-    local's type. (All four compile with javac and are accepted by the
-    definite assignment analysis.)
-
-3. Varargs method reference with primitive array (MethodReference36):
-   - Needs synthetic bridge method to wrap argument in Object[]
-   - javac generates lambda$test$N methods that create Object[] wrapper
-
-8. Nested interface methods are registered twice in semantic analysis
-   (once without and once with the implicit public abstract modifiers).
-   Consumers such as the functional interface lookup deduplicate by name;
-   the double registration itself should be removed.
-
-10. -sourcepath compiles more files than javac would, for a real (not
-    cosmetic) reason: scan_package_for_type() (semantic.c) - the fallback
-    used to find a same-package type referenced by simple name with no
-    import - scans and loads every .java file in the matching package
-    directory before it reaches the one that declares the type actually
-    being looked up (or gives up having found nothing), and
-    load_class_from_source_impl()'s "track this file as a dependency"
-    step fires unconditionally for every file it parses, including ones
-    loaded only to rule them out - even when resolving a completely
-    unrelated bare identifier (e.g. "System"). A fix was attempted
-    (suppress the generic per-file tracking during a scan, explicitly
-    queue only the file a lookup actually confirms it needs) but
-    reverted: same-package type resolution turns out to be reimplemented
-    independently in at least 4 separate places in semantic.c (in
-    lookup_same_package_type()'s own cache-hit path, a duplicate direct
-    hashtable_lookup(sem->types, ...) check in method-call target-class
-    resolution, and at least one more for parameter/field type resolution
-    via resolve_unresolved_type()/the shared type registry, never fully
-    traced to its exact call site), each bypassing a single-choke-point
-    fix differently. Fixing 3 of the 4 got a simple repro working but
-    broke SamePackageSourcepathTest (NoClassDefFoundError on types used
-    only as parameter types, resolved through the 4th, untraced path).
-    Needs either auditing all the duplicate resolution paths individually,
-    or consolidating them to all go through lookup_same_package_type().
-
 11. A JDK with no jmods directory (JDK 24+ builds such as Eclipse Temurin 25,
     JEP 493) cannot be used: jdk_detect_from_path() in classpath.c accepts
     lib/modules as the module source, but nothing reads it (it is a jimage
@@ -119,7 +60,11 @@ KNOWN BUGS
     test passing on genesis that fails on javac. (A later run, workdir
     genesis-spring-boot.gmhws3vg, has both compilers at 15,055: a few dozen
     tests are flaky, e.g. ConditionalOnPropertyTests.notAllPropertiesAreDefined
-    when the working directory is busy; compare sets, not counts.) Parity is the set, not a count:
+    when the working directory is busy; compare sets, not counts. One full run
+    also failed to compile pulsar's PulsarAutoConfigurationTests once ("method
+    callsInOrder cannot be applied to given types: incompatible inference
+    constraints") and could not be reproduced in 7 reruns: a nondeterminism
+    in the inference check, worth chasing if it recurs.) Parity is the set, not a count:
     compare with bench/spring-boot/triage-regressions.py (merges duplicate test
     ids without letting a later pass overwrite a failure). A test that passes
     on javac and is absent from the genesis reports counts as a regression
