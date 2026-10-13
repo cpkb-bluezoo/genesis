@@ -12480,6 +12480,7 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                     /* Determine if lambda is void-compatible or value-returning */
                     bool lambda_is_void_compatible = false;
                     bool lambda_returns_value = false;
+                    ast_node_t *lambda_value_body = NULL;   /* the expression of a "() -> expr" */
                     
                     if (unwrapped_arg->type == AST_LAMBDA_EXPR) {
                         ast_node_t *body = NULL;
@@ -12537,6 +12538,14 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                                     lambda_is_void_compatible = true;
                                 }
                             } else {
+                                {
+                                    ast_node_t *first_param = unwrapped_arg->data.node.children ?
+                                        (ast_node_t *)unwrapped_arg->data.node.children->data : NULL;
+                                    if (first_param && first_param->type == AST_PARENTHESIZED &&
+                                        !first_param->data.node.children) {
+                                        lambda_value_body = body;
+                                    }
+                                }
                                 /* Expression body - check structurally what kind of expression */
                                 /* JLS 15.27.3: Statement expressions are void-compatible:
                                  * Assignment, PreIncrement, PreDecrement, PostIncrement, PostDecrement
@@ -12599,6 +12608,41 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                             /* Void methods may have NULL type or TYPE_VOID */
                             if (sam && (!sam->type || sam->type->kind == TYPE_VOID)) {
                                 param_is_void_returning = true;
+                            }
+                        }
+                    }
+                    
+                    /* A lambda with no parameters is explicitly typed, so it takes part in
+                     * applicability (JLS 15.12.2.2): its expression must fit the interface's
+                     * result. "() -> "hello"" is a Supplier<?> but no MessageSupplier. */
+                    if (lambda_value_body && !param_is_void_returning && pfi && pfi->kind == TYPE_CLASS) {
+                        symbol_t *ret_class = pfi->data.class_type.symbol;
+                        if (!ret_class && pfi->data.class_type.name) {
+                            ret_class = load_external_class(sem, pfi->data.class_type.name);
+                        }
+                        symbol_t *ret_sam = ret_class ? get_functional_interface_sam(ret_class) : NULL;
+                        if (ret_sam && !ret_sam->type) {
+                            ensure_method_result_type(sem, ret_sam, ret_class);
+                        }
+                        type_t *want = ret_sam ? ret_sam->type : NULL;
+                        if (want && want->kind == TYPE_CLASS && !want->data.class_type.type_args &&
+                            want->data.class_type.symbol &&
+                            lambda_value_body->type != AST_METHOD_CALL &&
+                            lambda_value_body->type != AST_NEW_OBJECT &&
+                            lambda_value_body->type != AST_LAMBDA_EXPR &&
+                            lambda_value_body->type != AST_METHOD_REF &&
+                            lambda_value_body->type != AST_CONDITIONAL_EXPR) {
+                            bool quiet = sem->loading_dependency;
+                            type_t *call_target = sem->target_type;
+                            sem->loading_dependency = true;
+                            sem->target_type = NULL;
+                            type_t *got = get_expression_type(sem, lambda_value_body);
+                            sem->target_type = call_target;
+                            sem->loading_dependency = quiet;
+                            if (got && got->kind == TYPE_CLASS && !got->data.class_type.type_args &&
+                                got->data.class_type.symbol && !type_assignable(want, got)) {
+                                type_mismatch = true;
+                                break;
                             }
                         }
                     }
