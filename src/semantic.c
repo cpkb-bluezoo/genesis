@@ -9647,6 +9647,40 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         }
     }
     
+    /* A single-static-import can name a member TYPE of the class before the
+     * last dot ("import static pkg.Outer.Inner.Kind;", JLS 7.5.3): it brings
+     * that nested type in under its simple name, as a single-type import
+     * does. sem->static_imports is separate from sem->imports, so the loop
+     * above never sees it. A member that is not a type (a field or method of
+     * the same name) is left to the static-member lookups. */
+    for (slist_t *node = sem->static_imports; node; node = node->next) {
+        ast_node_t *import = (ast_node_t *)node->data;
+        const char *import_name = import ? import->data.node.name : NULL;
+        if (!import_name) {
+            continue;
+        }
+        const char *last_dot = strrchr(import_name, '.');
+        if (!last_dot || strcmp(last_dot + 1, simple_name) != 0) {
+            continue;
+        }
+        char *owner_name = strndup(import_name, last_dot - import_name);
+        symbol_t *owner = load_external_class(sem, owner_name);
+        symbol_t *nested = owner && owner->data.class_data.members
+            ? scope_lookup_local(owner->data.class_data.members, simple_name) : NULL;
+        if (nested && (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
+                       nested->kind == SYM_ENUM || nested->kind == SYM_RECORD ||
+                       nested->kind == SYM_ANNOTATION)) {
+            size_t result_len = strlen(owner_name) + 1 + strlen(simple_name) + 1;
+            char *result = malloc(result_len);
+            snprintf(result, result_len, "%s$%s", owner_name, simple_name);
+            free(owner_name);
+            hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(result));
+            sem->resolve_import_depth--;
+            return result;
+        }
+        free(owner_name);
+    }
+
     /* Same-package top-level types beat nested types on single-type imports
      * (e.g. ldap.client.Control vs ResourceBundle.Control). Must run before
      * the nested-import scan and must not rely on current_package alone. */
