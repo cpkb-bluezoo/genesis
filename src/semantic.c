@@ -12124,6 +12124,27 @@ static bool mref_inference_conflict(semantic_t *sem, symbol_t *method, slist_t *
     return false;
 }
 
+/**
+ * A class type with its symbol filled in. A literal's String is the shared built-in type,
+ * and a type named by a class not read yet may not have been resolved either; neither can be
+ * compared with another type until it has its class. Returns the type itself when it has one
+ * (or is no class type), a copy with the class when it can be loaded, and NULL when it cannot.
+ */
+static type_t *class_type_with_symbol(semantic_t *sem, type_t *type)
+{
+    if (!type || type->kind != TYPE_CLASS || type->data.class_type.symbol) {
+        return type;
+    }
+    symbol_t *cls = type->data.class_type.name ?
+        load_external_class(sem, type->data.class_type.name) : NULL;
+    if (!cls) {
+        return NULL;
+    }
+    type_t *resolved = type_new_class(type->data.class_type.name);
+    resolved->data.class_type.symbol = cls;
+    return resolved;
+}
+
 static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates, slist_t *args,
                                            type_t *recv_type, bool allow_iterable_fixup)
 {
@@ -12658,7 +12679,7 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                         if (ret_sam && !ret_sam->type) {
                             ensure_method_result_type(sem, ret_sam, ret_class);
                         }
-                        type_t *want = ret_sam ? ret_sam->type : NULL;
+                        type_t *want = class_type_with_symbol(sem, ret_sam ? ret_sam->type : NULL);
                         if (want && want->kind == TYPE_CLASS && !want->data.class_type.type_args &&
                             want->data.class_type.symbol &&
                             lambda_value_body->type != AST_METHOD_CALL &&
@@ -12673,6 +12694,7 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                             type_t *got = get_expression_type(sem, lambda_value_body);
                             sem->target_type = call_target;
                             sem->loading_dependency = quiet;
+                            got = class_type_with_symbol(sem, got);
                             if (got && got->kind == TYPE_CLASS && !got->data.class_type.type_args &&
                                 got->data.class_type.symbol && !type_assignable(want, got)) {
                                 type_mismatch = true;
