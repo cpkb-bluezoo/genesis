@@ -4965,6 +4965,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 mg->yield_patches = slist_prepend(mg->yield_patches, (void *)(uintptr_t)goto_pos);
                 
                 /* Value remains on stack */
+                mg->last_opcode = OP_GOTO;
                 return true;
             }
         

@@ -11442,6 +11442,13 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
     /* Track goto positions to patch at the end */
     slist_t *end_gotos = NULL;
     ast_node_t *default_rule = NULL;
+
+    /* A yield in a block arm is a jump to the end, patched with the others
+     * below; an enclosing switch expression's own yield target is not ours. */
+    bool outer_to_label = mg->yield_to_label;
+    slist_t *outer_yield_patches = mg->yield_patches;
+    mg->yield_to_label = false;
+    mg->yield_patches = NULL;
     
     /* Process each rule */
     for (slist_t *node = children->next; node; node = node->next) {
@@ -11483,8 +11490,9 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                     }
                 }
             } else if (child->type == AST_LITERAL && 
-                       child->data.leaf.token_type == TOK_NULL) {
-                /* null pattern - check for null */
+                       child->data.leaf.token_type == TOK_NULL && rc->next) {
+                /* null pattern - check for null (a "null" that is the last
+                 * child is the rule's body, "case P -> null") */
                 bc_emit(mg->code, OP_ALOAD);
                 bc_emit_u1(mg->code, (uint8_t)selector_slot);
                 mg_push(mg, 1);
@@ -11504,20 +11512,23 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                 /* Generate body */
                 mg_record_frame(mg);
                 if (body->type == AST_BLOCK) {
+                    mg->last_opcode = 0;
                     codegen_statement(mg, body);
                 } else {
                     codegen_expr(mg, body, cp);
                 }
                 
-                /* Jump to end */
-                size_t *goto_pos = malloc(sizeof(size_t));
-                *goto_pos = mg->code->length;
-                bc_emit(mg->code, OP_GOTO);
-                bc_emit_u2(mg->code, 0);
-                if (!end_gotos) {
-                    end_gotos = slist_new(goto_pos);
-                } else {
-                    slist_append(end_gotos, goto_pos);
+                /* Jump to end (not after a block that already ended in a yield or throw) */
+                if (!(body->type == AST_BLOCK && (mg->last_opcode == OP_GOTO || mg->last_opcode == OP_ATHROW))) {
+                    size_t *goto_pos = malloc(sizeof(size_t));
+                    *goto_pos = mg->code->length;
+                    bc_emit(mg->code, OP_GOTO);
+                    bc_emit_u2(mg->code, 0);
+                    if (!end_gotos) {
+                        end_gotos = slist_new(goto_pos);
+                    } else {
+                        slist_append(end_gotos, goto_pos);
+                    }
                 }
                 
                 /* Patch ifnonnull */
@@ -11730,9 +11741,14 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                             } else if (kind == TYPE_DOUBLE) {
                                 stackmap_set_local_double(mg->stackmap, comp_slot);
                             } else {
-                                stackmap_set_local_object(mg->stackmap, comp_slot, mg->cp, 
-                                    comp_type && comp_type->data.class_type.symbol ? 
-                                    comp_type->data.class_type.symbol->qualified_name : "java/lang/Object");
+                                /* The frame wants the JVM internal name ("java/lang/String",
+                                 * "Outer$Inner"), not the dotted source name */
+                                char *comp_internal = class_to_internal_name(
+                                    comp_type && comp_type->kind == TYPE_CLASS &&
+                                    comp_type->data.class_type.symbol ?
+                                    comp_type->data.class_type.symbol->qualified_name : "java.lang.Object");
+                                stackmap_set_local_object(mg->stackmap, comp_slot, mg->cp, comp_internal);
+                                free(comp_internal);
                             }
                         }
                         
@@ -11790,20 +11806,23 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
             
             /* Generate body */
             if (body->type == AST_BLOCK) {
+                mg->last_opcode = 0;
                 codegen_statement(mg, body);
             } else {
                 codegen_expr(mg, body, cp);
             }
             
-            /* Jump to end */
-            size_t *goto_pos = malloc(sizeof(size_t));
-            *goto_pos = mg->code->length;
-            bc_emit(mg->code, OP_GOTO);
-            bc_emit_u2(mg->code, 0);
-            if (!end_gotos) {
-                end_gotos = slist_new(goto_pos);
-            } else {
-                slist_append(end_gotos, goto_pos);
+            /* Jump to end (not after a block that already ended in a yield or throw) */
+            if (!(body->type == AST_BLOCK && (mg->last_opcode == OP_GOTO || mg->last_opcode == OP_ATHROW))) {
+                size_t *goto_pos = malloc(sizeof(size_t));
+                *goto_pos = mg->code->length;
+                bc_emit(mg->code, OP_GOTO);
+                bc_emit_u2(mg->code, 0);
+                if (!end_gotos) {
+                    end_gotos = slist_new(goto_pos);
+                } else {
+                    slist_append(end_gotos, goto_pos);
+                }
             }
             
             /* Patch guard ifeq */
@@ -11813,20 +11832,23 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
         } else {
             /* Generate body */
             if (body->type == AST_BLOCK) {
+                mg->last_opcode = 0;
                 codegen_statement(mg, body);
             } else {
                 codegen_expr(mg, body, cp);
             }
             
-            /* Jump to end */
-            size_t *goto_pos = malloc(sizeof(size_t));
-            *goto_pos = mg->code->length;
-            bc_emit(mg->code, OP_GOTO);
-            bc_emit_u2(mg->code, 0);
-            if (!end_gotos) {
-                end_gotos = slist_new(goto_pos);
-            } else {
-                slist_append(end_gotos, goto_pos);
+            /* Jump to end (not after a block that already ended in a yield or throw) */
+            if (!(body->type == AST_BLOCK && (mg->last_opcode == OP_GOTO || mg->last_opcode == OP_ATHROW))) {
+                size_t *goto_pos = malloc(sizeof(size_t));
+                *goto_pos = mg->code->length;
+                bc_emit(mg->code, OP_GOTO);
+                bc_emit_u2(mg->code, 0);
+                if (!end_gotos) {
+                    end_gotos = slist_new(goto_pos);
+                } else {
+                    slist_append(end_gotos, goto_pos);
+                }
             }
         }
         
@@ -11860,19 +11882,67 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
         }
         if (body) {
             if (body->type == AST_BLOCK) {
+                mg->last_opcode = 0;
                 codegen_statement(mg, body);
             } else {
                 codegen_expr(mg, body, cp);
             }
         }
     } else {
-        /* No default - push null as result */
+        /* No default: the switch is exhaustive, so no pattern matching is a
+         * MatchException (JLS 15.28.2). The throw leaves nothing on the stack;
+         * the value the join frame below declares is the expression's type. */
+        int cls = cp_add_class(cp, "java/lang/MatchException");
+        bc_emit(mg->code, OP_NEW);
+        bc_emit_u2(mg->code, (uint16_t)cls);
+        mg_push_object(mg, "java/lang/MatchException");
+        bc_emit(mg->code, OP_DUP);
+        mg_dup(mg);
         bc_emit(mg->code, OP_ACONST_NULL);
-        mg_push(mg, 1);
+        mg_push_null(mg);
+        bc_emit(mg->code, OP_ACONST_NULL);
+        mg_push_null(mg);
+        uint16_t init = cp_add_methodref(cp, "java/lang/MatchException", "<init>",
+                                         "(Ljava/lang/String;Ljava/lang/Throwable;)V");
+        bc_emit(mg->code, OP_INVOKESPECIAL);
+        bc_emit_u2(mg->code, init);
+        mg_pop_typed(mg, 3);
+        bc_emit(mg->code, OP_ATHROW);
+        mg_pop_typed(mg, 1);
+        mg->last_opcode = OP_ATHROW;
+        type_t *result = expr->sem_type;
+        switch (result ? result->kind : TYPE_CLASS) {
+            case TYPE_LONG:
+                mg_push_long(mg);
+                break;
+            case TYPE_FLOAT:
+                mg_push_float(mg);
+                break;
+            case TYPE_DOUBLE:
+                mg_push_double(mg);
+                break;
+            case TYPE_INT:
+            case TYPE_BOOLEAN:
+            case TYPE_CHAR:
+            case TYPE_SHORT:
+            case TYPE_BYTE:
+                mg_push_int(mg);
+                break;
+            default: {
+                char *desc = result ? type_to_descriptor(result) : NULL;
+                if (desc && (desc[0] == 'L' || desc[0] == '[')) {
+                    mg_push_object_from_descriptor(mg, desc);
+                } else {
+                    mg_push_object(mg, "java/lang/Object");
+                }
+                free(desc);
+                break;
+            }
+        }
     }
     
     /* Record frame at end of switch (join point for all gotos) */
-    if (end_gotos) {
+    if (end_gotos || mg->yield_patches) {
         mg_record_frame(mg);
     }
     
@@ -11885,6 +11955,13 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
         free(pos);
     }
     slist_free(end_gotos);
+    for (slist_t *y = mg->yield_patches; y; y = y->next) {
+        size_t pos = (size_t)(uintptr_t)y->data;
+        bc_patch_u2(mg->code, pos + 1, (uint16_t)(end_pos - pos));
+    }
+    slist_free(mg->yield_patches);
+    mg->yield_patches = outer_yield_patches;
+    mg->yield_to_label = outer_to_label;
     
     /* Restore slot counter to before switch - selector and pattern variables
      * are no longer in scope after the switch expression */

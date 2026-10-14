@@ -14896,6 +14896,32 @@ static void semantic_define_pattern_vars(semantic_t *sem, ast_node_t *pattern, s
 }
 
 /**
+ * Define the variables a pattern binds (a type pattern's, and those of every
+ * component of a record pattern) in a throwaway scope, so the body of a
+ * switch rule can be typed before the rule itself is analysed. Unlike
+ * semantic_define_pattern_vars() this leaves the pattern nodes untouched:
+ * the analysis proper attaches their real symbols later.
+ */
+static void define_pattern_vars_for_typing(semantic_t *sem, ast_node_t *pattern, scope_t *scope)
+{
+    slist_t *children = pattern->data.node.children;
+    if (pattern->type == AST_TYPE_PATTERN) {
+        const char *var_name = pattern->data.node.name;
+        if (children && var_name) {
+            symbol_t *sym = symbol_new(SYM_LOCAL_VAR, var_name);
+            sym->type = semantic_resolve_type(sem, (ast_node_t *)children->data);
+            sym->modifiers = MOD_FINAL;
+            scope_define(scope, sym);
+        }
+    } else if (pattern->type == AST_RECORD_PATTERN && children) {
+        /* The first child is the record type; the rest are component patterns */
+        for (slist_t *c = children->next; c; c = c->next) {
+            define_pattern_vars_for_typing(sem, (ast_node_t *)c->data, scope);
+        }
+    }
+}
+
+/**
  * Whether an AST_ENUM_CONSTANT node ("P(2) { ... }") declares a
  * constant-specific class body - any child that is a real member
  * declaration rather than a constructor-argument expression. Constructor
@@ -22857,18 +22883,17 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 /* Switch expression type is inferred from first non-pattern case branch */
                 slist_t *children = expr->data.node.children;
                 if (children) {
-                    /* Without patterns (whose bindings are not in scope here) the
-                     * type is the join of every arm (JLS 15.28.1): each rule's
-                     * expression, and each value a block yields. Arms whose type
-                     * cannot be told yet (they use a local the block declares)
-                     * do not take part. */
+                    /* The type is the join of every arm (JLS 15.28.1): each rule's
+                     * expression, and each value a block yields. What a pattern
+                     * binds is not in scope here, so it is defined in a throwaway
+                     * scope around the arm. Arms whose type cannot be told yet
+                     * (they use a local the block declares) do not take part. */
                     bool arms_typed = true;
                     for (slist_t *c = children->next; c && arms_typed; c = c->next) {
                         ast_node_t *rule = (ast_node_t *)c->data;
                         for (slist_t *rc = rule->data.node.children; rc; rc = rc->next) {
                             ast_node_t *item = (ast_node_t *)rc->data;
-                            if (item->type == AST_TYPE_PATTERN || item->type == AST_GUARDED_PATTERN ||
-                                item->type == AST_UNNAMED_PATTERN || item->type == AST_RECORD_PATTERN) {
+                            if (item->type == AST_UNNAMED_PATTERN) {
                                 arms_typed = false;
                                 break;
                             }
@@ -22877,14 +22902,30 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     if (arms_typed) {
                         type_t *joined = NULL;
                         ast_node_t *joined_expr = NULL;
+                        scope_t *saved_scope = sem->current_scope;
                         for (slist_t *c = children->next; c; c = c->next) {
                             ast_node_t *rule = (ast_node_t *)c->data;
                             ast_node_t *body = NULL;
+                            scope_t *arm_scope = NULL;
                             for (slist_t *rc = rule->data.node.children; rc; rc = rc->next) {
                                 body = (ast_node_t *)rc->data;
+                                ast_node_t *pattern = body;
+                                if (pattern->type == AST_GUARDED_PATTERN && pattern->data.node.children) {
+                                    pattern = (ast_node_t *)pattern->data.node.children->data;
+                                }
+                                if (rc->next && (pattern->type == AST_TYPE_PATTERN ||
+                                                 pattern->type == AST_RECORD_PATTERN)) {
+                                    if (!arm_scope) {
+                                        arm_scope = scope_new(SCOPE_BLOCK, saved_scope);
+                                    }
+                                    define_pattern_vars_for_typing(sem, pattern, arm_scope);
+                                }
                             }
                             if (!body || body->type == AST_THROW_STMT) {
                                 continue;
+                            }
+                            if (arm_scope) {
+                                sem->current_scope = arm_scope;
                             }
                             slist_t *values = NULL;
                             if (body->type == AST_BLOCK) {
@@ -22910,6 +22951,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 joined_expr = value;
                             }
                             slist_free(values);
+                            sem->current_scope = saved_scope;
                         }
                         if (joined) {
                             return joined;
@@ -22959,24 +23001,15 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     /* Expression case */
                                     return get_expression_type(sem, body);
                                 }
-                            } else if (has_pattern && pattern && pattern->type == AST_TYPE_PATTERN) {
-                                /* For type patterns, we need to set up a temporary scope
-                                 * to resolve the pattern variable */
+                            } else if (has_pattern && pattern &&
+                                       (pattern->type == AST_TYPE_PATTERN ||
+                                        pattern->type == AST_RECORD_PATTERN)) {
+                                /* For type and record patterns, we need to set up a
+                                 * temporary scope to resolve the pattern variables */
                                 scope_t *saved = sem->current_scope;
                                 scope_t *temp = scope_new(SCOPE_BLOCK, sem->current_scope);
                                 
-                                /* Define pattern variable */
-                                const char *var_name = pattern->data.node.name;
-                                slist_t *pattern_children = pattern->data.node.children;
-                                if (pattern_children && var_name) {
-                                    ast_node_t *type_node = (ast_node_t *)pattern_children->data;
-                                    type_t *pattern_type = semantic_resolve_type(sem, type_node);
-                                    
-                                    symbol_t *sym = symbol_new(SYM_LOCAL_VAR, var_name);
-                                    sym->type = pattern_type;
-                                    sym->modifiers = MOD_FINAL;
-                                    scope_define(temp, sym);
-                                }
+                                define_pattern_vars_for_typing(sem, pattern, temp);
                                 
                                 sem->current_scope = temp;
                                 type_t *result = NULL;
