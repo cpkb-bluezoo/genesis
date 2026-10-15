@@ -9752,6 +9752,37 @@ static char *resolve_import(semantic_t *sem, const char *simple_name)
         }
     }
 
+    /* A static-import-on-demand ("import static pkg.Outer.Inner.*;", JLS
+     * 7.5.4) imports every accessible static member of the class, member
+     * TYPES included, so a nested type is usable by its simple name. Tried
+     * after the other on-demand imports and java.lang, which it must not
+     * shadow. */
+    for (slist_t *node = sem->static_imports; node; node = node->next) {
+        ast_node_t *import = (ast_node_t *)node->data;
+        const char *import_name = import ? import->data.node.name : NULL;
+        size_t len = import_name ? strlen(import_name) : 0;
+        if (len <= 2 || import_name[len-1] != '*' || import_name[len-2] != '.') {
+            continue;
+        }
+        char *owner_name = strndup(import_name, len - 2);
+        symbol_t *owner = load_external_class(sem, owner_name);
+        symbol_t *nested = owner && owner->data.class_data.members
+            ? scope_lookup_local(owner->data.class_data.members, simple_name) : NULL;
+        if (nested && (nested->modifiers & MOD_STATIC) &&
+            (nested->kind == SYM_CLASS || nested->kind == SYM_INTERFACE ||
+             nested->kind == SYM_ENUM || nested->kind == SYM_RECORD ||
+             nested->kind == SYM_ANNOTATION)) {
+            size_t result_len = strlen(owner_name) + 1 + strlen(simple_name) + 1;
+            char *result = malloc(result_len);
+            snprintf(result, result_len, "%s$%s", owner_name, simple_name);
+            free(owner_name);
+            hashtable_insert(sem->resolved_imports, simple_name, (void *)intern(result));
+            sem->resolve_import_depth--;
+            return result;
+        }
+        free(owner_name);
+    }
+
     /* Lenient (not JLS) fallback: a member type of a single-type-imported
      * class, by simple name. Deliberately tried only after on-demand imports
      * and java.lang, so it can never shadow a type those legitimately
