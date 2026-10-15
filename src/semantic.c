@@ -12713,7 +12713,6 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                         type_t *want = class_type_with_symbol(sem, ret_sam ? ret_sam->type : NULL);
                         if (want && want->kind == TYPE_CLASS && !want->data.class_type.type_args &&
                             want->data.class_type.symbol &&
-                            lambda_value_body->type != AST_METHOD_CALL &&
                             lambda_value_body->type != AST_NEW_OBJECT &&
                             lambda_value_body->type != AST_LAMBDA_EXPR &&
                             lambda_value_body->type != AST_METHOD_REF &&
@@ -12726,7 +12725,21 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                             sem->target_type = call_target;
                             sem->loading_dependency = quiet;
                             got = class_type_with_symbol(sem, got);
-                            if (got && got->kind == TYPE_CLASS && !got->data.class_type.type_args &&
+                            /* A call is a poly expression when its method is generic: its result
+                             * adapts to the target, so it says nothing about applicability. Only
+                             * a call to a method with no type parameters of its own has a type
+                             * of its own to compare. */
+                            bool own_type = true;
+                            if (lambda_value_body->type == AST_METHOD_CALL) {
+                                symbol_t *callee = lambda_value_body->sem_symbol;
+                                if (callee && callee->kind == SYM_METHOD) {
+                                    ensure_method_type_params(callee);
+                                    own_type = !callee->data.method_data.type_params;
+                                } else {
+                                    own_type = false;
+                                }
+                            }
+                            if (own_type && got && got->kind == TYPE_CLASS && !got->data.class_type.type_args &&
                                 got->data.class_type.symbol && !type_assignable(want, got)) {
                                 type_mismatch = true;
                                 break;
