@@ -31655,8 +31655,14 @@ define_local_var:
                                             continue;
                                         }
                                         
-                                        /* Get case patterns/expressions */
+                                        /* Get case patterns/expressions. A pattern's bindings
+                                         * (and so its guard's view of them) belong to its own
+                                         * arm: defining them in the scope around the switch
+                                         * would clash with a same-named local in a later arm,
+                                         * or after the switch. */
                                         slist_t *rule_children = rule->data.node.children;
+                                        scope_t *outer_scope = sem->current_scope;
+                                        sem->current_scope = scope_new(SCOPE_BLOCK, outer_scope);
                                         for (slist_t *rc = rule_children; rc; rc = rc->next) {
                                             ast_node_t *case_item = (ast_node_t *)rc->data;
                                             
@@ -31731,6 +31737,7 @@ define_local_var:
                                                 }
                                             }
                                         }
+                                        sem->current_scope = outer_scope;
                                     }
                                 }
                             }
