@@ -4121,9 +4121,24 @@ static ast_node_t *parse_statement(parser_t *parser)
                     /* For simplicity, try to detect common patterns */
                     
                     uint32_t modifiers = 0;
-                    while (parser_check(parser, TOK_FINAL)) {
-                        modifiers |= MOD_FINAL;
-                        parser_advance(parser);
+                    slist_t *leading_annotations = NULL;
+                    while (parser_check(parser, TOK_FINAL) ||
+                           (parser_check(parser, TOK_AT) &&
+                            parser_peek_type(parser) != TOK_INTERFACE)) {
+                        if (parser_match(parser, TOK_FINAL)) {
+                            modifiers |= MOD_FINAL;
+                            continue;
+                        }
+                        /* An annotation may precede or follow 'final' */
+                        ast_node_t *annot = parse_annotation(parser);
+                        if (!annot) {
+                            break;
+                        }
+                        if (!leading_annotations) {
+                            leading_annotations = slist_new(annot);
+                        } else {
+                            slist_append(leading_annotations, annot);
+                        }
                     }
                     
                     /* After modifiers, we can have type annotations or type name */
@@ -4137,6 +4152,14 @@ static ast_node_t *parse_statement(parser_t *parser)
                         /* If followed by identifier (or contextual keyword used as identifier),
                          * it's a variable declaration */
                         if (type_node && parser_check_identifier_or_contextual(parser)) {
+                            for (slist_t *a = leading_annotations; a; a = a->next) {
+                                type_node->annotations = type_node->annotations
+                                    ? (slist_append(type_node->annotations, a->data),
+                                       type_node->annotations)
+                                    : slist_new(a->data);
+                            }
+                            slist_free(leading_annotations);
+                            leading_annotations = NULL;
                             ast_node_t *var_decl = ast_new(AST_VAR_DECL, line, col);
                             var_decl->data.node.flags = modifiers;
                             ast_add_child(var_decl, type_node);
@@ -4185,6 +4208,10 @@ static ast_node_t *parse_statement(parser_t *parser)
                         ast_free(type_node);
                         lexer_restore_pos(parser->lexer, save_pos);
                     }
+                    for (slist_t *a = leading_annotations; a; a = a->next) {
+                        ast_free(a->data);
+                    }
+                    slist_free(leading_annotations);
                 }
                 
                 /* Expression statement */
