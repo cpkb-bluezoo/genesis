@@ -9405,7 +9405,10 @@ static symbol_t *lookup_same_package_type(semantic_t *sem, const char *simple_na
         return NULL;
     }
     char pkg_qname[512];
-    snprintf(pkg_qname, sizeof(pkg_qname), "%s.%s", pkg, simple_name);
+    int qname_len = snprintf(pkg_qname, sizeof(pkg_qname), "%s.%s", pkg, simple_name);
+    if (qname_len < 0 || (size_t)qname_len >= sizeof(pkg_qname)) {
+        return NULL;
+    }
     type_t *pkg_type = hashtable_lookup(sem->types, pkg_qname);
     if (pkg_type && pkg_type->kind == TYPE_CLASS && pkg_type->data.class_type.symbol) {
         return pkg_type->data.class_type.symbol;

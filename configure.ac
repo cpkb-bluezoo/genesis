@@ -65,7 +65,19 @@ AC_ARG_ENABLE([warnings],
   [], [enable_warnings=yes])
 AS_IF([test "x$enable_warnings" = xyes],
       [AS_IF([test "x$GCC" = xyes || $CC --version 2>&1 | grep -qi clang],
-             [WARN_CFLAGS="-Wall -Wextra -pedantic"])])
+             [WARN_CFLAGS="-Wall -Wextra -pedantic"
+              dnl Newer glibc string.h wraps strchr and friends in _Generic
+              dnl macros, which clang flags under -std=c99 -pedantic.  That is
+              dnl the system header, not our code.
+              AC_CACHE_CHECK([whether $CC accepts -Wno-c11-extensions],
+                [genesis_cv_wno_c11_ext],
+                [genesis_save_CC=$CC
+                 CC="$CC -Werror -Wno-c11-extensions"
+                 AC_COMPILE_IFELSE([AC_LANG_PROGRAM([])],
+                   [genesis_cv_wno_c11_ext=yes], [genesis_cv_wno_c11_ext=no])
+                 CC=$genesis_save_CC])
+              AS_IF([test "x$genesis_cv_wno_c11_ext" = xyes],
+                    [WARN_CFLAGS="$WARN_CFLAGS -Wno-c11-extensions"])])])
 AC_SUBST([WARN_CFLAGS])
 
 dnl Development-only pieces (regression tests and jtreg glue) live in
