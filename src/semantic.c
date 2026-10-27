@@ -21495,6 +21495,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                          * This prevents "server.field" from being confused with "Server.field" when
                          * there's a parameter named 'server' and a class named 'Server'. */
                         symbol_t *local_sym = scope_lookup(sem->current_scope, first_part);
+                        symbol_t *first_sym = NULL;
                         
                         /* Check for local nested types FIRST (class/enum/interface/record).
                          * This handles inner classes/enums being referenced before imports are checked.
@@ -21503,14 +21504,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                           local_sym->kind == SYM_INTERFACE ||
                                           local_sym->kind == SYM_ENUM ||
                                           local_sym->kind == SYM_RECORD)) {
-                            /* Found a local nested type - use it directly, skipping import resolution */
-                            resolved_class = local_sym;
-                            remaining_parts = parts->next;
-                            if (root_node && root_node->type == AST_IDENTIFIER) {
-                                root_node->sem_symbol = local_sym;
-                                root_node->sem_type = local_sym->type;
-                            }
-                            /* Jump to field lookup below */
+                            /* Found a local nested type - use it directly, skipping import resolution.
+                             * (Handled as the first part resolving to a class, below, so that
+                             * "Outer.Inner" goes on to find the nested class Inner.) */
+                            first_sym = local_sym;
                         }
                         else if (local_sym && (local_sym->kind == SYM_LOCAL_VAR || 
                                           local_sym->kind == SYM_PARAMETER ||
@@ -21531,8 +21528,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                          * This handles cases like "Type.TCP" where Type is defined in ChannelHandler,
                          * or "Kind.SOURCE" where Kind is JavaFileObject$Kind inherited via SimpleJavaFileObject.
                          * Skip if we already found it as a local nested type. */
-                        symbol_t *first_sym = NULL;
-                        if (!resolved_class && sem->current_class) {
+                        if (!first_sym && sem->current_class) {
                             /* Check superclass chain and their interfaces */
                             symbol_t *check_class = sem->current_class;
                             while (check_class && !first_sym) {
