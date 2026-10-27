@@ -5671,6 +5671,50 @@ void semantic_set_classpath(semantic_t *sem, classpath_t *cp)
 }
 
 /**
+ * Whether a source file exists under exactly this name. On a case-insensitive file system
+ * fopen() also opens a file whose name differs only in case, so a class called
+ * DgsGraphQLClient would be "found" in DgsGraphQlClient.java; the directory entry is
+ * compared to make the lookup case-sensitive, as the name of a type is (JLS 7.6).
+ */
+static bool source_file_exists(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        return false;
+    }
+    fclose(f);
+
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + 1 : path;
+    char dir[1024];
+    if (slash) {
+        size_t len = (size_t)(slash - path);
+        if (len == 0) {
+            len = 1;
+        }
+        if (len >= sizeof(dir)) {
+            return true;
+        }
+        memcpy(dir, path, len);
+        dir[len] = '\0';
+    } else {
+        strcpy(dir, ".");
+    }
+
+    DIR *d = opendir(dir);
+    if (!d) {
+        return true;    /* it opened, so it is there; only the case cannot be checked */
+    }
+    bool exact = false;
+    struct dirent *entry;
+    while (!exact && (entry = readdir(d)) != NULL) {
+        exact = strcmp(entry->d_name, base) == 0;
+    }
+    closedir(d);
+    return exact;
+}
+
+/**
  * Parse a sourcepath string into a list of directory paths.
  * This can be used before a semantic_t is created.
  * The caller is responsible for freeing the list with sourcepath_list_free().
@@ -7101,10 +7145,7 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
                         char full_path[1024];
                         snprintf(full_path, sizeof(full_path), "%s/%s.java", dir, file_path);
                         
-                        FILE *f = fopen(full_path, "r");
-                        if (f) {
-                            fclose(f);
-                            
+                        if (source_file_exists(full_path)) {
                             source_file_t *src = source_file_new(full_path);
                             if (src && source_file_load(src)) {
                                 lexer_t *lexer = lexer_new(src, sem->source_version);
@@ -8020,10 +8061,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
          * resolving to an unrelated default-package Foo.java instead of
          * failing. Removed; a name's real path is always exactly its
          * package-to-directory translation. */
-        FILE *f = fopen(full_path, "r");
-
-        if (f) {
-            fclose(f);
+        if (source_file_exists(full_path)) {
             found_file = true;
             
             /* Load and parse the source file */
@@ -10435,9 +10473,7 @@ static bool class_exists_on_sourcepath(const char *qualified_name, slist_t *sour
     for (slist_t *entry = sourcepath_list; entry; entry = entry->next) {
         const char *dir = (const char *)entry->data;
         snprintf(path, sizeof(path), "%s/%s.java", dir, class_path);
-        FILE *f = fopen(path, "r");
-        if (f) {
-            fclose(f);
+        if (source_file_exists(path)) {
             return true;
         }
     }
