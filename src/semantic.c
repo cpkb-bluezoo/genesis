@@ -12750,7 +12750,6 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                         type_t *want = class_type_with_symbol(sem, ret_sam ? ret_sam->type : NULL);
                         if (want && want->kind == TYPE_CLASS && !want->data.class_type.type_args &&
                             want->data.class_type.symbol &&
-                            lambda_value_body->type != AST_NEW_OBJECT &&
                             lambda_value_body->type != AST_LAMBDA_EXPR &&
                             lambda_value_body->type != AST_METHOD_REF &&
                             lambda_value_body->type != AST_CONDITIONAL_EXPR) {
@@ -12767,6 +12766,20 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                              * a call to a method with no type parameters of its own has a type
                              * of its own to compare. */
                             bool own_type = true;
+                            if (lambda_value_body->type == AST_NEW_OBJECT) {
+                                /* ... and so is a diamond creation, which infers its arguments from
+                                 * the target; an anonymous class is left alone, not worth building
+                                 * for a comparison */
+                                slist_t *parts = lambda_value_body->data.node.children;
+                                ast_node_t *created = parts ? (ast_node_t *)parts->data : NULL;
+                                own_type = created && !(created->data.node.flags & 0x1000);
+                                for (; parts; parts = parts->next) {
+                                    ast_node_t *part = (ast_node_t *)parts->data;
+                                    if (part && part->type == AST_BLOCK) {
+                                        own_type = false;
+                                    }
+                                }
+                            }
                             if (lambda_value_body->type == AST_METHOD_CALL) {
                                 symbol_t *callee = lambda_value_body->sem_symbol;
                                 if (callee && callee->kind == SYM_METHOD) {
