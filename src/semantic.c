@@ -3220,6 +3220,9 @@ static int check_symbol_population(symbol_t *sym, const char *context)
     return missing;
 }
 
+/* Defined with the yield helpers below */
+static void collect_value_stmts(ast_node_t *stmt, ast_node_type_t kind, slist_t **yields);
+
 /* Forward declarations for lambda/method ref binding */
 static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type_t *target_type);
 static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, type_t *target_type);
@@ -12611,17 +12614,11 @@ static symbol_t *find_best_method_by_types(semantic_t *sem, slist_t *candidates,
                             }
                             
                             if (body->type == AST_BLOCK) {
-                                /* Block body - check for return statements */
-                                /* Simple heuristic: look at direct children for return statements */
-                                slist_t *stmts = body->data.node.children;
-                                for (slist_t *s = stmts; s; s = s->next) {
-                                    ast_node_t *stmt = (ast_node_t *)s->data;
-                                    if (stmt && stmt->type == AST_RETURN_STMT) {
-                                        if (stmt->data.node.children) {
-                                            lambda_returns_value = true;
-                                        }
-                                    }
-                                }
+                                /* Block body - check for return statements, however deeply nested */
+                                slist_t *returns = NULL;
+                                collect_value_stmts(body, AST_RETURN_STMT, &returns);
+                                lambda_returns_value = (returns != NULL);
+                                slist_free(returns);
                                 /* If no value return found, it's void compatible */
                                 if (!lambda_returns_value) {
                                     lambda_is_void_compatible = true;
@@ -17008,34 +17005,35 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
 type_t *get_expression_type(semantic_t *sem, ast_node_t *expr);
 
 /**
- * Recursively collect all yield expressions from a statement tree into a list.
+ * Recursively collect the value expressions of every statement of the given kind
+ * (AST_YIELD_STMT or AST_RETURN_STMT) from a statement tree into a list. It does not
+ * descend into expressions, so a nested lambda or class body is not searched.
  */
-static void collect_yields(ast_node_t *stmt, slist_t **yields)
+static void collect_value_stmts(ast_node_t *stmt, ast_node_type_t kind, slist_t **yields)
 {
     if (!stmt) {
         return;
     }
     
-    switch (stmt->type) {
-        case AST_YIELD_STMT:
-            {
-                slist_t *children = stmt->data.node.children;
-                if (children) {
-                    ast_node_t *expr = (ast_node_t *)children->data;
-                    if (!*yields) {
-                        *yields = slist_new(expr);
-                    } else {
-                        slist_append(*yields, expr);
-                    }
-                }
-                return;
+    if (stmt->type == kind) {
+        slist_t *children = stmt->data.node.children;
+        if (children) {
+            ast_node_t *expr = (ast_node_t *)children->data;
+            if (!*yields) {
+                *yields = slist_new(expr);
+            } else {
+                slist_append(*yields, expr);
             }
-        
+        }
+        return;
+    }
+    
+    switch (stmt->type) {
         case AST_BLOCK:
             {
                 slist_t *children = stmt->data.node.children;
                 for (slist_t *c = children; c; c = c->next) {
-                    collect_yields((ast_node_t *)c->data, yields);
+                    collect_value_stmts((ast_node_t *)c->data, kind, yields);
                 }
                 return;
             }
@@ -17045,9 +17043,9 @@ static void collect_yields(ast_node_t *stmt, slist_t **yields)
                 /* Check then and else branches */
                 slist_t *children = stmt->data.node.children;
                 if (children && children->next) {
-                    collect_yields((ast_node_t *)children->next->data, yields);
+                    collect_value_stmts((ast_node_t *)children->next->data, kind, yields);
                     if (children->next->next) {
-                        collect_yields((ast_node_t *)children->next->next->data, yields);
+                        collect_value_stmts((ast_node_t *)children->next->next->data, kind, yields);
                     }
                 }
                 return;
@@ -17066,7 +17064,7 @@ static void collect_yields(ast_node_t *stmt, slist_t **yields)
                     for (slist_t *c = children; c; c = c->next) {
                         last = (ast_node_t *)c->data;
                     }
-                    collect_yields(last, yields);
+                    collect_value_stmts(last, kind, yields);
                 }
                 return;
             }
@@ -17076,7 +17074,7 @@ static void collect_yields(ast_node_t *stmt, slist_t **yields)
                 /* Check try block and catch blocks */
                 slist_t *children = stmt->data.node.children;
                 for (slist_t *c = children; c; c = c->next) {
-                    collect_yields((ast_node_t *)c->data, yields);
+                    collect_value_stmts((ast_node_t *)c->data, kind, yields);
                 }
                 return;
             }
@@ -17090,7 +17088,7 @@ static void collect_yields(ast_node_t *stmt, slist_t **yields)
                     for (slist_t *c = children; c; c = c->next) {
                         last = (ast_node_t *)c->data;
                     }
-                    collect_yields(last, yields);
+                    collect_value_stmts(last, kind, yields);
                 }
                 return;
             }
@@ -17100,7 +17098,7 @@ static void collect_yields(ast_node_t *stmt, slist_t **yields)
                 /* Body is second child */
                 slist_t *children = stmt->data.node.children;
                 if (children && children->next) {
-                    collect_yields((ast_node_t *)children->next->data, yields);
+                    collect_value_stmts((ast_node_t *)children->next->data, kind, yields);
                 }
                 return;
             }
@@ -17108,6 +17106,11 @@ static void collect_yields(ast_node_t *stmt, slist_t **yields)
         default:
             return;
     }
+}
+
+static void collect_yields(ast_node_t *stmt, slist_t **yields)
+{
+    collect_value_stmts(stmt, AST_YIELD_STMT, yields);
 }
 
 /**
@@ -26285,21 +26288,21 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                         /* Return type is still a type variable - scan for return statements */
                         type_t *body_type = NULL;
                         
-                        /* Simple scan for first return statement's expression type */
-                        for (slist_t *stmt = body->data.node.children; stmt && !body_type; stmt = stmt->next) {
-                            ast_node_t *s = (ast_node_t *)stmt->data;
-                            if (s && s->type == AST_RETURN_STMT && s->data.node.children) {
-                                ast_node_t *ret_expr = (ast_node_t *)s->data.node.children->data;
-                                if (ret_expr) {
-                                    /* A local the block declares is not in scope here yet: that is
-                                     * no error, the block is analysed in full later. */
-                                    bool saved_quiet = sem->loading_dependency;
-                                    sem->loading_dependency = true;
-                                    body_type = get_expression_type(sem, ret_expr);
-                                    sem->loading_dependency = saved_quiet;
-                                }
+                        /* Take the first return statement, at any depth, whose type is known */
+                        slist_t *returns = NULL;
+                        collect_value_stmts(body, AST_RETURN_STMT, &returns);
+                        for (slist_t *r = returns; r && !body_type; r = r->next) {
+                            ast_node_t *ret_expr = (ast_node_t *)r->data;
+                            if (ret_expr) {
+                                /* A local the block declares is not in scope here yet: that is
+                                 * no error, the block is analysed in full later. */
+                                bool saved_quiet = sem->loading_dependency;
+                                sem->loading_dependency = true;
+                                body_type = get_expression_type(sem, ret_expr);
+                                sem->loading_dependency = saved_quiet;
                             }
                         }
+                        slist_free(returns);
                         
                         /* If we found a return type, update the lambda's type */
                         if (body_type && body_type->kind != TYPE_UNKNOWN && 
