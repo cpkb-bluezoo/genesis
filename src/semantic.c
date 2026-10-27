@@ -32235,6 +32235,115 @@ define_local_var:
 /**
  * Perform semantic analysis on an AST.
  */
+/**
+ * Whether an annotation is one of Lombok's, as the name is written: qualified, imported by name,
+ * or one of those Lombok defines under an on-demand import of its packages.
+ */
+static bool is_lombok_annotation(semantic_t *sem, const char *name)
+{
+    static const char *const lombok_annotations[] = {
+        "AllArgsConstructor", "Builder", "Cleanup", "CommonsLog", "CustomLog", "Data",
+        "Delegate", "EqualsAndHashCode", "ExtensionMethod", "FieldDefaults", "FieldNameConstants",
+        "Flogger", "Getter", "Jacksonized", "JBossLog", "Locked", "Log", "Log4j", "Log4j2",
+        "NoArgsConstructor", "NonNull", "RequiredArgsConstructor", "Setter", "Singular", "Slf4j",
+        "SneakyThrows", "StandardException", "SuperBuilder", "Synchronized", "ToString",
+        "UtilityClass", "Value", "With", "WithBy", "XSlf4j", "Accessors", NULL
+    };
+    if (strncmp(name, "lombok.", 7) == 0) {
+        return true;
+    }
+    char *qualified = resolve_import(sem, name);
+    bool lombok = qualified && strncmp(qualified, "lombok.", 7) == 0;
+    free(qualified);
+    if (lombok) {
+        return true;
+    }
+    for (slist_t *i = sem->imports; i; i = i->next) {
+        ast_node_t *import = (ast_node_t *)i->data;
+        const char *import_name = import && import->type == AST_IMPORT_DECL ? import->data.node.name : NULL;
+        size_t len = import_name ? strlen(import_name) : 0;
+        if (len >= 8 && strncmp(import_name, "lombok.", 7) == 0 && strcmp(import_name + len - 2, ".*") == 0) {
+            for (int k = 0; lombok_annotations[k]; k++) {
+                if (strcmp(lombok_annotations[k], name) == 0) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Lombok adds the members of a class (constructors, getters, "log") by running as an annotation
+ * processor inside javac. Genesis runs no Java, so it would go on to report what those members'
+ * absence causes - an uninitialised final field, a method it cannot find - and say nothing of
+ * the real reason. Reports each Lombok annotation use instead, and true when there was any: the
+ * rest of the file is not analysed, as what it reports would only follow from them.
+ */
+static bool report_lombok_annotations(semantic_t *sem, ast_node_t *ast)
+{
+    bool found = false;
+    size_t capacity = 256, top = 0;
+    ast_node_t **stack = malloc(capacity * sizeof(*stack));
+    if (!stack) {
+        return false;
+    }
+    stack[top++] = ast;
+    while (top > 0) {
+        ast_node_t *node = stack[--top];
+        if (!node) {
+            continue;
+        }
+        for (slist_t *a = node->annotations; a; a = a->next) {
+            ast_node_t *annot = (ast_node_t *)a->data;
+            if (annot && annot->type == AST_ANNOTATION && annot->data.node.name &&
+                is_lombok_annotation(sem, annot->data.node.name)) {
+                semantic_error(sem, annot->line, annot->column,
+                    "unsupported Lombok annotation @%s (annotation processors are not run; "
+                    "delombok the source or write the members by hand)", annot->data.node.name);
+                found = true;
+            }
+        }
+        switch (node->type) {
+            case AST_LITERAL:
+            case AST_IDENTIFIER:
+            case AST_THIS_EXPR:
+            case AST_SUPER_EXPR:
+            case AST_PRIMITIVE_TYPE:
+            case AST_VAR_TYPE:
+                continue;
+            default:
+                break;
+        }
+        /* children in source order: pushed last first, popped first */
+        size_t count = 0;
+        for (slist_t *c = node->data.node.children; c; c = c->next) {
+            count++;
+        }
+        if (top + count + 1 > capacity) {
+            while (top + count + 1 > capacity) {
+                capacity *= 2;
+            }
+            ast_node_t **grown = realloc(stack, capacity * sizeof(*stack));
+            if (!grown) {
+                break;
+            }
+            stack = grown;
+        }
+        if (node->data.node.extra) {
+            stack[top++] = (ast_node_t *)node->data.node.extra;
+        }
+        size_t base = top;
+        top += count;
+        size_t i = base + count;
+        for (slist_t *c = node->data.node.children; c; c = c->next) {
+            stack[--i] = (ast_node_t *)c->data;
+        }
+    }
+    free(stack);
+    return found;
+}
+
 bool semantic_analyze(semantic_t *sem, ast_node_t *ast, source_file_t *source)
 {
     if (!sem || !ast) {
@@ -32278,6 +32387,11 @@ bool semantic_analyze(semantic_t *sem, ast_node_t *ast, source_file_t *source)
     /* Pass 1: Collect all declarations */
     pass1_collect_declarations(sem, ast);
     
+    if (report_lombok_annotations(sem, ast)) {
+        g_current_semantic = NULL;
+        return false;
+    }
+
     /* Pass 1.5: Resolve type hierarchy (superclass/interfaces) */
     /* This handles forward references where class A extends B and B is defined later */
     resolve_type_hierarchy(sem, ast);

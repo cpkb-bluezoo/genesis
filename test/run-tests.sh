@@ -144,6 +144,40 @@ check_source_rejected OldSealed "sealed classes are not supported" -source 8
 check_source_rejected OldSealed "sealed classes are not supported" -source 16
 
 echo
+echo "--- Lombok annotations (annotation processors are not run) ---"
+# check_lombok_rejected <file> <annotation> [<annotation> ...]
+# The stub annotations are on the sourcepath, as lombok.jar would be on the classpath. Each
+# annotation use is reported once as unsupported, and nothing is reported that follows from the
+# members it would have generated.
+check_lombok_rejected() {
+    name=$1
+    shift
+    printf "%-30s ... " "$name"
+    rm -rf "$TEST_BUILD/lombok"
+    mkdir -p "$TEST_BUILD/lombok"
+    out=$("$GENESIS" -source 21 -sourcepath "$TEST_SRC/lombok" -d "$TEST_BUILD/lombok" \
+              "$TEST_SRC/lombok/$name.java" 2>&1)
+    rc=$?
+    ok=true
+    [ $rc -eq 1 ] || ok=false
+    for annotation in "$@"; do
+        echo "$out" | grep -q "unsupported Lombok annotation @$annotation (annotation processors are not run" ||
+            ok=false
+    done
+    echo "$out" | grep -q "Cannot \(find\|resolve\)\|not initialized" && ok=false
+    if $ok; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo "FAIL (exit $rc)"
+        failed=$((failed + 1))
+    fi
+}
+check_lombok_rejected LombokRequiredArgsConstructor RequiredArgsConstructor
+check_lombok_rejected LombokInnerGetterMethodRef Getter
+check_lombok_rejected LombokQualifiedAndStarImport lombok.Getter Slf4j
+
+echo
 echo "--- Generic classes loaded from class files ---"
 # The library is compiled first, then the client against its class files
 # only (-cp, no -sourcepath), so its symbols come from the class files.

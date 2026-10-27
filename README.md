@@ -188,6 +188,21 @@ arguments in an `@argfile` in javac's format, which genesis reads.
   guess or fall back to platform-default encodings. Invalid UTF-8 sequences
   are rejected with an error. Use Unicode escapes (`\uXXXX`) for non-UTF-8 sources.
 
+- **No annotation processing (Lombok and the like)**: genesis never runs Java
+  - there is no JVM, no `javac` annotation-processing round - so annotation
+  processors are not supported. [Lombok](https://projectlombok.org/) is the
+  common case: `@Getter`, `@RequiredArgsConstructor`, `@Slf4j` and the rest add
+  members that do not exist in the text of the `.java` file until its
+  processor has run inside `javac`. Genesis compiles the source as written,
+  and reports each Lombok annotation it finds as an unsupported feature
+  (`unsupported Lombok annotation @Getter ...`) instead of the errors that
+  follow from the missing members. Having `lombok.jar` on the classpath does
+  not change this. To compile such a project with genesis, run
+  [delombok](https://projectlombok.org/features/delombok) as a separate step
+  and point genesis at the generated tree, or write the members by hand.
+  Other processors (MapStruct, AutoValue, Immutables, Dagger) are likewise not
+  run: the classes they generate must be produced by a prior build step.
+
 - **JDK without `jmods`**: see Building. A JDK that has only the `lib/modules`
   runtime image (such as Eclipse Temurin 25) cannot be used to compile against,
   because genesis has no reader for that image format yet.
