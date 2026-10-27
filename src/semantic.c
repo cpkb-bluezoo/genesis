@@ -3220,6 +3220,7 @@ static int check_symbol_population(symbol_t *sym, const char *context)
     return missing;
 }
 
+static void desugar_enum_method_ref_args(semantic_t *sem, slist_t *args);
 /* Defined with the yield helpers below */
 static void collect_value_stmts(ast_node_t *stmt, ast_node_type_t kind, slist_t **yields);
 
@@ -19059,6 +19060,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 symbol_t *found_method = NULL;
                 type_t *recv_type_for_subst = NULL;  /* Track receiver type for type arg substitution */
                 
+                desugar_enum_method_ref_args(sem, ((expr->data.node.flags & AST_METHOD_CALL_EXPLICIT_RECEIVER) &&
+                                                   children) ? children->next : children);
                 /* Count arguments early for overload resolution.
                  * Total children minus 1 for receiver (if explicit) */
                 int arg_count = 0;
@@ -22202,6 +22205,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     return type_new_primitive(TYPE_UNKNOWN);
                 }
                 
+                desugar_enum_method_ref_args(sem, children->next);
                 /* First child is the type (class or interface being extended/implemented) */
                 ast_node_t *type_node = (ast_node_t *)children->data;
                 type_t *base_type = NULL;
@@ -26696,8 +26700,8 @@ static symbol_t *mref_bound_zero_sam_pick(semantic_t *sem, symbol_t *sym, const 
     return NULL;
 }
 
-static bool mref_desugar_to_lambda_call(semantic_t *sem, ast_node_t *ref, type_t *target_type,
-                                        ast_node_t *recv, const char *method_name, int sam_pcount)
+static void mref_rewrite_as_lambda_call(ast_node_t *ref, ast_node_t *recv, const char *method_name,
+                                        int sam_pcount)
 {
     int line = ref->line;
     int column = ref->column;
@@ -26731,7 +26735,13 @@ static bool mref_desugar_to_lambda_call(semantic_t *sem, ast_node_t *ref, type_t
     ast_add_child(lambda, params);
     ast_add_child(lambda, call);
     slist_free(old_children);
-    return bind_lambda_to_target_type(sem, lambda, target_type);
+}
+
+static bool mref_desugar_to_lambda_call(semantic_t *sem, ast_node_t *ref, type_t *target_type,
+                                        ast_node_t *recv, const char *method_name, int sam_pcount)
+{
+    mref_rewrite_as_lambda_call(ref, recv, method_name, sam_pcount);
+    return bind_lambda_to_target_type(sem, ref, target_type);
 }
 
 /**
@@ -26833,10 +26843,123 @@ static symbol_t *mref_lookup_inherited(semantic_t *sem, symbol_t *sym, const cha
     return found;
 }
 
+/* An expression naming a type from its (possibly dotted) name: "Color", "Outer.Color" */
+static ast_node_t *type_name_expression(const char *dotted, int line, int column)
+{
+    char *copy = strdup(dotted);
+    ast_node_t *expr = NULL;
+    char *save = NULL;
+    for (char *part = strtok_r(copy, ".", &save); part; part = strtok_r(NULL, ".", &save)) {
+        if (!expr) {
+            expr = ast_new(AST_IDENTIFIER, line, column);
+            expr->data.leaf.name = (char *)intern(part);
+        } else {
+            ast_node_t *access = ast_new(AST_FIELD_ACCESS, line, column);
+            access->data.node.name = (char *)intern(part);
+            ast_add_child(access, expr);
+            expr = access;
+        }
+    }
+    free(copy);
+    return expr;
+}
+
+/**
+ * The "valueOf(String)" and "values()" of an enum are implicit: no member stands for them, so
+ * "E::valueOf" is rewritten as the call it means, "s -> E.valueOf(s)" ("E::values" as
+ * "() -> E.values()"). Done before the reference is bound, so that a generic method it is passed
+ * to infers from it as it does from the lambda. An enum with real members of that name (one
+ * loaded from a class file) is left to the ordinary lookup. True when the reference was rewritten.
+ */
+static bool desugar_enum_method_ref(semantic_t *sem, ast_node_t *ref)
+{
+    if (!ref || ref->type != AST_METHOD_REF || !ref->data.node.name || !ref->data.node.children) {
+        return false;
+    }
+    const char *method_name = ref->data.node.name;
+    int arity;
+    if (strcmp(method_name, "valueOf") == 0) {
+        arity = 1;
+    } else if (strcmp(method_name, "values") == 0) {
+        arity = 0;
+    } else {
+        return false;
+    }
+
+    ast_node_t *target_node = (ast_node_t *)ref->data.node.children->data;
+    char dotted[512];
+    if (target_node->type == AST_IDENTIFIER && target_node->data.leaf.name) {
+        symbol_t *var = scope_lookup(sem->current_scope, target_node->data.leaf.name);
+        if (var && (var->kind == SYM_LOCAL_VAR || var->kind == SYM_PARAMETER || var->kind == SYM_FIELD)) {
+            return false;
+        }
+        snprintf(dotted, sizeof(dotted), "%s", target_node->data.leaf.name);
+    } else if (target_node->type == AST_CLASS_TYPE && target_node->data.node.name &&
+               !target_node->data.node.children) {
+        snprintf(dotted, sizeof(dotted), "%s", target_node->data.node.name);
+    } else {
+        return false;
+    }
+
+    bool saved_quiet = sem->loading_dependency;
+    type_t *saved_target = sem->target_type;
+    sem->loading_dependency = true;
+    sem->target_type = NULL;
+    ast_node_t *probe = ast_new(AST_CLASS_TYPE, ref->line, ref->column);
+    probe->data.node.name = (char *)intern(dotted);
+    type_t *named = semantic_resolve_type(sem, probe);
+    sem->loading_dependency = saved_quiet;
+    sem->target_type = saved_target;
+
+    symbol_t *enum_sym = (named && named->kind == TYPE_CLASS) ? named->data.class_type.symbol : NULL;
+    if (!enum_sym || enum_sym->kind != SYM_ENUM) {
+        return false;
+    }
+    if (enum_sym->data.class_data.members) {
+        /* One loaded from a class file has the methods as members; a declared "valueOf(int)" is
+         * another overload, which the call the reference is rewritten as picks by argument */
+        slist_t *declared = scope_find_all_methods(enum_sym->data.class_data.members, method_name);
+        bool real = false;
+        for (slist_t *m = declared; m; m = m->next) {
+            symbol_t *method = (symbol_t *)m->data;
+            slist_t *params = method ? method->data.method_data.parameters : NULL;
+            symbol_t *first = params ? (symbol_t *)params->data : NULL;
+            if (arity == 0 ? !params :
+                (first && first->type && first->type->kind == TYPE_CLASS && first->type->data.class_type.name &&
+                 strcmp(first->type->data.class_type.name, "java.lang.String") == 0)) {
+                real = true;
+            }
+        }
+        slist_free(declared);
+        if (real) {
+            return false;
+        }
+    }
+    mref_rewrite_as_lambda_call(ref, type_name_expression(dotted, ref->line, ref->column), method_name, arity);
+    return true;
+}
+
+/** Rewrite the enum method references among call arguments (see desugar_enum_method_ref) */
+static void desugar_enum_method_ref_args(semantic_t *sem, slist_t *args)
+{
+    for (slist_t *a = args; a; a = a->next) {
+        ast_node_t *arg = (ast_node_t *)a->data;
+        while (arg && arg->type == AST_PARENTHESIZED && arg->data.node.children) {
+            arg = (ast_node_t *)arg->data.node.children->data;
+        }
+        if (arg && arg->type == AST_METHOD_REF) {
+            desugar_enum_method_ref(sem, arg);
+        }
+    }
+}
+
 static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, type_t *target_type)
 {
     if (!ref || ref->type != AST_METHOD_REF || !target_type) {
         return false;
+    }
+    if (desugar_enum_method_ref(sem, ref)) {
+        return bind_lambda_to_target_type(sem, ref, target_type);
     }
     
     /* Target must be a class/interface type */
