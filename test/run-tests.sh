@@ -660,6 +660,24 @@ else
     failed=$((failed + 1))
 fi
 
+# The library is compiled with javac, as a dependency JAR would be.
+printf "%-30s ... " "InheritedProtectedStaticField"
+ips_lib="$TEST_BUILD/protectedstaticfieldlib-lib"
+ips_out="$TEST_BUILD/protectedstaticfieldlib-out"
+rm -rf "$ips_lib" "$ips_out"
+mkdir -p "$ips_lib" "$ips_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$ips_lib" "$TEST_SRC"/external/protectedstaticfieldlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ips_lib" -d "$ips_out" \
+       "$TEST_SRC/external/InheritedProtectedStaticFieldTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ips_out:$ips_lib" InheritedProtectedStaticFieldTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 # The library is compiled with genesis itself, into a separate classfile
 # (see protectedmethodreceiverlib/Base.java's own comment) - the bug is in
 # semantic.c's own receiver resolution, independent of same-batch vs.
