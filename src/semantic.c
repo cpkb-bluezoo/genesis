@@ -30697,9 +30697,29 @@ define_local_var:
                                 /* Declaration form */
                                 if (children) {
                                     ast_node_t *type_node = (ast_node_t *)children->data;
-                                    type_t *res_type = semantic_resolve_type(sem, type_node);
                                     const char *name = node->data.node.name;
-                                    
+                                    bool is_var = type_node->type == AST_VAR_TYPE ||
+                                        (type_node->type == AST_CLASS_TYPE &&
+                                         type_node->data.node.name &&
+                                         strcmp(type_node->data.node.name, "var") == 0);
+                                    type_t *res_type;
+
+                                    if (is_var && children->next) {
+                                        /* 'var' resource (Java 10+): the type is that of the initializer */
+                                        ast_node_t *init_expr = (ast_node_t *)children->next->data;
+                                        res_type = get_expression_type(sem, init_expr);
+                                        if (res_type->kind == TYPE_NULL ||
+                                            res_type->kind == TYPE_VOID ||
+                                            res_type->kind == TYPE_UNKNOWN) {
+                                            semantic_error(sem, node->line, node->column,
+                                                "Cannot infer type for 'var'");
+                                        }
+                                        /* Store inferred type on type node for codegen */
+                                        type_node->sem_type = res_type;
+                                    } else {
+                                        res_type = semantic_resolve_type(sem, type_node);
+                                    }
+
                                     node->sem_type = res_type;
                                     
                                     if (name) {
