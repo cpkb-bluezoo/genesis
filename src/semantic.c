@@ -3223,6 +3223,7 @@ static int check_symbol_population(symbol_t *sym, const char *context)
 static void desugar_enum_method_ref_args(semantic_t *sem, slist_t *args);
 /* Defined with the yield helpers below */
 static void collect_value_stmts(ast_node_t *stmt, ast_node_type_t kind, slist_t **yields);
+static void declare_block_locals_for_probe(semantic_t *sem, ast_node_t *block, scope_t *probe);
 
 /* Forward declarations for lambda/method ref binding */
 static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type_t *target_type);
@@ -17059,6 +17060,51 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr);
  * (AST_YIELD_STMT or AST_RETURN_STMT) from a statement tree into a list. It does not
  * descend into expressions, so a nested lambda or class body is not searched.
  */
+/**
+ * Declare, in `probe`, stand-ins for the local variables a block declares at its top level, so
+ * that a return expression in the block can be typed before the block itself is analysed. A
+ * "var" local takes the type of its initializer. Anything that cannot be typed is left out.
+ */
+static void declare_block_locals_for_probe(semantic_t *sem, ast_node_t *block, scope_t *probe)
+{
+    bool saved_quiet = sem->loading_dependency;
+    sem->loading_dependency = true;
+    for (slist_t *c = block->data.node.children; c; c = c->next) {
+        ast_node_t *stmt = (ast_node_t *)c->data;
+        if (!stmt || stmt->type != AST_VAR_DECL) {
+            continue;
+        }
+        slist_t *parts = stmt->data.node.children;
+        ast_node_t *type_node = parts ? (ast_node_t *)parts->data : NULL;
+        if (!type_node || type_node->type == AST_VAR_DECLARATOR) {
+            continue;
+        }
+        bool is_var = type_node->type == AST_VAR_TYPE ||
+            (type_node->type == AST_CLASS_TYPE && type_node->data.node.name &&
+             strcmp(type_node->data.node.name, "var") == 0);
+        type_t *declared = is_var ? NULL : semantic_resolve_type(sem, type_node);
+        for (slist_t *d = parts->next; d; d = d->next) {
+            ast_node_t *decl = (ast_node_t *)d->data;
+            if (!decl || decl->type != AST_VAR_DECLARATOR || !decl->data.node.name ||
+                decl->data.node.flags > 0) {
+                continue;
+            }
+            type_t *type = declared;
+            if (is_var && decl->data.node.children) {
+                type = get_expression_type(sem, (ast_node_t *)decl->data.node.children->data);
+            }
+            if (!type || type->kind == TYPE_UNKNOWN || type->kind == TYPE_NULL ||
+                type->kind == TYPE_VOID) {
+                continue;
+            }
+            symbol_t *sym = symbol_new(SYM_LOCAL_VAR, decl->data.node.name);
+            sym->type = type;
+            scope_define(probe, sym);
+        }
+    }
+    sem->loading_dependency = saved_quiet;
+}
+
 static void collect_value_stmts(ast_node_t *stmt, ast_node_type_t kind, slist_t **yields)
 {
     if (!stmt) {
@@ -26337,14 +26383,20 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                         /* Return type is still a type variable - scan for return statements */
                         type_t *body_type = NULL;
                         
-                        /* Take the first return statement, at any depth, whose type is known */
+                        /* Take the first return statement, at any depth, whose type is known.
+                         * The block's own top-level locals are not declared yet (the block is
+                         * analysed in full later): stand-ins for them go in a scope of its own,
+                         * for the return expressions to be typed against. */
+                        scope_t *probe_scope = scope_new(SCOPE_BLOCK, lambda_scope);
+                        sem->current_scope = probe_scope;
+                        declare_block_locals_for_probe(sem, body, probe_scope);
                         slist_t *returns = NULL;
                         collect_value_stmts(body, AST_RETURN_STMT, &returns);
                         for (slist_t *r = returns; r && !body_type; r = r->next) {
                             ast_node_t *ret_expr = (ast_node_t *)r->data;
                             if (ret_expr) {
-                                /* A local the block declares is not in scope here yet: that is
-                                 * no error, the block is analysed in full later. */
+                                /* A local declared deeper in the block is still not in scope
+                                 * here: that is no error either. */
                                 bool saved_quiet = sem->loading_dependency;
                                 sem->loading_dependency = true;
                                 body_type = get_expression_type(sem, ret_expr);
@@ -26352,6 +26404,8 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                             }
                         }
                         slist_free(returns);
+                        sem->current_scope = lambda_scope;
+                        scope_free(probe_scope);
                         
                         /* If we found a return type, update the lambda's type */
                         if (body_type && body_type->kind != TYPE_UNKNOWN && 
