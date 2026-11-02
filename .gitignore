@@ -22,6 +22,8 @@ INSTALL
 
 # Build products
 src/genesis
+src/commit.h
+src/commit.h.tmp
 genesis
 *.class
 

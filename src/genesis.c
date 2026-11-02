@@ -24,6 +24,7 @@
 #endif
 
 #include "genesis.h"
+#include "commit.h"
 #include "classpath.h"
 #include "classfile.h"
 #include "codegen.h"
@@ -3291,7 +3292,7 @@ static char **read_argument_file(const char *filename, int *arg_count)
  */
 void print_version(void)
 {
-    printf("%s %s\n", PACKAGE_NAME, GENESIS_VERSION);
+    printf("%s %s (%s)\n", PACKAGE_NAME, GENESIS_VERSION, GENESIS_COMMIT);
     /* Build tools that run a compiler executable with -version (the Maven
      * compiler plugin) look for a "javac <version>" line to learn which
      * options it takes; this is the language level genesis implements. */
