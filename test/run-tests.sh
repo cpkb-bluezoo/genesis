@@ -679,6 +679,25 @@ else
 fi
 
 # The library is compiled with javac, as a dependency JAR would be.
+printf "%-30s ... " "StaticFieldAndMethodSameName"
+sfm_lib="$TEST_BUILD/staticfieldmethodlib-lib"
+sfm_out="$TEST_BUILD/staticfieldmethodlib-out"
+rm -rf "$sfm_lib" "$sfm_out"
+mkdir -p "$sfm_lib" "$sfm_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$sfm_lib" "$TEST_SRC"/external/staticfieldmethodlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$sfm_lib" -d "$sfm_out" \
+       "$TEST_SRC/external/staticfieldmethodmid/Mid.java" \
+       "$TEST_SRC/external/StaticFieldAndMethodSameNameTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$sfm_out:$sfm_lib" StaticFieldAndMethodSameNameTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The library is compiled with javac, as a dependency JAR would be.
 printf "%-30s ... " "VarBoundMethodRefClassfile"
 vbr_lib="$TEST_BUILD/varboundrefslib-lib"
 vbr_out="$TEST_BUILD/varboundrefslib-out"
