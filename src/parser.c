@@ -1229,10 +1229,12 @@ static ast_node_t *parse_pattern(parser_t *parser)
     if (parser_check(parser, TOK_IDENTIFIER)) {
         const char *var_name = parser_current_text(parser);
         int is_unnamed = (strcmp(var_name, "_") == 0);
+        /* (the text is the lexer's buffer, which the next token overwrites: "String s when ...") */
+        const char *interned_name = is_unnamed ? NULL : intern(var_name);
         parser_advance(parser);
         
         ast_node_t *pattern = ast_new(AST_TYPE_PATTERN, pattern_line, pattern_col);
-        pattern->data.node.name = is_unnamed ? NULL : (char *)intern(var_name);
+        pattern->data.node.name = (char *)interned_name;
         ast_add_child(pattern, type_node);
         
         return pattern;

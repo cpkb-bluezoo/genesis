@@ -11893,10 +11893,10 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                 }
             }
             
-            /* Patch guard ifeq */
+            /* Patch guard ifeq. Its target is where the next case starts, whose frame is recorded
+             * below from the state at the case's entry: the stack here still holds the body's value. */
             uint16_t guard_skip = (uint16_t)(mg->code->length - guard_ifeq_pos);
             bc_patch_u2(mg->code, guard_ifeq_pos + 1, guard_skip);
-            mg_record_frame(mg);
         } else {
             /* Generate body */
             switch_arm_body(mg, body, cp, stmt_mode);
