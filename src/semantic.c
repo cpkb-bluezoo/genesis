@@ -19434,6 +19434,17 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 }
                             }
 
+                            /* A field brought in by a static import ("import static
+                             * java.util.concurrent.TimeUnit.SECONDS;"), an enum constant
+                             * among them, is a receiver like any other variable. */
+                            if (!sym) {
+                                symbol_t *imported_field = NULL;
+                                if (resolve_static_import_field(sem, recv_name, &imported_field) &&
+                                    imported_field) {
+                                    sym = imported_field;
+                                }
+                            }
+
                             if (sym && (sym->kind == SYM_LOCAL_VAR || sym->kind == SYM_PARAMETER ||
                                         sym->kind == SYM_FIELD)) {
                                 if (debug_getenv("GENESIS_DEBUG_SAM") && method_name && 
