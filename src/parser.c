@@ -3778,11 +3778,16 @@ static ast_node_t *parse_statement(parser_t *parser)
                                 ast_node_t *case_label = ast_new(AST_CASE_LABEL,
                                                                  parser_current_line(parser),
                                                                  parser_current_column(parser));
-                                parser->in_case_label++;
-                                ast_node_t *case_expr = parse_expression(parser);
-                                parser->in_case_label--;
-                                if (case_expr) {
-                                    ast_add_child(case_label, case_expr);
+                                if (parser_match(parser, TOK_DEFAULT)) {
+                                    /* "case null, default" */
+                                    case_label->data.node.name = (char *)intern("default");
+                                } else {
+                                    parser->in_case_label++;
+                                    ast_node_t *case_expr = parse_expression(parser);
+                                    parser->in_case_label--;
+                                    if (case_expr) {
+                                        ast_add_child(case_label, case_expr);
+                                    }
                                 }
                                 if (labels) {
                                     slist_append(labels, case_label);

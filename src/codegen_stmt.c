@@ -376,6 +376,27 @@ bool switch_label_int_value(ast_node_t *case_expr, int32_t *out)
     return eval_int_constant_expr(case_expr, out);
 }
 
+/** True if a switch statement's label is "case null". */
+static bool switch_stmt_label_is_null(ast_node_t *case_label)
+{
+    if (!case_label || case_label->type != AST_CASE_LABEL || !case_label->data.node.children) {
+        return false;
+    }
+    ast_node_t *expr = (ast_node_t *)case_label->data.node.children->data;
+    return expr && expr->type == AST_LITERAL && expr->data.leaf.token_type == TOK_NULL;
+}
+
+/** True if any label of a switch statement is "case null". */
+static bool switch_stmt_has_null_label(slist_t *labels)
+{
+    for (slist_t *n = labels; n; n = n->next) {
+        if (switch_stmt_label_is_null((ast_node_t *)n->data)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * Generate code for switch statement on String (Java 7+).
  * 
@@ -409,6 +430,19 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
         stackmap_set_local_object(mg->stackmap, selector_slot, mg->cp, "java/lang/String");
     }
     
+    /* A null selector goes to the body of "case null", patched when that body is generated */
+    size_t null_jump_pos = 0;
+    bool has_null_label = switch_stmt_has_null_label(children->next);
+    if (has_null_label) {
+        bc_emit(mg->code, OP_ALOAD);
+        bc_emit_u1(mg->code, (uint8_t)selector_slot);
+        mg_push(mg, 1);
+        null_jump_pos = mg->code->length;
+        bc_emit(mg->code, OP_IFNULL);
+        bc_emit_u2(mg->code, 0);
+        mg_pop_typed(mg, 1);
+    }
+
     /* Collect case string info */
     string_case_info_t *cases = calloc(num_cases, sizeof(string_case_info_t));
     int case_idx = 0;
@@ -625,6 +659,10 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
 
         if (is_default) {
             default_body_pos = body_pos;
+        } else if (switch_stmt_label_is_null(case_label)) {
+            int16_t null_offset = (int16_t)(body_pos - null_jump_pos);
+            mg->code->code[null_jump_pos + 1] = (null_offset >> 8) & 0xFF;
+            mg->code->code[null_jump_pos + 2] = null_offset & 0xFF;
         } else {
             /* Find this case in our sorted array and patch the ifne */
             for (int i = 0; i < actual_cases; i++) {
@@ -4308,11 +4346,13 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     ast_node_t *case_label = (ast_node_t *)node->data;
                     if (case_label->type == AST_CASE_LABEL) {
                         if (!(case_label->data.node.name && 
-                              strcmp(case_label->data.node.name, "default") == 0)) {
+                              strcmp(case_label->data.node.name, "default") == 0) &&
+                            !switch_stmt_label_is_null(case_label)) {
                             num_cases++;
                         }
                     }
                 }
+                bool has_null_label = switch_stmt_has_null_label(children->next);
                 
                 /* Check if this is an enum switch (selector has sem_type of enum).
                  * selector->sem_type isn't set for every selector expression
@@ -4347,6 +4387,26 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     return codegen_string_switch(mg, children, num_cases);
                 }
                 
+                /* A null selector goes to the body of "case null", patched when that body is generated */
+                slist_t *null_jumps = NULL;
+                if (has_null_label) {
+                    slist_t *not_null = NULL;
+                    bc_emit(mg->code, OP_DUP);
+                    mg_dup(mg);
+                    cond_emit_jump(mg, OP_IFNONNULL, 1, &not_null);
+                    bc_emit(mg->code, OP_POP);
+                    mg_pop_typed(mg, 1);
+                    cond_emit_jump(mg, OP_GOTO, 0, &null_jumps);
+                    cond_bind_label(mg, &not_null, false);
+                }
+
+                /* a boxed Integer, Character, Short or Byte selector is unboxed to the int it switches on */
+                if (!is_enum_switch && selector->sem_type && selector->sem_type->kind == TYPE_CLASS &&
+                    selector->sem_type->data.class_type.name) {
+                    coerce_stack_value(mg, mg->cp, TYPE_CLASS, selector->sem_type->data.class_type.name,
+                                       TYPE_INT, NULL);
+                }
+
                 /* For enum switch, call ordinal() on selector BEFORE lookupswitch */
                 if (is_enum_switch) {
                     uint16_t methodref = cp_add_methodref(mg->cp, "java/lang/Enum", "ordinal", "()I");
@@ -4413,6 +4473,8 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         if (case_label->data.node.name && 
                             strcmp(case_label->data.node.name, "default") == 0) {
                             /* Skip default */
+                        } else if (switch_stmt_label_is_null(case_label)) {
+                            /* Skip "case null": no value to match */
                         } else {
                             slist_t *case_children = case_label->data.node.children;
                             if (case_children) {
@@ -4622,6 +4684,12 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     
                     if (is_default) {
                         default_code_pos = current_code_pos;
+                    } else if (switch_stmt_label_is_null(case_label)) {
+                        /* the null selector's jump lands here, on the frame just recorded */
+                        for (slist_t *nj = null_jumps; nj; nj = nj->next) {
+                            size_t jump_pos = ((pending_condition_branch_t *)nj->data)->branch_pos;
+                            bc_patch_u2(mg->code, jump_pos + 1, (uint16_t)(int16_t)(current_code_pos - jump_pos));
+                        }
                     } else {
                         /* Find sorted index for this case */
                         int sorted_idx = ast_to_sorted_idx[ast_idx];

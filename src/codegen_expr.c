@@ -11087,6 +11087,12 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
  * Pattern Matching Switch Expression (Java 21+)
  * ======================================================================== */
 
+/** True if a case label is the literal "case null". */
+static bool switch_label_is_null(ast_node_t *label)
+{
+    return label && label->type == AST_LITERAL && label->data.leaf.token_type == TOK_NULL;
+}
+
 /**
  * A switch expression whose labels are constants (an int, char or boxed value, an
  * enum constant, a String), in either form. The selector is dispatched on once:
@@ -11121,6 +11127,7 @@ static bool codegen_constant_switch_expr(method_gen_t *mg, ast_node_t *expr, con
     }
     ast_node_t **rules = calloc(nrules ? nrules : 1, sizeof(*rules));
     int default_rule = -1;
+    int null_rule = -1;     /* the rule with "case null", which a null selector selects */
     int nlabels = 0;
     int r = 0;
     for (slist_t *c = children->next; c; c = c->next, r++) {
@@ -11128,8 +11135,11 @@ static bool codegen_constant_switch_expr(method_gen_t *mg, ast_node_t *expr, con
         rules[r] = rule;
         if (rule->data.node.name && strcmp(rule->data.node.name, "default") == 0) {
             default_rule = r;
-        } else {
-            for (slist_t *l = rule->data.node.children; l && l->next; l = l->next) {
+        }
+        for (slist_t *l = rule->data.node.children; l && l->next; l = l->next) {
+            if (switch_label_is_null((ast_node_t *)l->data)) {
+                null_rule = r;
+            } else if (r != default_rule) {
                 nlabels++;
             }
         }
@@ -11174,11 +11184,20 @@ static bool codegen_constant_switch_expr(method_gen_t *mg, ast_node_t *expr, con
             stackmap_set_local_object(mg->stackmap, tmp, mg->cp, "java/lang/String");
         }
         uint16_t equals_ref = cp_add_methodref(cp, "java/lang/String", "equals", "(Ljava/lang/Object;)Z");
+        if (null_rule >= 0) {
+            bc_emit(mg->code, OP_ALOAD);
+            bc_emit_u1(mg->code, (uint8_t)tmp);
+            mg_push_object(mg, "java/lang/String");
+            cond_emit_jump(mg, OP_IFNULL, 1, &rule_jumps[null_rule]);
+        }
         for (int i = 0; i < nrules; i++) {
             if (i == default_rule && !synthetic_default) {
                 continue;
             }
             for (slist_t *l = rules[i]->data.node.children; l && l->next; l = l->next) {
+                if (switch_label_is_null((ast_node_t *)l->data)) {
+                    continue;
+                }
                 bc_emit(mg->code, OP_ALOAD);
                 bc_emit_u1(mg->code, (uint8_t)tmp);
                 mg_push_object(mg, "java/lang/String");
@@ -11194,6 +11213,17 @@ static bool codegen_constant_switch_expr(method_gen_t *mg, ast_node_t *expr, con
         }
         cond_emit_jump(mg, OP_GOTO, 0, &rule_jumps[default_rule]);
     } else {
+        if (null_rule >= 0) {
+            /* a null selector goes to its rule; the others carry on to be unboxed or ordinal()ed */
+            slist_t *not_null = NULL;
+            bc_emit(mg->code, OP_DUP);
+            mg_dup(mg);
+            cond_emit_jump(mg, OP_IFNONNULL, 1, &not_null);
+            bc_emit(mg->code, OP_POP);
+            mg_pop_typed(mg, 1);
+            cond_emit_jump(mg, OP_GOTO, 0, &rule_jumps[null_rule]);
+            cond_bind_label(mg, &not_null, false);
+        }
         if (sel_class && !is_enum) {
             /* a boxed Integer, Character, Short or Byte */
             coerce_stack_value(mg, cp, TYPE_CLASS, sel_class, TYPE_INT, NULL);
@@ -11209,6 +11239,9 @@ static bool codegen_constant_switch_expr(method_gen_t *mg, ast_node_t *expr, con
                 continue;
             }
             for (slist_t *l = rules[i]->data.node.children; l && l->next; l = l->next) {
+                if (switch_label_is_null((ast_node_t *)l->data)) {
+                    continue;
+                }
                 int32_t v = 0;
                 switch_label_int_value((ast_node_t *)l->data, &v);
                 label_values[n] = v;
@@ -11261,7 +11294,7 @@ static bool codegen_constant_switch_expr(method_gen_t *mg, ast_node_t *expr, con
             stackmap_restore_state(mg->stackmap, entry_state);
         }
         rule_pos[i] = mg->code->length;
-        if (is_string) {
+        if (is_string || rule_jumps[i]) {
             cond_bind_label(mg, &rule_jumps[i], false);
         } else {
             mg_record_frame(mg);
