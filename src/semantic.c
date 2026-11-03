@@ -26976,6 +26976,26 @@ static ast_node_t *type_name_expression(const char *dotted, int line, int column
     return expr;
 }
 
+/** Writes "Outer.Inner" for a qualified-name expression of identifiers; false for any other shape. */
+static bool qualified_name_text(ast_node_t *expr, char *out, size_t size)
+{
+    if (!expr) {
+        return false;
+    }
+    if (expr->type == AST_IDENTIFIER && expr->data.leaf.name) {
+        return snprintf(out, size, "%s", expr->data.leaf.name) < (int)size;
+    }
+    if (expr->type == AST_FIELD_ACCESS && expr->data.node.name && expr->data.node.children &&
+        !expr->data.node.children->next) {
+        if (!qualified_name_text((ast_node_t *)expr->data.node.children->data, out, size)) {
+            return false;
+        }
+        size_t used = strlen(out);
+        return snprintf(out + used, size - used, ".%s", expr->data.node.name) < (int)(size - used);
+    }
+    return false;
+}
+
 /**
  * The "valueOf(String)" and "values()" of an enum are implicit: no member stands for them, so
  * "E::valueOf" is rewritten as the call it means, "s -> E.valueOf(s)" ("E::values" as
@@ -27009,7 +27029,7 @@ static bool desugar_enum_method_ref(semantic_t *sem, ast_node_t *ref)
     } else if (target_node->type == AST_CLASS_TYPE && target_node->data.node.name &&
                !target_node->data.node.children) {
         snprintf(dotted, sizeof(dotted), "%s", target_node->data.node.name);
-    } else {
+    } else if (!qualified_name_text(target_node, dotted, sizeof(dotted))) {
         return false;
     }
 
