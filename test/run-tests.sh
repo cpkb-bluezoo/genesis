@@ -679,6 +679,24 @@ else
 fi
 
 # The library is compiled with javac, as a dependency JAR would be.
+printf "%-30s ... " "VarBoundMethodRefClassfile"
+vbr_lib="$TEST_BUILD/varboundrefslib-lib"
+vbr_out="$TEST_BUILD/varboundrefslib-out"
+rm -rf "$vbr_lib" "$vbr_out"
+mkdir -p "$vbr_lib" "$vbr_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$vbr_lib" "$TEST_SRC"/external/varboundrefslib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -source 21 -cp "$vbr_lib" -d "$vbr_out" \
+       "$TEST_SRC/external/VarBoundMethodRefClassfileTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$vbr_out:$vbr_lib" VarBoundMethodRefClassfileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The library is compiled with javac, as a dependency JAR would be.
 printf "%-30s ... " "ProtectedFieldViaSourceSubclass"
 pfc_lib="$TEST_BUILD/protectedfieldchainlib-lib"
 pfc_out="$TEST_BUILD/protectedfieldchainlib-out"

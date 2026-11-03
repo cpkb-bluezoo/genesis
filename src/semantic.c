@@ -27471,6 +27471,15 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
                 }
             } else {
             target_class_sym = target_class_type->data.class_type.symbol;
+            /* (a "var" takes the type of its initializer, whose class need not be loaded yet) */
+            if ((!target_class_sym || !target_class_sym->data.class_data.members) &&
+                target_class_type->data.class_type.name) {
+                symbol_t *loaded = load_external_class(sem, target_class_type->data.class_type.name);
+                if (loaded) {
+                    target_class_sym = loaded;
+                    target_class_type->data.class_type.symbol = loaded;
+                }
+            }
             }
             is_bound = true;
             
