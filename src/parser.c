@@ -1246,6 +1246,8 @@ static ast_node_t *parse_pattern(parser_t *parser)
     return NULL;
 }
 
+static bool statement_ends_abruptly(ast_node_t *stmt);
+
 /**
  * Parse the arrow-style rules of a switch, up to and including its closing brace, adding each as
  * an AST_SWITCH_RULE child of "node" (which already holds the selector). Frees "node" and returns
@@ -1316,6 +1318,31 @@ static ast_node_t *parse_switch_rules(parser_t *parser, ast_node_t *node, bool a
                 } while (parser_match(parser, TOK_COMMA));
             }
             
+            if (as_statement && parser_match(parser, TOK_COLON)) {
+                /* The old form, "case P:" and the statements after it, up to the next label. The
+                 * statements are the arm's block; falling out of one arm into the next is not
+                 * supported (JLS 14.11.1 forbids it where the next label binds variables). */
+                ast_node_t *block = ast_new(AST_BLOCK, parser_current_line(parser),
+                                            parser_current_column(parser));
+                while (!parser_check(parser, TOK_CASE) && !parser_check(parser, TOK_DEFAULT) &&
+                       !parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
+                    ast_node_t *stmt = parse_statement(parser);
+                    if (!stmt) {
+                        ast_free(block);
+                        ast_free(rule);
+                        ast_free(node);
+                        return NULL;
+                    }
+                    ast_add_child(block, stmt);
+                }
+                if (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF) &&
+                    !statement_ends_abruptly(block)) {
+                    rule->data.node.flags |= AST_SWITCH_RULE_FALLS_THROUGH;   /* (reported by semantic analysis) */
+                }
+                ast_add_child(rule, block);
+                ast_add_child(node, rule);
+                continue;
+            }
             if (!parser_expect(parser, TOK_ARROW)) {
                 ast_free(rule);
                 ast_free(node);

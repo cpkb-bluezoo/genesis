@@ -519,6 +519,7 @@ static inline bool is_unnamed_name(const char *name)
 /* AST node flags (for non-modifier uses of data.node.flags) */
 #define AST_METHOD_CALL_EXPLICIT_RECEIVER 0x10000  /* Method call has explicit receiver (obj.method()) */
 #define AST_SWITCH_IS_STATEMENT 0x20000  /* AST_SWITCH_EXPR that is a switch statement with pattern labels */
+#define AST_SWITCH_RULE_FALLS_THROUGH 0x40000  /* AST_SWITCH_RULE of a colon-form case that runs on into the next */
 
 /* Annotation retention policies */
 typedef enum {

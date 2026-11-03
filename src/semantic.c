@@ -30517,6 +30517,11 @@ static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
                             /* Switch rule: case pattern -> body
                              * Check for type patterns and create scope if needed */
                             slist_t *children = node->data.node.children;
+                            if (node->data.node.flags & AST_SWITCH_RULE_FALLS_THROUGH) {
+                                semantic_error(sem, node->line, node->column,
+                                    "fall-through to the next case is not supported in a switch with pattern "
+                                    "labels (end the case with break, return, continue or throw)");
+                            }
                             for (slist_t *c = children; c; c = c->next) {
                                 ast_node_t *child = (ast_node_t *)c->data;
                                 
