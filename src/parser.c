@@ -1245,6 +1245,122 @@ static ast_node_t *parse_pattern(parser_t *parser)
 }
 
 /**
+ * Parse the arrow-style rules of a switch, up to and including its closing brace, adding each as
+ * an AST_SWITCH_RULE child of "node" (which already holds the selector). Frees "node" and returns
+ * NULL on error. In a switch statement ("as_statement") an arm that is an expression becomes an
+ * expression statement.
+ */
+static ast_node_t *parse_switch_rules(parser_t *parser, ast_node_t *node, bool as_statement)
+{
+    /* Parse switch rules (arrow-style cases) */
+    while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
+        if (parser_check(parser, TOK_CASE) || parser_check(parser, TOK_DEFAULT)) {
+            ast_node_t *rule = ast_new(AST_SWITCH_RULE,
+                                       parser_current_line(parser),
+                                       parser_current_column(parser));
+            
+            if (parser_match(parser, TOK_DEFAULT)) {
+                rule->data.node.name = (char *)intern("default");
+            } else {
+                parser_advance(parser);  /* consume 'case' */
+                /* Parse one or more case patterns/constants separated by commas */
+                do {
+                    int pattern_line = parser_current_line(parser);
+                    int pattern_col = parser_current_column(parser);
+                    
+                    /* Check for null pattern */
+                    if (parser_check(parser, TOK_NULL)) {
+                        ast_node_t *null_lit = ast_new_literal_from_lexer(parser->lexer);
+                        parser_advance(parser);
+                        ast_add_child(rule, null_lit);
+                    }
+                    /* Try to parse as a pattern (type, unnamed, record) */
+                    else if (parser_check(parser, TOK_IDENTIFIER)) {
+                        ast_node_t *pattern = parse_pattern(parser);
+                        
+                        if (pattern) {
+                            /* Check for when guard */
+                            if (parser_match(parser, TOK_WHEN)) {
+                                parser->in_case_label++;
+                                ast_node_t *guard = parse_expression(parser);
+                                parser->in_case_label--;
+                                ast_node_t *guarded = ast_new(AST_GUARDED_PATTERN, pattern_line, pattern_col);
+                                ast_add_child(guarded, pattern);
+                                if (guard) {
+                                    ast_add_child(guarded, guard);
+                                }
+                                ast_add_child(rule, guarded);
+                            } else {
+                                ast_add_child(rule, pattern);
+                            }
+                        } else {
+                            /* Not a pattern, parse as expression */
+                            parser->in_case_label++;
+                            ast_node_t *case_expr = parse_expression(parser);
+                            parser->in_case_label--;
+                            if (case_expr) {
+                                ast_add_child(rule, case_expr);
+                            }
+                        }
+                    } else {
+                        /* Regular expression */
+                        parser->in_case_label++;
+                        ast_node_t *case_expr = parse_expression(parser);
+                        parser->in_case_label--;
+                        if (case_expr) {
+                            ast_add_child(rule, case_expr);
+                        }
+                    }
+                } while (parser_match(parser, TOK_COMMA));
+            }
+            
+            if (!parser_expect(parser, TOK_ARROW)) {
+                ast_free(rule);
+                ast_free(node);
+                return NULL;
+            }
+            
+            /* After ->, either a block { ... } or an expression followed by ; */
+            if (parser_check(parser, TOK_LBRACE)) {
+                ast_node_t *block = parse_block(parser);
+                if (block) {
+                    ast_add_child(rule, block);
+                }
+            } else if (parser_check(parser, TOK_THROW)) {
+                /* throw expression; */
+                ast_node_t *throw_stmt = parse_statement(parser);
+                if (throw_stmt) {
+                    ast_add_child(rule, throw_stmt);
+                }
+            } else {
+                /* Expression followed by semicolon */
+                int body_line = parser_current_line(parser);
+                int body_col = parser_current_column(parser);
+                ast_node_t *expr = parse_expression(parser);
+                if (expr && as_statement) {
+                    ast_node_t *stmt = ast_new(AST_EXPR_STMT, body_line, body_col);
+                    ast_add_child(stmt, expr);
+                    expr = stmt;
+                }
+                if (expr) {
+                    ast_add_child(rule, expr);
+                }
+                parser_expect(parser, TOK_SEMICOLON);
+            }
+            
+            ast_add_child(node, rule);
+        } else {
+            parser_error(parser, "Expected 'case' or 'default'");
+            ast_free(node);
+            return NULL;
+        }
+    }
+    
+    parser_expect(parser, TOK_RBRACE);
+    return node;
+}
+
+/**
  * Parse a primary expression (literals, identifiers, parenthesized, etc.)
  */
 static ast_node_t *parse_primary(parser_t *parser)
@@ -1903,105 +2019,7 @@ static ast_node_t *parse_primary(parser_t *parser)
                 ast_node_t *node = ast_new(AST_SWITCH_EXPR, sw_line, sw_col);
                 ast_add_child(node, selector);
                 
-                /* Parse switch rules (arrow-style cases) */
-                while (!parser_check(parser, TOK_RBRACE) && !parser_check(parser, TOK_EOF)) {
-                    if (parser_check(parser, TOK_CASE) || parser_check(parser, TOK_DEFAULT)) {
-                        ast_node_t *rule = ast_new(AST_SWITCH_RULE,
-                                                   parser_current_line(parser),
-                                                   parser_current_column(parser));
-                        
-                        if (parser_match(parser, TOK_DEFAULT)) {
-                            rule->data.node.name = (char *)intern("default");
-                        } else {
-                            parser_advance(parser);  /* consume 'case' */
-                            /* Parse one or more case patterns/constants separated by commas */
-                            do {
-                                int pattern_line = parser_current_line(parser);
-                                int pattern_col = parser_current_column(parser);
-                                
-                                /* Check for null pattern */
-                                if (parser_check(parser, TOK_NULL)) {
-                                    ast_node_t *null_lit = ast_new_literal_from_lexer(parser->lexer);
-                                    parser_advance(parser);
-                                    ast_add_child(rule, null_lit);
-                                }
-                                /* Try to parse as a pattern (type, unnamed, record) */
-                                else if (parser_check(parser, TOK_IDENTIFIER)) {
-                                    ast_node_t *pattern = parse_pattern(parser);
-                                    
-                                    if (pattern) {
-                                        /* Check for when guard */
-                                        if (parser_match(parser, TOK_WHEN)) {
-                                            parser->in_case_label++;
-                                            ast_node_t *guard = parse_expression(parser);
-                                            parser->in_case_label--;
-                                            ast_node_t *guarded = ast_new(AST_GUARDED_PATTERN, pattern_line, pattern_col);
-                                            ast_add_child(guarded, pattern);
-                                            if (guard) {
-                                                ast_add_child(guarded, guard);
-                                            }
-                                            ast_add_child(rule, guarded);
-                                        } else {
-                                            ast_add_child(rule, pattern);
-                                        }
-                                    } else {
-                                        /* Not a pattern, parse as expression */
-                                        parser->in_case_label++;
-                                        ast_node_t *case_expr = parse_expression(parser);
-                                        parser->in_case_label--;
-                                        if (case_expr) {
-                                            ast_add_child(rule, case_expr);
-                                        }
-                                    }
-                                } else {
-                                    /* Regular expression */
-                                    parser->in_case_label++;
-                                    ast_node_t *case_expr = parse_expression(parser);
-                                    parser->in_case_label--;
-                                    if (case_expr) {
-                                        ast_add_child(rule, case_expr);
-                                    }
-                                }
-                            } while (parser_match(parser, TOK_COMMA));
-                        }
-                        
-                        if (!parser_expect(parser, TOK_ARROW)) {
-                            ast_free(rule);
-                            ast_free(node);
-                            return NULL;
-                        }
-                        
-                        /* After ->, either a block { ... } or an expression followed by ; */
-                        if (parser_check(parser, TOK_LBRACE)) {
-                            ast_node_t *block = parse_block(parser);
-                            if (block) {
-                                ast_add_child(rule, block);
-                            }
-                        } else if (parser_check(parser, TOK_THROW)) {
-                            /* throw expression; */
-                            ast_node_t *throw_stmt = parse_statement(parser);
-                            if (throw_stmt) {
-                                ast_add_child(rule, throw_stmt);
-                            }
-                        } else {
-                            /* Expression followed by semicolon */
-                            ast_node_t *expr = parse_expression(parser);
-                            if (expr) {
-                                ast_add_child(rule, expr);
-                            }
-                            parser_expect(parser, TOK_SEMICOLON);
-                        }
-                        
-                        ast_add_child(node, rule);
-                    } else {
-                        parser_error(parser, "Expected 'case' or 'default'");
-                        ast_free(node);
-                        return NULL;
-                    }
-                }
-                
-                parser_expect(parser, TOK_RBRACE);
-                return node;
+                return parse_switch_rules(parser, node, false);
             }
             
         /* Primitive types for class literals: boolean.class, int.class, etc. */
@@ -3193,6 +3211,69 @@ static bool statement_ends_abruptly(ast_node_t *stmt)
            stmt->type == AST_BREAK_STMT || stmt->type == AST_CONTINUE_STMT;
 }
 
+/**
+ * True if any case label of the switch whose body starts at the current token (just past its
+ * opening brace) is a pattern ("case String s", "case Point(int x, int y)"). The parser is left
+ * where it was, with its error state untouched.
+ */
+static bool switch_body_has_pattern(parser_t *parser)
+{
+    lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
+    char *saved_msg = parser->error_msg ? strdup(parser->error_msg) : NULL;
+    int saved_line = parser->error_line;
+    int saved_column = parser->error_column;
+    bool found = false;
+    int depth = 0;
+
+    while (!parser_check(parser, TOK_EOF)) {
+        token_type_t t = parser_current_type(parser);
+        if (t == TOK_LBRACE || t == TOK_LPAREN || t == TOK_LBRACKET) {
+            depth++;
+        } else if (t == TOK_RBRACE || t == TOK_RPAREN || t == TOK_RBRACKET) {
+            if (depth == 0) {
+                break;
+            }
+            depth--;
+        } else if (t == TOK_CASE && depth == 0) {
+            parser_advance(parser);
+            do {
+                ast_node_t *pattern = parse_pattern(parser);
+                if (pattern) {
+                    ast_free(pattern);
+                    found = true;
+                    break;
+                }
+                /* a constant: skip to the comma, arrow or colon that ends it */
+                int inner = 0;
+                while (!parser_check(parser, TOK_EOF)) {
+                    token_type_t u = parser_current_type(parser);
+                    if (u == TOK_LPAREN || u == TOK_LBRACKET) {
+                        inner++;
+                    } else if (u == TOK_RPAREN || u == TOK_RBRACKET) {
+                        inner--;
+                    } else if (inner == 0 && (u == TOK_COMMA || u == TOK_ARROW || u == TOK_COLON ||
+                                              u == TOK_LBRACE || u == TOK_RBRACE)) {
+                        break;
+                    }
+                    parser_advance(parser);
+                }
+            } while (parser_match(parser, TOK_COMMA));
+            if (found) {
+                break;
+            }
+            continue;
+        }
+        parser_advance(parser);
+    }
+
+    lexer_restore_pos(parser->lexer, save_pos);
+    free(parser->error_msg);
+    parser->error_msg = saved_msg;
+    parser->error_line = saved_line;
+    parser->error_column = saved_column;
+    return found;
+}
+
 static ast_node_t *parse_statement(parser_t *parser)
 {
     token_type_t tok_type = parser_current_type(parser);
@@ -3622,6 +3703,26 @@ static ast_node_t *parse_statement(parser_t *parser)
                 if (!parser_expect(parser, TOK_LBRACE)) {
                     ast_free(node);
                     return NULL;
+                }
+
+                /* A pattern label makes it a switch over types, which is generated like a switch
+                 * expression whose value is discarded. */
+                if (switch_body_has_pattern(parser)) {
+                    ast_node_t *sw = ast_new(AST_SWITCH_EXPR, line, col);
+                    sw->data.node.flags |= AST_SWITCH_IS_STATEMENT;
+                    if (expr) {
+                        ast_add_child(sw, expr);
+                    }
+                    slist_free(node->data.node.children);
+                    node->data.node.children = NULL;
+                    ast_free(node);
+                    sw = parse_switch_rules(parser, sw, true);
+                    if (!sw) {
+                        return NULL;
+                    }
+                    ast_node_t *stmt = ast_new(AST_EXPR_STMT, line, col);
+                    ast_add_child(stmt, sw);
+                    return stmt;
                 }
                 
                 /* Parse cases. A rule "case A, B -> body" is the old form with

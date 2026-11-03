@@ -23100,6 +23100,9 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
         
         case AST_SWITCH_EXPR:
             {
+                if (expr->data.node.flags & AST_SWITCH_IS_STATEMENT) {
+                    return type_void();
+                }
                 /* Switch expression type is inferred from first non-pattern case branch */
                 slist_t *children = expr->data.node.children;
                 if (children) {
@@ -31210,6 +31213,9 @@ define_local_var:
                                         case AST_EXPLICIT_CTOR_CALL:  /* this() or super() */
                                             valid_stmt = true;
                                             break;
+                                        case AST_SWITCH_EXPR:         /* a switch statement over patterns */
+                                            valid_stmt = (expr->data.node.flags & AST_SWITCH_IS_STATEMENT) != 0;
+                                            break;
                                         case AST_UNARY_EXPR:
                                             {
                                                 token_type_t op = expr->data.node.op_token;
@@ -31922,6 +31928,9 @@ define_local_var:
                     
                     case AST_SWITCH_EXPR:
                         {
+                            if (node->data.node.flags & AST_SWITCH_IS_STATEMENT) {
+                                sem->switch_depth++;    /* (a break leaves it) */
+                            }
                             /* Switch expressions require Java 14+ (preview in 12-13) */
                             if (sem->source_version < 14) {
                                 semantic_error(sem, node->line, node->column,
@@ -32358,6 +32367,11 @@ define_local_var:
                     
                     case AST_SWITCH_EXPR:
                         {
+                            if (node->data.node.flags & AST_SWITCH_IS_STATEMENT) {
+                                sem->switch_depth--;
+                                node->sem_type = type_void();
+                                break;
+                            }
                             /* The arms have all been walked: what a block yields is typed now */
                             type_t *switch_type = get_expression_type(sem, node);
                             if (switch_type && switch_type->kind != TYPE_UNKNOWN) {

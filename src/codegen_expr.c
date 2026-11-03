@@ -11405,6 +11405,39 @@ static bool codegen_constant_switch_expr(method_gen_t *mg, ast_node_t *expr, con
     return true;
 }
 
+/** An arm of a switch over patterns: its body, a statement in a switch statement. */
+static void switch_arm_body(method_gen_t *mg, ast_node_t *body, const_pool_t *cp, bool stmt_mode)
+{
+    if (stmt_mode || body->type == AST_BLOCK) {
+        mg->last_opcode = 0;
+        codegen_statement(mg, body);
+    } else {
+        codegen_expr(mg, body, cp);
+    }
+}
+
+/** True if control can go on from the end of an arm's body (it did not yield, throw or return). */
+static bool switch_arm_completes(method_gen_t *mg, ast_node_t *body, bool stmt_mode)
+{
+    if (!stmt_mode && body->type != AST_BLOCK) {
+        return true;
+    }
+    switch (mg->last_opcode) {
+        case OP_GOTO:
+        case OP_ATHROW:
+            return false;
+        case OP_RETURN:
+        case OP_IRETURN:
+        case OP_LRETURN:
+        case OP_FRETURN:
+        case OP_DRETURN:
+        case OP_ARETURN:
+            return !stmt_mode;
+        default:
+            return true;
+    }
+}
+
 /**
  * Generate code for switch expression with type patterns.
  * Uses instanceof checks instead of lookupswitch.
@@ -11449,6 +11482,12 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
     /* Track goto positions to patch at the end */
     slist_t *end_gotos = NULL;
     ast_node_t *default_rule = NULL;
+
+    /* A switch statement (its arms are statements, and it has no value) is left by a break */
+    bool stmt_mode = (expr->data.node.flags & AST_SWITCH_IS_STATEMENT) != 0;
+    if (stmt_mode) {
+        mg_push_break_scope(mg, NULL);
+    }
 
     /* A yield in a block arm is a jump to the end, patched with the others
      * below; an enclosing switch expression's own yield target is not ours. */
@@ -11518,15 +11557,10 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                 
                 /* Generate body */
                 mg_record_frame(mg);
-                if (body->type == AST_BLOCK) {
-                    mg->last_opcode = 0;
-                    codegen_statement(mg, body);
-                } else {
-                    codegen_expr(mg, body, cp);
-                }
+                switch_arm_body(mg, body, cp, stmt_mode);
                 
                 /* Jump to end (not after a block that already ended in a yield or throw) */
-                if (!(body->type == AST_BLOCK && (mg->last_opcode == OP_GOTO || mg->last_opcode == OP_ATHROW))) {
+                if (switch_arm_completes(mg, body, stmt_mode)) {
                     size_t *goto_pos = malloc(sizeof(size_t));
                     *goto_pos = mg->code->length;
                     bc_emit(mg->code, OP_GOTO);
@@ -11812,15 +11846,10 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
             mg_pop_typed(mg, 1);
             
             /* Generate body */
-            if (body->type == AST_BLOCK) {
-                mg->last_opcode = 0;
-                codegen_statement(mg, body);
-            } else {
-                codegen_expr(mg, body, cp);
-            }
+            switch_arm_body(mg, body, cp, stmt_mode);
             
             /* Jump to end (not after a block that already ended in a yield or throw) */
-            if (!(body->type == AST_BLOCK && (mg->last_opcode == OP_GOTO || mg->last_opcode == OP_ATHROW))) {
+            if (switch_arm_completes(mg, body, stmt_mode)) {
                 size_t *goto_pos = malloc(sizeof(size_t));
                 *goto_pos = mg->code->length;
                 bc_emit(mg->code, OP_GOTO);
@@ -11838,15 +11867,10 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
             mg_record_frame(mg);
         } else {
             /* Generate body */
-            if (body->type == AST_BLOCK) {
-                mg->last_opcode = 0;
-                codegen_statement(mg, body);
-            } else {
-                codegen_expr(mg, body, cp);
-            }
+            switch_arm_body(mg, body, cp, stmt_mode);
             
             /* Jump to end (not after a block that already ended in a yield or throw) */
-            if (!(body->type == AST_BLOCK && (mg->last_opcode == OP_GOTO || mg->last_opcode == OP_ATHROW))) {
+            if (switch_arm_completes(mg, body, stmt_mode)) {
                 size_t *goto_pos = malloc(sizeof(size_t));
                 *goto_pos = mg->code->length;
                 bc_emit(mg->code, OP_GOTO);
@@ -11888,12 +11912,7 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
             body = (ast_node_t *)rc->data;
         }
         if (body) {
-            if (body->type == AST_BLOCK) {
-                mg->last_opcode = 0;
-                codegen_statement(mg, body);
-            } else {
-                codegen_expr(mg, body, cp);
-            }
+            switch_arm_body(mg, body, cp, stmt_mode);
         }
     } else {
         /* No default: the switch is exhaustive, so no pattern matching is a
@@ -11918,7 +11937,9 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
         mg_pop_typed(mg, 1);
         mg->last_opcode = OP_ATHROW;
         type_t *result = expr->sem_type;
-        switch (result ? result->kind : TYPE_CLASS) {
+        switch (stmt_mode ? TYPE_VOID : result ? result->kind : TYPE_CLASS) {
+            case TYPE_VOID:
+                break;
             case TYPE_LONG:
                 mg_push_long(mg);
                 break;
@@ -11949,12 +11970,20 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
     }
     
     /* Record frame at end of switch (join point for all gotos) */
-    if (end_gotos || mg->yield_patches) {
+    bool left_by_break = stmt_mode && mg->loop_stack &&
+        ((loop_context_t *)mg->loop_stack->data)->break_offsets;
+    if (end_gotos || mg->yield_patches || left_by_break) {
         mg_record_frame(mg);
+        if (stmt_mode) {
+            mg->last_opcode = 0;
+        }
     }
     
     /* Patch all end gotos */
     size_t end_pos = mg->code->length;
+    if (stmt_mode) {
+        mg_pop_loop(mg, end_pos);
+    }
     for (slist_t *g = end_gotos; g; g = g->next) {
         size_t *pos = (size_t *)g->data;
         uint16_t offset = (uint16_t)(end_pos - *pos);
