@@ -11405,6 +11405,25 @@ static bool codegen_constant_switch_expr(method_gen_t *mg, ast_node_t *expr, con
     return true;
 }
 
+/** True if one of a switch's rules has "case null" among its labels. */
+static bool switch_has_null_label(slist_t *rules)
+{
+    for (slist_t *r = rules; r; r = r->next) {
+        ast_node_t *rule = (ast_node_t *)r->data;
+        if (rule->type != AST_SWITCH_RULE) {
+            continue;
+        }
+        for (slist_t *rc = rule->data.node.children; rc; rc = rc->next) {
+            ast_node_t *child = (ast_node_t *)rc->data;
+            /* (a "null" that is the last child is the rule's body, "case P -> null") */
+            if (child->type == AST_LITERAL && child->data.leaf.token_type == TOK_NULL && rc->next) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 /** An arm of a switch over patterns: its body, a statement in a switch statement. */
 static void switch_arm_body(method_gen_t *mg, ast_node_t *body, const_pool_t *cp, bool stmt_mode)
 {
@@ -11482,6 +11501,19 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
     /* Track goto positions to patch at the end */
     slist_t *end_gotos = NULL;
     ast_node_t *default_rule = NULL;
+
+    /* A null selector is a NullPointerException unless a label is "case null" (JLS 14.11.3) */
+    if (!switch_has_null_label(children->next)) {
+        bc_emit(mg->code, OP_ALOAD);
+        bc_emit_u1(mg->code, (uint8_t)selector_slot);
+        mg_push(mg, 1);
+        uint16_t require_non_null = cp_add_methodref(cp, "java/util/Objects", "requireNonNull",
+                                                     "(Ljava/lang/Object;)Ljava/lang/Object;");
+        bc_emit(mg->code, OP_INVOKESTATIC);
+        bc_emit_u2(mg->code, require_non_null);
+        bc_emit(mg->code, OP_POP);
+        mg_pop_typed(mg, 1);
+    }
 
     /* A switch statement (its arms are statements, and it has no value) is left by a break */
     bool stmt_mode = (expr->data.node.flags & AST_SWITCH_IS_STATEMENT) != 0;
