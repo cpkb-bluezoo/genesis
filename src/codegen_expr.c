@@ -1782,6 +1782,13 @@ static bool codegen_identifier(method_gen_t *mg, ast_node_t *ident)
             if (mg->class_gen && mg->class_gen->class_sym) {
                 symbol_t *search = mg->class_gen->class_sym->data.class_data.superclass;
                 while (search) {
+                    /* (a superclass that is only a classfile has no members until it is loaded) */
+                    if (!search->data.class_data.members && search->qualified_name) {
+                        symbol_t *loaded = load_external_class(mg->class_gen->sem, search->qualified_name);
+                        if (loaded && loaded->data.class_data.members) {
+                            search = loaded;
+                        }
+                    }
                     if (search->data.class_data.members &&
                         scope_lookup_local(search->data.class_data.members, name) == field_sym) {
                         field_class = search;

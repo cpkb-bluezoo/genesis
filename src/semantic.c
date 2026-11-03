@@ -19415,6 +19415,12 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             if (!sym && sem->current_class) {
                                 symbol_t *search_class = sem->current_class->data.class_data.superclass;
                                 while (search_class && !sym) {
+                                    if (!search_class->data.class_data.members && search_class->qualified_name) {
+                                        symbol_t *loaded = load_external_class(sem, search_class->qualified_name);
+                                        if (loaded && loaded->data.class_data.members) {
+                                            search_class = loaded;
+                                        }
+                                    }
                                     if (search_class->data.class_data.members) {
                                         sym = scope_lookup_local(
                                             search_class->data.class_data.members, recv_name);
