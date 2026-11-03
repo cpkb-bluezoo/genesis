@@ -679,6 +679,24 @@ else
 fi
 
 # The library is compiled with javac, as a dependency JAR would be.
+printf "%-30s ... " "InheritedMethodRefResultChain"
+imr_lib="$TEST_BUILD/valuechainlib-lib"
+imr_out="$TEST_BUILD/valuechainlib-out"
+rm -rf "$imr_lib" "$imr_out"
+mkdir -p "$imr_lib" "$imr_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$imr_lib" "$TEST_SRC"/external/valuechainlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$imr_lib" -d "$imr_out" \
+       "$TEST_SRC/external/InheritedMethodRefResultChainTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$imr_out:$imr_lib" InheritedMethodRefResultChainTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+# The library is compiled with javac, as a dependency JAR would be.
 printf "%-30s ... " "StaticFieldAndMethodSameName"
 sfm_lib="$TEST_BUILD/staticfieldmethodlib-lib"
 sfm_out="$TEST_BUILD/staticfieldmethodlib-out"

@@ -20764,7 +20764,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 if (bound_recv && bound_recv->kind == TYPE_CLASS && bound_recv->data.class_type.type_args) {
                                     symbol_t *own_owner = g_own_type_vars_of;
                                     g_own_type_vars_of = referred;
-                                    type_t *seen = substitute_from_receiver(referred->type, bound_recv);
+                                    type_t *seen = substitute_from_receiver(referred->type,
+                                        receiver_for_method(sem, bound_recv, referred));
                                     g_own_type_vars_of = own_owner;
                                     if (seen && seen->kind != TYPE_TYPEVAR && seen->kind != TYPE_WILDCARD) {
                                         produced = seen;
@@ -20805,7 +20806,9 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                         referred->type->kind != TYPE_VOID) {
                                         symbol_t *own_owner = g_own_type_vars_of;
                                         g_own_type_vars_of = referred;
-                                        type_t *seen = substitute_from_receiver(referred->type, recv_declared);
+                                        /* (a method the type inherits is written in its declaring type's variables) */
+                                        type_t *seen = substitute_from_receiver(referred->type,
+                                            receiver_for_method(sem, recv_declared, referred));
                                         g_own_type_vars_of = own_owner;
                                         if (seen && seen->kind != TYPE_TYPEVAR && seen->kind != TYPE_WILDCARD) {
                                             produced = seen;
