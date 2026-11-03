@@ -11137,6 +11137,38 @@ void resolve_types_in_compilation_unit(ast_node_t *ast, classpath_t *classpath,
 }
 
 /**
+ * The static field "name" of a class or interface, declared there or inherited from a superclass or
+ * superinterface (a static import names the members the type has, JLS 7.5.3).
+ */
+static symbol_t *static_field_of_type(semantic_t *sem, symbol_t *cls, const char *name, int depth)
+{
+    if (!cls || depth > 16) {
+        return NULL;
+    }
+    if (!cls->data.class_data.members && cls->qualified_name) {
+        symbol_t *loaded = load_external_class(sem, cls->qualified_name);
+        if (loaded) {
+            cls = loaded;
+        }
+    }
+    if (cls->data.class_data.members) {
+        symbol_t *field = scope_lookup_local(cls->data.class_data.members, name);
+        if (field && field->kind == SYM_FIELD && (field->modifiers & MOD_STATIC)) {
+            return field;
+        }
+    }
+    symbol_t *up = cls->data.class_data.superclass;
+    if (!up && cls->data.class_data.unresolved_superclass) {
+        up = load_external_class(sem, cls->data.class_data.unresolved_superclass);
+    }
+    symbol_t *found = static_field_of_type(sem, up, name, depth + 1);
+    for (slist_t *i = cls->data.class_data.interfaces; i && !found; i = i->next) {
+        found = static_field_of_type(sem, (symbol_t *)i->data, name, depth + 1);
+    }
+    return found;
+}
+
+/**
  * Resolve a static import for a field.
  * Returns the class symbol and sets *field_sym if found.
  * 
@@ -11175,8 +11207,8 @@ static symbol_t *resolve_static_import_field(semantic_t *sem, const char *field_
             symbol_t *class_sym = load_external_class(sem, class_name);
             if (class_sym && class_sym->data.class_data.members) {
                 /* Look for static field with matching name */
-                symbol_t *field = scope_lookup_local(class_sym->data.class_data.members, field_name);
-                if (field && field->kind == SYM_FIELD && (field->modifiers & MOD_STATIC)) {
+                symbol_t *field = static_field_of_type(sem, class_sym, field_name, 0);
+                if (field) {
                     if (field_sym) {
                         *field_sym = field;
                     }
@@ -11197,8 +11229,8 @@ static symbol_t *resolve_static_import_field(semantic_t *sem, const char *field_
                     /* Load the class */
                     symbol_t *class_sym = load_external_class(sem, class_name);
                     if (class_sym && class_sym->data.class_data.members) {
-                        symbol_t *field = scope_lookup_local(class_sym->data.class_data.members, field_name);
-                        if (field && field->kind == SYM_FIELD && (field->modifiers & MOD_STATIC)) {
+                        symbol_t *field = static_field_of_type(sem, class_sym, field_name, 0);
+                        if (field) {
                             if (field_sym) {
                                 *field_sym = field;
                             }
