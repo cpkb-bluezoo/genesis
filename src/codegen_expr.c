@@ -11571,6 +11571,8 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                        child->data.leaf.token_type == TOK_NULL && rc->next) {
                 /* null pattern - check for null (a "null" that is the last
                  * child is the rule's body, "case P -> null") */
+                stackmap_state_t *null_entry_state = mg->stackmap ? stackmap_save_state(mg->stackmap) : NULL;
+                uint16_t null_saved_slot = mg->next_slot;
                 bc_emit(mg->code, OP_ALOAD);
                 bc_emit_u1(mg->code, (uint8_t)selector_slot);
                 mg_push(mg, 1);
@@ -11604,9 +11606,15 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                     }
                 }
                 
-                /* Patch ifnonnull */
+                /* Patch ifnonnull. The next label is reached from the test alone: with the state
+                 * from before the body, which left its value on the stack and may have declared locals. */
                 uint16_t skip_offset = (uint16_t)(mg->code->length - ifnonnull_pos);
                 bc_patch_u2(mg->code, ifnonnull_pos + 1, skip_offset);
+                mg->next_slot = null_saved_slot;
+                if (null_entry_state && mg->stackmap) {
+                    stackmap_restore_state(mg->stackmap, null_entry_state);
+                }
+                stackmap_state_free(null_entry_state);
                 mg_record_frame(mg);
                 
                 continue;

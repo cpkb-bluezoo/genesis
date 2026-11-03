@@ -1278,6 +1278,11 @@ static ast_node_t *parse_switch_rules(parser_t *parser, ast_node_t *node, bool a
                         parser_advance(parser);
                         ast_add_child(rule, null_lit);
                     }
+                    /* "case null, default": the default arm, which null selects too */
+                    else if (parser_check(parser, TOK_DEFAULT)) {
+                        parser_advance(parser);
+                        rule->data.node.name = (char *)intern("default");
+                    }
                     /* Try to parse as a pattern (type, unnamed, record) */
                     else if (parser_check(parser, TOK_IDENTIFIER)) {
                         ast_node_t *pattern = parse_pattern(parser);
