@@ -18394,8 +18394,12 @@ static type_t *var_decl_statement_local_type(semantic_t *sem, ast_node_t *stmt, 
     }
     slist_t *ch = stmt->data.node.children;
     ast_node_t *type_node = ch ? (ast_node_t *)ch->data : NULL;
-    type_t *decl_type = type_node ? type_node->sem_type : NULL;
-    if (!decl_type && type_node && sem) {
+    /* ("var" has no type of its own: the local takes its initializer's, once that is known) */
+    bool is_var = type_node && (type_node->type == AST_VAR_TYPE ||
+        (type_node->type == AST_CLASS_TYPE && type_node->data.node.name &&
+         strcmp(type_node->data.node.name, "var") == 0));
+    type_t *decl_type = is_var ? NULL : type_node ? type_node->sem_type : NULL;
+    if (!decl_type && !is_var && type_node && sem) {
         decl_type = semantic_resolve_type(sem, type_node);
     }
     for (slist_t *c = ch ? ch->next : NULL; c; c = c->next) {
