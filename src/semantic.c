@@ -18691,8 +18691,11 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                                  sem->classpath, sem->current_class);
                     }
                     
-                    /* Store the type on the expression for codegen */
-                    expr->sem_symbol = sym;
+                    /* Store the type on the expression for codegen (not the symbol of a probe
+                     * scope, which is freed before the expression is generated) */
+                    if (!(sym->scope && sym->scope->is_probe)) {
+                        expr->sem_symbol = sym;
+                    }
                     expr->sem_type = sym->type;
                     return sym->type;
                 }
@@ -26565,6 +26568,7 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                          * analysed in full later): stand-ins for them go in a scope of its own,
                          * for the return expressions to be typed against. */
                         scope_t *probe_scope = scope_new(SCOPE_BLOCK, lambda_scope);
+                        probe_scope->is_probe = true;
                         sem->current_scope = probe_scope;
                         declare_block_locals_for_probe(sem, body, probe_scope);
                         slist_t *returns = NULL;
@@ -27571,10 +27575,29 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
         
         /* First, try to resolve as a variable (for bound method references) */
         symbol_t *var_sym = scope_lookup(sem->current_scope, name);
+        /* A field the class inherits ("session::associate"): not in the scope chain, but a
+         * variable all the same, and it hides a type of that name (JLS 6.4.2) */
+        type_t *inherited_type = NULL;
+        if (!(var_sym && (var_sym->kind == SYM_LOCAL_VAR || var_sym->kind == SYM_PARAMETER ||
+                          var_sym->kind == SYM_FIELD)) &&
+            !is_constructor && name) {
+            /* (the parser reads a bare name as a type; read it as the variable it may be) */
+            ast_node_t *probe = ast_new_leaf(AST_IDENTIFIER, name, ref->line, ref->column);
+            type_t *seen = get_expression_type(sem, probe);
+            if (probe->sem_symbol && probe->sem_symbol->kind == SYM_FIELD &&
+                seen && seen->kind == TYPE_CLASS) {
+                var_sym = probe->sem_symbol;
+                inherited_type = seen;
+                /* codegen pushes the receiver by generating the target, which must be the
+                 * field read and not the type the parser took the name for */
+                ref->data.node.children->data = probe;
+                target_node = probe;
+            }
+        }
         if (var_sym && (var_sym->kind == SYM_LOCAL_VAR || var_sym->kind == SYM_PARAMETER ||
                         var_sym->kind == SYM_FIELD)) {
             /* This is a bound method reference like instance::method */
-            target_class_type = var_sym->type;
+            target_class_type = inherited_type ? inherited_type : var_sym->type;
             if (target_class_type && target_class_type->kind == TYPE_TYPEVAR) {
                 /* A variable of a type variable has the members of its bound */
                 target_class_type = target_class_type->data.type_var.bound ?

@@ -835,6 +835,8 @@ struct scope
     scope_t *parent;            /* Enclosing scope */
     hashtable_t *symbols;       /* name -> symbol_t* */
     symbol_t *owner;            /* For class/method scopes, the owning symbol */
+    bool is_probe;              /* Holds stand-ins only, freed once an expression is typed against
+                                 * it: no AST node may keep a pointer to one of its symbols */
 };
 
 scope_t *scope_new(scope_type_t type, scope_t *parent);
