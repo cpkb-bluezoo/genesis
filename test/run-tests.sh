@@ -3043,6 +3043,24 @@ else
     failed=$((failed + 1))
 fi
 
+# The library is compiled with javac, as a dependency JAR would be.
+printf "%-30s ... " "MethodRefResultAsReceiver"
+mrr_lib="$TEST_BUILD/eitherchainlib-lib"
+mrr_out="$TEST_BUILD/eitherchainlib-out"
+rm -rf "$mrr_lib" "$mrr_out"
+mkdir -p "$mrr_lib" "$mrr_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$mrr_lib" "$TEST_SRC"/external/eitherchainlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$mrr_lib" -d "$mrr_out" \
+       "$TEST_SRC/external/MethodRefResultAsReceiverTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$mrr_out:$mrr_lib" MethodRefResultAsReceiverTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

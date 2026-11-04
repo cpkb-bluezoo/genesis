@@ -20911,6 +20911,11 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                         recv_declared->data.wildcard.bound) {
                                         recv_declared = recv_declared->data.wildcard.bound;   /* ? super T */
                                     }
+                                    /* (a receiver type taken from another method's result is a bare name until
+                                     * its class is loaded, and its variables are read from the class) */
+                                    if (recv_declared && recv_declared->kind == TYPE_CLASS) {
+                                        ensure_type_symbol_loaded(sem, recv_declared);
+                                    }
                                     /* What the method returns, in the terms of the receiver the functional
                                      * interface hands it: Map.Entry::getKey on an Entry<String, V> is a String */
                                     if (recv_declared && recv_declared->kind == TYPE_CLASS &&
