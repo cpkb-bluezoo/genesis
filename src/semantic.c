@@ -20926,6 +20926,32 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                             produced = seen;
                                         }
                                     }
+                                    /* "toMap(Map.Entry::getKey, ...)": the receiver the interface hands the
+                                     * reference is the method's own T, which the context the call is an
+                                     * argument of fixes (Collector<? super Entry<String, V>, A, R>) */
+                                    if (recv_declared && recv_declared->kind == TYPE_TYPEVAR &&
+                                        recv_declared->data.type_var.name && !produced &&
+                                        sem->target_type && sem->target_type->kind == TYPE_CLASS &&
+                                        sem->target_type->data.class_type.type_args && found_method->type) {
+                                        type_t *context_recv = infer_type_arg(found_method->type, sem->target_type,
+                                                                              recv_declared->data.type_var.name);
+                                        if (context_recv && context_recv->kind == TYPE_WILDCARD &&
+                                            context_recv->data.wildcard.bound) {
+                                            context_recv = context_recv->data.wildcard.bound;
+                                        }
+                                        if (context_recv && context_recv->kind == TYPE_CLASS &&
+                                            context_recv->data.class_type.type_args && referred->type &&
+                                            referred->type->kind != TYPE_VOID) {
+                                            symbol_t *own_owner = g_own_type_vars_of;
+                                            g_own_type_vars_of = referred;
+                                            type_t *seen = substitute_from_receiver(referred->type,
+                                                receiver_for_method(sem, context_recv, referred));
+                                            g_own_type_vars_of = own_owner;
+                                            if (seen && seen->kind != TYPE_TYPEVAR && seen->kind != TYPE_WILDCARD) {
+                                                produced = seen;
+                                            }
+                                        }
+                                    }
                                     if (recv_declared && recv_declared->kind == TYPE_TYPEVAR &&
                                         recv_declared->data.type_var.name) {
                                         for (int tpi = 0; tpi < n_type_params; tpi++) {
