@@ -5359,12 +5359,34 @@ static void ensure_class_implements_prescanned(semantic_t *sem, symbol_t *sym)
 }
 
 /**
+ * Of two methods a class inherits with the same signature from different
+ * interfaces ("LeafBuilder extends MidBuilder, Maker<LeafBuilder, Leaf>", each
+ * declaring build()), the one whose return type, as the receiver sees it, is
+ * the subtype of the other's (JLS 8.4.8.4, 15.12.2.5): the order the interfaces
+ * are written in must not decide. "best" wins unless "cand" is strictly narrower.
+ */
+static symbol_t *narrower_inherited_return(semantic_t *sem, type_t *recv_type,
+                                           symbol_t *best, symbol_t *cand)
+{
+    if (!best || !recv_type || !cand || cand == best || !best->type || !cand->type) {
+        return best ? best : cand;
+    }
+    type_t *best_ret = substitute_from_receiver(best->type, receiver_for_method(sem, recv_type, best));
+    type_t *cand_ret = substitute_from_receiver(cand->type, receiver_for_method(sem, recv_type, cand));
+    if (best_ret && cand_ret && best_ret->kind == TYPE_CLASS && cand_ret->kind == TYPE_CLASS &&
+        type_assignable(best_ret, cand_ret) && !type_assignable(cand_ret, best_ret)) {
+        return cand;
+    }
+    return best;
+}
+
+/**
  * Recursively look up a method in an interface hierarchy.
  * Checks the interface and all its super-interfaces.
  */
 static symbol_t *lookup_method_in_interfaces_ex(semantic_t *sem, symbol_t *class_sym,
                                                  const char *method_name,
-                                                 slist_t *args, bool typed)
+                                                 slist_t *args, bool typed, type_t *recv_type)
 {
     ensure_class_implements_prescanned(sem, class_sym);
 
@@ -5392,6 +5414,10 @@ static symbol_t *lookup_method_in_interfaces_ex(semantic_t *sem, symbol_t *class
         }
     }
     
+    /* With a receiver type every interface is searched and the narrowest return wins;
+     * without one the first method found is the answer. */
+    symbol_t *best = NULL;
+
     /* Check the interfaces of this class/interface */
     slist_t *interfaces = class_sym->data.class_data.interfaces;
     for (slist_t *iface_node = interfaces; iface_node; iface_node = iface_node->next) {
@@ -5433,7 +5459,11 @@ static symbol_t *lookup_method_in_interfaces_ex(semantic_t *sem, symbol_t *class
             symbol_t *method = typed ? scope_lookup_method_with_types(sem, iface->data.class_data.members, method_name, args)
                                 : scope_lookup_method(iface->data.class_data.members, method_name);
             if (method && method->kind == SYM_METHOD) {
-                return method;
+                if (!recv_type) {
+                    return method;
+                }
+                best = narrower_inherited_return(sem, recv_type, best, method);
+                continue;
             }
         } else if (iface->qualified_name) {
             /* Interface has no members loaded - try to fully load it */
@@ -5445,15 +5475,22 @@ static symbol_t *lookup_method_in_interfaces_ex(semantic_t *sem, symbol_t *class
                 symbol_t *method = typed ? scope_lookup_method_with_types(sem, loaded->data.class_data.members, method_name, args)
                                     : scope_lookup_method(loaded->data.class_data.members, method_name);
                 if (method && method->kind == SYM_METHOD) {
-                    return method;
+                    if (!recv_type) {
+                        return method;
+                    }
+                    best = narrower_inherited_return(sem, recv_type, best, method);
+                    continue;
                 }
             }
         }
         
         /* Recursively check super-interfaces */
-        symbol_t *method = lookup_method_in_interfaces_ex(sem, iface, method_name, args, typed);
+        symbol_t *method = lookup_method_in_interfaces_ex(sem, iface, method_name, args, typed, recv_type);
         if (method) {
-            return method;
+            if (!recv_type) {
+                return method;
+            }
+            best = narrower_inherited_return(sem, recv_type, best, method);
         }
     }
     
@@ -5462,19 +5499,19 @@ static symbol_t *lookup_method_in_interfaces_ex(semantic_t *sem, symbol_t *class
      * E.g., SNIKeyManager extends X509ExtendedKeyManager implements X509KeyManager */
     if (class_sym->data.class_data.superclass) {
         symbol_t *method = lookup_method_in_interfaces_ex(sem,
-            class_sym->data.class_data.superclass, method_name, args, typed);
+            class_sym->data.class_data.superclass, method_name, args, typed, recv_type);
         if (method) {
-            return method;
+            best = narrower_inherited_return(sem, recv_type, best, method);
         }
     }
     
-    return NULL;
+    return best;
 }
 
 static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sym,
                                               const char *method_name)
 {
-    return lookup_method_in_interfaces_ex(sem, class_sym, method_name, NULL, false);
+    return lookup_method_in_interfaces_ex(sem, class_sym, method_name, NULL, false, NULL);
 }
 
 /**
@@ -5485,13 +5522,14 @@ static symbol_t *lookup_method_in_interfaces(semantic_t *sem, symbol_t *class_sy
  * no overload fits.
  */
 static symbol_t *lookup_method_in_interfaces_for_args(semantic_t *sem, symbol_t *class_sym,
-                                                       const char *method_name, slist_t *args)
+                                                       const char *method_name, slist_t *args,
+                                                       type_t *recv_type)
 {
-    symbol_t *m = lookup_method_in_interfaces_ex(sem, class_sym, method_name, args, true);
+    symbol_t *m = lookup_method_in_interfaces_ex(sem, class_sym, method_name, args, true, recv_type);
     if (m && m->kind == SYM_METHOD) {
         return m;
     }
-    return lookup_method_in_interfaces_ex(sem, class_sym, method_name, NULL, false);
+    return lookup_method_in_interfaces_ex(sem, class_sym, method_name, NULL, false, NULL);
 }
 
 /* ========================================================================
@@ -19701,7 +19739,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     
                                     /* Check interface hierarchy */
                                     if (!method || method->kind != SYM_METHOD) {
-                                        method = lookup_method_in_interfaces_for_args(sem, recv_class, method_name, args);
+                                        method = lookup_method_in_interfaces_for_args(sem, recv_class, method_name, args, recv_type_for_subst);
                                     }
                                     
                                     /* For enums, also check java.lang.Enum explicitly */
@@ -19990,7 +20028,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             if (recv_class && (!method || method->kind != SYM_METHOD)) {
                                 /* For interface methods, use the receiver's superclass_type if available 
                                  * and it has type arguments for substitution */
-                                method = lookup_method_in_interfaces_for_args(sem, recv_class, method_name, args);
+                                method = lookup_method_in_interfaces_for_args(sem, recv_class, method_name, args, recv_type_for_subst);
                                 if (method && method->kind == SYM_METHOD && 
                                     recv_class->data.class_data.superclass_type &&
                                     recv_class->data.class_data.superclass_type->kind == TYPE_CLASS &&
@@ -20179,7 +20217,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 }
                                 /* Also check superinterfaces recursively */
                                 if (!found_method && iface_sym) {
-                                    found_method = lookup_method_in_interfaces_for_args(sem, iface_sym, method_name, method_args);
+                                    found_method = lookup_method_in_interfaces_for_args(sem, iface_sym, method_name, method_args, NULL);
                                 }
                             }
                             check_class = check_class->data.class_data.superclass;

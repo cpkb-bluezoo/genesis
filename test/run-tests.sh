@@ -3025,6 +3025,24 @@ else
     failed=$((failed + 1))
 fi
 
+# The library is compiled with javac, as a dependency JAR would be.
+printf "%-30s ... " "InheritedBuildMoreSpecific"
+ib_lib="$TEST_BUILD/inheritedbuildlib-lib"
+ib_out="$TEST_BUILD/inheritedbuildlib-out"
+rm -rf "$ib_lib" "$ib_out"
+mkdir -p "$ib_lib" "$ib_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$JAVAC" -d "$ib_lib" "$TEST_SRC"/external/inheritedbuildlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -cp "$ib_lib" -d "$ib_out" \
+       "$TEST_SRC/external/InheritedBuildTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$ib_out:$ib_lib" InheritedBuildTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]
