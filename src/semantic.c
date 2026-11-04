@@ -27015,6 +27015,46 @@ static bool mref_desugar_to_lambda_call(semantic_t *sem, ast_node_t *ref, type_t
 }
 
 /**
+ * True when the type arguments written on a method reference ("Outcome::<String, Exception>ok")
+ * make the method inapplicable to the argument types the functional interface passes.
+ */
+static bool mref_explicit_type_args_reject(semantic_t *sem, ast_node_t *ref, symbol_t *method,
+                                           type_t **ptypes, int nptypes)
+{
+    ast_node_t *written = ref->data.node.extra;
+    if (!written || written->type != AST_TYPE_ARGS || !method || method->kind != SYM_METHOD || !ptypes) {
+        return false;
+    }
+    ensure_method_type_params(method);
+    int i = 0;
+    for (slist_t *p = method->data.method_data.parameters; p && i < nptypes; p = p->next, i++) {
+        symbol_t *ps = (symbol_t *)p->data;
+        type_t *param = ps ? ps->type : NULL;
+        type_t *given = ptypes[i];
+        if (!param || !given || given->kind != TYPE_CLASS || (ps->modifiers & MOD_VARARGS)) {
+            continue;
+        }
+        slist_t *arg_node = written->data.node.children;
+        for (slist_t *tp = method->data.method_data.type_params; tp && arg_node;
+             tp = tp->next, arg_node = arg_node->next) {
+            symbol_t *tps = (symbol_t *)tp->data;
+            type_t *arg = semantic_resolve_type(sem, (ast_node_t *)arg_node->data);
+            if (tps && tps->name && arg && arg->kind != TYPE_UNKNOWN) {
+                param = substitute_type_var(param, tps->name, arg);
+            }
+        }
+        if (param->kind == TYPE_CLASS && param->data.class_type.name) {
+            ensure_type_symbol_loaded(sem, param);
+            ensure_type_symbol_loaded(sem, given);
+            if (!type_assignable(param, given)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
  * The method a method reference names among overloads: of the methods called name that take
  * arity parameters (static ones only, or instance ones only, or either: want_static is 1, 0,
  * -1), the one whose parameter types suit the types the functional interface passes
@@ -27996,6 +28036,13 @@ static bool bind_method_ref_to_target_type(semantic_t *sem, ast_node_t *ref, typ
                     /* First try to find static method with exact SAM param count */
                     resolved_method = mref_lookup(sem, target_class_sym->data.class_data.members,
                                                   method_name, sam_param_count, sam_ptypes, sam_pcount, 1);
+                    /* "Outcome::<String, Exception>ok": the type arguments written fix the static
+                     * method's variables, and with them it may take no argument the interface passes
+                     * (JLS 15.13.1), which leaves the instance method the first one is the receiver of */
+                    if (resolved_method && mref_explicit_type_args_reject(sem, ref, resolved_method,
+                                                                          sam_ptypes, sam_pcount)) {
+                        resolved_method = NULL;
+                    }
                     if (!resolved_method && sam_param_count > 0) {
                         /* An instance method of the type, the first argument its receiver */
                         resolved_method = mref_lookup(sem, target_class_sym->data.class_data.members,
@@ -28523,6 +28570,11 @@ static bool mref_applicable_to_functional_param(semantic_t *sem, ast_node_t *ref
     ensure_type_symbol_loaded(sem, expected);
     ensure_type_symbol_loaded(sem, actual);
     if (type_assignable(expected, actual)) {
+        return true;
+    }
+    /* Declaring-type type params (Optional.get() -> T) are fixed by inference at the call, so
+     * nothing is known yet to reject the reference by. */
+    if (actual->kind == TYPE_TYPEVAR) {
         return true;
     }
     if (fi_sam_return_is_extends_wildcard(fi_type, iface, sam, expected)) {
