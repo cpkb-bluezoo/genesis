@@ -17456,6 +17456,29 @@ static void collect_ancestor_symbols(symbol_t *sym, slist_t **out)
     }
 }
 
+/** True if "sym" is a proper descendant of "ancestor" (compared by name, as below). */
+static bool ancestor_symbol_extends(symbol_t *sym, symbol_t *ancestor)
+{
+    const char *want = ancestor->qualified_name ? ancestor->qualified_name : ancestor->name;
+    if (!want) {
+        return false;
+    }
+    slist_t *all = NULL;
+    collect_ancestor_symbols(sym, &all);
+    bool found = false;
+    for (slist_t *n = all; n; ) {
+        symbol_t *a = (symbol_t *)n->data;
+        const char *name = a->qualified_name ? a->qualified_name : a->name;
+        if (a != sym && name && strcmp(name, want) == 0) {
+            found = true;
+        }
+        slist_t *next = n->next;
+        free(n);
+        n = next;
+    }
+    return found;
+}
+
 /**
  * Find a common ancestor (class or interface) of two class symbols - a
  * simplified least-upper-bound: not necessarily the single most-specific
@@ -17495,7 +17518,7 @@ static symbol_t *find_common_ancestor_symbol(symbol_t *a, symbol_t *b)
      * ancestor" case instead of finding one. */
     symbol_t *result = NULL;
     symbol_t *object_ancestor = NULL;
-    for (slist_t *an = a_ancestors; an && !result; an = an->next) {
+    for (slist_t *an = a_ancestors; an; an = an->next) {
         symbol_t *candidate = (symbol_t *)an->data;
         const char *candidate_name = candidate->qualified_name ? candidate->qualified_name : candidate->name;
         if (!candidate_name) {
@@ -17509,7 +17532,10 @@ static symbol_t *find_common_ancestor_symbol(symbol_t *a, symbol_t *b)
                  * implement is the better answer ("flag ? new Default() : NoOp.INSTANCE") */
                 if (strcmp(candidate_name, "java.lang.Object") == 0) {
                     object_ancestor = candidate;
-                } else {
+                } else if (!result || ancestor_symbol_extends(candidate, result)) {
+                    /* the narrowest of the common ancestors (JLS 4.10.4): a common
+                     * superclass that itself implements a common interface is the
+                     * better answer than that interface, whatever order they were found in */
                     result = candidate;
                 }
                 break;
