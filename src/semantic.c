@@ -18414,6 +18414,51 @@ static type_t *diamond_instantiation_type(semantic_t *sem, ast_node_t *type_node
     return diamond;
 }
 
+/**
+ * The type of "new Pair<>(a, b)" when nothing else (a target type) fixes the class's variables:
+ * each is what the arguments at the constructor's parameters of that variable make of it. The
+ * raw type if any of them is left open.
+ */
+static type_t *diamond_type_from_arguments(semantic_t *sem, type_t *raw, symbol_t *ctor, slist_t *args)
+{
+    symbol_t *cls = raw->data.class_type.symbol;
+    if (!cls || !cls->data.class_data.type_params || !ctor->data.method_data.parameters) {
+        return raw;
+    }
+    type_t *result = type_new_class(raw->data.class_type.name);
+    result->data.class_type.symbol = cls;
+    for (slist_t *tp = cls->data.class_data.type_params; tp; tp = tp->next) {
+        symbol_t *tps = (symbol_t *)tp->data;
+        type_t *fixed = NULL;
+        slist_t *pj = ctor->data.method_data.parameters;
+        for (slist_t *aj = args; aj && pj && !fixed; aj = aj->next, pj = pj->next) {
+            ast_node_t *arg = (ast_node_t *)aj->data;
+            symbol_t *param = (symbol_t *)pj->data;
+            if (!arg || !param || !param->type || !tps || !tps->name ||
+                arg->type == AST_LAMBDA_EXPR || arg->type == AST_METHOD_REF ||
+                is_poly_functional_expr(arg)) {
+                continue;
+            }
+            type_t *arg_type = get_expression_type(sem, arg);
+            if (arg_type && arg_type->kind != TYPE_UNKNOWN && arg_type->kind != TYPE_NULL) {
+                fixed = infer_type_arg_from_expression(sem, param->type, arg, arg_type, tps->name);
+            }
+        }
+        if (!fixed) {
+            return raw;
+        }
+        if (fixed->kind != TYPE_CLASS && fixed->kind != TYPE_ARRAY && fixed->kind != TYPE_TYPEVAR) {
+            fixed = type_boxed(fixed);
+        }
+        if (!result->data.class_type.type_args) {
+            result->data.class_type.type_args = slist_new(fixed);
+        } else {
+            slist_append(result->data.class_type.type_args, fixed);
+        }
+    }
+    return result;
+}
+
 static void reinfer_anonymous_diamond_super(semantic_t *sem, ast_node_t *new_expr, type_t *target)
 {
     if (!sem || !new_expr || new_expr->type != AST_NEW_OBJECT || !target) {
@@ -23075,6 +23120,15 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                     }
                 }
                 
+                /* "new Pair<>(a, b)" with no target type: the class's variables are what the
+                 * constructor's arguments say they are (JLS 15.9.3, 18.5.2) */
+                if (ctor && type_node && (type_node->data.node.flags & 0x1000) && base_type &&
+                    base_type->kind == TYPE_CLASS && !base_type->data.class_type.type_args &&
+                    base_type->data.class_type.symbol && !anon_body) {
+                    base_type = diamond_type_from_arguments(sem, base_type, ctor, args);
+                    type_node->sem_type = base_type;
+                }
+
                 if (args) {
                     slist_free(args);
                 }
