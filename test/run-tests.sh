@@ -3062,5 +3062,34 @@ else
 fi
 
 echo
+echo "--- A batch large enough for worker processes, with threads kept out of the front end ---"
+# GENESIS_DEBUG_SERIAL_FRONTEND parses and qualifies on the main thread, so
+# that no thread has existed in the process before it forks its workers.
+# The classes must come out the same as they do with the threaded front end.
+printf "%-30s ... " "SerialFrontendWorkers"
+sf_src="$TEST_BUILD/serialfrontend-src"
+sf_thr="$TEST_BUILD/serialfrontend-threaded"
+sf_ser="$TEST_BUILD/serialfrontend-serial"
+rm -rf "$sf_src" "$sf_thr" "$sf_ser"
+mkdir -p "$sf_src" "$sf_thr" "$sf_ser"
+n=0
+while [ $n -lt 40 ]; do
+    printf 'public class SerialFrontend%d {\n    int next(int x) { return x + SerialFrontend%d.K; }\n    static final int K = %d;\n}\n' \
+        $n $n $n > "$sf_src/SerialFrontend$n.java"
+    n=$((n + 1))
+done
+sf_log=$(GENESIS_DEBUG_SERIAL_FRONTEND=1 "$GENESIS" -verbose -j4 -d "$sf_ser" "$sf_src"/*.java 2>&1)
+if "$GENESIS" -j4 -d "$sf_thr" "$sf_src"/*.java >/dev/null 2>&1 &&
+   echo "$sf_log" | grep -q "main thread" &&
+   diff -r "$sf_thr" "$sf_ser" >/dev/null 2>&1 &&
+   [ "$(find "$sf_ser" -name '*.class' | wc -l)" -eq 40 ]; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

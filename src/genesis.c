@@ -2623,11 +2623,19 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
     counter_init(&parse_state.next_index);
     
     pthread_t *threads = malloc(thread_count * sizeof(pthread_t));
-    for (i = 0; i < thread_count; i++) {
-        pthread_create(&threads[i], &attr, parse_phase_worker, &parse_state);
-    }
-    for (i = 0; i < thread_count; i++) {
-        pthread_join(threads[i], NULL);
+    if (g_debug_serial_frontend) {
+        if (opts->verbose) {
+            printf("Parsing and qualifying on the main thread "
+                   "(GENESIS_DEBUG_SERIAL_FRONTEND)\n");
+        }
+        parse_phase_worker(&parse_state);
+    } else {
+        for (i = 0; i < thread_count; i++) {
+            pthread_create(&threads[i], &attr, parse_phase_worker, &parse_state);
+        }
+        for (i = 0; i < thread_count; i++) {
+            pthread_join(threads[i], NULL);
+        }
     }
     counter_destroy(&parse_state.next_index);
     timing_mark("parse");
@@ -2715,11 +2723,15 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
         .registry = registry
     };
     counter_init(&qualify_state.next_index);
-    for (i = 0; i < thread_count; i++) {
-        pthread_create(&threads[i], &attr, qualify_phase_worker, &qualify_state);
-    }
-    for (i = 0; i < thread_count; i++) {
-        pthread_join(threads[i], NULL);
+    if (g_debug_serial_frontend) {
+        qualify_phase_worker(&qualify_state);
+    } else {
+        for (i = 0; i < thread_count; i++) {
+            pthread_create(&threads[i], &attr, qualify_phase_worker, &qualify_state);
+        }
+        for (i = 0; i < thread_count; i++) {
+            pthread_join(threads[i], NULL);
+        }
     }
     counter_destroy(&qualify_state.next_index);
     sourcepath_list_free(sp_list);

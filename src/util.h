@@ -186,9 +186,14 @@ void debug_env_init(void);
 /* GENESIS_DEBUG_TIMING: report the wall-clock time of each compilation
  * phase on stderr. GENESIS_DEBUG_PAUSE=<seconds>: wait that long before
  * starting, so that a profiler attaching by process name sees the whole
- * run. Neither enables debug_getenv(). */
+ * run. GENESIS_DEBUG_SERIAL_FRONTEND: parse and qualify type names on the
+ * main thread, so that when worker processes are forked no thread has ever
+ * existed in the process (POSIX allows a forked child of a multithreaded
+ * process to call only async-signal-safe functions, malloc not among them).
+ * None of the three enables debug_getenv(). */
 extern bool g_debug_timing;
 extern int g_debug_pause;
+extern bool g_debug_serial_frontend;
 
 /* ========================================================================
  * String Interning

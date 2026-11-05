@@ -1057,13 +1057,15 @@ bool parse_boolean(const char *str, bool default_value)
 bool g_debug_env_enabled = false;
 bool g_debug_timing = false;
 int g_debug_pause = 0;
+bool g_debug_serial_frontend = false;
 
 extern char **environ;
 
 /**
  * Note whether any GENESIS_DEBUG_* tracing variable is set (see
- * debug_getenv()). GENESIS_DEBUG_TIMING and GENESIS_DEBUG_PAUSE are read
- * here once and for all and do not count: they exist to measure the
+ * debug_getenv()). GENESIS_DEBUG_TIMING, GENESIS_DEBUG_PAUSE and
+ * GENESIS_DEBUG_SERIAL_FRONTEND are read here once and for all and do not
+ * count: they exist to measure the
  * compiler, and must not themselves switch the hot paths over to calling
  * getenv().
  */
@@ -1072,10 +1074,12 @@ void debug_env_init(void)
     static const char prefix[] = "GENESIS_DEBUG_";
     static const char timing[] = "GENESIS_DEBUG_TIMING=";
     static const char pause[] = "GENESIS_DEBUG_PAUSE=";
+    static const char serial[] = "GENESIS_DEBUG_SERIAL_FRONTEND=";
 
     g_debug_env_enabled = false;
     g_debug_timing = false;
     g_debug_pause = 0;
+    g_debug_serial_frontend = false;
     if (!environ) {
         return;
     }
@@ -1087,6 +1091,8 @@ void debug_env_init(void)
             g_debug_timing = true;
         } else if (strncmp(*e, pause, sizeof(pause) - 1) == 0) {
             g_debug_pause = atoi(*e + sizeof(pause) - 1);
+        } else if (strncmp(*e, serial, sizeof(serial) - 1) == 0) {
+            g_debug_serial_frontend = parse_boolean(*e + sizeof(serial) - 1, true);
         } else {
             g_debug_env_enabled = true;
         }
