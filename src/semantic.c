@@ -21682,7 +21682,8 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                     if (sem->current_lambda) {
                                         sem->current_lambda->lambda_captures_this = true;
                                     }
-                                    return target_class->data.class_data.superclass->type;
+                                    expr->sem_type = target_class->data.class_data.superclass->type;
+                                    return expr->sem_type;
                                 }
                             }
                         }

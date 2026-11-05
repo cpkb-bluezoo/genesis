@@ -42,6 +42,24 @@ public class SuperFieldAccessTest {
         Runnable lambda() {
             return () -> super.n += 100;
         }
+
+        // the qualified form names the same field: ClassName.super.field (JLS 15.11.2)
+        int qualified() {
+            Child.super.n = Child.super.n + 1;
+            Child.super.n++;
+            return Child.super.n + Child.super.session.length();
+        }
+
+        int qualifiedStatic() {
+            return Child.super.counter;
+        }
+
+        class Inner {
+            // the superclass of the enclosing instance, reached through this$0
+            String outerSuper() {
+                return Child.super.session + Child.super.n;
+            }
+        }
     }
 
     public static void main(String[] args) {
@@ -57,6 +75,13 @@ public class SuperFieldAccessTest {
         c.lambda().run();
         if (b.n != 109) {
             throw new AssertionError(b.n);
+        }
+        Child q = new Child();
+        if (q.qualified() != 3 + 4 || q.new Inner().outerSuper().isEmpty() || !q.new Inner().outerSuper().equals("base3")) {
+            throw new AssertionError(q.qualified() + " " + q.new Inner().outerSuper());
+        }
+        if (q.qualifiedStatic() != 5) {
+            throw new AssertionError(q.qualifiedStatic());
         }
         System.out.println("SuperFieldAccessTest passed!");
     }
