@@ -3180,6 +3180,33 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
         return false;
     }
     
+    /* "super.counter", a static field of the superclass: there is no object to read it from */
+    if (receiver->type == AST_SUPER_EXPR && receiver->sem_type && receiver->sem_type->kind == TYPE_CLASS &&
+        receiver->sem_type->data.class_type.symbol) {
+        symbol_t *owner_sym = receiver->sem_type->data.class_type.symbol;
+        symbol_t *static_field = lookup_field_with_superclass(owner_sym, field_name);
+        if (static_field && (static_field->modifiers & MOD_STATIC) && static_field->type) {
+            char *owner_internal = class_to_internal_name(owner_sym->qualified_name ?
+                                                          owner_sym->qualified_name : owner_sym->name);
+            char *static_desc = type_to_descriptor(static_field->type);
+            uint16_t static_ref = cp_add_fieldref(cp, owner_internal, field_name, static_desc);
+            bc_emit(mg->code, OP_GETSTATIC);
+            bc_emit_u2(mg->code, static_ref);
+            switch (static_desc[0]) {
+                case 'J': mg_push_long(mg); break;
+                case 'D': mg_push_double(mg); break;
+                case 'F': mg_push_float(mg); break;
+                case 'L':
+                case '[': mg_push_object_from_descriptor(mg, static_desc); break;
+                default:  mg_push_int(mg); break;
+            }
+            mg_narrow_erased_reference_field(mg, cp, static_desc, expr->sem_type);
+            free(owner_internal);
+            free(static_desc);
+            return true;
+        }
+    }
+
     /* General case: receiver is some other expression */
     /* Generate code for the receiver, then access the field */
     if (!codegen_expr(mg, receiver, cp)) {

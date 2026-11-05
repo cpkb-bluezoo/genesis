@@ -19092,7 +19092,10 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                 if (sem->current_lambda) {
                     sem->current_lambda->lambda_captures_this = true;
                 }
-                return sem->current_class->data.class_data.superclass->type;
+                /* (cached, as for a variable: the field "super.session" names is read from the
+                 * superclass, which code generation takes from the type of its receiver) */
+                expr->sem_type = sem->current_class->data.class_data.superclass->type;
+                return expr->sem_type;
             }
             if (sem->current_class) {
                 /* No explicit superclass - assume Object */
