@@ -25766,6 +25766,25 @@ static void scan_lambda_body_for_this_capture(semantic_t *sem, ast_node_t *node,
         const char *name = node->data.leaf.name;
         if (name && sem->current_class->data.class_data.members) {
             symbol_t *sym = scope_lookup_local(sem->current_class->data.class_data.members, name);
+            /* A field the class inherits, or a field of a class around this one (an inner class
+             * reaches it through this$0), is read through 'this' just the same */
+            for (symbol_t *cls = sem->current_class; !sym && cls; cls = cls->data.class_data.enclosing_class) {
+                for (symbol_t *up = cls; !sym && up; ) {
+                    symbol_complete(up);
+                    if (up->data.class_data.members) {
+                        symbol_t *found = scope_lookup_local(up->data.class_data.members, name);
+                        if (found && found->kind == SYM_FIELD &&
+                            (up == cls || !(found->modifiers & MOD_PRIVATE))) {
+                            sym = found;
+                        }
+                    }
+                    symbol_t *next = up->data.class_data.superclass;
+                    if (!next && up->data.class_data.unresolved_superclass) {
+                        next = load_external_class(sem, up->data.class_data.unresolved_superclass);
+                    }
+                    up = next;
+                }
+            }
             /* A local variable or parameter of the same name hides the field. */
             symbol_t *visible = sem->current_scope ? scope_lookup(sem->current_scope, name) : NULL;
             bool hidden = visible && (visible->kind == SYM_LOCAL_VAR || visible->kind == SYM_PARAMETER);
