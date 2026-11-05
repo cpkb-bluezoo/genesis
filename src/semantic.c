@@ -26100,6 +26100,38 @@ static void collect_lambda_parameter_names(ast_node_t *params, slist_t **names)
     }
 }
 
+/**
+ * The type of the first return statement, at any depth, of a block lambda's body whose type is
+ * known. The block's own top-level locals are not declared yet (the block is analysed in full
+ * later): stand-ins for them go in a scope of their own, for the return expressions to be typed
+ * against.
+ */
+static type_t *block_lambda_first_return_type(semantic_t *sem, ast_node_t *body, scope_t *lambda_scope)
+{
+    type_t *body_type = NULL;
+    scope_t *probe_scope = scope_new(SCOPE_BLOCK, lambda_scope);
+    probe_scope->is_probe = true;
+    sem->current_scope = probe_scope;
+    declare_block_locals_for_probe(sem, body, probe_scope);
+    slist_t *returns = NULL;
+    collect_value_stmts(body, AST_RETURN_STMT, &returns);
+    for (slist_t *r = returns; r && !body_type; r = r->next) {
+        ast_node_t *ret_expr = (ast_node_t *)r->data;
+        if (ret_expr) {
+            /* A local declared deeper in the block is still not in scope
+             * here: that is no error either. */
+            bool saved_quiet = sem->loading_dependency;
+            sem->loading_dependency = true;
+            body_type = get_expression_type(sem, ret_expr);
+            sem->loading_dependency = saved_quiet;
+        }
+    }
+    slist_free(returns);
+    sem->current_scope = lambda_scope;
+    scope_free(probe_scope);
+    return body_type;
+}
+
 static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type_t *target_type)
 {
     bool debug = debug_getenv("GENESIS_DEBUG_SAM") != NULL;
@@ -26594,30 +26626,7 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                         /* Return type is still a type variable - scan for return statements */
                         type_t *body_type = NULL;
                         
-                        /* Take the first return statement, at any depth, whose type is known.
-                         * The block's own top-level locals are not declared yet (the block is
-                         * analysed in full later): stand-ins for them go in a scope of its own,
-                         * for the return expressions to be typed against. */
-                        scope_t *probe_scope = scope_new(SCOPE_BLOCK, lambda_scope);
-                        probe_scope->is_probe = true;
-                        sem->current_scope = probe_scope;
-                        declare_block_locals_for_probe(sem, body, probe_scope);
-                        slist_t *returns = NULL;
-                        collect_value_stmts(body, AST_RETURN_STMT, &returns);
-                        for (slist_t *r = returns; r && !body_type; r = r->next) {
-                            ast_node_t *ret_expr = (ast_node_t *)r->data;
-                            if (ret_expr) {
-                                /* A local declared deeper in the block is still not in scope
-                                 * here: that is no error either. */
-                                bool saved_quiet = sem->loading_dependency;
-                                sem->loading_dependency = true;
-                                body_type = get_expression_type(sem, ret_expr);
-                                sem->loading_dependency = saved_quiet;
-                            }
-                        }
-                        slist_free(returns);
-                        sem->current_scope = lambda_scope;
-                        scope_free(probe_scope);
+                        body_type = block_lambda_first_return_type(sem, body, lambda_scope);
                         
                         /* If we found a return type, update the lambda's type */
                         if (body_type && body_type->kind != TYPE_UNKNOWN && 
@@ -26664,6 +26673,30 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                                 }
                                 new_type->data.class_type.type_args = new_args;
                                 lambda->sem_type = new_type;
+                            }
+                        }
+                    } else if (expected_type && expected_type->kind == TYPE_CLASS &&
+                               expected_type->data.class_type.type_args &&
+                               lambda->sem_type && lambda->sem_type->kind == TYPE_CLASS) {
+                        /* A result that is itself parameterized by the method's variable
+                         * ("Function<T, ? extends Optional<? extends U>>" for flatMap), returned
+                         * from a block: what the returned value is says what U is, as for an
+                         * expression body */
+                        type_t *body_type = block_lambda_first_return_type(sem, body, lambda_scope);
+                        if (body_type && body_type->kind == TYPE_CLASS && body_type->data.class_type.type_args) {
+                            for (slist_t *ea = expected_type->data.class_type.type_args; ea; ea = ea->next) {
+                                type_t *e_arg = (type_t *)ea->data;
+                                if (e_arg && e_arg->kind == TYPE_WILDCARD && e_arg->data.wildcard.bound) {
+                                    e_arg = e_arg->data.wildcard.bound;
+                                }
+                                if (e_arg && e_arg->kind == TYPE_TYPEVAR && e_arg->data.type_var.name) {
+                                    type_t *inferred = infer_type_arg(expected_type, body_type,
+                                                                      e_arg->data.type_var.name);
+                                    if (inferred && inferred->kind != TYPE_WILDCARD) {
+                                        lambda->sem_type = substitute_type_var(lambda->sem_type,
+                                                               e_arg->data.type_var.name, inferred);
+                                    }
+                                }
                             }
                         }
                     }
