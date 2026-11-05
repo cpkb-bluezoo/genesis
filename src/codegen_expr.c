@@ -11456,14 +11456,13 @@ static bool switch_has_null_label(slist_t *rules)
 }
 
 /** An arm of a switch over patterns: its body, a statement in a switch statement. */
-static void switch_arm_body(method_gen_t *mg, ast_node_t *body, const_pool_t *cp, bool stmt_mode)
+static bool switch_arm_body(method_gen_t *mg, ast_node_t *body, const_pool_t *cp, bool stmt_mode)
 {
     if (stmt_mode || body->type == AST_BLOCK) {
         mg->last_opcode = 0;
-        codegen_statement(mg, body);
-    } else {
-        codegen_expr(mg, body, cp);
+        return codegen_statement(mg, body);
     }
+    return codegen_expr(mg, body, cp);
 }
 
 /** True if control can go on from the end of an arm's body (it did not yield, throw or return). */
@@ -11622,8 +11621,9 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                 
                 /* Generate body */
                 mg_record_frame(mg);
-                switch_arm_body(mg, body, cp, stmt_mode);
-                
+                if (!switch_arm_body(mg, body, cp, stmt_mode)) {
+                    return false;
+                }
                 /* Jump to end (not after a block that already ended in a yield or throw) */
                 if (switch_arm_completes(mg, body, stmt_mode)) {
                     size_t *goto_pos = malloc(sizeof(size_t));
@@ -11910,15 +11910,18 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
         
         /* Handle guard if present */
         if (guard) {
-            codegen_expr(mg, guard, cp);
+            if (!codegen_expr(mg, guard, cp)) {
+                return false;
+            }
             size_t guard_ifeq_pos = mg->code->length;
             bc_emit(mg->code, OP_IFEQ);
             bc_emit_u2(mg->code, 0);
             mg_pop_typed(mg, 1);
             
             /* Generate body */
-            switch_arm_body(mg, body, cp, stmt_mode);
-            
+            if (!switch_arm_body(mg, body, cp, stmt_mode)) {
+                return false;
+            }
             /* Jump to end (not after a block that already ended in a yield or throw) */
             if (switch_arm_completes(mg, body, stmt_mode)) {
                 size_t *goto_pos = malloc(sizeof(size_t));
@@ -11938,8 +11941,9 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
             bc_patch_u2(mg->code, guard_ifeq_pos + 1, guard_skip);
         } else {
             /* Generate body */
-            switch_arm_body(mg, body, cp, stmt_mode);
-            
+            if (!switch_arm_body(mg, body, cp, stmt_mode)) {
+                return false;
+            }
             /* Jump to end (not after a block that already ended in a yield or throw) */
             if (switch_arm_completes(mg, body, stmt_mode)) {
                 size_t *goto_pos = malloc(sizeof(size_t));
@@ -11983,7 +11987,9 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
             body = (ast_node_t *)rc->data;
         }
         if (body) {
-            switch_arm_body(mg, body, cp, stmt_mode);
+            if (!switch_arm_body(mg, body, cp, stmt_mode)) {
+                return false;
+            }
         }
     } else {
         /* No default: the switch is exhaustive, so no pattern matching is a
@@ -14629,7 +14635,12 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 if (body) {
                     if (body->type == AST_BLOCK) {
                         /* Block body - compile statements */
-                        codegen_statement(lambda_mg, body);
+                        if (!codegen_statement(lambda_mg, body)) {
+                            /* (not a body to be dropped: the class would be written without it) */
+                            fprintf(stderr, "codegen: cannot generate the body of the lambda at line %d\n",
+                                    expr->line);
+                            return false;
+                        }
                         
                         /* Add return instruction if block doesn't end with one */
                         /* For void-returning lambdas (e.g., Consumer), add RETURN */
@@ -14679,7 +14690,11 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         }
                     } else {
                         /* Expression body - evaluate and return */
-                        codegen_expr(lambda_mg, body, cp);
+                        if (!codegen_expr(lambda_mg, body, cp)) {
+                            fprintf(stderr, "codegen: cannot generate the body of the lambda at line %d\n",
+                                    expr->line);
+                            return false;
+                        }
                         
                         /* Get body expression type for boxing decision.
                          * If sem_type is not set on body, compute it from the expression. */
@@ -15387,7 +15402,9 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 
                 /* For bound method references, we need to push the receiver first */
                 if (is_bound) {
-                    codegen_expr(mg, target_node, cp);
+                    if (!codegen_expr(mg, target_node, cp)) {
+                        return false;
+                    }
                 }
                 
                 /* Build invocation type descriptor:

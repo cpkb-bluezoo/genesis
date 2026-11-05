@@ -1709,7 +1709,7 @@ static void emit_pending_monitorexits(method_gen_t *mg)
  * swallowed by the outer catch), silently truncating parse() to whatever
  * had been read before the first blank/comment line.
  */
-static void emit_pending_finally_blocks(method_gen_t *mg, size_t stop_depth)
+static bool emit_pending_finally_blocks(method_gen_t *mg, size_t stop_depth)
 {
     size_t depth = slist_length(mg->finally_stack);
     for (slist_t *node = mg->finally_stack; node && depth > stop_depth;
@@ -1738,7 +1738,7 @@ static void emit_pending_finally_blocks(method_gen_t *mg, size_t stop_depth)
             }
         }
 
-        codegen_statement(mg, finally_block);
+        bool finally_ok = codegen_statement(mg, finally_block);
         mg->next_slot = saved_slot;
 
         for (size_t i = 0; i < saved_count; i++) {
@@ -1747,7 +1747,11 @@ static void emit_pending_finally_blocks(method_gen_t *mg, size_t stop_depth)
         }
         free(saved_names);
         free(saved_infos);
+        if (!finally_ok) {
+            return false;
+        }
     }
+    return true;
 }
 
 /* ========================================================================
@@ -2116,12 +2120,16 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                         uint16_t saved_slot_for_tmp = mg->next_slot;
                         uint16_t tmp_slot = mg_allocate_local(mg, "__pending_return", tmp_type);
                         mg_emit_store_local(mg, tmp_slot, tmp_kind);
-                        emit_pending_finally_blocks(mg, 0);
+                        if (!emit_pending_finally_blocks(mg, 0)) {
+                            return false;
+                        }
                         emit_pending_monitorexits(mg);
                         mg_emit_load_local(mg, tmp_slot, tmp_kind);
                         mg->next_slot = saved_slot_for_tmp;
                     } else {
-                        emit_pending_finally_blocks(mg, 0);
+                        if (!emit_pending_finally_blocks(mg, 0)) {
+                            return false;
+                        }
                         emit_pending_monitorexits(mg);
                     }
                     bc_emit(mg->code, return_op);
@@ -2132,7 +2140,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                      * "if (x) return someLong;" before more statements). */
                     mg_pop_typed(mg, (return_op == OP_LRETURN || return_op == OP_DRETURN) ? 2 : 1);
                 } else {
-                    emit_pending_finally_blocks(mg, 0);
+                    if (!emit_pending_finally_blocks(mg, 0)) {
+                        return false;
+                    }
                     emit_pending_monitorexits(mg);
                     bc_emit(mg->code, OP_RETURN);
                     mg->last_opcode = OP_RETURN;
@@ -3508,8 +3518,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * finally block entirely on this path - the same class of
                  * bug already fixed for `return`, just for a different
                  * exit statement. */
-                emit_pending_finally_blocks(mg, target_ctx->finally_depth);
-
+                if (!emit_pending_finally_blocks(mg, target_ctx->finally_depth)) {
+                    return false;
+                }
                 /* Emit goto with placeholder offset */
                 size_t break_pos = mg->code->length;
                 bc_emit(mg->code, OP_GOTO);
@@ -4298,8 +4309,9 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                  * happen before computing the branch position below, since
                  * inlining the finally block's own bytecode here shifts
                  * mg->code->length. */
-                emit_pending_finally_blocks(mg, target_ctx->finally_depth);
-
+                if (!emit_pending_finally_blocks(mg, target_ctx->finally_depth)) {
+                    return false;
+                }
                 /* Emit a placeholder goto and defer patching its real
                  * offset until the target loop's real continue_target is
                  * known (mg_patch_continue_offsets(), called by each loop

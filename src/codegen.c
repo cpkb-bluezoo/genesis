@@ -3708,7 +3708,9 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                         mg_push_object(mg, cg->internal_name);
 
                         /* Generate initializer expression */
-                        codegen_expr(mg, init_expr, cg->cp);
+                        if (!codegen_expr(mg, init_expr, cg->cp)) {
+                            return false;
+                        }
                         coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
 
                         /* putfield */
@@ -3726,7 +3728,9 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
                 ast_node_t *init_block = (ast_node_t *)node->data;
                 if (init_block->data.node.children) {
                     ast_node_t *block = (ast_node_t *)init_block->data.node.children->data;
-                    codegen_statement(mg, block);
+                    if (!codegen_statement(mg, block)) {
+                        return false;
+                    }
                 }
             }
         }
@@ -6910,7 +6914,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                      * instance-field-init site above. */
                     bc_emit(mg->code, OP_ALOAD_0);
                     mg_push_object(mg, cg->internal_name);
-                    codegen_expr(mg, init_expr, cg->cp);
+                    if (!codegen_expr(mg, init_expr, cg->cp)) {
+                        return false;
+                    }
                     coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
                     uint16_t field_ref = cp_add_fieldref(cg->cp,
                         cg->internal_name, field_name, field->descriptor);
@@ -6926,7 +6932,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             ast_node_t *init_block = (ast_node_t *)node->data;
             if (init_block->data.node.children) {
                 ast_node_t *block = (ast_node_t *)init_block->data.node.children->data;
-                codegen_statement(mg, block);
+                if (!codegen_statement(mg, block)) {
+                    return false;
+                }
             }
         }
 
@@ -7220,7 +7228,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     user_arg_index++;
 
                     /* Generate the argument expression */
-                    codegen_expr(mg, arg, cg->cp);
+                    if (!codegen_expr(mg, arg, cg->cp)) {
+                        return false;
+                    }
                     arg_count++;
 
                     /* Prefer the matched constructor's own declared
@@ -7436,7 +7446,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 field_gen_t *field = hashtable_lookup(cg->field_map, field_name);
                 if (field) {
                     /* Generate initializer expression */
-                    codegen_expr(mg, init_expr, cg->cp);
+                    if (!codegen_expr(mg, init_expr, cg->cp)) {
+                        return false;
+                    }
                     coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
 
                     /* putstatic field */
@@ -7459,7 +7471,9 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             /* The block is the first child */
             if (init_block->data.node.children) {
                 ast_node_t *block = (ast_node_t *)init_block->data.node.children->data;
-                codegen_statement(mg, block);
+                if (!codegen_statement(mg, block)) {
+                    return false;
+                }
             }
         }
         
@@ -8458,7 +8472,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
  * super(name, ordinal, ...). `init` is a freshly allocated, zeroed
  * method_info_gen_t with access_flags/name_index already set by the
  * caller; this function fills in the rest and appends it to cg->methods. */
-static void codegen_enum_constant_anon_constructor(class_gen_t *cg,
+static bool codegen_enum_constant_anon_constructor(class_gen_t *cg,
     method_info_gen_t *init, symbol_t *enum_owner)
 {
     /* Count this enum constant's own actual argument expressions
@@ -8643,7 +8657,9 @@ static void codegen_enum_constant_anon_constructor(class_gen_t *cg,
             if (field) {
                 bc_emit(mg->code, OP_ALOAD_0);
                 mg_push_object(mg, cg->internal_name);
-                codegen_expr(mg, init_expr, cg->cp);
+                if (!codegen_expr(mg, init_expr, cg->cp)) {
+                    return false;
+                }
                 coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
                 uint16_t field_ref = cp_add_fieldref(cg->cp,
                     cg->internal_name, field_name, field->descriptor);
@@ -8657,7 +8673,9 @@ static void codegen_enum_constant_anon_constructor(class_gen_t *cg,
         ast_node_t *init_block = (ast_node_t *)node->data;
         if (init_block->data.node.children) {
             ast_node_t *block = (ast_node_t *)init_block->data.node.children->data;
-            codegen_statement(mg, block);
+            if (!codegen_statement(mg, block)) {
+                return false;
+            }
         }
     }
 
@@ -8691,6 +8709,7 @@ static void codegen_enum_constant_anon_constructor(class_gen_t *cg,
     } else {
         slist_append(cg->methods, init);
     }
+    return true;
 }
 
 static type_t *anon_super_ctor_arg_type(semantic_t *sem, ast_node_t *arg_node)
@@ -8978,7 +8997,9 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             cg->class_sym->data.class_data.superclass : NULL;
 
         if (enum_owner) {
-            codegen_enum_constant_anon_constructor(cg, init, enum_owner);
+            if (!codegen_enum_constant_anon_constructor(cg, init, enum_owner)) {
+                return false;
+            }
         } else {
         /* Build constructor descriptor */
         string_t *desc = string_new("(");
@@ -9481,7 +9502,9 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                      * instance-field-init site above. */
                     bc_emit(mg->code, OP_ALOAD_0);
                     mg_push_object(mg, cg->internal_name);
-                    codegen_expr(mg, init_expr, cg->cp);
+                    if (!codegen_expr(mg, init_expr, cg->cp)) {
+                        return false;
+                    }
                     coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
                     uint16_t field_ref = cp_add_fieldref(cg->cp,
                         cg->internal_name, field_name, field->descriptor);
@@ -9497,7 +9520,9 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             ast_node_t *init_block = (ast_node_t *)node->data;
             if (init_block->data.node.children) {
                 ast_node_t *block = (ast_node_t *)init_block->data.node.children->data;
-                codegen_statement(mg, block);
+                if (!codegen_statement(mg, block)) {
+                    return false;
+                }
             }
         }
 
@@ -9573,7 +9598,9 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                 
                 field_gen_t *field = hashtable_lookup(cg->field_map, field_name);
                 if (field) {
-                    codegen_expr(mg, init_expr, cg->cp);
+                    if (!codegen_expr(mg, init_expr, cg->cp)) {
+                        return false;
+                    }
                     coerce_value_to_descriptor(mg, cg->cp, init_expr, field->descriptor);
                     uint16_t field_ref = cp_add_fieldref(cg->cp,
                         cg->internal_name, field_name, field->descriptor);
@@ -9593,7 +9620,9 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             ast_node_t *init_block = (ast_node_t *)node->data;
             if (init_block->data.node.children) {
                 ast_node_t *block = (ast_node_t *)init_block->data.node.children->data;
-                codegen_statement(mg, block);
+                if (!codegen_statement(mg, block)) {
+                    return false;
+                }
             }
         }
         
