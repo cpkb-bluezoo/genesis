@@ -2766,8 +2766,8 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                                   nested->kind == SYM_ENUM || nested->kind == SYM_RECORD)) {
                         /* Look up field in nested type */
                         if (nested->data.class_data.members) {
-                            symbol_t *field_sym = scope_lookup_local(
-                                nested->data.class_data.members, field_name);
+                            /* (a field the type inherits is read through it just the same) */
+                            symbol_t *field_sym = lookup_field_with_superclass(nested, field_name);
                             if (field_sym && field_sym->kind == SYM_FIELD) {
                                 static __thread char field_desc_buf[256];
                                 /* For enum constants, the type is the enum type itself */
@@ -2796,8 +2796,7 @@ static bool codegen_field_access(method_gen_t *mg, ast_node_t *expr, const_pool_
                  receiver->sem_symbol->kind == SYM_ENUM || receiver->sem_symbol->kind == SYM_RECORD)) {
                 symbol_t *ext_class = receiver->sem_symbol;
                 if (ext_class->data.class_data.members) {
-                    symbol_t *field_sym = scope_lookup_local(
-                        ext_class->data.class_data.members, field_name);
+                    symbol_t *field_sym = lookup_field_with_superclass(ext_class, field_name);
                     if (field_sym && field_sym->kind == SYM_FIELD) {
                         static __thread char ext_field_desc_buf[256];
                         if (field_sym->type && field_sym->type->kind == TYPE_CLASS) {
@@ -10610,8 +10609,7 @@ static bool codegen_assignment(method_gen_t *mg, ast_node_t *expr, const_pool_t 
                      recv_sym->kind == SYM_ENUM || recv_sym->kind == SYM_RECORD)) {
                     symbol_t *ext_class = recv_sym;
                     if (ext_class->data.class_data.members) {
-                        symbol_t *field_sym = scope_lookup_local(
-                            ext_class->data.class_data.members, field_name);
+                        symbol_t *field_sym = lookup_field_with_superclass(ext_class, field_name);
                         if (field_sym && field_sym->kind == SYM_FIELD && field_sym->type) {
                             static __thread char ext_field_desc_buf[256];
                             char *desc = type_to_descriptor(field_sym->type);
