@@ -12783,6 +12783,28 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 
                                 ast_node_t *receiver = (ast_node_t *)op_children->data;
 
+                                /* "Holder.COUNT++", "Child.COUNT++" (a field Child inherits),
+                                 * "Outer.Inner.COUNT++": a static field named through a type has no
+                                 * object to read it from */
+                                {
+                                    symbol_t *owner_sym = resolve_type_receiver(mg, receiver);
+                                    symbol_t *static_field = owner_sym ?
+                                        lookup_field_with_superclass(owner_sym, field_name) : NULL;
+                                    if (static_field && (static_field->modifiers & MOD_STATIC) &&
+                                        static_field->type) {
+                                        const char *owner_name = owner_sym->qualified_name ?
+                                            owner_sym->qualified_name : owner_sym->name;
+                                        char *owner_internal = class_to_internal_name(owner_name);
+                                        char *static_desc = type_to_descriptor(static_field->type);
+                                        bool done = codegen_static_field_incdec(mg, cp, owner_internal,
+                                                                                field_name, static_desc,
+                                                                                is_post, is_inc);
+                                        free(owner_internal);
+                                        free(static_desc);
+                                        return done;
+                                    }
+                                }
+
                                 /* Get field descriptor and class info from semantic analysis */
                                 const char *obj_class = "java/lang/Object";
                                 const char *field_desc = "I";  /* Default to int */
