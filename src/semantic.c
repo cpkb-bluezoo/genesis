@@ -11747,6 +11747,13 @@ static int mref_potentially_compatible(semantic_t *sem, ast_node_t *ref, int ari
         type_t *t = get_expression_type(sem, target);
         sem->target_type = saved_target;
         sem->loading_dependency = quiet;
+        /* A field the class inherits is not in the scope chain, but the name is a variable all
+         * the same, and hides a type of that name (JLS 6.4.2) */
+        if (target->type == AST_IDENTIFIER && target->sem_symbol &&
+            (target->sem_symbol->kind == SYM_FIELD || target->sem_symbol->kind == SYM_LOCAL_VAR ||
+             target->sem_symbol->kind == SYM_PARAMETER)) {
+            is_type_name = false;
+        }
         if (t && t->kind == TYPE_CLASS) {
             cls = t->data.class_type.symbol;
             if (!cls && t->data.class_type.name) {
