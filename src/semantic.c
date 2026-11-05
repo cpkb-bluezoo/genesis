@@ -26109,6 +26109,7 @@ static void collect_lambda_parameter_names(ast_node_t *params, slist_t **names)
 static type_t *block_lambda_first_return_type(semantic_t *sem, ast_node_t *body, scope_t *lambda_scope)
 {
     type_t *body_type = NULL;
+    type_t *first_known = NULL;
     scope_t *probe_scope = scope_new(SCOPE_BLOCK, lambda_scope);
     probe_scope->is_probe = true;
     sem->current_scope = probe_scope;
@@ -26122,14 +26123,27 @@ static type_t *block_lambda_first_return_type(semantic_t *sem, ast_node_t *body,
              * here: that is no error either. */
             bool saved_quiet = sem->loading_dependency;
             sem->loading_dependency = true;
-            body_type = get_expression_type(sem, ret_expr);
+            type_t *seen = get_expression_type(sem, ret_expr);
             sem->loading_dependency = saved_quiet;
+            if (!seen || seen->kind == TYPE_UNKNOWN) {
+                continue;
+            }
+            /* "return Optional.empty();" is an Optional of a variable nothing fixes: another
+             * return that names its type ("return Optional.of(port);") says more */
+            const char *names[1];
+            int n_names = 0;
+            collect_typevar_names(seen, names, &n_names, 1);
+            if (n_names == 0) {
+                body_type = seen;
+            } else if (!first_known) {
+                first_known = seen;
+            }
         }
     }
     slist_free(returns);
     sem->current_scope = lambda_scope;
     scope_free(probe_scope);
-    return body_type;
+    return body_type ? body_type : first_known;
 }
 
 static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type_t *target_type)
