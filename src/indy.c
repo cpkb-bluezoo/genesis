@@ -49,6 +49,11 @@ static uint16_t cp_add_raw_entry(const_pool_t *cp)
         if (!new_entries) {
             return 0;
         }
+        /* The new entries must read as unused: a long or double takes a
+         * second slot that is never written, and const_pool_free() frees
+         * the string of any slot whose type is CONST_UTF8 */
+        memset(&new_entries[cp->capacity], 0,
+               (size_t)(new_cap - cp->capacity) * sizeof(const_pool_entry_t));
         cp->entries = new_entries;
         cp->capacity = new_cap;
     }

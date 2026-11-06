@@ -3091,5 +3091,27 @@ else
 fi
 
 echo
+echo "--- C unit tests ---"
+# ConstPoolGrowTest: the sources under test are built with realloc() replaced
+# by one that fills the memory it adds with 0x01 (see dirty_realloc.c), so
+# that a slot the constant pool leaves uninitialised is dirty every time.
+printf "%-30s ... " "ConstPoolGrow"
+cpg_dir="$TEST_BUILD/unit"
+rm -rf "$cpg_dir"
+mkdir -p "$cpg_dir"
+if ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -Drealloc=dirty_realloc \
+       -I"$here/.." -I"$here/../src" -o "$cpg_dir/ConstPoolGrowTest" \
+       "$here/unit/ConstPoolGrowTest.c" "$here/unit/dirty_realloc.c" \
+       "$here/../src/constpool.c" "$here/../src/indy.c" "$here/../src/util.c" \
+       -lz -lpthread >"$cpg_dir/build.log" 2>&1 &&
+   "$cpg_dir/ConstPoolGrowTest" >"$cpg_dir/run.log" 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

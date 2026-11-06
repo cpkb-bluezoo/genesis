@@ -236,8 +236,10 @@ uint16_t cp_add_long(const_pool_t *cp, int64_t value)
     cp->entries[index].type = CONST_LONG;
     cp->entries[index].data.long_val = value;
 
-    /* Long and Double take two constant pool slots */
-    cp_add_entry(cp);
+    /* Long and Double take two constant pool slots; the second is never
+     * written, so it must be cleared here */
+    uint16_t second = cp_add_entry(cp);
+    memset(&cp->entries[second], 0, sizeof(const_pool_entry_t));
 
     return index;
 }
@@ -261,8 +263,10 @@ uint16_t cp_add_double(const_pool_t *cp, double value)
     cp->entries[index].type = CONST_DOUBLE;
     cp->entries[index].data.double_val = value;
 
-    /* Long and Double take two constant pool slots */
-    cp_add_entry(cp);
+    /* Long and Double take two constant pool slots; the second is never
+     * written, so it must be cleared here */
+    uint16_t second = cp_add_entry(cp);
+    memset(&cp->entries[second], 0, sizeof(const_pool_entry_t));
 
     return index;
 }
