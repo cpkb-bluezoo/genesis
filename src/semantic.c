@@ -3007,6 +3007,13 @@ void registry_resolve_types(type_registry_t *reg, classpath_t *cp)
  * This is set when entering semantic_analyze and cleared when exiting. */
 static __thread semantic_t *g_current_semantic = NULL;
 
+semantic_t *semantic_set_current(semantic_t *sem)
+{
+    semantic_t *previous = g_current_semantic;
+    g_current_semantic = sem;
+    return previous;
+}
+
 /* Function for type.c to access the current semantic analyzer */
 void *get_current_semantic(void)
 {
@@ -25452,6 +25459,17 @@ static void collect_sam_from_interface(symbol_t *iface, hashtable_t *seen_method
         symbol_t *loaded = load_external_class(g_current_semantic, iface->qualified_name);
         if (loaded && loaded->data.class_data.members) {
             iface = loaded;
+        } else if (g_current_semantic->classpath) {
+            /* The cache holds a symbol without members too (one made by
+             * symbol_from_classfile_minimal(), for the interface chain
+             * only): read the class file again */
+            classfile_t *cf = classpath_load_class(g_current_semantic->classpath,
+                                                   iface->qualified_name);
+            symbol_t *fresh = cf ? symbol_from_classfile(g_current_semantic, cf) : NULL;
+            if (fresh && fresh->data.class_data.members) {
+                symbol_complete(fresh);
+                iface = fresh;
+            }
         }
     }
 

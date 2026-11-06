@@ -3112,6 +3112,26 @@ else
     failed=$((failed + 1))
 fi
 
+# FunctionalInterfaceSamTest links the compiler's objects (genesis.c without
+# its main) and reads java.util.function.Consumer from the JDK.
+printf "%-30s ... " "FunctionalInterfaceSam"
+fis_src="$here/../src"
+if ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -Dmain=genesis_main \
+       -I"$here/.." -I"$fis_src" -c -o "$cpg_dir/genesis_nomain.o" \
+       "$fis_src/genesis.c" >"$cpg_dir/fis-build.log" 2>&1 &&
+   ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -I"$here/.." -I"$fis_src" \
+       -o "$cpg_dir/FunctionalInterfaceSamTest" \
+       "$here/unit/FunctionalInterfaceSamTest.c" "$cpg_dir/genesis_nomain.o" \
+       $(ls "$fis_src"/genesis-*.o | grep -v 'genesis-genesis\.o') \
+       -lz -lpthread -lm >>"$cpg_dir/fis-build.log" 2>&1 &&
+   "$cpg_dir/FunctionalInterfaceSamTest" >"$cpg_dir/fis-run.log" 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

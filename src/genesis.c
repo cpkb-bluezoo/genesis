@@ -1679,6 +1679,10 @@ static int generate_file_code(parse_result_t *pr, compiler_options_t *opts,
     }
     
     semantic_t *sem = pr->sem;
+
+    /* Class loading consults the current analyzer: keep this file's current
+     * while its code is generated, as it was while it was analysed */
+    semantic_t *previous_sem = semantic_set_current(sem);
     
     /* Code generation for each top-level type */
     slist_t *children = pr->ast->data.node.children;
@@ -1776,6 +1780,7 @@ static int generate_file_code(parse_result_t *pr, compiler_options_t *opts,
         children = children->next;
     }
 
+    semantic_set_current(previous_sem);
     return errors;
 }
 

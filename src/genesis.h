@@ -1155,5 +1155,13 @@ void print_usage(const char *program_name);
  * is not one (semantic.c). Handles inherited and default methods. */
 symbol_t *get_functional_interface_sam(symbol_t *iface_sym);
 
+/**
+ * Make `sem` the analyzer that class loading consults on this thread (it is
+ * current inside semantic_analyze() only), returning the one it replaces.
+ * Code generation sets the analyzer of the file it is generating, so that a
+ * symbol stored without members can be reloaded there too.
+ */
+semantic_t *semantic_set_current(semantic_t *sem);
+
 #endif /* GENESIS_H */
 
