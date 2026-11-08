@@ -3149,6 +3149,56 @@ else
     failed=$((failed + 1))
 fi
 
+# JImageTest: the jimage reader against the JDK's own "jimage" tool, on the
+# runtime image of the JDK the tests run with: the same classes in the same
+# modules, the same bytes for a sample of them, and the same module-info.
+printf "%-30s ... " "JImageReader"
+ji_home=$("$JAVA" -XshowSettings:properties -version 2>&1 | sed -n 's/^ *java\.home = //p')
+ji_tool="$ji_home/bin/jimage"
+ji_dir="$TEST_BUILD/jimage"
+rm -rf "$ji_dir"
+mkdir -p "$ji_dir"
+if [ ! -f "$ji_home/lib/modules" ] || [ ! -x "$ji_tool" ]; then
+    echo "SKIP (no lib/modules or jimage tool)"
+else
+    ji_ok=1
+    ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -I"$here/.." -I"$here/../src" \
+        -o "$ji_dir/JImageTest" "$here/unit/JImageTest.c" "$here/../src/jimage.c" \
+        "$here/../src/platimage.c" "$here/../src/util.c" -lz -lpthread \
+        >"$ji_dir/build.log" 2>&1 || ji_ok=0
+    if [ $ji_ok = 1 ]; then
+        "$ji_tool" list "$ji_home/lib/modules" 2>/dev/null |
+            awk '/^Module:/ { m = $2; next }
+                 /\.class$/ && $1 != "module-info.class" { sub(/\.class$/, "", $1); print m " " $1 }' |
+            sort >"$ji_dir/expected.txt"
+        "$ji_dir/JImageTest" list "$ji_home/lib/modules" | sort >"$ji_dir/actual.txt" 2>"$ji_dir/run.log"
+        [ -s "$ji_dir/expected.txt" ] && cmp -s "$ji_dir/expected.txt" "$ji_dir/actual.txt" || ji_ok=0
+    fi
+    if [ $ji_ok = 1 ]; then
+        mkdir -p "$ji_dir/extracted"
+        "$ji_tool" extract --dir "$ji_dir/extracted" \
+            --include 'glob:/java.base/java/lang/Object.class,glob:/java.base/java/lang/String.class,glob:/java.base/java/lang/Thread$State.class,glob:/java.base/java/util/HashMap.class,glob:/java.base/module-info.class' \
+            "$ji_home/lib/modules" >/dev/null 2>&1
+        for c in java/lang/Object java/lang/String 'java/lang/Thread$State' java/util/HashMap; do
+            "$ji_dir/JImageTest" read "$ji_home/lib/modules" "$c" >"$ji_dir/one.class" 2>>"$ji_dir/run.log" &&
+                cmp -s "$ji_dir/one.class" "$ji_dir/extracted/java.base/$c.class" || ji_ok=0
+        done
+        "$ji_dir/JImageTest" modinfo "$ji_home/lib/modules" java.base >"$ji_dir/one.class" 2>>"$ji_dir/run.log" &&
+            cmp -s "$ji_dir/one.class" "$ji_dir/extracted/java.base/module-info.class" || ji_ok=0
+        # Keeping only some modules
+        "$ji_dir/JImageTest" list "$ji_home/lib/modules" java.base java.xml |
+            awk '{ print $1 }' | sort -u >"$ji_dir/modules.txt"
+        [ "$(tr '\n' ' ' <"$ji_dir/modules.txt")" = "java.base java.xml " ] || ji_ok=0
+    fi
+    if [ $ji_ok = 1 ]; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+fi
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]
