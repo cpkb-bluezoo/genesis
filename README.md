@@ -191,9 +191,11 @@ arguments in an `@argfile` in javac's format, which genesis reads.
   common case: `@Getter`, `@RequiredArgsConstructor`, `@Slf4j` and the rest add
   members that do not exist in the text of the `.java` file until its
   processor has run inside `javac`. Genesis compiles the source as written,
-  and reports each Lombok annotation it finds as an unsupported feature
+  as `javac` does without the processor. If that fails, it reports each
+  Lombok annotation it finds as an unsupported feature
   (`unsupported Lombok annotation @Getter ...`) instead of the errors that
-  follow from the missing members. Having `lombok.jar` on the classpath does
+  follow from the missing members; a file that needs none of the generated
+  members compiles. Having `lombok.jar` on the classpath does
   not change this. To compile such a project with genesis, run
   [delombok](https://projectlombok.org/features/delombok) as a separate step
   and point genesis at the generated tree, or write the members by hand.

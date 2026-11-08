@@ -146,9 +146,9 @@ check_source_rejected OldSealed "sealed classes are not supported" -source 16
 echo
 echo "--- Lombok annotations (annotation processors are not run) ---"
 # check_lombok_rejected <file> <annotation> [<annotation> ...]
-# The stub annotations are on the sourcepath, as lombok.jar would be on the classpath. Each
-# annotation use is reported once as unsupported, and nothing is reported that follows from the
-# members it would have generated.
+# The stub annotations are on the sourcepath, as lombok.jar would be on the classpath. A file that
+# fails to compile because members are missing has each annotation use reported once as
+# unsupported, and nothing reported that follows from the members it would have generated.
 check_lombok_rejected() {
     name=$1
     shift
@@ -173,6 +173,26 @@ check_lombok_rejected() {
         failed=$((failed + 1))
     fi
 }
+# check_lombok_accepted <file>
+# A file that needs none of the generated members compiles as written, as javac does when the
+# processor is not run.
+check_lombok_accepted() {
+    name=$1
+    printf "%-30s ... " "$name"
+    rm -rf "$TEST_BUILD/lombok"
+    mkdir -p "$TEST_BUILD/lombok"
+    out=$("$GENESIS" -source 21 -sourcepath "$TEST_SRC/lombok" -d "$TEST_BUILD/lombok" \
+              "$TEST_SRC/lombok/$name.java" 2>&1)
+    rc=$?
+    if [ $rc -eq 0 ] && [ -f "$TEST_BUILD/lombok/$name.class" ]; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo "FAIL (exit $rc)"
+        failed=$((failed + 1))
+    fi
+}
+check_lombok_accepted LombokMarkerOnly
 check_lombok_rejected LombokRequiredArgsConstructor RequiredArgsConstructor
 check_lombok_rejected LombokInnerGetterMethodRef Getter
 check_lombok_rejected LombokQualifiedAndStarImport lombok.Getter Slf4j

@@ -32781,10 +32781,11 @@ static bool is_lombok_annotation(semantic_t *sem, const char *name)
 
 /**
  * Lombok adds the members of a class (constructors, getters, "log") by running as an annotation
- * processor inside javac. Genesis runs no Java, so it would go on to report what those members'
- * absence causes - an uninitialised final field, a method it cannot find - and say nothing of
- * the real reason. Reports each Lombok annotation use instead, and true when there was any: the
- * rest of the file is not analysed, as what it reports would only follow from them.
+ * processor inside javac. Genesis runs no Java, so a file that needs those members fails with
+ * what their absence causes - an uninitialised final field, a method it cannot find - and says
+ * nothing of the real reason. A file that needs none of them compiles as written, as it does
+ * under javac without the processor, so this is only called once a file has failed.
+ * Reports each Lombok annotation use, and true when there was any.
  */
 static bool report_lombok_annotations(semantic_t *sem, ast_node_t *ast)
 {
@@ -32862,6 +32863,10 @@ bool semantic_analyze(semantic_t *sem, ast_node_t *ast, source_file_t *source)
     sem->source = source;
     sem->error_count = 0;
     sem->warning_count = 0;
+
+    /* This file's diagnostics are kept apart from those of earlier files until it is done */
+    slist_t *earlier = sem->diagnostics;
+    sem->diagnostics = NULL;
     
     /* Reset state */
     sem->current_scope = sem->global_scope;
@@ -32893,11 +32898,6 @@ bool semantic_analyze(semantic_t *sem, ast_node_t *ast, source_file_t *source)
     /* Pass 1: Collect all declarations */
     pass1_collect_declarations(sem, ast);
     
-    if (report_lombok_annotations(sem, ast)) {
-        g_current_semantic = NULL;
-        return false;
-    }
-
     /* Pass 1.5: Resolve type hierarchy (superclass/interfaces) */
     /* This handles forward references where class A extends B and B is defined later */
     resolve_type_hierarchy(sem, ast);
@@ -32908,6 +32908,26 @@ bool semantic_analyze(semantic_t *sem, ast_node_t *ast, source_file_t *source)
     /* Definite assignment (JLS 16), once the rest of the file is known to be well formed */
     if (sem->error_count == 0) {
         flow_check_definite_assignment(sem, ast);
+    }
+
+    /* A file that failed and uses Lombok annotations is reported for those: what it printed
+     * only follows from the members Lombok would have generated. */
+    if (sem->error_count > 0) {
+        slist_t *failures = sem->diagnostics;
+        int count = sem->error_count;
+        sem->diagnostics = NULL;
+        sem->error_count = 0;
+        if (report_lombok_annotations(sem, ast)) {
+            slist_free_full(failures, (void (*)(void *))diagnostic_free);
+        } else {
+            sem->diagnostics = failures;
+            sem->error_count = count;
+        }
+    }
+
+    if (earlier) {
+        slist_last(earlier)->next = sem->diagnostics;
+        sem->diagnostics = earlier;
     }
     
     /* Clear global */
