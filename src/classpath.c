@@ -32,6 +32,7 @@
 #include <pthread.h>
 #include "classpath.h"
 #include "jimage.h"
+#include "jmods.h"
 
 /*
  * ZIP file format constants
@@ -460,6 +461,16 @@ slist_t *jar_list_entries(void *handle, const char *pattern)
     }
 
     return list;
+}
+
+void jar_foreach_entry(void *handle, jar_entry_fn fn, void *user_data)
+{
+    jar_handle_t *jar = (jar_handle_t *)handle;
+    for (zip_entry_t *e = jar->entries; e; e = e->next) {
+        if (e->filename) {
+            fn(e->filename, e->uncompressed_size, user_data);
+        }
+    }
 }
 
 /*
@@ -1070,27 +1081,11 @@ bool classpath_setup_jdk(classpath_t *cp, jdk_info_t *jdk)
             NULL
         };
 
-        if (!is_directory(jdk->modules_path)) {
-            /* No jmods directory: the classes are in the runtime image, lib/modules */
-            platform_image_t *image = jimage_load(jdk->modules_path, essential_modules);
-            return image && classpath_add_boot_platform(cp, image, jdk->modules_path);
-        }
-
-        bool any_added = false;
-        char jmod_path[1024];
-        
-        for (int i = 0; essential_modules[i]; i++) {
-            snprintf(jmod_path, sizeof(jmod_path), "%s/%s.jmod",
-                     jdk->modules_path, essential_modules[i]);
-            
-            if (file_exists(jmod_path)) {
-                if (classpath_add_boot(cp, jmod_path)) {
-                    any_added = true;
-                }
-            }
-        }
-        
-        return any_added;
+        /* The classes are in the jmods directory, or else in the runtime image, lib/modules */
+        platform_image_t *image = is_directory(jdk->modules_path)
+                ? jmods_load(jdk->modules_path, essential_modules)
+                : jimage_load(jdk->modules_path, essential_modules);
+        return image && classpath_add_boot_platform(cp, image, jdk->modules_path);
     }
 
     return false;

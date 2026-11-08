@@ -3270,6 +3270,29 @@ else
     fi
 fi
 
+# JmodsTest: on a JDK that has both its jmods and its lib/modules image, the two readers
+# must give the same model - the same classes in the same modules, with the same bytes.
+printf "%-30s ... " "JmodsReader"
+jm_dir="$TEST_BUILD/jmods"
+rm -rf "$jm_dir"
+mkdir -p "$jm_dir"
+if [ ! -d "$ji_home/jmods" ] || [ ! -f "$ji_home/lib/modules" ]; then
+    echo "SKIP (JDK has not both jmods and lib/modules)"
+elif ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -Dmain=genesis_main -I"$here/.." -I"$here/../src" -c \
+         -o "$jm_dir/genesis_nomain.o" "$here/../src/genesis.c" >"$jm_dir/build.log" 2>&1 &&
+     ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -I"$here/.." -I"$here/../src" -o "$jm_dir/JmodsTest" \
+         "$here/unit/JmodsTest.c" "$jm_dir/genesis_nomain.o" \
+         $(ls "$here"/../src/genesis-*.o | grep -v 'genesis-genesis\.o') \
+         -lz -lpthread -lm >>"$jm_dir/build.log" 2>&1 &&
+     "$jm_dir/JmodsTest" "$ji_home" java.base java.logging java.xml java.sql java.desktop \
+         java.compiler java.net.http java.naming >"$jm_dir/run.log" 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

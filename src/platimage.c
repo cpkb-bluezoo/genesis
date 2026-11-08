@@ -104,10 +104,14 @@ int platform_image_add_module(platform_image_t *img, const char *name)
 bool platform_image_reserve(platform_image_t *img, size_t n)
 {
     free(img->class_table);
+    if (img->classes) {
+        hashtable_free(img->classes);       /* One that is sized for what is going in */
+    }
+    img->classes = hashtable_new_sized(n ? n : 1);
     img->class_table = calloc(n ? n : 1, sizeof(platform_class_t));
     img->class_count = 0;
     img->class_capacity = img->class_table ? n : 0;
-    return img->class_table != NULL;
+    return img->class_table != NULL && img->classes != NULL;
 }
 
 void platform_image_set_module_info(platform_image_t *img, uint32_t module,
@@ -163,7 +167,7 @@ uint8_t *platform_image_read_class(platform_image_t *img, const char *internal_n
     if (!c || !img->store.read) {
         return NULL;
     }
-    return img->store.read(img, c, size);
+    return img->store.read(img, internal_name, c, size);
 }
 
 uint8_t *platform_image_read_module_info(platform_image_t *img, const char *module,
@@ -173,5 +177,5 @@ uint8_t *platform_image_read_module_info(platform_image_t *img, const char *modu
     if (m < 0 || img->module_info[m].size == 0 || !img->store.read) {
         return NULL;
     }
-    return img->store.read(img, &img->module_info[m], size);
+    return img->store.read(img, "module-info", &img->module_info[m], size);
 }

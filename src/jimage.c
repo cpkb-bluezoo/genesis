@@ -426,8 +426,10 @@ static uint8_t *remove_layers(const jimage_store_t *store, uint8_t *data, size_t
     return data;
 }
 
-static uint8_t *jimage_store_read(platform_image_t *img, const platform_class_t *c, size_t *size)
+static uint8_t *jimage_store_read(platform_image_t *img, const char *name,
+                                  const platform_class_t *c, size_t *size)
 {
+    (void)name;     /* The image finds a class by where it is */
     jimage_store_t *store = (jimage_store_t *)img->store.data;
     size_t stored = c->stored_size ? c->stored_size : c->size;
     uint64_t start = store->index_size + c->offset;

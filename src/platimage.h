@@ -52,8 +52,10 @@ typedef struct platform_class
 /* The store behind a model */
 typedef struct platform_store
 {
-    /* The class file of c, malloc'd, *size bytes - NULL if it cannot be read */
-    uint8_t *(*read)(platform_image_t *img, const platform_class_t *c, size_t *size);
+    /* The class file of c, which has this internal name ("module-info" for a module's
+     * own), malloc'd, *size bytes - NULL if it cannot be read */
+    uint8_t *(*read)(platform_image_t *img, const char *name, const platform_class_t *c,
+                     size_t *size);
     void (*close)(platform_image_t *img);
     void *data;                 /* The reader's own state */
 } platform_store_t;

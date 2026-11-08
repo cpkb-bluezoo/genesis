@@ -204,6 +204,10 @@ bool jar_entry_exists(void *handle, const char *entry_path);
 /* List entries in a JAR matching a pattern */
 slist_t *jar_list_entries(void *handle, const char *pattern);
 
+/* Call fn for every entry of the archive: its name and its size when uncompressed */
+typedef void (*jar_entry_fn)(const char *name, uint32_t size, void *user_data);
+void jar_foreach_entry(void *handle, jar_entry_fn fn, void *user_data);
+
 /*
  * JMod file handling (Java 9+ modules)
  */

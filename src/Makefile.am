@@ -31,6 +31,8 @@ genesis_SOURCES = \
 	jarwriter.h \
 	jimage.c \
 	jimage.h \
+	jmods.c \
+	jmods.h \
 	lexer.c \
 	parser.c \
 	platimage.c \
