@@ -3199,6 +3199,49 @@ else
     fi
 fi
 
+# The same against images made with jlink's compressors, for the JDK the tests run
+# with and for any more named in JIMAGE_TEST_JDKS (an older JDK's jlink also
+# makes the string-sharing "compact-cp" images, with --compress=1 and 2): every
+# class of the image, byte for byte as the jimage tool extracts it.
+printf "%-30s ... " "JImageCompressed"
+if [ ! -x "$ji_dir/JImageTest" ]; then
+    echo "SKIP (no jimage reader test driver)"
+else
+    jc_ok=1
+    jc_images=0
+    for jc_home in "$ji_home" $JIMAGE_TEST_JDKS; do
+        for jc_level in zip-6 zip-1 1 2; do
+            jc_out="$ji_dir/image-$(basename "$jc_home")-$jc_level"
+            rm -rf "$jc_out"
+            "$jc_home/bin/jlink" --add-modules java.base --compress=$jc_level \
+                --output "$jc_out" >/dev/null 2>&1 || continue
+            jc_images=$((jc_images + 1))
+            rm -rf "$jc_out.theirs" "$jc_out.ours"
+            mkdir -p "$jc_out.theirs" "$jc_out.ours"
+            "$jc_home/bin/jimage" extract --dir "$jc_out.theirs" "$jc_out/lib/modules" >/dev/null 2>&1
+            find "$jc_out.theirs" -type f ! -name '*.class' -delete
+            find "$jc_out.theirs" -type d -empty -delete
+            mkdir -p "$jc_out.theirs"
+            "$ji_dir/JImageTest" extract "$jc_out/lib/modules" "$jc_out.ours" >>"$ji_dir/run.log" 2>&1
+            if ! diff -r "$jc_out.theirs" "$jc_out.ours" >/dev/null 2>&1 ||
+               [ "$(find "$jc_out.ours" -name '*.class' | wc -l)" -lt 1000 ]; then
+                echo "  (failed: $jc_home --compress=$jc_level)" >>"$ji_dir/run.log"
+                jc_ok=0
+            fi
+            rm -rf "$jc_out" "$jc_out.theirs" "$jc_out.ours"
+        done
+    done
+    if [ $jc_ok = 1 ] && [ $jc_images -gt 0 ]; then
+        echo PASS
+        passed=$((passed + 1))
+    elif [ $jc_images = 0 ]; then
+        echo "SKIP (jlink made no image)"
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+fi
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

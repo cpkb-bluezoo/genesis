@@ -30,6 +30,7 @@
 #include <unistd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <zlib.h>
 #include "jimage.h"
 
 /*
@@ -75,6 +76,9 @@ typedef struct jimage_store
     int fd;
     uint64_t index_size;        /* The content offsets count from here */
     uint64_t file_size;
+    bool swap;                  /* The file is in the other byte order to this machine's */
+    uint8_t *strings;           /* The strings table, which decompression refers to */
+    size_t strings_size;
 } jimage_store_t;
 
 static uint32_t read_u32(const uint8_t *p, bool swap)
@@ -82,6 +86,13 @@ static uint32_t read_u32(const uint8_t *p, bool swap)
     uint32_t v;
     memcpy(&v, p, sizeof(v));
     return swap ? __builtin_bswap32(v) : v;
+}
+
+static uint64_t read_u64(const uint8_t *p, bool swap)
+{
+    uint64_t v;
+    memcpy(&v, p, sizeof(v));
+    return swap ? __builtin_bswap64(v) : v;
 }
 
 /* The location starting at p (limit bytes left): its attributes. False if it is malformed. */
@@ -132,32 +143,321 @@ static bool wanted_module(const char *name, const char *const *modules)
     return false;
 }
 
+/*
+ * Compressed resources. A resource that was compressed when the image was made
+ * is stored as a layer: a 29-byte header (magic 0xCAFEFAFA, the compressed and
+ * uncompressed size as 64-bit words, the offset in the strings table of the
+ * name of the compressor, a word of padding, a byte that says whether this is
+ * the last layer) and then the content. Taking the layer off may give another
+ * layer, and so on until the bytes no longer start with the magic. The
+ * compressors are "zip" (zlib) and "compact-cp", which leaves out of a class
+ * file the strings that the image holds anyway.
+ */
+
+#define LAYER_MAGIC         0xCAFEFAFAu
+#define LAYER_HEADER_SIZE   29
+#define MAX_RESOURCE_SIZE   (1u << 30)
+
+/* A growing buffer */
+typedef struct buffer
+{
+    uint8_t *data;
+    size_t size;
+    size_t capacity;
+    bool failed;
+} buffer_t;
+
+static void buffer_put(buffer_t *b, const void *bytes, size_t n)
+{
+    if (b->failed || n == 0) {
+        return;
+    }
+    if (b->size + n > b->capacity) {
+        size_t capacity = b->capacity ? b->capacity : 1024;
+        while (capacity < b->size + n) {
+            capacity *= 2;
+        }
+        uint8_t *grown = realloc(b->data, capacity);
+        if (!grown) {
+            b->failed = true;
+            return;
+        }
+        b->data = grown;
+        b->capacity = capacity;
+    }
+    memcpy(b->data + b->size, bytes, n);
+    b->size += n;
+}
+
+static void buffer_put_u8(buffer_t *b, unsigned v)
+{
+    uint8_t byte = (uint8_t)v;
+    buffer_put(b, &byte, 1);
+}
+
+static void buffer_put_u16(buffer_t *b, unsigned v)
+{
+    uint8_t bytes[2] = { (uint8_t)(v >> 8), (uint8_t)v };
+    buffer_put(b, bytes, 2);
+}
+
+/* A cursor over the bytes of a layer */
+typedef struct cursor
+{
+    const uint8_t *p;
+    size_t left;
+    bool failed;
+} cursor_t;
+
+static const uint8_t *cursor_take(cursor_t *c, size_t n)
+{
+    if (c->failed || n > c->left) {
+        c->failed = true;
+        return NULL;
+    }
+    const uint8_t *at = c->p;
+    c->p += n;
+    c->left -= n;
+    return at;
+}
+
+static unsigned cursor_u8(cursor_t *c)
+{
+    const uint8_t *p = cursor_take(c, 1);
+    return p ? p[0] : 0;
+}
+
+static unsigned cursor_u16(cursor_t *c)
+{
+    const uint8_t *p = cursor_take(c, 2);
+    return p ? (unsigned)(p[0] << 8 | p[1]) : 0;
+}
+
+/* An index into the strings table as compact-cp writes it. A first byte with
+ * the top bit set holds the number of bytes of the index (bits 5 and 6) and its
+ * high bits (the low five); otherwise the index is four bytes, big-endian. */
+static uint32_t cursor_index(cursor_t *c)
+{
+    unsigned header = cursor_u8(c);
+    size_t length = 4;
+    uint32_t value = header;
+    if (header & 0x80) {
+        length = (header >> 5) & 3;
+        value = header & 0x1f;
+    }
+    for (size_t i = 1; i < length; i++) {
+        value = (value << 8) | cursor_u8(c);
+    }
+    return value;
+}
+
+/* The size of the body of a constant pool entry of each tag, after the tag; 0 where it varies or the tag is not valid */
+static const uint8_t constant_sizes[21] = {
+    0, 0, 0, 4, 4, 8, 8, 2, 2, 4, 4, 4, 4, 0, 0, 3, 2, 4, 4, 2, 2
+};
+
+#define TAG_UTF8                1
+#define TAG_LONG                5
+#define TAG_DOUBLE              6
+#define TAG_EXTERNAL_STRING     23      /* A Utf8 whose text is a string of the image */
+#define TAG_EXTERNAL_DESCRIPTOR 25      /* A descriptor whose type names are strings of the image */
+
+/* A Utf8 constant with this text */
+static void put_utf8(buffer_t *out, const char *text, size_t length, bool *bad)
+{
+    if (length > 0xFFFF) {
+        *bad = true;
+        return;
+    }
+    buffer_put_u8(out, TAG_UTF8);
+    buffer_put_u16(out, (unsigned)length);
+    buffer_put(out, text, length);
+}
+
+/* A descriptor with the package and class names of its types left out ("(L;L;)V"),
+ * followed by the list of indexes of those names, a package then a class for each L */
+static void put_descriptor(buffer_t *out, const uint8_t *strings, size_t strings_size,
+                           cursor_t *c, bool *bad)
+{
+    const char *desc = string_at(strings, strings_size, cursor_index(c));
+    size_t list_length = cursor_index(c);
+    const uint8_t *list = cursor_take(c, list_length);
+    if (!desc || !list) {
+        *bad = true;
+        return;
+    }
+    cursor_t names = { list, list_length, false };
+    buffer_t text = {0};
+    for (const char *d = desc; *d; d++) {
+        buffer_put_u8(&text, (unsigned char)*d);
+        if (*d != 'L') {
+            continue;
+        }
+        const char *package = string_at(strings, strings_size, cursor_index(&names));
+        const char *name = string_at(strings, strings_size, cursor_index(&names));
+        if (names.failed || !package || !name) {
+            *bad = true;
+            break;
+        }
+        if (*package) {
+            buffer_put(&text, package, strlen(package));
+            buffer_put_u8(&text, '/');
+        }
+        buffer_put(&text, name, strlen(name));
+    }
+    if (!*bad && !text.failed) {
+        put_utf8(out, (const char *)text.data, text.size, bad);
+    } else {
+        *bad = true;
+    }
+    free(text.data);
+}
+
+/* A class file whose constant pool refers to the strings table for some of its
+ * Utf8 constants, put back as a plain class file */
+static uint8_t *decompress_compact_cp(const uint8_t *in, size_t in_size, const uint8_t *strings,
+                                      size_t strings_size, size_t *out_size)
+{
+    cursor_t c = { in, in_size, false };
+    buffer_t out = {0};
+    bool bad = false;
+
+    const uint8_t *header = cursor_take(&c, 8);        /* Magic, minor, major */
+    buffer_put(&out, header, header ? 8 : 0);
+    unsigned count = cursor_u16(&c);
+    buffer_put_u16(&out, count);
+    for (unsigned i = 1; i < count && !c.failed && !out.failed && !bad; i++) {
+        unsigned tag = cursor_u8(&c);
+        if (tag == TAG_UTF8) {
+            unsigned length = cursor_u16(&c);
+            const uint8_t *text = cursor_take(&c, length);
+            if (text) {
+                put_utf8(&out, (const char *)text, length, &bad);
+            }
+        } else if (tag == TAG_EXTERNAL_STRING) {
+            const char *text = string_at(strings, strings_size, cursor_index(&c));
+            if (text) {
+                put_utf8(&out, text, strlen(text), &bad);
+            } else {
+                bad = true;
+            }
+        } else if (tag == TAG_EXTERNAL_DESCRIPTOR) {
+            put_descriptor(&out, strings, strings_size, &c, &bad);
+        } else if (tag < sizeof(constant_sizes) && constant_sizes[tag]) {
+            const uint8_t *body = cursor_take(&c, constant_sizes[tag]);
+            buffer_put_u8(&out, tag);
+            buffer_put(&out, body, body ? constant_sizes[tag] : 0);
+            if (tag == TAG_LONG || tag == TAG_DOUBLE) {
+                i++;        /* A long or double takes two slots */
+            }
+        } else {
+            bad = true;
+        }
+    }
+    if (!c.failed && !bad) {
+        buffer_put(&out, c.p, c.left);      /* The rest of the class file as it was */
+    }
+    if (c.failed || bad || out.failed) {
+        free(out.data);
+        return NULL;
+    }
+    *out_size = out.size;
+    return out.data;
+}
+
+static uint8_t *decompress_zip(const uint8_t *in, size_t in_size, size_t original_size,
+                               size_t *out_size)
+{
+    uint8_t *out = malloc(original_size ? original_size : 1);
+    if (!out) {
+        return NULL;
+    }
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    if (inflateInit(&zs) != Z_OK) {
+        free(out);
+        return NULL;
+    }
+    zs.next_in = (Bytef *)in;
+    zs.avail_in = (uInt)in_size;
+    zs.next_out = out;
+    zs.avail_out = (uInt)original_size;
+    int rc = inflate(&zs, Z_FINISH);
+    size_t produced = original_size - zs.avail_out;
+    inflateEnd(&zs);
+    if (rc != Z_STREAM_END || produced != original_size) {
+        free(out);
+        return NULL;
+    }
+    *out_size = produced;
+    return out;
+}
+
+/* Take the compression layers off a resource. Takes over data (malloc'd, *size bytes)
+ * and returns the bytes under the layers, or NULL. */
+static uint8_t *remove_layers(const jimage_store_t *store, uint8_t *data, size_t *size)
+{
+    while (*size >= LAYER_HEADER_SIZE && read_u32(data, store->swap) == LAYER_MAGIC) {
+        uint64_t original = read_u64(data + 12, store->swap);
+        const char *name = string_at(store->strings, store->strings_size,
+                                     read_u32(data + 20, store->swap));
+        const uint8_t *body = data + LAYER_HEADER_SIZE;
+        size_t body_size = *size - LAYER_HEADER_SIZE;
+        uint8_t *under = NULL;
+        size_t under_size = 0;
+
+        if (!name || original > MAX_RESOURCE_SIZE) {
+            fprintf(stderr, "error: jimage compressed resource is corrupt\n");
+        } else if (strcmp(name, "zip") == 0) {
+            under = decompress_zip(body, body_size, (size_t)original, &under_size);
+        } else if (strcmp(name, "compact-cp") == 0) {
+            under = decompress_compact_cp(body, body_size, store->strings, store->strings_size,
+                                          &under_size);
+        } else {
+            fprintf(stderr, "error: jimage resource compressed with unknown plugin \"%s\"\n", name);
+        }
+        free(data);
+        if (!under) {
+            return NULL;
+        }
+        data = under;
+        *size = under_size;
+    }
+    return data;
+}
+
 static uint8_t *jimage_store_read(platform_image_t *img, const platform_class_t *c, size_t *size)
 {
     jimage_store_t *store = (jimage_store_t *)img->store.data;
-    if (c->stored_size != 0) {
-        fprintf(stderr, "error: compressed jimage resources are not supported yet\n");
-        return NULL;
-    }
+    size_t stored = c->stored_size ? c->stored_size : c->size;
     uint64_t start = store->index_size + c->offset;
-    if (start > store->file_size || c->size > store->file_size - start) {
+    if (start > store->file_size || stored > store->file_size - start) {
         return NULL;
     }
-    uint8_t *data = malloc(c->size ? c->size : 1);
+    uint8_t *data = malloc(stored ? stored : 1);
     if (!data) {
         return NULL;
     }
     size_t done = 0;
-    while (done < c->size) {
-        ssize_t n = pread(store->fd, data + done, c->size - done, (off_t)(start + done));
+    while (done < stored) {
+        ssize_t n = pread(store->fd, data + done, stored - done, (off_t)(start + done));
         if (n <= 0) {
             free(data);
             return NULL;
         }
         done += (size_t)n;
     }
-    if (size) {
-        *size = c->size;
+    size_t length = stored;
+    if (c->stored_size != 0) {
+        data = remove_layers(store, data, &length);
+        if (data && length != c->size) {
+            fprintf(stderr, "error: jimage compressed resource has the wrong size\n");
+            free(data);
+            data = NULL;
+        }
+    }
+    if (data && size) {
+        *size = length;
     }
     return data;
 }
@@ -166,6 +466,7 @@ static void jimage_store_close(platform_image_t *img)
 {
     jimage_store_t *store = (jimage_store_t *)img->store.data;
     if (store) {
+        free(store->strings);
         if (store->fd >= 0) {
             close(store->fd);
         }
@@ -312,8 +613,14 @@ platform_image_t *jimage_load(const char *path, const char *const *modules)
     img->store.close = jimage_store_close;
     img->store.data = store;
 
-    bool ok = jimage_index_to_model(img, (const uint8_t *)map, table_length, locations_size,
-                                    strings_size, swap, modules);
+    store->swap = swap;
+    store->strings_size = (size_t)strings_size;
+    store->strings = malloc(strings_size ? strings_size : 1);
+    if (store->strings) {
+        memcpy(store->strings, (const uint8_t *)map + index_size - strings_size, strings_size);
+    }
+    bool ok = store->strings && jimage_index_to_model(img, (const uint8_t *)map, table_length,
+                                                      locations_size, strings_size, swap, modules);
     munmap(map, (size_t)index_size);
     if (!ok) {
         platform_image_free(img);

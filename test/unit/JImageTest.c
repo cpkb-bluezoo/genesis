@@ -26,6 +26,9 @@
  *   JImageTest list IMAGE [MODULE...]    "module internal/name" per class
  *   JImageTest read IMAGE NAME           the class file, on stdout
  *   JImageTest modinfo IMAGE MODULE      the module-info.class, on stdout
+ *   JImageTest extract IMAGE DIR [MODULE...]
+ *                                        every class (and module-info) as
+ *                                        DIR/module/internal/name.class
  */
 
 #ifdef HAVE_CONFIG_H
@@ -35,6 +38,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include "jimage.h"
 
 static void print_class(const char *name, void *value, void *user_data)
@@ -42,6 +47,48 @@ static void print_class(const char *name, void *value, void *user_data)
     platform_image_t *img = (platform_image_t *)user_data;
     const platform_class_t *c = (const platform_class_t *)value;
     printf("%s %s\n", img->module_names[c->module], name);
+}
+
+typedef struct extract_state
+{
+    platform_image_t *img;
+    const char *dir;
+    int failures;
+} extract_state_t;
+
+static void make_directories(char *path)
+{
+    for (char *p = strchr(path + 1, '/'); p; p = strchr(p + 1, '/')) {
+        *p = '\0';
+        mkdir(path, 0777);
+        *p = '/';
+    }
+}
+
+static void write_file(extract_state_t *st, const char *module, const char *name, uint8_t *data,
+                       size_t size)
+{
+    char path[2048];
+    snprintf(path, sizeof(path), "%s/%s/%s.class", st->dir, module, name);
+    make_directories(path);
+    FILE *f = data ? fopen(path, "wb") : NULL;
+    if (!f || fwrite(data, 1, size, f) != size) {
+        fprintf(stderr, "cannot write %s\n", path);
+        st->failures++;
+    }
+    if (f) {
+        fclose(f);
+    }
+    free(data);
+}
+
+static void extract_class(const char *name, void *value, void *user_data)
+{
+    extract_state_t *st = (extract_state_t *)user_data;
+    const platform_class_t *c = (const platform_class_t *)value;
+    size_t size = 0;
+    uint8_t *data = platform_image_read_class(st->img, name, &size);
+    write_file(st, st->img->module_names[c->module], name, data, size);
 }
 
 static int write_bytes(uint8_t *data, size_t size)
@@ -62,7 +109,9 @@ int main(int argc, char **argv)
         return 2;
     }
     const char *const *modules = NULL;
-    if (strcmp(argv[1], "list") == 0 && argc > 3) {
+    if (strcmp(argv[1], "extract") == 0 && argc > 4) {
+        modules = (const char *const *)&argv[4];
+    } else if (strcmp(argv[1], "list") == 0 && argc > 3) {
         modules = (const char *const *)&argv[3];
         argv[argc] = NULL;
     }
@@ -74,6 +123,19 @@ int main(int argc, char **argv)
     size_t size = 0;
     if (strcmp(argv[1], "list") == 0) {
         hashtable_foreach(img->classes, print_class, img);
+    } else if (strcmp(argv[1], "extract") == 0 && argc > 3) {
+        extract_state_t st = { img, argv[3], 0 };
+        hashtable_foreach(img->classes, extract_class, &st);
+        for (int m = 0; m < img->module_count; m++) {
+            size_t n = 0;
+            uint8_t *info = platform_image_read_module_info(img, img->module_names[m], &n);
+            if (info) {
+                char name[512];
+                snprintf(name, sizeof(name), "module-info");
+                write_file(&st, img->module_names[m], name, info, n);
+            }
+        }
+        rc = st.failures ? 1 : 0;
     } else if (strcmp(argv[1], "read") == 0 && argc > 3) {
         uint8_t *data = platform_image_read_class(img, argv[3], &size);
         rc = write_bytes(data, size);
