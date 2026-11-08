@@ -1,5 +1,54 @@
 GNU Genesis NEWS -- history of user-visible changes.
 
+* Noteworthy changes in release 1.1.0 (2026-11-08) [stable]
+
+** New features
+
+  A JDK without a jmods directory can now be compiled against.  Genesis
+  reads the classes of the JDK's runtime image (lib/modules), including
+  images whose resources are compressed (zip and compact-cp).  When both
+  exist, jmods is still preferred.  The README no longer requires jmods.
+
+  Switch statements accept pattern labels, including the colon form, and
+  "case null".  Record patterns work in switch expressions.
+
+  Definite assignment of local variables (JLS 16) is checked.  Pattern
+  bindings of instanceof are scoped as the language specifies and compile
+  to jumps.
+
+  Lombok annotations are reported as unsupported instead of being ignored.
+
+  "-version" prints a javac-style line, and "--version" shows the source
+  commit.  @argfiles are read with javac's quoting and token rules.
+
+** Performance
+
+  Both the jmods and the runtime image route build one in-memory model of
+  the platform classes, so the class library is resolved by the same code
+  whichever the JDK provides.  The jmods directory is read without mapping
+  files or allocating per class: the classpath is ready in about 1.6 ms
+  instead of about 4 ms, and a Hello World compile takes about 5 ms
+  instead of about 8 ms.
+
+  Compiling against a runtime image reads each class about eight times
+  faster than against jmods, because the resources are stored uncompressed;
+  for a program that reads more than about 200 JDK classes the two are on
+  a par.
+
+** Bugs fixed
+
+  Parity with javac on the Spring Boot sources and on gumdrop's tests: many
+  gaps in generic inference, lambda and method reference typing, overload
+  selection, diamond inference, nested and statically imported types,
+  inherited and protected fields of class-file superclasses, and bytecode
+  for switches, conditionals, boxed increments and constant narrowing.
+
+  Every enum class now carries the Signature Enum<E>.  A class whose
+  expression or block cannot be generated fails instead of being written
+  incomplete.  Fields declared with postfix array dimensions are typed
+  correctly.  Sourcepath files are looked up with case-sensitive names.
+  A constant pool that grew by a raw copy left uninitialised slots.
+
 * Noteworthy changes in release 1.0.1 (2026-10-02) [stable]
 
 ** Compatibility

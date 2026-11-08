@@ -1,3 +1,19 @@
+2026-11-08  Chris Burdess  <dog@gnu.org>
+
+	Release 1.1.0.
+
+	Compile against a JDK that has only lib/modules; resolve the class
+	library through one platform model; javac parity on Spring Boot.
+	The individual fixes are recorded in the git history between v1.0.1
+	and this release.
+	* src/platimage.c, src/jimage.c, src/jmods.c: Platform model and the
+	readers that fill it from a runtime image or the jmods directory.
+	* src/classpath.c: One CP_PLATFORM entry for the class library;
+	zip scanner shared by jars and jmods.
+	* src/semantic.c, src/codegen.c, src/parser.c: Pattern switches,
+	definite assignment, inference and resolution fixes, Enum<E>
+	Signature.
+
 2026-10-02  Chris Burdess  <dog@gnu.org>
 
 	Release 1.0.1.
