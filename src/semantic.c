@@ -4071,6 +4071,27 @@ static void append_type_sig_name(char *buf, size_t bufsize, size_t *pos, type_t 
     }
 }
 
+/* Append formatted text to a key being built in [*pk, buf_end). The text is cut where it
+ * does not fit, and *pk never moves past the last byte before buf_end: snprintf returns the
+ * length it wanted to write, not the length it did. */
+static void method_key_append(char **pk, char *buf_end, const char *fmt, ...)
+{
+    if (*pk >= buf_end - 1) {
+        return;
+    }
+    va_list args;
+    va_start(args, fmt);
+    int wanted = vsnprintf(*pk, (size_t)(buf_end - *pk), fmt, args);
+    va_end(args);
+    if (wanted < 0) {
+        **pk = '\0';
+    } else if (wanted >= buf_end - *pk) {
+        *pk = buf_end - 1;
+    } else {
+        *pk += wanted;
+    }
+}
+
 /**
  * Append a JVM-descriptor-style fragment for `type` (V/B/S/I/J/F/D/C/Z
  * for primitives, "L<name>;" for a class, "T<name>;" for a type
@@ -4103,26 +4124,26 @@ static void append_method_key_descriptor_fragment(char **pk, char *buf_end, type
         return;
     }
     switch (type->kind) {
-        case TYPE_VOID:    *pk += snprintf(*pk, buf_end - *pk, "V"); break;
-        case TYPE_BYTE:     *pk += snprintf(*pk, buf_end - *pk, "B"); break;
-        case TYPE_SHORT:    *pk += snprintf(*pk, buf_end - *pk, "S"); break;
-        case TYPE_INT:      *pk += snprintf(*pk, buf_end - *pk, "I"); break;
-        case TYPE_LONG:     *pk += snprintf(*pk, buf_end - *pk, "J"); break;
-        case TYPE_FLOAT:    *pk += snprintf(*pk, buf_end - *pk, "F"); break;
-        case TYPE_DOUBLE:   *pk += snprintf(*pk, buf_end - *pk, "D"); break;
-        case TYPE_CHAR:     *pk += snprintf(*pk, buf_end - *pk, "C"); break;
-        case TYPE_BOOLEAN:  *pk += snprintf(*pk, buf_end - *pk, "Z"); break;
+        case TYPE_VOID:    method_key_append(pk, buf_end, "V"); break;
+        case TYPE_BYTE:     method_key_append(pk, buf_end, "B"); break;
+        case TYPE_SHORT:    method_key_append(pk, buf_end, "S"); break;
+        case TYPE_INT:      method_key_append(pk, buf_end, "I"); break;
+        case TYPE_LONG:     method_key_append(pk, buf_end, "J"); break;
+        case TYPE_FLOAT:    method_key_append(pk, buf_end, "F"); break;
+        case TYPE_DOUBLE:   method_key_append(pk, buf_end, "D"); break;
+        case TYPE_CHAR:     method_key_append(pk, buf_end, "C"); break;
+        case TYPE_BOOLEAN:  method_key_append(pk, buf_end, "Z"); break;
         case TYPE_CLASS:
             if (type->data.class_type.name) {
-                *pk += snprintf(*pk, buf_end - *pk, "L%s;", type->data.class_type.name);
+                method_key_append(pk, buf_end, "L%s;", type->data.class_type.name);
             } else {
-                *pk += snprintf(*pk, buf_end - *pk, "L?;");
+                method_key_append(pk, buf_end, "L?;");
             }
             break;
         case TYPE_ARRAY: {
             int dims = type->data.array_type.dimensions > 0 ? type->data.array_type.dimensions : 1;
             for (int i = 0; i < dims && *pk < buf_end; i++) {
-                *pk += snprintf(*pk, buf_end - *pk, "[");
+                method_key_append(pk, buf_end, "[");
             }
             append_method_key_descriptor_fragment(pk, buf_end, type->data.array_type.element_type);
             break;
@@ -4134,17 +4155,17 @@ static void append_method_key_descriptor_fragment(char **pk, char *buf_end, type
                 type_t *bound = type->data.type_var.bound;
                 if (bound && bound->kind == TYPE_CLASS && bound->data.class_type.name &&
                     strcmp(bound->data.class_type.name, "java.lang.Object") != 0) {
-                    *pk += snprintf(*pk, buf_end - *pk, "T%s:%s;", type->data.type_var.name,
+                    method_key_append(pk, buf_end, "T%s:%s;", type->data.type_var.name,
                                     bound->data.class_type.name);
                 } else {
-                    *pk += snprintf(*pk, buf_end - *pk, "T%s;", type->data.type_var.name);
+                    method_key_append(pk, buf_end, "T%s;", type->data.type_var.name);
                 }
             } else {
-                *pk += snprintf(*pk, buf_end - *pk, "Ljava/lang/Object;");
+                method_key_append(pk, buf_end, "Ljava/lang/Object;");
             }
             break;
         default:
-            *pk += snprintf(*pk, buf_end - *pk, "?");
+            method_key_append(pk, buf_end, "?");
             break;
     }
 }
@@ -16803,10 +16824,10 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             {
                                 char method_key[1024];
                                 char *pk = method_key;
-                                pk += snprintf(pk, sizeof(method_key), "%s(", name);
+                                char *method_key_end = method_key + sizeof(method_key);
+                                method_key_append(&pk, method_key_end, "%s(", name);
                                 
                                 /* Build parameter type signature using type kinds and class names */
-                                char *method_key_end = method_key + sizeof(method_key);
                                 for (slist_t *plist = sym->data.method_data.parameters; plist; plist = plist->next) {
                                     symbol_t *ps = (symbol_t *)plist->data;
                                     if (ps && ps->type) {
@@ -23977,26 +23998,56 @@ static char *fi_build_substituted_sig(symbol_t *method, hashtable_t *type_args_m
     if (!method) {
         return NULL;
     }
-    
-    char buf[512];
-    char *p = buf;
-    p += snprintf(p, buf + sizeof(buf) - p, "%s(", method->name);
-    
+
+    /* The signature has no length bound: grow the buffer to fit each piece */
+    size_t length = 0, capacity = 128;
+    char *sig = malloc(capacity);
+    if (!sig) {
+        return NULL;
+    }
+    const char *pieces[2] = { method->name, "(" };
+    for (int i = 0; i < 2; i++) {
+        size_t n = strlen(pieces[i]);
+        if (length + n + 2 > capacity) {
+            capacity = (length + n + 2) * 2;
+            char *grown = realloc(sig, capacity);
+            if (!grown) {
+                free(sig);
+                return NULL;
+            }
+            sig = grown;
+        }
+        memcpy(sig + length, pieces[i], n);
+        length += n;
+    }
+
     slist_t *params = method->data.method_data.parameters;
     bool first = true;
     for (slist_t *pn = params; pn; pn = pn->next) {
         symbol_t *param = (symbol_t *)pn->data;
         if (param && param->type) {
-            if (!first) {
-                p += snprintf(p, buf + sizeof(buf) - p, ",");
+            const char *name = fi_get_substituted_name(param->type, type_args_map);
+            size_t n = strlen(name);
+            if (length + n + 3 > capacity) {
+                capacity = (length + n + 3) * 2;
+                char *grown = realloc(sig, capacity);
+                if (!grown) {
+                    free(sig);
+                    return NULL;
+                }
+                sig = grown;
             }
-            p += snprintf(p, buf + sizeof(buf) - p, "%s", 
-                fi_get_substituted_name(param->type, type_args_map));
+            if (!first) {
+                sig[length++] = ',';
+            }
+            memcpy(sig + length, name, n);
+            length += n;
             first = false;
         }
     }
-    snprintf(p, buf + sizeof(buf) - p, ")");
-    return strdup(buf);
+    sig[length++] = ')';
+    sig[length] = '\0';
+    return sig;
 }
 
 /**
