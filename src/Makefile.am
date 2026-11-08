@@ -29,8 +29,12 @@ genesis_SOURCES = \
 	indy.h \
 	jarwriter.c \
 	jarwriter.h \
+	jimage.c \
+	jimage.h \
 	lexer.c \
 	parser.c \
+	platimage.c \
+	platimage.h \
 	semantic.c \
 	stackmap.c \
 	stackmap.h \

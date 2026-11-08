@@ -26,6 +26,7 @@
 #include <stddef.h>
 #include "classfile.h"
 #include "util.h"
+#include "platimage.h"
 
 /*
  * Classpath Management
@@ -46,7 +47,8 @@ typedef enum cp_entry_type
 {
     CP_DIRECTORY,       /* Directory with .class files */
     CP_JAR,             /* JAR/ZIP archive */
-    CP_JMOD             /* Java module file (Java 9+) */
+    CP_JMOD,            /* Java module file (Java 9+) */
+    CP_PLATFORM         /* The classes of a JDK's modules, read into a platform model */
 } cp_entry_type_t;
 
 /*
@@ -59,6 +61,9 @@ typedef struct cp_entry
 
     /* For JAR files: cached central directory */
     void *jar_handle;               /* Opaque handle for JAR reading */
+
+    /* For a CP_PLATFORM entry: the model of the JDK's classes, which the entry owns */
+    platform_image_t *platform;
 
     /* Position in the search order: boot entries first, then user entries */
     int order;

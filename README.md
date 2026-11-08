@@ -108,13 +108,10 @@ make
 ```
 
 Genesis reads the Java platform classes it compiles against from a JDK
-(`JAVA_HOME`, or a standard location for your platform). That JDK must ship
-its `jmods` directory: genesis does not read the `lib/modules` runtime image
-by itself. Most JDKs include `jmods`, but JDK 24 and later let vendors leave
-it out (JEP 493) and some do: Eclipse Temurin 25 on Linux has none, for
-example, and genesis then reports every `java.*` type as unresolved. Check
-for `$JAVA_HOME/jmods`; Oracle JDK, Azul Zulu and the macOS and Linux
-distribution packages that include it work.
+(`JAVA_HOME`, or a standard location for your platform). It reads them from
+the JDK's `jmods` directory if there is one, and otherwise from the `lib/modules`
+runtime image, which is all that a JDK made by `jlink`, or one from a vendor
+that leaves out `jmods` (JEP 493), has. Compressed images are read too.
 
 Regression tests (`make check`) and the jtreg integration live in `test/`,
 which is only present in a git checkout, not in the release tarball. They
@@ -202,10 +199,6 @@ arguments in an `@argfile` in javac's format, which genesis reads.
   and point genesis at the generated tree, or write the members by hand.
   Other processors (MapStruct, AutoValue, Immutables, Dagger) are likewise not
   run: the classes they generate must be produced by a prior build step.
-
-- **JDK without `jmods`**: see Building. A JDK that has only the `lib/modules`
-  runtime image (such as Eclipse Temurin 25) cannot be used to compile against,
-  because genesis has no reader for that image format yet.
 
 ## Contributing
 

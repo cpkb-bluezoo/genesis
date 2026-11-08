@@ -3149,6 +3149,127 @@ else
     failed=$((failed + 1))
 fi
 
+# JImageTest: the jimage reader against the JDK's own "jimage" tool, on the
+# runtime image of the JDK the tests run with: the same classes in the same
+# modules, the same bytes for a sample of them, and the same module-info.
+printf "%-30s ... " "JImageReader"
+ji_home=$("$JAVA" -XshowSettings:properties -version 2>&1 | sed -n 's/^ *java\.home = //p')
+ji_tool="$ji_home/bin/jimage"
+ji_dir="$TEST_BUILD/jimage"
+rm -rf "$ji_dir"
+mkdir -p "$ji_dir"
+if [ ! -f "$ji_home/lib/modules" ] || [ ! -x "$ji_tool" ]; then
+    echo "SKIP (no lib/modules or jimage tool)"
+else
+    ji_ok=1
+    ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -I"$here/.." -I"$here/../src" \
+        -o "$ji_dir/JImageTest" "$here/unit/JImageTest.c" "$here/../src/jimage.c" \
+        "$here/../src/platimage.c" "$here/../src/util.c" -lz -lpthread \
+        >"$ji_dir/build.log" 2>&1 || ji_ok=0
+    if [ $ji_ok = 1 ]; then
+        "$ji_tool" list "$ji_home/lib/modules" 2>/dev/null |
+            awk '/^Module:/ { m = $2; next }
+                 /\.class$/ && $1 != "module-info.class" { sub(/\.class$/, "", $1); print m " " $1 }' |
+            sort >"$ji_dir/expected.txt"
+        "$ji_dir/JImageTest" list "$ji_home/lib/modules" | sort >"$ji_dir/actual.txt" 2>"$ji_dir/run.log"
+        [ -s "$ji_dir/expected.txt" ] && cmp -s "$ji_dir/expected.txt" "$ji_dir/actual.txt" || ji_ok=0
+    fi
+    if [ $ji_ok = 1 ]; then
+        mkdir -p "$ji_dir/extracted"
+        "$ji_tool" extract --dir "$ji_dir/extracted" \
+            --include 'glob:/java.base/java/lang/Object.class,glob:/java.base/java/lang/String.class,glob:/java.base/java/lang/Thread$State.class,glob:/java.base/java/util/HashMap.class,glob:/java.base/module-info.class' \
+            "$ji_home/lib/modules" >/dev/null 2>&1
+        for c in java/lang/Object java/lang/String 'java/lang/Thread$State' java/util/HashMap; do
+            "$ji_dir/JImageTest" read "$ji_home/lib/modules" "$c" >"$ji_dir/one.class" 2>>"$ji_dir/run.log" &&
+                cmp -s "$ji_dir/one.class" "$ji_dir/extracted/java.base/$c.class" || ji_ok=0
+        done
+        "$ji_dir/JImageTest" modinfo "$ji_home/lib/modules" java.base >"$ji_dir/one.class" 2>>"$ji_dir/run.log" &&
+            cmp -s "$ji_dir/one.class" "$ji_dir/extracted/java.base/module-info.class" || ji_ok=0
+        # Keeping only some modules
+        "$ji_dir/JImageTest" list "$ji_home/lib/modules" java.base java.xml |
+            awk '{ print $1 }' | sort -u >"$ji_dir/modules.txt"
+        [ "$(tr '\n' ' ' <"$ji_dir/modules.txt")" = "java.base java.xml " ] || ji_ok=0
+    fi
+    if [ $ji_ok = 1 ]; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+fi
+
+# The same against images made with jlink's compressors, for the JDK the tests run
+# with and for any more named in JIMAGE_TEST_JDKS (an older JDK's jlink also
+# makes the string-sharing "compact-cp" images, with --compress=1 and 2): every
+# class of the image, byte for byte as the jimage tool extracts it.
+printf "%-30s ... " "JImageCompressed"
+if [ ! -x "$ji_dir/JImageTest" ]; then
+    echo "SKIP (no jimage reader test driver)"
+else
+    jc_ok=1
+    jc_images=0
+    for jc_home in "$ji_home" $JIMAGE_TEST_JDKS; do
+        for jc_level in zip-6 zip-1 1 2; do
+            jc_out="$ji_dir/image-$(basename "$jc_home")-$jc_level"
+            rm -rf "$jc_out"
+            "$jc_home/bin/jlink" --add-modules java.base --compress=$jc_level \
+                --output "$jc_out" >/dev/null 2>&1 || continue
+            jc_images=$((jc_images + 1))
+            rm -rf "$jc_out.theirs" "$jc_out.ours"
+            mkdir -p "$jc_out.theirs" "$jc_out.ours"
+            "$jc_home/bin/jimage" extract --dir "$jc_out.theirs" "$jc_out/lib/modules" >/dev/null 2>&1
+            find "$jc_out.theirs" -type f ! -name '*.class' -delete
+            find "$jc_out.theirs" -type d -empty -delete
+            mkdir -p "$jc_out.theirs"
+            "$ji_dir/JImageTest" extract "$jc_out/lib/modules" "$jc_out.ours" >>"$ji_dir/run.log" 2>&1
+            if ! diff -r "$jc_out.theirs" "$jc_out.ours" >/dev/null 2>&1 ||
+               [ "$(find "$jc_out.ours" -name '*.class' | wc -l)" -lt 1000 ]; then
+                echo "  (failed: $jc_home --compress=$jc_level)" >>"$ji_dir/run.log"
+                jc_ok=0
+            fi
+            rm -rf "$jc_out" "$jc_out.theirs" "$jc_out.ours"
+        done
+    done
+    if [ $jc_ok = 1 ] && [ $jc_images -gt 0 ]; then
+        echo PASS
+        passed=$((passed + 1))
+    elif [ $jc_images = 0 ]; then
+        echo "SKIP (jlink made no image)"
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+fi
+
+# A JDK that has only the lib/modules runtime image, as jlink makes it (and as some
+# vendors ship the whole JDK): the platform classes must come from the image. The
+# program is run with that same runtime.
+printf "%-30s ... " "JImageJdkTest"
+jj_dir="$TEST_BUILD/jimagejdk"
+rm -rf "$jj_dir"
+mkdir -p "$jj_dir"
+if [ ! -x "$ji_home/bin/jlink" ]; then
+    echo "SKIP (no jlink)"
+elif ! "$ji_home/bin/jlink" --add-modules java.base,java.logging --output "$jj_dir/jdk" >/dev/null 2>&1; then
+    echo "SKIP (jlink made no image)"
+else
+    jj_ok=1
+    JAVA_HOME="$jj_dir/jdk" "$GENESIS" -d "$jj_dir/out" \
+        "$TEST_SRC/external/jimagejdk/JImageJdkTest.java" >"$jj_dir/build.log" 2>&1 || jj_ok=0
+    [ "$jj_ok" = 1 ] && [ "$("$jj_dir/jdk/bin/java" -Xverify:all -cp "$jj_dir/out" JImageJdkTest 2>&1)" = "jimage" ] || jj_ok=0
+    JAVA_HOME="$jj_dir/jdk" "$GENESIS" -source 25 -d "$jj_dir/out2" \
+        "$TEST_SRC/external/jimagejdk/JImageModuleImportTest.java" >>"$jj_dir/build.log" 2>&1 || jj_ok=0
+    [ "$jj_ok" = 1 ] && [ "$("$jj_dir/jdk/bin/java" -Xverify:all -cp "$jj_dir/out2" JImageModuleImportTest 2>&1)" = "module" ] || jj_ok=0
+    if [ $jj_ok = 1 ]; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+fi
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]
