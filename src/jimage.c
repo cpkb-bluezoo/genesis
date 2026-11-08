@@ -426,8 +426,10 @@ static uint8_t *remove_layers(const jimage_store_t *store, uint8_t *data, size_t
     return data;
 }
 
-static uint8_t *jimage_store_read(platform_image_t *img, const platform_class_t *c, size_t *size)
+static uint8_t *jimage_store_read(platform_image_t *img, const char *name,
+                                  const platform_class_t *c, size_t *size)
 {
+    (void)name;     /* The image finds a class by where it is */
     jimage_store_t *store = (jimage_store_t *)img->store.data;
     size_t stored = c->stored_size ? c->stored_size : c->size;
     uint64_t start = store->index_size + c->offset;
@@ -475,6 +477,42 @@ static void jimage_store_close(platform_image_t *img)
     }
 }
 
+/* What is to be done with the resources of a module, which are all told by the offset in
+ * the strings table of its name; there are some seventy modules and tens of thousands of resources */
+typedef struct module_decision
+{
+    uint64_t name_offset;
+    int module;                 /* Index in the model */
+    bool wanted;                /* Its classes are to be kept (its module-info always is) */
+} module_decision_t;
+
+#define MAX_MODULE_DECISIONS    256
+
+/* The decision for the module whose name is at name_offset, made the first time it is asked for;
+ * NULL if the resources are not of a module or the table is corrupt */
+static const module_decision_t *decide_module(platform_image_t *img, module_decision_t *decisions,
+                                              int *count, uint64_t name_offset,
+                                              const uint8_t *strings, size_t strings_size,
+                                              const char *const *modules)
+{
+    for (int i = 0; i < *count; i++) {
+        if (decisions[i].name_offset == name_offset) {
+            return decisions[i].module < 0 ? NULL : &decisions[i];
+        }
+    }
+    const char *name = string_at(strings, strings_size, name_offset);
+    if (!name || *count >= MAX_MODULE_DECISIONS) {
+        return NULL;
+    }
+    module_decision_t *d = &decisions[(*count)++];
+    d->name_offset = name_offset;
+    d->wanted = wanted_module(name, modules);
+    /* The image describes itself under the module names "modules" and "packages" */
+    d->module = (strcmp(name, "modules") == 0 || strcmp(name, "packages") == 0)
+            ? -1 : platform_image_add_module(img, name);
+    return d->module < 0 ? NULL : d;
+}
+
 /* Walk the index and enter what it holds in the model */
 static bool jimage_index_to_model(platform_image_t *img, const uint8_t *index, uint64_t table_length,
                                   uint64_t locations_size, uint64_t strings_size, bool swap,
@@ -484,10 +522,15 @@ static bool jimage_index_to_model(platform_image_t *img, const uint8_t *index, u
     const uint8_t *locations = offsets + table_length * 4;
     const uint8_t *strings = locations + locations_size;
 
-    if (!platform_image_reserve(img, (size_t)table_length)) {
+    /* A good part of the resources are not classes of the modules wanted; the model grows if
+     * this is too few */
+    if (!platform_image_reserve(img, (size_t)table_length * 60 / 100)) {
         return false;
     }
 
+    module_decision_t decisions[MAX_MODULE_DECISIONS];
+    int decision_count = 0;
+    uint64_t class_extension = 0;       /* Where "class" is in the strings, once seen */
     char name[1024];
     for (uint64_t n = 0; n < table_length; n++) {
         uint32_t at = read_u32(offsets + n * 4, swap);
@@ -496,24 +539,33 @@ static bool jimage_index_to_model(platform_image_t *img, const uint8_t *index, u
             fprintf(stderr, "error: jimage location table is corrupt\n");
             return false;
         }
-        if (attrs[ATTR_MODULE] == 0) {
-            continue;       /* Not a resource of a module */
+        if (attrs[ATTR_MODULE] == 0 || attrs[ATTR_EXTENSION] == 0) {
+            continue;       /* Not a resource of a module, or one without an extension */
         }
-        const char *module = string_at(strings, strings_size, attrs[ATTR_MODULE]);
-        const char *base = string_at(strings, strings_size, attrs[ATTR_BASE]);
-        const char *ext = attrs[ATTR_EXTENSION]
-                ? string_at(strings, strings_size, attrs[ATTR_EXTENSION]) : NULL;
-        if (!module || !base || !ext || strcmp(ext, "class") != 0) {
-            continue;
-        }
-        /* The image describes itself under the module names "modules" and "packages" */
-        if (strcmp(module, "modules") == 0 || strcmp(module, "packages") == 0) {
+        const module_decision_t *d = decide_module(img, decisions, &decision_count,
+                                                   attrs[ATTR_MODULE], strings,
+                                                   (size_t)strings_size, modules);
+        if (!d) {
             continue;
         }
         /* Every module's module-info is kept, whether or not its classes are: what a
          * module exports can be asked of one that is not on the class path */
+        if (!d->wanted && attrs[ATTR_PARENT] != 0) {
+            continue;
+        }
+        if (attrs[ATTR_EXTENSION] != class_extension) {
+            const char *ext = string_at(strings, strings_size, attrs[ATTR_EXTENSION]);
+            if (!ext || strcmp(ext, "class") != 0) {
+                continue;
+            }
+            class_extension = attrs[ATTR_EXTENSION];
+        }
+        const char *base = string_at(strings, strings_size, attrs[ATTR_BASE]);
+        if (!base) {
+            continue;
+        }
         bool is_module_info = attrs[ATTR_PARENT] == 0 && strcmp(base, "module-info") == 0;
-        if (!is_module_info && !wanted_module(module, modules)) {
+        if (!d->wanted && !is_module_info) {
             continue;
         }
         const char *parent = attrs[ATTR_PARENT]
@@ -523,10 +575,6 @@ static bool jimage_index_to_model(platform_image_t *img, const uint8_t *index, u
             return false;
         }
 
-        int m = platform_image_add_module(img, module);
-        if (m < 0) {
-            return false;
-        }
         platform_class_t c = {0};
         c.offset = attrs[ATTR_OFFSET];
         c.stored_size = (uint32_t)attrs[ATTR_COMPRESSED];
@@ -536,15 +584,21 @@ static bool jimage_index_to_model(platform_image_t *img, const uint8_t *index, u
         }
 
         if (is_module_info) {
-            platform_image_set_module_info(img, (uint32_t)m, &c);
+            platform_image_set_module_info(img, (uint32_t)d->module, &c);
             continue;
         }
-        int len = snprintf(name, sizeof(name), "%s%s%s", parent ? parent : "",
-                           parent ? "/" : "", base);
-        if (len < 0 || (size_t)len >= sizeof(name)) {
+        size_t parent_length = parent ? strlen(parent) : 0;
+        size_t base_length = strlen(base);
+        size_t length = parent_length + (parent ? 1 : 0) + base_length;
+        if (length >= sizeof(name)) {
             continue;
         }
-        if (!platform_image_add_class(img, name, (uint32_t)m, &c)) {
+        if (parent) {
+            memcpy(name, parent, parent_length);
+            name[parent_length] = '/';
+        }
+        memcpy(name + length - base_length, base, base_length);
+        if (!platform_image_add_class_n(img, name, length, (uint32_t)d->module, &c)) {
             return false;
         }
     }

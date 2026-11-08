@@ -3149,6 +3149,22 @@ else
     failed=$((failed + 1))
 fi
 
+# PlatImageTest: the platform model on its own.
+printf "%-30s ... " "PlatformModel"
+pm_dir="$TEST_BUILD/platmodel"
+rm -rf "$pm_dir"
+mkdir -p "$pm_dir"
+if ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -I"$here/.." -I"$here/../src" -o "$pm_dir/PlatImageTest" \
+       "$here/unit/PlatImageTest.c" "$here/../src/platimage.c" "$here/../src/util.c" \
+       -lz -lpthread >"$pm_dir/build.log" 2>&1 &&
+   "$pm_dir/PlatImageTest" >"$pm_dir/run.log" 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 # JImageTest: the jimage reader against the JDK's own "jimage" tool, on the
 # runtime image of the JDK the tests run with: the same classes in the same
 # modules, the same bytes for a sample of them, and the same module-info.
@@ -3268,6 +3284,29 @@ else
         echo FAIL
         failed=$((failed + 1))
     fi
+fi
+
+# JmodsTest: on a JDK that has both its jmods and its lib/modules image, the two readers
+# must give the same model - the same classes in the same modules, with the same bytes.
+printf "%-30s ... " "JmodsReader"
+jm_dir="$TEST_BUILD/jmods"
+rm -rf "$jm_dir"
+mkdir -p "$jm_dir"
+if [ ! -d "$ji_home/jmods" ] || [ ! -f "$ji_home/lib/modules" ]; then
+    echo "SKIP (JDK has not both jmods and lib/modules)"
+elif ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -Dmain=genesis_main -I"$here/.." -I"$here/../src" -c \
+         -o "$jm_dir/genesis_nomain.o" "$here/../src/genesis.c" >"$jm_dir/build.log" 2>&1 &&
+     ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -I"$here/.." -I"$here/../src" -o "$jm_dir/JmodsTest" \
+         "$here/unit/JmodsTest.c" "$jm_dir/genesis_nomain.o" \
+         $(ls "$here"/../src/genesis-*.o | grep -v 'genesis-genesis\.o') \
+         -lz -lpthread -lm >>"$jm_dir/build.log" 2>&1 &&
+     "$jm_dir/JmodsTest" "$ji_home" java.base java.logging java.xml java.sql java.desktop \
+         java.compiler java.net.http java.naming >"$jm_dir/run.log" 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
 fi
 
 echo
