@@ -3149,6 +3149,22 @@ else
     failed=$((failed + 1))
 fi
 
+# PlatImageTest: the platform model on its own.
+printf "%-30s ... " "PlatformModel"
+pm_dir="$TEST_BUILD/platmodel"
+rm -rf "$pm_dir"
+mkdir -p "$pm_dir"
+if ${CC:-cc} -std=c99 -DHAVE_CONFIG_H -I"$here/.." -I"$here/../src" -o "$pm_dir/PlatImageTest" \
+       "$here/unit/PlatImageTest.c" "$here/../src/platimage.c" "$here/../src/util.c" \
+       -lz -lpthread >"$pm_dir/build.log" 2>&1 &&
+   "$pm_dir/PlatImageTest" >"$pm_dir/run.log" 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 # JImageTest: the jimage reader against the JDK's own "jimage" tool, on the
 # runtime image of the JDK the tests run with: the same classes in the same
 # modules, the same bytes for a sample of them, and the same module-info.

@@ -286,13 +286,7 @@ bool platform_image_add_class_n(platform_image_t *img, const char *internal_name
         platform_class_t *existing = &img->classes[img->class_slots[i] - 1];
         if (existing->hash == hash && existing->name_length == length
                 && memcmp(img->names + existing->name_offset, internal_name, length) == 0) {
-            /* The same class again: the later one stands */
-            uint32_t name_offset = existing->name_offset;
-            *existing = *c;
-            existing->module = module;
-            existing->hash = hash;
-            existing->name_offset = name_offset;
-            existing->name_length = (uint16_t)length;
+            /* The same class again: the module that is searched first has it */
             return true;
         }
         i = (i + 1) & img->class_slot_mask;
