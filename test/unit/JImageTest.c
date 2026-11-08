@@ -42,10 +42,9 @@
 #include <sys/stat.h>
 #include "jimage.h"
 
-static void print_class(const char *name, void *value, void *user_data)
+static void print_class(const char *name, const platform_class_t *c, void *user_data)
 {
     platform_image_t *img = (platform_image_t *)user_data;
-    const platform_class_t *c = (const platform_class_t *)value;
     printf("%s %s\n", img->module_names[c->module], name);
 }
 
@@ -82,10 +81,9 @@ static void write_file(extract_state_t *st, const char *module, const char *name
     free(data);
 }
 
-static void extract_class(const char *name, void *value, void *user_data)
+static void extract_class(const char *name, const platform_class_t *c, void *user_data)
 {
     extract_state_t *st = (extract_state_t *)user_data;
-    const platform_class_t *c = (const platform_class_t *)value;
     size_t size = 0;
     uint8_t *data = platform_image_read_class(st->img, name, &size);
     write_file(st, st->img->module_names[c->module], name, data, size);
@@ -122,10 +120,10 @@ int main(int argc, char **argv)
     int rc = 0;
     size_t size = 0;
     if (strcmp(argv[1], "list") == 0) {
-        hashtable_foreach(img->classes, print_class, img);
+        platform_image_foreach_class(img, print_class, img);
     } else if (strcmp(argv[1], "extract") == 0 && argc > 3) {
         extract_state_t st = { img, argv[3], 0 };
-        hashtable_foreach(img->classes, extract_class, &st);
+        platform_image_foreach_class(img, extract_class, &st);
         for (int m = 0; m < img->module_count; m++) {
             size_t n = 0;
             uint8_t *info = platform_image_read_module_info(img, img->module_names[m], &n);

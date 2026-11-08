@@ -83,7 +83,7 @@ static bool made_by_jlink(const char *name)
             || strncmp(name, "jdk/internal/module/SystemModules", 33) == 0;
 }
 
-static void compare_class(const char *name, void *value, void *user_data)
+static void compare_class(const char *name, const platform_class_t *c, void *user_data)
 {
     compare_state_t *st = (compare_state_t *)user_data;
     const platform_class_t *o = platform_image_find_class(st->other, name);
@@ -94,7 +94,7 @@ static void compare_class(const char *name, void *value, void *user_data)
     if (!o) {
         difference(st, "is missing from the other", name);
     } else {
-        compare_bytes(st, name, (const platform_class_t *)value, o);
+        compare_bytes(st, name, c, o);
     }
 }
 
@@ -116,8 +116,8 @@ int main(int argc, char **argv)
 
     compare_state_t a = { jmods, image, "jmods", "jimage", 0, 0 };
     compare_state_t b = { image, jmods, "jimage", "jmods", 0, 0 };
-    hashtable_foreach(jmods->classes, compare_class, &a);
-    hashtable_foreach(image->classes, compare_class, &b);
+    platform_image_foreach_class(jmods, compare_class, &a);
+    platform_image_foreach_class(image, compare_class, &b);
 
     /* The module-info of each module */
     for (int m = 0; m < jmods->module_count; m++) {

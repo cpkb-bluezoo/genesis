@@ -87,14 +87,23 @@ static uint32_t read_le32(const uint8_t *buf)
 }
 
 /*
- * Find end of central directory record
- * base_offset is the offset where ZIP data starts (0 for JAR, 4 for JMOD)
+ * Find end of central directory record of the zip that starts at base_offset in fd
+ * (0 for a JAR, 4 for a JMOD): its position, or -1
  */
-static long find_eocd(FILE *fp, long base_offset)
+static long find_eocd(int fd, long base_offset)
 {
-    /* EOCD is at least 22 bytes, search backwards from end */
-    fseek(fp, 0, SEEK_END);
-    long file_size = ftell(fp);
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < base_offset + 22) {
+        return -1;
+    }
+    long file_size = (long)st.st_size;
+
+    /* The record is nearly always the last thing in the file, with no comment after it */
+    uint8_t tail[22];
+    if (pread(fd, tail, 22, (off_t)(file_size - 22)) == 22 &&
+        read_le32(tail) == ZIP_END_CENTRAL_DIR_SIG && read_le16(tail + 20) == 0) {
+        return file_size - 22;
+    }
 
     /* Search backwards for signature (max 65KB for comment) */
     long search_start = file_size - 65536 - 22;
@@ -103,15 +112,12 @@ static long find_eocd(FILE *fp, long base_offset)
     }
 
     uint8_t buf[65536 + 22];
-    size_t search_len = file_size - search_start;
-    fseek(fp, search_start, SEEK_SET);
-
-    if (fread(buf, 1, search_len, fp) != search_len) {
+    size_t search_len = (size_t)(file_size - search_start);
+    if (pread(fd, buf, search_len, (off_t)search_start) != (ssize_t)search_len) {
         return -1;
     }
 
-    /* Search backwards for EOCD signature */
-    for (long i = search_len - 22; i >= 0; i--) {
+    for (long i = (long)search_len - 22; i >= 0; i--) {
         if (read_le32(buf + i) == ZIP_END_CENTRAL_DIR_SIG) {
             return search_start + i;
         }
@@ -120,105 +126,233 @@ static long find_eocd(FILE *fp, long base_offset)
     return -1;
 }
 
-/*
- * Parse central directory
- */
-static bool parse_central_directory(jar_handle_t *jar)
+/* The end of central directory record: the number of entries, and where the directory is */
+static int read_eocd(int fd, long base_offset, uint32_t *entries, uint32_t *cd_size,
+                     uint32_t *cd_offset)
 {
-    long eocd_offset = find_eocd(jar->fp, jar->base_offset);
+    long eocd_offset = find_eocd(fd, base_offset);
     if (eocd_offset < 0) {
-        fprintf(stderr, "error: cannot find end of central directory in %s\n", jar->path);
-        return false;
+        return ZIP_ERROR_NO_DIRECTORY;
     }
-
-    /* Read EOCD */
     uint8_t eocd[22];
-    fseek(jar->fp, eocd_offset, SEEK_SET);
-    if (fread(eocd, 1, 22, jar->fp) != 22) {
-        return false;
+    if (pread(fd, eocd, 22, (off_t)eocd_offset) != 22) {
+        return ZIP_ERROR_READ;
     }
-
     uint16_t total_entries = read_le16(eocd + 10);
-    uint32_t cd_size = read_le32(eocd + 12);
-    uint32_t cd_offset = read_le32(eocd + 16);
+    *cd_size = read_le32(eocd + 12);
+    *cd_offset = read_le32(eocd + 16);
+    if (*cd_offset == 0xFFFFFFFF || total_entries == 0xFFFF) {
+        return ZIP_ERROR_ZIP64;     /* TODO: Implement ZIP64 support */
+    }
+    *entries = total_entries;
+    return 0;
+}
 
-    /* Handle ZIP64 if needed */
-    if (cd_offset == 0xFFFFFFFF || total_entries == 0xFFFF) {
-        /* TODO: Implement ZIP64 support */
-        fprintf(stderr, "error: ZIP64 format not yet supported\n");
-        return false;
+int zip_member_count(int fd, long base_offset, size_t *count)
+{
+    uint32_t entries, cd_size, cd_offset;
+    int rc = read_eocd(fd, base_offset, &entries, &cd_size, &cd_offset);
+    if (rc == 0) {
+        *count = entries;
+    }
+    return rc;
+}
+
+int zip_scan_members(int fd, long base_offset, zip_member_fn fn, void *user_data)
+{
+    uint32_t entries, cd_size, cd_offset;
+    int rc = read_eocd(fd, base_offset, &entries, &cd_size, &cd_offset);
+    if (rc != 0) {
+        return rc;
     }
 
     /* Read central directory - add base_offset for JMOD files */
-    uint8_t *cd = malloc(cd_size);
+    uint8_t *cd = malloc(cd_size ? cd_size : 1);
     if (!cd) {
-        return false;
+        return ZIP_ERROR_READ;
+    }
+    size_t got = 0;
+    while (got < cd_size) {
+        ssize_t n = pread(fd, cd + got, cd_size - got, (off_t)(base_offset + cd_offset) + (off_t)got);
+        if (n <= 0) {
+            free(cd);
+            return ZIP_ERROR_READ;
+        }
+        got += (size_t)n;
     }
 
-    fseek(jar->fp, jar->base_offset + cd_offset, SEEK_SET);
-    if (fread(cd, 1, cd_size, jar->fp) != cd_size) {
-        free(cd);
-        return false;
-    }
-
-    /* Parse entries */
     uint8_t *p = cd;
     uint8_t *end = cd + cd_size;
-    zip_entry_t *last = NULL;
-
     while (p + 46 <= end) {
-        uint32_t sig = read_le32(p);
-        if (sig != ZIP_CENTRAL_DIR_HEADER_SIG) {
+        if (read_le32(p) != ZIP_CENTRAL_DIR_HEADER_SIG) {
             break;
         }
 
-        uint16_t compression = read_le16(p + 10);
-        uint32_t compressed = read_le32(p + 20);
-        uint32_t uncompressed = read_le32(p + 24);
+        zip_member_t member;
+        member.method = read_le16(p + 10);
+        member.compressed_size = read_le32(p + 20);
+        member.uncompressed_size = read_le32(p + 24);
         uint16_t name_len = read_le16(p + 28);
         uint16_t extra_len = read_le16(p + 30);
         uint16_t comment_len = read_le16(p + 32);
-        uint32_t local_offset = read_le32(p + 42);
+        member.local_header_offset = read_le32(p + 42);
 
         if (p + 46 + name_len > end) {
             break;
         }
-
-        /* Create entry */
-        zip_entry_t *entry = calloc(1, sizeof(zip_entry_t));
-        if (!entry) {
-            free(cd);
-            return false;
+        if (!fn((const char *)(p + 46), name_len, &member, user_data)) {
+            break;
         }
-
-        entry->filename = malloc(name_len + 1);
-        if (!entry->filename) {
-            free(entry);
-            free(cd);
-            return false;
-        }
-        memcpy(entry->filename, p + 46, name_len);
-        entry->filename[name_len] = '\0';
-
-        entry->compression_method = compression;
-        entry->compressed_size = compressed;
-        entry->uncompressed_size = uncompressed;
-        entry->local_header_offset = local_offset;
-        entry->next = NULL;
-
-        if (last) {
-            last->next = entry;
-        } else {
-            jar->entries = entry;
-        }
-        last = entry;
-        jar->entry_count++;
 
         p += 46 + name_len + extra_len + comment_len;
     }
 
     free(cd);
-    
+    return 0;
+}
+
+uint8_t *zip_read_member(int fd, long base_offset, const zip_member_t *member, size_t *size)
+{
+    /* Read local file header to find actual data offset.
+     * The archive is read with positioned reads on its descriptor: classes
+     * are loaded from several code generation threads at once, and a
+     * seek followed by a read on the one shared stream is not atomic. */
+    long local_offset = base_offset + member->local_header_offset;
+    uint8_t local_header[30];
+    if (pread(fd, local_header, 30, (off_t)local_offset) != 30) {
+        return NULL;
+    }
+
+    if (read_le32(local_header) != ZIP_LOCAL_FILE_HEADER_SIG) {
+        return NULL;
+    }
+
+    uint16_t name_len = read_le16(local_header + 26);
+    uint16_t extra_len = read_le16(local_header + 28);
+
+    /* Read compressed data, which follows the header's name and extra field */
+    uint8_t *compressed = malloc(member->compressed_size ? member->compressed_size : 1);
+    if (!compressed) {
+        return NULL;
+    }
+
+    size_t got = 0;
+    while (got < member->compressed_size) {
+        ssize_t n = pread(fd, compressed + got, member->compressed_size - got,
+                          (off_t)(local_offset + 30 + name_len + extra_len) + (off_t)got);
+        if (n <= 0) {
+            free(compressed);
+            return NULL;
+        }
+        got += (size_t)n;
+    }
+
+    uint8_t *result;
+    *size = member->uncompressed_size;
+
+    if (member->method == ZIP_METHOD_STORED) {
+        /* No compression */
+        result = compressed;
+    } else if (member->method == ZIP_METHOD_DEFLATED) {
+        /* Deflate compression */
+        result = malloc(member->uncompressed_size ? member->uncompressed_size : 1);
+        if (!result) {
+            free(compressed);
+            return NULL;
+        }
+
+        z_stream strm = {0};
+        strm.next_in = compressed;
+        strm.avail_in = member->compressed_size;
+        strm.next_out = result;
+        strm.avail_out = member->uncompressed_size;
+
+        /* Use raw deflate (negative windowBits) */
+        if (inflateInit2(&strm, -MAX_WBITS) != Z_OK) {
+            free(compressed);
+            free(result);
+            return NULL;
+        }
+
+        int ret = inflate(&strm, Z_FINISH);
+        inflateEnd(&strm);
+        free(compressed);
+
+        if (ret != Z_STREAM_END) {
+            free(result);
+            return NULL;
+        }
+    } else {
+        fprintf(stderr, "error: unsupported compression method %d\n", member->method);
+        free(compressed);
+        return NULL;
+    }
+
+    return result;
+}
+
+/* Enter a member of the archive in the handle's entries */
+typedef struct jar_scan
+{
+    jar_handle_t *jar;
+    zip_entry_t *last;
+    bool failed;
+} jar_scan_t;
+
+static bool jar_scan_member(const char *name, size_t name_len, const zip_member_t *member,
+                            void *user_data)
+{
+    jar_scan_t *scan = (jar_scan_t *)user_data;
+    zip_entry_t *entry = calloc(1, sizeof(zip_entry_t));
+    if (!entry) {
+        scan->failed = true;
+        return false;
+    }
+
+    entry->filename = malloc(name_len + 1);
+    if (!entry->filename) {
+        free(entry);
+        scan->failed = true;
+        return false;
+    }
+    memcpy(entry->filename, name, name_len);
+    entry->filename[name_len] = '\0';
+
+    entry->compression_method = member->method;
+    entry->compressed_size = member->compressed_size;
+    entry->uncompressed_size = member->uncompressed_size;
+    entry->local_header_offset = member->local_header_offset;
+    entry->next = NULL;
+
+    if (scan->last) {
+        scan->last->next = entry;
+    } else {
+        scan->jar->entries = entry;
+    }
+    scan->last = entry;
+    scan->jar->entry_count++;
+    return true;
+}
+
+/*
+ * Parse central directory
+ */
+static bool parse_central_directory(jar_handle_t *jar)
+{
+    jar_scan_t scan = { jar, NULL, false };
+    int rc = zip_scan_members(fileno(jar->fp), jar->base_offset, jar_scan_member, &scan);
+    if (rc == ZIP_ERROR_NO_DIRECTORY) {
+        fprintf(stderr, "error: cannot find end of central directory in %s\n", jar->path);
+        return false;
+    }
+    if (rc == ZIP_ERROR_ZIP64) {
+        fprintf(stderr, "error: ZIP64 format not yet supported\n");
+        return false;
+    }
+    if (rc != 0 || scan.failed) {
+        return false;
+    }
+
     /* Build hashtable index for O(1) lookups */
     jar->entry_index = hashtable_new_sized(jar->entry_count);
     if (jar->entry_index) {
@@ -351,85 +485,12 @@ uint8_t *jar_read_entry(void *handle, const char *entry_path, size_t *size)
         return NULL;
     }
 
-    /* Read local file header to find actual data offset */
-    /* Add base_offset for JMOD files.
-     * The archive is read with positioned reads on its descriptor: classes
-     * are loaded from several code generation threads at once, and a
-     * seek followed by a read on the one shared stream is not atomic. */
-    int fd = fileno(jar->fp);
-    long local_offset = jar->base_offset + entry->local_header_offset;
-    uint8_t local_header[30];
-    if (pread(fd, local_header, 30, (off_t)local_offset) != 30) {
-        return NULL;
-    }
-
-    if (read_le32(local_header) != ZIP_LOCAL_FILE_HEADER_SIG) {
-        return NULL;
-    }
-
-    uint16_t name_len = read_le16(local_header + 26);
-    uint16_t extra_len = read_le16(local_header + 28);
-
-    /* Read compressed data, which follows the header's name and extra field */
-    uint8_t *compressed = malloc(entry->compressed_size);
-    if (!compressed) {
-        return NULL;
-    }
-
-    size_t got = 0;
-    while (got < entry->compressed_size) {
-        ssize_t n = pread(fd, compressed + got, entry->compressed_size - got,
-                          (off_t)(local_offset + 30 + name_len + extra_len) + (off_t)got);
-        if (n <= 0) {
-            free(compressed);
-            return NULL;
-        }
-        got += (size_t)n;
-    }
-
-    uint8_t *result;
-    *size = entry->uncompressed_size;
-
-    if (entry->compression_method == ZIP_METHOD_STORED) {
-        /* No compression */
-        result = compressed;
-    } else if (entry->compression_method == ZIP_METHOD_DEFLATED) {
-        /* Deflate compression */
-        result = malloc(entry->uncompressed_size);
-        if (!result) {
-            free(compressed);
-            return NULL;
-        }
-
-        z_stream strm = {0};
-        strm.next_in = compressed;
-        strm.avail_in = entry->compressed_size;
-        strm.next_out = result;
-        strm.avail_out = entry->uncompressed_size;
-
-        /* Use raw deflate (negative windowBits) */
-        if (inflateInit2(&strm, -MAX_WBITS) != Z_OK) {
-            free(compressed);
-            free(result);
-            return NULL;
-        }
-
-        int ret = inflate(&strm, Z_FINISH);
-        inflateEnd(&strm);
-        free(compressed);
-
-        if (ret != Z_STREAM_END) {
-            free(result);
-            return NULL;
-        }
-    } else {
-        fprintf(stderr, "error: unsupported compression method %d\n",
-                entry->compression_method);
-        free(compressed);
-        return NULL;
-    }
-
-    return result;
+    zip_member_t member;
+    member.local_header_offset = entry->local_header_offset;
+    member.compressed_size = entry->compressed_size;
+    member.uncompressed_size = entry->uncompressed_size;
+    member.method = entry->compression_method;
+    return zip_read_member(fileno(jar->fp), jar->base_offset, &member, size);
 }
 
 bool jar_entry_exists(void *handle, const char *entry_path)
@@ -461,16 +522,6 @@ slist_t *jar_list_entries(void *handle, const char *pattern)
     }
 
     return list;
-}
-
-void jar_foreach_entry(void *handle, jar_entry_fn fn, void *user_data)
-{
-    jar_handle_t *jar = (jar_handle_t *)handle;
-    for (zip_entry_t *e = jar->entries; e; e = e->next) {
-        if (e->filename) {
-            fn(e->filename, e->uncompressed_size, user_data);
-        }
-    }
 }
 
 /*
@@ -1233,7 +1284,7 @@ static void classpath_index_add(hashtable_t *index, const char *package, cp_entr
     pkg->entries[pkg->count++] = entry;
 }
 
-static void index_platform_package(const char *package, void *module, void *user_data)
+static void index_platform_package(const char *package, const char *module, void *user_data)
 {
     (void)module;
     void **state = (void **)user_data;
@@ -1245,7 +1296,7 @@ static void classpath_index_archive(classpath_t *cp, cp_entry_t *entry)
 {
     if (entry->type == CP_PLATFORM) {
         void *state[2] = { cp->package_index, entry };
-        hashtable_foreach(entry->platform->packages, index_platform_package, state);
+        platform_image_foreach_package(entry->platform, index_platform_package, state);
         return;
     }
     jar_handle_t *jar = (jar_handle_t *)entry->jar_handle;

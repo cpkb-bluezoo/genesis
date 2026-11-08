@@ -204,9 +204,34 @@ bool jar_entry_exists(void *handle, const char *entry_path);
 /* List entries in a JAR matching a pattern */
 slist_t *jar_list_entries(void *handle, const char *pattern);
 
-/* Call fn for every entry of the archive: its name and its size when uncompressed */
-typedef void (*jar_entry_fn)(const char *name, uint32_t size, void *user_data);
-void jar_foreach_entry(void *handle, jar_entry_fn fn, void *user_data);
+/*
+ * Zip archives read directly: the members of the archive that starts at base_offset
+ * in the open file fd (0 for a JAR, 4 for a JMOD), without building a handle for it.
+ */
+typedef struct zip_member
+{
+    uint32_t local_header_offset;
+    uint32_t compressed_size;
+    uint32_t uncompressed_size;
+    uint16_t method;                /* 0 stored, 8 deflated */
+} zip_member_t;
+
+#define ZIP_ERROR_NO_DIRECTORY  1
+#define ZIP_ERROR_ZIP64         2
+#define ZIP_ERROR_READ          3
+
+/* Called for each member with its name (not NUL-terminated); false stops the scan */
+typedef bool (*zip_member_fn)(const char *name, size_t name_length, const zip_member_t *member,
+                              void *user_data);
+
+/* The number of members the archive says it has; 0, or a ZIP_ERROR */
+int zip_member_count(int fd, long base_offset, size_t *count);
+
+/* Walk the archive's central directory; 0, or a ZIP_ERROR */
+int zip_scan_members(int fd, long base_offset, zip_member_fn fn, void *user_data);
+
+/* The content of a member (malloc'd; *size set), or NULL */
+uint8_t *zip_read_member(int fd, long base_offset, const zip_member_t *member, size_t *size);
 
 /*
  * JMod file handling (Java 9+ modules)
