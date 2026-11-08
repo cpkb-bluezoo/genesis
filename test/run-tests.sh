@@ -543,6 +543,23 @@ else
     failed=$((failed + 1))
 fi
 
+# The enum is compiled by genesis; REAL javac then reads its class file and must see the
+# superclass Enum<Color> (the Signature javac writes), not a raw Enum.
+printf "%-30s ... " "EnumClassSignatureTest"
+es_lib="$TEST_BUILD/enumsiglib-lib"
+es_out="$TEST_BUILD/enumsiglib-out"
+rm -rf "$es_lib" "$es_out"
+mkdir -p "$es_lib" "$es_out"
+if command -v "$JAVAC" >/dev/null 2>&1 &&
+   "$GENESIS" -d "$es_lib" "$TEST_SRC/external/enumsiglib/Color.java" >/dev/null 2>&1 &&
+   "$JAVAC" -classpath "$es_lib" -d "$es_out" "$TEST_SRC/external/enumsiglib/Demo.java" >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 # The library is compiled with REAL javac so its class file carries the generic Signature
 # "Consumer<Liplib/Configurer<...>.Registry;>" a lambda's parameter type is read from.
 printf "%-30s ... " "InnerOfParameterizedTypeTest"

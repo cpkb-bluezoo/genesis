@@ -1818,8 +1818,12 @@ char *generate_class_signature(semantic_t *sem, ast_node_t *class_decl, symbol_t
         }
     }
     
+    /* An enum never writes "extends Enum<Itself>", but its superclass is exactly that: the
+     * Signature javac writes for every enum, which a reader needs to see Enum<E> and not a raw Enum */
+    bool is_enum = class_decl->type == AST_ENUM_DECL && class_sym && class_sym->qualified_name;
+
     /* If no type parameters and nothing parameterized above it, no signature needed */
-    if (!type_params && !has_parameterized_super && !has_parameterized_interface) {
+    if (!type_params && !has_parameterized_super && !has_parameterized_interface && !is_enum) {
         slist_free(interface_types);
         return NULL;
     }
@@ -1848,6 +1852,12 @@ char *generate_class_signature(semantic_t *sem, ast_node_t *class_decl, symbol_t
                 free(iface_sig);
             }
         }
+    } else if (is_enum) {
+        char *internal = class_to_internal_name(class_sym->qualified_name);
+        string_append(sig, "Ljava/lang/Enum<L");
+        string_append(sig, internal);
+        string_append(sig, ";>;");
+        free(internal);
     } else if (super_type) {
         char *super_sig = type_to_signature(super_type);
         if (super_sig) {
