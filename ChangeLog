@@ -1,5 +1,14 @@
 2026-11-08  Chris Burdess  <dog@gnu.org>
 
+	Release 1.1.1.
+
+	* src/semantic.c: Report Lombok annotations as unsupported only when
+	the file fails to compile, so that a file needing none of the
+	generated members compiles as written.
+	* README.md: Describe the behaviour.
+
+2026-11-08  Chris Burdess  <dog@gnu.org>
+
 	Release 1.1.0.
 
 	Compile against a JDK that has only lib/modules; resolve the class

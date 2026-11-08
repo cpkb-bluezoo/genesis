@@ -1,5 +1,18 @@
 GNU Genesis NEWS -- history of user-visible changes.
 
+* Noteworthy changes in release 1.1.1 (2026-11-08) [stable]
+
+** Bugs fixed
+
+  Lombok annotations are reported as unsupported only when the file fails to
+  compile.  Release 1.1.0 rejected every use of a Lombok annotation, which
+  refused sources that javac accepts when the processor is not run: a class
+  whose generated members nothing uses, such as Spring Boot's Lombok test
+  fixtures, compiled with 1.0.1 and failed with 1.1.0.  A file that needs
+  none of the generated members now compiles as written, and a file that
+  does is reported for its annotations instead of the errors that follow
+  from the missing members, as before.
+
 * Noteworthy changes in release 1.1.0 (2026-11-08) [stable]
 
 ** New features
