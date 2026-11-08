@@ -31,6 +31,7 @@
 #include <zlib.h>
 #include <pthread.h>
 #include "classpath.h"
+#include "jimage.h"
 
 /*
  * ZIP file format constants
@@ -806,6 +807,8 @@ static void cp_entry_free(cp_entry_t *entry)
             jar_close(entry->jar_handle);
         } else if (entry->type == CP_JMOD && entry->jar_handle) {
             jmod_close(entry->jar_handle);
+        } else if (entry->type == CP_PLATFORM) {
+            platform_image_free(entry->platform);
         }
         free(entry);
     }
@@ -962,6 +965,30 @@ bool classpath_add_boot(classpath_t *cp, const char *path)
     return true;
 }
 
+/* Add the classes of a JDK, as read into a model, to the boot classpath. The classpath
+ * takes over image, even if it fails. */
+static bool classpath_add_boot_platform(classpath_t *cp, platform_image_t *image, const char *path)
+{
+    cp_entry_t *entry = calloc(1, sizeof(cp_entry_t));
+    if (entry) {
+        entry->path = strdup(path);
+    }
+    if (!entry || !entry->path) {
+        free(entry);
+        platform_image_free(image);
+        return false;
+    }
+    entry->type = CP_PLATFORM;
+    entry->platform = image;
+    if (!cp->boot_entries) {
+        cp->boot_entries = slist_new(entry);
+    } else {
+        slist_append(cp->boot_entries, entry);
+    }
+    cp->entry_count++;
+    return true;
+}
+
 bool classpath_add(classpath_t *cp, const char *path)
 {
     cp_entry_t *entry = cp_entry_new(path);
@@ -1018,37 +1045,42 @@ bool classpath_setup_jdk(classpath_t *cp, jdk_info_t *jdk)
         /* Pre-Java 9: add rt.jar to boot classpath */
         return classpath_add_boot(cp, jdk->rt_jar_path);
     } else if (jdk->modules_path) {
-        /* Java 9+: add essential jmod files */
-        /* These modules contain the core Java classes */
+        /* Java 9+: the essential modules; these contain the core Java classes */
         static const char *essential_modules[] = {
-            "java.base.jmod",       /* Object, String, System, etc. */
-            "java.logging.jmod",    /* java.util.logging */
-            "java.sql.jmod",        /* java.sql */
-            "java.xml.jmod",        /* javax.xml */
-            "java.management.jmod", /* java.lang.management */
-            "java.compiler.jmod",   /* javax.tools (JavaCompiler, etc.) */
-            "java.security.sasl.jmod", /* javax.security.sasl (SASL) */
-            "java.security.jgss.jmod", /* org.ietf.jgss (GSSAPI / Kerberos) */
-            "java.naming.jmod",     /* javax.naming (JNDI) */
-            "java.desktop.jmod",    /* java.beans (BeanInfo, Introspector) */
-            "java.net.http.jmod",   /* java.net.http (HttpClient) */
-            "java.prefs.jmod",      /* java.util.prefs */
-            "java.scripting.jmod",  /* javax.script */
-            "java.instrument.jmod", /* java.lang.instrument */
-            "java.rmi.jmod",        /* java.rmi */
-            "java.xml.crypto.jmod", /* javax.xml.crypto */
-            "java.transaction.xa.jmod", /* javax.transaction.xa */
-            "java.datatransfer.jmod",   /* java.awt.datatransfer */
-            "java.sql.rowset.jmod",     /* javax.sql.rowset */
-            "java.management.rmi.jmod", /* javax.management.remote.rmi */
+            "java.base",            /* Object, String, System, etc. */
+            "java.logging",         /* java.util.logging */
+            "java.sql",             /* java.sql */
+            "java.xml",             /* javax.xml */
+            "java.management",      /* java.lang.management */
+            "java.compiler",        /* javax.tools (JavaCompiler, etc.) */
+            "java.security.sasl",   /* javax.security.sasl (SASL) */
+            "java.security.jgss",   /* org.ietf.jgss (GSSAPI / Kerberos) */
+            "java.naming",          /* javax.naming (JNDI) */
+            "java.desktop",         /* java.beans (BeanInfo, Introspector) */
+            "java.net.http",        /* java.net.http (HttpClient) */
+            "java.prefs",           /* java.util.prefs */
+            "java.scripting",       /* javax.script */
+            "java.instrument",      /* java.lang.instrument */
+            "java.rmi",             /* java.rmi */
+            "java.xml.crypto",      /* javax.xml.crypto */
+            "java.transaction.xa",  /* javax.transaction.xa */
+            "java.datatransfer",    /* java.awt.datatransfer */
+            "java.sql.rowset",      /* javax.sql.rowset */
+            "java.management.rmi",  /* javax.management.remote.rmi */
             NULL
         };
-        
+
+        if (!is_directory(jdk->modules_path)) {
+            /* No jmods directory: the classes are in the runtime image, lib/modules */
+            platform_image_t *image = jimage_load(jdk->modules_path, essential_modules);
+            return image && classpath_add_boot_platform(cp, image, jdk->modules_path);
+        }
+
         bool any_added = false;
         char jmod_path[1024];
         
         for (int i = 0; essential_modules[i]; i++) {
-            snprintf(jmod_path, sizeof(jmod_path), "%s/%s", 
+            snprintf(jmod_path, sizeof(jmod_path), "%s/%s.jmod",
                      jdk->modules_path, essential_modules[i]);
             
             if (file_exists(jmod_path)) {
@@ -1142,9 +1174,32 @@ static classfile_t *load_from_jmod(cp_entry_t *entry, const char *path)
     return cf;
 }
 
+/* A class of a platform model; path is "java/lang/String.class" */
+static classfile_t *load_from_platform(cp_entry_t *entry, const char *path)
+{
+    size_t length = strlen(path);
+    char name[1024];
+    if (length < 7 || length - 6 >= sizeof(name)) {
+        return NULL;
+    }
+    memcpy(name, path, length - 6);
+    name[length - 6] = '\0';
+
+    size_t size;
+    uint8_t *data = platform_image_read_class(entry->platform, name, &size);
+    if (!data) {
+        return NULL;
+    }
+    classfile_t *cf = classfile_read(data, size);
+    free(data);
+    return cf;
+}
+
 static classfile_t *load_from_entry(cp_entry_t *entry, const char *path)
 {
     switch (entry->type) {
+        case CP_PLATFORM:
+            return load_from_platform(entry, path);
         case CP_DIRECTORY:
             return load_from_directory(entry, path);
         case CP_JAR:
@@ -1183,9 +1238,21 @@ static void classpath_index_add(hashtable_t *index, const char *package, cp_entr
     pkg->entries[pkg->count++] = entry;
 }
 
+static void index_platform_package(const char *package, void *module, void *user_data)
+{
+    (void)module;
+    void **state = (void **)user_data;
+    classpath_index_add((hashtable_t *)state[0], package, (cp_entry_t *)state[1]);
+}
+
 /* Enter every package a JAR/JMOD entry holds classes of */
 static void classpath_index_archive(classpath_t *cp, cp_entry_t *entry)
 {
+    if (entry->type == CP_PLATFORM) {
+        void *state[2] = { cp->package_index, entry };
+        hashtable_foreach(entry->platform->packages, index_platform_package, state);
+        return;
+    }
     jar_handle_t *jar = (jar_handle_t *)entry->jar_handle;
     if (!jar) {
         return;
@@ -1559,8 +1626,36 @@ bool classpath_class_exists(classpath_t *cp, const char *classname)
     return classpath_find_class(cp, classname) != NULL;
 }
 
+/* The module-info.class of a module of the JDK: from the jmod of that name, or
+ * from the runtime image if the JDK has no jmods */
+static uint8_t *jdk_module_info(classpath_t *cp, const char *module_name, size_t *size)
+{
+    char jmod_path[1024];
+    snprintf(jmod_path, sizeof(jmod_path), "%s/jmods/%s.jmod",
+             cp->java_home, module_name);
+
+    void *handle = jmod_open(jmod_path);
+    if (handle) {
+        uint8_t *data = jmod_read_class(handle, "module-info", size);
+        jmod_close(handle);
+        return data;
+    }
+
+    slist_t *node = cp->boot_entries;
+    for (; node; node = node->next) {
+        cp_entry_t *entry = (cp_entry_t *)node->data;
+        if (entry->type == CP_PLATFORM) {
+            uint8_t *data = platform_image_read_module_info(entry->platform, module_name, size);
+            if (data) {
+                return data;
+            }
+        }
+    }
+    return NULL;
+}
+
 /**
- * Load exported packages from a module's module-info.class in the JDK jmods.
+ * Load exported packages from a module's module-info.class in the JDK.
  */
 char **classpath_module_exports(classpath_t *cp, const char *module_name, int *count_out)
 {
@@ -1570,19 +1665,9 @@ char **classpath_module_exports(classpath_t *cp, const char *module_name, int *c
     if (!cp || !module_name || !cp->java_home) {
         return NULL;
     }
-    
-    char jmod_path[1024];
-    snprintf(jmod_path, sizeof(jmod_path), "%s/jmods/%s.jmod",
-             cp->java_home, module_name);
-    
-    void *handle = jmod_open(jmod_path);
-    if (!handle) {
-        return NULL;
-    }
-    
+
     size_t size = 0;
-    uint8_t *data = jmod_read_class(handle, "module-info", &size);
-    jmod_close(handle);
+    uint8_t *data = jdk_module_info(cp, module_name, &size);
     if (!data || size == 0) {
         free(data);
         return NULL;

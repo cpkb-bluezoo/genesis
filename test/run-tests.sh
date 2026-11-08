@@ -3242,6 +3242,34 @@ else
     fi
 fi
 
+# A JDK that has only the lib/modules runtime image, as jlink makes it (and as some
+# vendors ship the whole JDK): the platform classes must come from the image. The
+# program is run with that same runtime.
+printf "%-30s ... " "JImageJdkTest"
+jj_dir="$TEST_BUILD/jimagejdk"
+rm -rf "$jj_dir"
+mkdir -p "$jj_dir"
+if [ ! -x "$ji_home/bin/jlink" ]; then
+    echo "SKIP (no jlink)"
+elif ! "$ji_home/bin/jlink" --add-modules java.base,java.logging --output "$jj_dir/jdk" >/dev/null 2>&1; then
+    echo "SKIP (jlink made no image)"
+else
+    jj_ok=1
+    JAVA_HOME="$jj_dir/jdk" "$GENESIS" -d "$jj_dir/out" \
+        "$TEST_SRC/external/jimagejdk/JImageJdkTest.java" >"$jj_dir/build.log" 2>&1 || jj_ok=0
+    [ "$jj_ok" = 1 ] && [ "$("$jj_dir/jdk/bin/java" -Xverify:all -cp "$jj_dir/out" JImageJdkTest 2>&1)" = "jimage" ] || jj_ok=0
+    JAVA_HOME="$jj_dir/jdk" "$GENESIS" -source 25 -d "$jj_dir/out2" \
+        "$TEST_SRC/external/jimagejdk/JImageModuleImportTest.java" >>"$jj_dir/build.log" 2>&1 || jj_ok=0
+    [ "$jj_ok" = 1 ] && [ "$("$jj_dir/jdk/bin/java" -Xverify:all -cp "$jj_dir/out2" JImageModuleImportTest 2>&1)" = "module" ] || jj_ok=0
+    if [ $jj_ok = 1 ]; then
+        echo PASS
+        passed=$((passed + 1))
+    else
+        echo FAIL
+        failed=$((failed + 1))
+    fi
+fi
+
 echo
 echo "=== Results: $passed passed, $failed failed ==="
 [ $failed -eq 0 ]

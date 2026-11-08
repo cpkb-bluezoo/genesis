@@ -507,8 +507,13 @@ static bool jimage_index_to_model(platform_image_t *img, const uint8_t *index, u
             continue;
         }
         /* The image describes itself under the module names "modules" and "packages" */
-        if (strcmp(module, "modules") == 0 || strcmp(module, "packages") == 0
-                || !wanted_module(module, modules)) {
+        if (strcmp(module, "modules") == 0 || strcmp(module, "packages") == 0) {
+            continue;
+        }
+        /* Every module's module-info is kept, whether or not its classes are: what a
+         * module exports can be asked of one that is not on the class path */
+        bool is_module_info = attrs[ATTR_PARENT] == 0 && strcmp(base, "module-info") == 0;
+        if (!is_module_info && !wanted_module(module, modules)) {
             continue;
         }
         const char *parent = attrs[ATTR_PARENT]
@@ -530,7 +535,7 @@ static bool jimage_index_to_model(platform_image_t *img, const uint8_t *index, u
             continue;
         }
 
-        if (!parent && strcmp(base, "module-info") == 0) {
+        if (is_module_info) {
             platform_image_set_module_info(img, (uint32_t)m, &c);
             continue;
         }
