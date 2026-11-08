@@ -1,5 +1,14 @@
 2026-11-08  Chris Burdess  <dog@gnu.org>
 
+	Release 1.1.2.
+
+	* src/semantic.c (fi_build_substituted_sig): Build the signature in a
+	buffer that grows.
+	(method_key_append): New.  Append to an overload key without moving
+	past the end of its buffer.
+
+2026-11-08  Chris Burdess  <dog@gnu.org>
+
 	Release 1.1.1.
 
 	* src/semantic.c: Report Lombok annotations as unsupported only when

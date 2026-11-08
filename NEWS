@@ -1,5 +1,17 @@
 GNU Genesis NEWS -- history of user-visible changes.
 
+* Noteworthy changes in release 1.1.2 (2026-11-08) [stable]
+
+** Bugs fixed
+
+  A method with a very long signature no longer crashes the compiler.  The
+  signature of a method inherited by a @FunctionalInterface, and the key by
+  which a method is stored for overload resolution, were built in fixed-size
+  buffers and written past their end when the parameter types were long
+  enough (a method with 40 parameters of long class names was enough).
+  The signature is now built in a buffer that grows; an overload key too
+  long for its buffer is cut, not overflowed.
+
 * Noteworthy changes in release 1.1.1 (2026-11-08) [stable]
 
 ** Bugs fixed
