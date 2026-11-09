@@ -2353,3 +2353,73 @@ record_component_info_t *classfile_get_record_components(classfile_t *cf)
     }
     return head;
 }
+
+/*
+ * PermittedSubclasses attribute (JVMS 4.7.31):
+ *
+ * PermittedSubclasses_attribute {
+ *     u2 attribute_name_index;
+ *     u4 attribute_length;
+ *     u2 number_of_classes;
+ *     u2 classes[number_of_classes];
+ * }
+ */
+
+void permitted_subclasses_free(char **names)
+{
+    if (!names) {
+        return;
+    }
+    for (char **n = names; *n; n++) {
+        free(*n);
+    }
+    free(names);
+}
+
+char **classfile_get_permitted_subclasses(classfile_t *cf, int *count)
+{
+    if (count) {
+        *count = 0;
+    }
+    if (!cf || !cf->attributes) {
+        return NULL;
+    }
+
+    attribute_info_t *attr = NULL;
+    for (uint16_t i = 0; i < cf->attributes_count; i++) {
+        char *name = classfile_get_utf8(cf, cf->attributes[i].attribute_name_index);
+        bool match = name && strcmp(name, "PermittedSubclasses") == 0;
+        free(name);
+        if (match) {
+            attr = &cf->attributes[i];
+            break;
+        }
+    }
+    if (!attr || !attr->info || attr->attribute_length < 2) {
+        return NULL;
+    }
+
+    const uint8_t *data = attr->info;
+    uint16_t number = record_read_u2(data);
+    data += 2;
+    if (attr->attribute_length < (size_t)(2 + number * 2)) {
+        return NULL;
+    }
+
+    char **names = calloc((size_t)number + 1, sizeof(char *));
+    if (!names) {
+        return NULL;
+    }
+    int n = 0;
+    for (uint16_t i = 0; i < number; i++) {
+        char *internal = classfile_get_class_name(cf, record_read_u2(data + 2 * i));
+        if (internal) {
+            names[n++] = classname_to_binary(internal);
+            free(internal);
+        }
+    }
+    if (count) {
+        *count = n;
+    }
+    return names;
+}

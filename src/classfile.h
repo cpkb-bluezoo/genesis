@@ -544,5 +544,17 @@ record_component_info_t *classfile_get_record_components(classfile_t *cf);
 /* Free a record component list */
 void record_component_info_free(record_component_info_t *info);
 
+/*
+ * PermittedSubclasses attribute parsing (Java 17+ sealed classes)
+ */
+
+/* The binary names (a.b.C$D) of the classes a sealed class permits, in the order the attribute
+ * lists them, in a NULL-terminated array that holds *count names; NULL if the class has no
+ * PermittedSubclasses attribute (it is not sealed). Free with permitted_subclasses_free. */
+char **classfile_get_permitted_subclasses(classfile_t *cf, int *count);
+
+/* Free what classfile_get_permitted_subclasses returned */
+void permitted_subclasses_free(char **names);
+
 #endif /* CLASSFILE_H */
 

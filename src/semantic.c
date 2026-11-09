@@ -3814,6 +3814,7 @@ void symbol_free(symbol_t *sym)
                 }
             }
             slist_free(sym->data.class_data.record_components);
+            slist_free_full(sym->data.class_data.permitted_subclasses, free);
             break;
         
         case SYM_METHOD:
@@ -6547,6 +6548,25 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
         }
         record_component_info_free(components);
     }
+
+    /* A sealed class: the classes it permits */
+    if (kind == SYM_CLASS || kind == SYM_INTERFACE) {
+        int permitted_count = 0;
+        char **permitted = classfile_get_permitted_subclasses(cf, &permitted_count);
+        for (int i = 0; permitted && i < permitted_count; i++) {
+            char *name = strdup(permitted[i]);
+            if (!name) {
+                break;
+            }
+            slist_t *entry = sym->data.class_data.permitted_subclasses
+                ? slist_append(sym->data.class_data.permitted_subclasses, name)
+                : slist_new(name);
+            if (!sym->data.class_data.permitted_subclasses) {
+                sym->data.class_data.permitted_subclasses = entry;
+            }
+        }
+        permitted_subclasses_free(permitted);
+    }
     
     /* Convert access flags to our modifiers */
     uint32_t mods = 0;
@@ -6609,6 +6629,9 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
     }
     inner_class_info_free(self_inner_classes);
 
+    if (sym->data.class_data.permitted_subclasses) {
+        mods |= MOD_SEALED;
+    }
     sym->modifiers = mods;
     
     /* Create class member scope. A shared symbol outlives the analyzer
@@ -30641,6 +30664,567 @@ static void resolve_switch_labels(semantic_t *sem, ast_node_t *node, slist_t *ch
     hashtable_free(seen_cases);
 }
 
+/* ========================================================================
+ * Exhaustiveness of switches (JLS 14.11.1.1)
+ *
+ * A switch expression, and a switch statement over patterns, must name every
+ * value its selector can have: a "default", the constants of an enum, or
+ * patterns that between them cover the selector's type. A pattern covers a
+ * type it is a supertype of; a sealed type is covered when all the classes it
+ * permits are; a record type is covered when its component patterns cover its
+ * components, which the rows of patterns below are narrowed down to, one
+ * component at a time.
+ *
+ * Wherever something cannot be found out (a sealed class whose permitted
+ * classes are in another file, a type that does not resolve) the switch is
+ * taken to be exhaustive: an error here is never a guess.
+ * ======================================================================== */
+
+typedef struct cover_row
+{
+    ast_node_t **cells;     /* A pattern per column; NULL matches anything */
+} cover_row_t;
+
+/** The class of a type, with no type arguments, so that types compare by their erasure. */
+static type_t *cover_erased(type_t *type)
+{
+    if (!type) {
+        return NULL;
+    }
+    if (type->kind == TYPE_TYPEVAR) {
+        return type->data.type_var.bound ? cover_erased(type->data.type_var.bound) : type_object();
+    }
+    if (type->kind == TYPE_WILDCARD) {
+        return type->data.wildcard.bound_kind == 1 && type->data.wildcard.bound
+            ? cover_erased(type->data.wildcard.bound) : type_object();
+    }
+    if (type->kind != TYPE_CLASS || !type->data.class_type.name) {
+        return type;
+    }
+    type_t *erased = type_new_class(type->data.class_type.name);
+    erased->data.class_type.symbol = type->data.class_type.symbol;
+    return erased;
+}
+
+/** The symbol of a class type, loading the class if it has not been yet. */
+static symbol_t *cover_symbol(type_t *type)
+{
+    if (!type || type->kind != TYPE_CLASS) {
+        return NULL;
+    }
+    symbol_t *sym = receiver_class_symbol(type);
+    if (sym) {
+        type->data.class_type.symbol = sym;
+        symbol_complete(sym);
+    }
+    return sym;
+}
+
+/** A class type for a symbol. */
+static type_t *cover_type_of(symbol_t *sym)
+{
+    type_t *type = type_new_class(sym->qualified_name);
+    type->data.class_type.symbol = sym;
+    return type;
+}
+
+/** The classes declared in the unit being analysed, in source order. */
+static void cover_unit_classes(ast_node_t *root, slist_t **out)
+{
+    if (!root) {
+        return;
+    }
+    size_t capacity = 64, top = 0;
+    ast_node_t **stack = malloc(capacity * sizeof(*stack));
+    if (!stack) {
+        return;
+    }
+    stack[top++] = root;
+    slist_t *tail = NULL;
+    while (top > 0) {
+        ast_node_t *node = stack[--top];
+        if (!node) {
+            continue;
+        }
+        if ((node->type == AST_CLASS_DECL || node->type == AST_INTERFACE_DECL ||
+             node->type == AST_ENUM_DECL || node->type == AST_RECORD_DECL) && node->sem_symbol) {
+            slist_t *entry = slist_new(node->sem_symbol);
+            if (tail) {
+                tail->next = entry;
+            } else {
+                *out = entry;
+            }
+            tail = entry;
+        }
+        switch (node->type) {
+            case AST_LITERAL: case AST_IDENTIFIER: case AST_THIS_EXPR: case AST_SUPER_EXPR:
+            case AST_PRIMITIVE_TYPE: case AST_VAR_TYPE:
+                continue;
+            default:
+                break;
+        }
+        size_t count = 0;
+        for (slist_t *c = node->data.node.children; c; c = c->next) {
+            count++;
+        }
+        if (top + count + 1 > capacity) {
+            while (top + count + 1 > capacity) {
+                capacity *= 2;
+            }
+            ast_node_t **grown = realloc(stack, capacity * sizeof(*stack));
+            if (!grown) {
+                break;
+            }
+            stack = grown;
+        }
+        size_t base = top;
+        top += count;
+        size_t i = base + count;
+        for (slist_t *c = node->data.node.children; c; c = c->next) {
+            stack[--i] = (ast_node_t *)c->data;
+        }
+    }
+    free(stack);
+}
+
+/**
+ * The classes a sealed class permits, as symbols, in order. False when they cannot be told:
+ * the clause names classes the analysis has not resolved, or it is left out (so they are the
+ * classes of the unit that extend it) and the class is not in this unit.
+ */
+static bool cover_permitted(semantic_t *sem, symbol_t *sealed, slist_t **out)
+{
+    *out = NULL;
+    slist_t *tail = NULL;
+
+    if (sealed->data.class_data.permitted_subclasses) {
+        for (slist_t *n = sealed->data.class_data.permitted_subclasses; n; n = n->next) {
+            symbol_t *permitted = load_external_class(sem, (const char *)n->data);
+            if (!permitted) {
+                slist_free(*out);
+                *out = NULL;
+                return false;
+            }
+            symbol_complete(permitted);
+            slist_t *entry = slist_new(permitted);
+            if (tail) {
+                tail->next = entry;
+            } else {
+                *out = entry;
+            }
+            tail = entry;
+        }
+        return true;
+    }
+
+    ast_node_t *decl = sealed->ast;
+    if (!decl) {
+        return false;
+    }
+
+    bool explicit_clause = false;
+    for (slist_t *c = decl->data.node.children; c; c = c->next) {
+        ast_node_t *child = (ast_node_t *)c->data;
+        if (child && child->type == AST_CLASS_TYPE && child->data.node.flags == 3) {
+            explicit_clause = true;
+            type_t *type = child->sem_type;
+            if (!type) {
+                /* (a name that does not resolve from here is no error here) */
+                bool quiet = sem->loading_dependency;
+                sem->loading_dependency = true;
+                type = semantic_resolve_type(sem, child);
+                sem->loading_dependency = quiet;
+            }
+            symbol_t *permitted = type ? cover_symbol(type) : NULL;
+            if (!permitted) {
+                slist_free(*out);
+                *out = NULL;
+                return false;
+            }
+            slist_t *entry = slist_new(permitted);
+            if (tail) {
+                tail->next = entry;
+            } else {
+                *out = entry;
+            }
+            tail = entry;
+        }
+    }
+    if (explicit_clause) {
+        return true;
+    }
+
+    /* No clause: the classes of this unit that extend or implement it */
+    slist_t *unit = NULL;
+    cover_unit_classes(sem->unit_ast, &unit);
+    bool in_unit = false;
+    for (slist_t *u = unit; u; u = u->next) {
+        if (u->data == sealed) {
+            in_unit = true;
+        }
+    }
+    if (in_unit) {
+        for (slist_t *u = unit; u; u = u->next) {
+            symbol_t *candidate = (symbol_t *)u->data;
+            bool direct = candidate->data.class_data.superclass == sealed;
+            for (slist_t *i = candidate->data.class_data.interfaces; i && !direct; i = i->next) {
+                direct = i->data == sealed;
+            }
+            if (direct) {
+                slist_t *entry = slist_new(candidate);
+                if (tail) {
+                    tail->next = entry;
+                } else {
+                    *out = entry;
+                }
+                tail = entry;
+            }
+        }
+    }
+    slist_free(unit);
+    return in_unit;
+}
+
+/**
+ * The classes that between them make up everything of the given type that can exist: the type
+ * itself, or - for a sealed type - the classes under it that are not sealed (and the sealed class
+ * itself, unless it is abstract or an interface). False when that cannot be told.
+ */
+static bool cover_atoms(semantic_t *sem, type_t *type, slist_t **out, int depth)
+{
+    if (depth > 16) {
+        return false;
+    }
+    type = cover_erased(type);
+    symbol_t *sym = cover_symbol(type);
+    if (!sym || !(sym->modifiers & MOD_SEALED)) {
+        slist_t *entry = slist_new(type);
+        if (*out) {
+            slist_append(*out, type);
+            slist_free(entry);
+        } else {
+            *out = entry;
+        }
+        return true;
+    }
+
+    bool abstract = sym->kind == SYM_INTERFACE || (sym->modifiers & MOD_ABSTRACT);
+    if (!abstract) {
+        if (*out) {
+            slist_append(*out, type);
+        } else {
+            *out = slist_new(type);
+        }
+    }
+    slist_t *permitted = NULL;
+    if (!cover_permitted(sem, sym, &permitted)) {
+        return false;
+    }
+    for (slist_t *p = permitted; p; p = p->next) {
+        if (!cover_atoms(sem, cover_type_of((symbol_t *)p->data), out, depth + 1)) {
+            slist_free(permitted);
+            return false;
+        }
+    }
+    slist_free(permitted);
+    return true;
+}
+
+/** The number of components of a record type, or -1 if it is not a record. */
+static int cover_record_arity(symbol_t *sym)
+{
+    if (!sym) {
+        return -1;
+    }
+    if (sym->ast && sym->ast->type == AST_RECORD_DECL) {
+        int count = 0;
+        for (slist_t *c = sym->ast->data.node.children; c; c = c->next) {
+            ast_node_t *child = (ast_node_t *)c->data;
+            if (child && child->type == AST_PARAMETER && (child->data.node.flags & MOD_RECORD_COMPONENT)) {
+                count++;
+            }
+        }
+        return count;
+    }
+    if (sym->data.class_data.record_components) {
+        int count = 0;
+        for (slist_t *c = sym->data.class_data.record_components; c; c = c->next) {
+            count++;
+        }
+        return count;
+    }
+    return -1;
+}
+
+/** True if the rows, matching the columns of the given types, cover everything those can be. */
+static bool cover_rows(semantic_t *sem, cover_row_t *rows, int nrows, type_t **types, int ncols,
+                       int depth)
+{
+    if (nrows == 0) {
+        return false;
+    }
+    if (ncols == 0 || depth > 24) {
+        return true;
+    }
+
+    slist_t *atoms = NULL;
+    if (!cover_atoms(sem, types[0], &atoms, 0)) {
+        slist_free(atoms);
+        return true;    /* cannot tell */
+    }
+
+    bool covered = true;
+    for (slist_t *a = atoms; a && covered; a = a->next) {
+        type_t *atom = (type_t *)a->data;
+        symbol_t *atom_sym = cover_symbol(atom);
+        int arity = cover_record_arity(atom_sym);
+
+        cover_row_t *matching = calloc((size_t)nrows, sizeof(*matching));
+        int nmatching = 0;
+        bool destructured = false;
+        for (int r = 0; r < nrows && matching; r++) {
+            ast_node_t *head = rows[r].cells[0];
+            bool matches = false;
+            if (!head || head->type == AST_UNNAMED_PATTERN) {
+                matches = true;
+            } else if (head->type == AST_TYPE_PATTERN) {
+                type_t *pattern_type = head->sem_type;
+                matches = (head->data.node.flags & AST_PATTERN_TOTAL) != 0 ||
+                          !pattern_type || pattern_type->kind != TYPE_CLASS ||
+                          type_assignable(cover_erased(pattern_type), atom);
+                /* (a pattern of a primitive type matches that primitive, the atom) */
+                if (!matches && pattern_type && pattern_type->kind != TYPE_CLASS) {
+                    matches = true;
+                }
+            } else if (head->type == AST_RECORD_PATTERN) {
+                symbol_t *pattern_sym = cover_symbol(head->sem_type);
+                matches = pattern_sym && pattern_sym == atom_sym;
+                if (matches) {
+                    destructured = true;
+                }
+            }
+            if (matches) {
+                matching[nmatching++].cells = rows[r].cells;
+            }
+        }
+        if (!matching || nmatching == 0) {
+            free(matching);
+            covered = false;
+            break;
+        }
+
+        if (destructured && arity >= 0) {
+            /* The record's components take the place of the column */
+            int ncomponents = arity;
+            int width = ncomponents + ncols - 1;
+            cover_row_t *expanded = calloc((size_t)nmatching, sizeof(*expanded));
+            type_t **component_types = calloc((size_t)width, sizeof(*component_types));
+            bool built = expanded && component_types;
+            for (int j = 0; built && j < ncomponents; j++) {
+                type_t *component = record_pattern_component_type(sem, atom, j);
+                if (!component) {
+                    built = false;      /* cannot tell */
+                }
+                component_types[j] = component;
+            }
+            for (int j = 1; built && j < ncols; j++) {
+                component_types[ncomponents + j - 1] = types[j];
+            }
+            for (int r = 0; built && r < nmatching; r++) {
+                ast_node_t **cells = calloc((size_t)width, sizeof(*cells));
+                expanded[r].cells = cells;
+                if (!cells) {
+                    built = false;
+                    break;
+                }
+                ast_node_t *head = matching[r].cells[0];
+                if (head && head->type == AST_RECORD_PATTERN && head->data.node.children) {
+                    int j = 0;
+                    for (slist_t *c = head->data.node.children->next; c && j < ncomponents; c = c->next, j++) {
+                        cells[j] = (ast_node_t *)c->data;
+                    }
+                    if (j != ncomponents) {
+                        built = false;  /* the wrong number of patterns is reported elsewhere */
+                    }
+                }
+                for (int j = 1; j < ncols; j++) {
+                    cells[ncomponents + j - 1] = matching[r].cells[j];
+                }
+            }
+            if (built) {
+                covered = cover_rows(sem, expanded, nmatching, component_types, width, depth + 1);
+            }
+            for (int r = 0; r < nmatching; r++) {
+                free(expanded ? expanded[r].cells : NULL);
+            }
+            free(expanded);
+            free(component_types);
+        } else {
+            cover_row_t *tails = calloc((size_t)nmatching, sizeof(*tails));
+            for (int r = 0; tails && r < nmatching; r++) {
+                tails[r].cells = matching[r].cells + 1;
+            }
+            covered = tails ? cover_rows(sem, tails, nmatching, types + 1, ncols - 1, depth + 1) : true;
+            free(tails);
+        }
+        free(matching);
+    }
+    slist_free(atoms);
+    return covered;
+}
+
+/** Whether a guard is the constant true (a pattern with such a guard is unguarded). */
+static bool cover_guard_is_true(ast_node_t *guard)
+{
+    return guard && guard->type == AST_LITERAL && guard->data.leaf.token_type == TOK_TRUE;
+}
+
+/** The names of the constants of an enum; false if they cannot be told. */
+static bool cover_enum_constants(symbol_t *enum_sym, slist_t **names)
+{
+    *names = NULL;
+    if (!enum_sym->data.class_data.members || !enum_sym->data.class_data.members->symbols) {
+        return false;
+    }
+    hashtable_t *table = enum_sym->data.class_data.members->symbols;
+    for (size_t i = 0; i < table->size; i++) {
+        for (hashtable_entry_t *e = table->buckets[i]; e; e = e->next) {
+            symbol_t *member = (symbol_t *)e->value;
+            if (member && member->kind == SYM_FIELD && member->data.var_data.is_enum_constant) {
+                *names = slist_prepend(*names, (void *)member->name);
+            }
+        }
+    }
+    return *names != NULL;
+}
+
+/**
+ * Reports a switch expression, or a switch statement over patterns, that does not cover every
+ * value of its selector. `selector_type` is the type of the selector.
+ */
+static void check_switch_exhaustive(semantic_t *sem, ast_node_t *node, type_t *selector_type)
+{
+    if (!selector_type || selector_type->kind == TYPE_UNKNOWN || sem->loading_dependency) {
+        return;
+    }
+    slist_t *children = node->data.node.children;
+    if (!children) {
+        return;
+    }
+
+    size_t nrules = 0;
+    for (slist_t *c = children->next; c; c = c->next) {
+        nrules++;
+    }
+    cover_row_t *rows = calloc(nrules ? nrules * 2 : 1, sizeof(*rows));     /* (a rule can name several) */
+    size_t nrows = 0;
+    slist_t *constants = NULL;      /* names of the enum constants some case lists */
+    bool has_default = false;
+    bool unsure = false;
+    bool patterns = false;
+    size_t capacity = nrules ? nrules * 2 : 1;
+
+    for (slist_t *c = children->next; c && rows; c = c->next) {
+        ast_node_t *rule = (ast_node_t *)c->data;
+        if (!rule || rule->type != AST_SWITCH_RULE) {
+            unsure = true;
+            continue;
+        }
+        if (rule->data.node.name && strcmp(rule->data.node.name, "default") == 0) {
+            has_default = true;
+        }
+        for (slist_t *rc = rule->data.node.children; rc && rc->next; rc = rc->next) {
+            ast_node_t *item = (ast_node_t *)rc->data;
+            ast_node_t *pattern = item;
+            if (item->type == AST_GUARDED_PATTERN) {
+                slist_t *parts = item->data.node.children;
+                pattern = parts ? (ast_node_t *)parts->data : NULL;
+                if (!parts || !parts->next || !cover_guard_is_true((ast_node_t *)parts->next->data)) {
+                    patterns = true;
+                    continue;       /* a guarded pattern covers nothing */
+                }
+            }
+            if (pattern->type == AST_TYPE_PATTERN || pattern->type == AST_RECORD_PATTERN ||
+                pattern->type == AST_UNNAMED_PATTERN) {
+                patterns = true;
+                if (nrows >= capacity) {
+                    unsure = true;
+                    continue;
+                }
+                rows[nrows].cells = calloc(1, sizeof(ast_node_t *));
+                if (!rows[nrows].cells) {
+                    unsure = true;
+                    continue;
+                }
+                rows[nrows].cells[0] = pattern->type == AST_UNNAMED_PATTERN ? NULL : pattern;
+                nrows++;
+            } else if (pattern->type == AST_LITERAL && pattern->data.leaf.token_type == TOK_NULL) {
+                /* null is not a value of the type: it covers nothing */
+            } else if (pattern->type == AST_IDENTIFIER) {
+                constants = slist_prepend(constants, (void *)pattern->data.leaf.name);
+            } else if (pattern->type == AST_FIELD_ACCESS && pattern->data.node.name) {
+                constants = slist_prepend(constants, (void *)pattern->data.node.name);
+            } else if (pattern->type == AST_LITERAL) {
+                /* a constant of int, String, ...: covers nothing in particular */
+            } else {
+                unsure = true;
+            }
+        }
+    }
+
+    bool exhaustive = has_default || unsure || !rows;
+    if (!exhaustive) {
+        symbol_t *selector_sym = selector_type->kind == TYPE_CLASS ? cover_symbol(selector_type) : NULL;
+        slist_t *all = NULL;
+        if (selector_sym && selector_sym->kind == SYM_ENUM && constants &&
+            cover_enum_constants(selector_sym, &all)) {
+            /* every constant of the enum is listed */
+            exhaustive = true;
+            for (slist_t *a = all; a && exhaustive; a = a->next) {
+                bool listed = false;
+                for (slist_t *l = constants; l && !listed; l = l->next) {
+                    listed = strcmp((const char *)a->data, (const char *)l->data) == 0;
+                }
+                exhaustive = listed;
+            }
+        } else if (selector_sym && selector_sym->kind == SYM_ENUM && constants) {
+            exhaustive = true;      /* the constants cannot be told */
+        }
+        slist_free(all);
+        if (!exhaustive && nrows > 0 && selector_type->kind == TYPE_CLASS) {
+            type_t *types[1] = { selector_type };
+            exhaustive = cover_rows(sem, rows, (int)nrows, types, 1, 0);
+            /* With type arguments a permitted class can be one the selector cannot hold
+             * (an I<Integer> is never an A that implements I<String>), which this does not
+             * work out: do not report what might be that */
+            if (!exhaustive && selector_type->data.class_type.type_args) {
+                exhaustive = true;
+            }
+        }
+        if (!exhaustive && nrows == 0 && selector_type->kind != TYPE_CLASS &&
+            selector_type->kind != TYPE_ARRAY && selector_type->kind != TYPE_TYPEVAR &&
+            selector_type->kind != TYPE_UNKNOWN) {
+            exhaustive = false;     /* a primitive selector with only constants needs a default */
+        } else if (!exhaustive && selector_type->kind != TYPE_CLASS && nrows > 0) {
+            exhaustive = true;      /* patterns over a selector this does not follow */
+        }
+    }
+    (void)patterns;
+
+    for (size_t r = 0; r < nrows && rows; r++) {
+        free(rows[r].cells);
+    }
+    free(rows);
+    slist_free(constants);
+
+    if (!exhaustive) {
+        semantic_error(sem, node->line, node->column,
+            (node->data.node.flags & AST_SWITCH_IS_STATEMENT)
+                ? "the switch statement does not cover all possible input values"
+                : "the switch expression does not cover all possible input values");
+    }
+}
+
 static void pass2_check_types(semantic_t *sem, ast_node_t *ast)
 {
     if (!ast) {
@@ -32662,6 +33246,11 @@ define_local_var:
                                 }
                             }
                             
+                            if (children) {
+                                check_switch_exhaustive(sem, node, node->data.node.children->data
+                                    ? ((ast_node_t *)node->data.node.children->data)->sem_type : NULL);
+                            }
+
                             /* Leave the type of the whole expression on the node
                              * (resolve_switch_labels left the selector's there). */
                             type_t *switch_type = get_expression_type(sem, node);
@@ -33102,6 +33691,7 @@ bool semantic_analyze(semantic_t *sem, ast_node_t *ast, source_file_t *source)
     g_current_semantic = sem;
     
     sem->source = source;
+    sem->unit_ast = ast;
     sem->error_count = 0;
     sem->warning_count = 0;
 

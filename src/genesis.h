@@ -738,6 +738,10 @@ struct symbol
             slist_t *pending_field_accessors; /* list of pending_field_accessor_t*
                                          * this class must emit as synthetic methods -
                                          * see pending_field_accessor_t's own comment. */
+            slist_t *permitted_subclasses; /* A sealed class loaded from a class file: the
+                                         * binary names (char*) of the classes it permits.
+                                         * NULL for every other class; one declared in source
+                                         * keeps its permits clause in its AST. */
             slist_t *record_components; /* A record loaded from a class file: its components
                                          * in declaration order, as record_component_t*.
                                          * NULL for every other class; a record declared in
@@ -908,6 +912,7 @@ typedef struct semantic
     type_t *target_type;         /* Target type for expression (for type inference) */
     
     slist_t *diagnostics;       /* List of diagnostic_t* */
+    ast_node_t *unit_ast;       /* The compilation unit being analysed */
     int error_count;
     int warning_count;
     
