@@ -1572,6 +1572,21 @@ static ast_node_t *parse_primary(parser_t *parser)
                     parser_current_type(parser) == TOK_AT) {
                     /* Peek ahead to see if this is (Type) expr or (expr) */
                     lexer_pos_t save_pos = lexer_save_pos(parser->lexer);
+
+                    /* Annotations followed by "final" are the modifiers of a lambda parameter,
+                     * (@A final var x) -> ...; no type follows them to try as a cast */
+                    if (parser_current_type(parser) == TOK_AT) {
+                        slist_t *skipped = NULL;
+                        uint32_t modifiers = parse_modifiers_with_annotations(parser, &skipped);
+                        for (slist_t *a = skipped; a; a = a->next) {
+                            ast_free((ast_node_t *)a->data);
+                        }
+                        slist_free(skipped);
+                        lexer_restore_pos(parser->lexer, save_pos);
+                        if (modifiers & MOD_FINAL) {
+                            goto check_lambda_params;
+                        }
+                    }
                     
                     /* Try parsing as a type */
                     ast_node_t *maybe_type = parse_type(parser);

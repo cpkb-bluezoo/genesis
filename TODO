@@ -12,9 +12,6 @@ Legend:
 PENDING FEATURES
 ================================================================================
 
-Java 11:
-  [ ] Annotations on lambda params with var: (@NonNull var x) -> x
-
 Java 21:
   [ ] Record attribute parsing for positional component matching
       Currently pattern variable names must match record component names.
