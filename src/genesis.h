@@ -665,6 +665,15 @@ typedef struct pending_method_accessor {
 } pending_method_accessor_t;
 
 /**
+ * A component of a record loaded from a class file: the accessor method has the same name
+ */
+typedef struct record_component
+{
+    char *name;
+    char *descriptor;       /* Erased type of the component, as a field descriptor */
+} record_component_t;
+
+/**
  * Represents a declared symbol (class, method, variable, etc.)
  */
 struct symbol
@@ -728,6 +737,10 @@ struct symbol
             slist_t *pending_field_accessors; /* list of pending_field_accessor_t*
                                          * this class must emit as synthetic methods -
                                          * see pending_field_accessor_t's own comment. */
+            slist_t *record_components; /* A record loaded from a class file: its components
+                                         * in declaration order, as record_component_t*.
+                                         * NULL for every other class; a record declared in
+                                         * source keeps its components in its AST. */
         } class_data;
         
         /* SYM_METHOD, SYM_CONSTRUCTOR */
@@ -1084,6 +1097,9 @@ bool semantic_analyze(semantic_t *sem, ast_node_t *ast, source_file_t *source);
 void semantic_error(semantic_t *sem, int line, int col, const char *fmt, ...);
 void semantic_warning(semantic_t *sem, int line, int col, const char *fmt, ...);
 void semantic_print_diagnostics(semantic_t *sem);
+
+/* The name of the index'th component of a record, declared in source or loaded from a class file */
+const char *record_component_name(symbol_t *record_sym, int index);
 char *semantic_format_diagnostics(semantic_t *sem);
 
 /* Type resolution */

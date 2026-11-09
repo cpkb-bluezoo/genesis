@@ -11842,9 +11842,23 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                         }
                     }
                     
-                    /* Fallback for external records or when param type isn't resolved:
-                     * use pattern variable name as accessor name.
-                     * This works when pattern uses same names as record components. */
+                    /* A record loaded from a class file: its Record attribute names the
+                     * component in this position, whatever the pattern variable is called */
+                    if (!accessor_name && record_sym) {
+                        int position = 0;
+                        for (slist_t *rc = record_sym->data.class_data.record_components; rc;
+                             rc = rc->next, position++) {
+                            if (position == comp_index) {
+                                record_component_t *component = (record_component_t *)rc->data;
+                                accessor_name = component->name;
+                                accessor_desc = component->descriptor;
+                                break;
+                            }
+                        }
+                    }
+
+                    /* Fallback when the record's components are not known: use the pattern
+                     * variable name as accessor name, which works when it is the component's. */
                     if (!accessor_name && comp_var_name) {
                         accessor_name = comp_var_name;
                     }
@@ -11854,8 +11868,10 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                     }
                     
                     if (accessor_name && accessor_desc) {
-                        /* Allocate local for component variable */
-                        uint16_t comp_slot = mg->next_slot++;
+                        /* Allocate local for component variable; a long or double takes two */
+                        uint16_t comp_slot = mg->next_slot;
+                        mg->next_slot += (comp_type && (comp_type->kind == TYPE_LONG ||
+                                                        comp_type->kind == TYPE_DOUBLE)) ? 2 : 1;
                         if (mg->next_slot > mg->max_locals) {
                             mg->max_locals = mg->next_slot;
                         }

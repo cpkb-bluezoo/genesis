@@ -525,5 +525,24 @@ inner_class_info_t *classfile_get_inner_classes(classfile_t *cf);
 /* Free an inner class info list */
 void inner_class_info_free(inner_class_info_t *info);
 
+/*
+ * Record attribute parsing (Java 16+)
+ */
+
+/* One component of a record: the name of the accessor method and its erased return type */
+typedef struct record_component_info
+{
+    char *name;                         /* Component name, which is also its accessor's */
+    char *descriptor;                   /* Field descriptor, e.g. "Ljava/util/List;" */
+    struct record_component_info *next; /* In declaration order */
+} record_component_info_t;
+
+/* Parse the Record attribute and return the components in declaration order, or NULL if the
+ * class has no Record attribute (it is not a record). Free with record_component_info_free. */
+record_component_info_t *classfile_get_record_components(classfile_t *cf);
+
+/* Free a record component list */
+void record_component_info_free(record_component_info_t *info);
+
 #endif /* CLASSFILE_H */
 

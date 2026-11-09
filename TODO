@@ -13,10 +13,13 @@ PENDING FEATURES
 ================================================================================
 
 Java 21:
-  [ ] Record attribute parsing for positional component matching
-      Currently pattern variable names must match record component names.
-      Should read Record attribute from external class files for position-based matching.
-
+  [ ] instanceof with a record pattern: if (o instanceof Pt(int x, int y)).
+      The parser accepts it, but the statement is silently dropped from the
+      output.  Switch has record patterns; instanceof has none.
+  [ ] Nested record patterns in switch: case Line(Pt(var a, var b), var c).
+      Also a component pattern narrower than the component's type
+      (case Box(String s) for an Object component), which needs a type test:
+      codegen assumes each component pattern is total.
 
 ================================================================================
 DEFERRED / WILL NOT IMPLEMENT
@@ -86,3 +89,9 @@ Inner class synthetic accessors:
     NestHost/NestMembers attributes are omitted, so private access between
     nested classes fails at run time. Full support for older targets would
     generate synthetic access$N methods, as javac does for -target 8.
+
+Records:
+  - A record whose components include a long or a double gets a generated
+    equals() that fails verification (VerifyError), e.g. record M(int i, long l).
+  - A method or a record component named "to" (or "from") is a parse error:
+    record R(int to), r.to().  "to" is a contextual keyword.

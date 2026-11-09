@@ -2243,3 +2243,113 @@ inner_class_info_t *classfile_get_inner_classes(classfile_t *cf)
     
     return head;
 }
+
+/*
+ * Record attribute (JVMS 4.7.30):
+ *
+ * Record_attribute {
+ *     u2 attribute_name_index;
+ *     u4 attribute_length;
+ *     u2 components_count;
+ *     record_component_info components[components_count];
+ * }
+ * record_component_info {
+ *     u2 name_index;
+ *     u2 descriptor_index;
+ *     u2 attributes_count;
+ *     attribute_info attributes[attributes_count];
+ * }
+ */
+
+void record_component_info_free(record_component_info_t *info)
+{
+    while (info) {
+        record_component_info_t *next = info->next;
+        free(info->name);
+        free(info->descriptor);
+        free(info);
+        info = next;
+    }
+}
+
+static uint16_t record_read_u2(const uint8_t *p)
+{
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+record_component_info_t *classfile_get_record_components(classfile_t *cf)
+{
+    if (!cf || !cf->attributes) {
+        return NULL;
+    }
+
+    attribute_info_t *record_attr = NULL;
+    for (uint16_t i = 0; i < cf->attributes_count; i++) {
+        char *name = classfile_get_utf8(cf, cf->attributes[i].attribute_name_index);
+        bool match = name && strcmp(name, "Record") == 0;
+        free(name);
+        if (match) {
+            record_attr = &cf->attributes[i];
+            break;
+        }
+    }
+    if (!record_attr || !record_attr->info || record_attr->attribute_length < 2) {
+        return NULL;
+    }
+
+    const uint8_t *data = record_attr->info;
+    const uint8_t *end = data + record_attr->attribute_length;
+    uint16_t count = record_read_u2(data);
+    data += 2;
+
+    record_component_info_t *head = NULL;
+    record_component_info_t *tail = NULL;
+    for (uint16_t i = 0; i < count; i++) {
+        if (end - data < 6) {
+            break;
+        }
+        uint16_t name_index = record_read_u2(data);
+        uint16_t descriptor_index = record_read_u2(data + 2);
+        uint16_t attributes_count = record_read_u2(data + 4);
+        data += 6;
+
+        /* The attributes (Signature, annotations) are not needed: skip them */
+        bool truncated = false;
+        for (uint16_t a = 0; a < attributes_count; a++) {
+            if (end - data < 6) {
+                truncated = true;
+                break;
+            }
+            uint32_t length = ((uint32_t)data[2] << 24) | ((uint32_t)data[3] << 16) |
+                              ((uint32_t)data[4] << 8) | data[5];
+            if ((size_t)(end - data - 6) < length) {
+                truncated = true;
+                break;
+            }
+            data += 6 + length;
+        }
+
+        char *name = classfile_get_utf8(cf, name_index);
+        char *descriptor = classfile_get_utf8(cf, descriptor_index);
+        record_component_info_t *info = calloc(1, sizeof(*info));
+        if (!name || !descriptor || !info) {
+            free(name);
+            free(descriptor);
+            free(info);
+            record_component_info_free(head);
+            return NULL;
+        }
+        info->name = name;
+        info->descriptor = descriptor;
+        if (tail) {
+            tail->next = info;
+        } else {
+            head = info;
+        }
+        tail = info;
+        if (truncated) {
+            break;
+        }
+    }
+    return head;
+}

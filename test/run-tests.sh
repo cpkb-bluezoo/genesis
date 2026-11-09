@@ -217,6 +217,22 @@ else
     failed=$((failed + 1))
 fi
 
+printf "%-30s ... " "RecordPatternClassFile"
+rp_lib="$TEST_BUILD/recordpattern-lib"
+rp_out="$TEST_BUILD/recordpattern-out"
+rm -rf "$rp_lib" "$rp_out"
+mkdir -p "$rp_lib" "$rp_out"
+if "$GENESIS" -d "$rp_lib" "$TEST_SRC"/external/recordpatternlib/recordlib/*.java >/dev/null 2>&1 &&
+   "$GENESIS" -source 21 -cp "$rp_lib" -d "$rp_out" \
+       "$TEST_SRC/external/RecordPatternClassFileTest.java" >/dev/null 2>&1 &&
+   "$JAVA" -cp "$rp_out:$rp_lib" RecordPatternClassFileTest >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
 printf "%-30s ... " "MultiCatchExternalLibException"
 mc_lib="$TEST_BUILD/multicatch-ext-lib"
 mc_out="$TEST_BUILD/multicatch-ext-out"

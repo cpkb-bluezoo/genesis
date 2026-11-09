@@ -3804,6 +3804,15 @@ void symbol_free(symbol_t *sym)
             /* interfaces list contains symbol pointers, don't free */
             slist_free(sym->data.class_data.interfaces);
             slist_free(sym->data.class_data.type_params);
+            for (slist_t *rc = sym->data.class_data.record_components; rc; rc = rc->next) {
+                record_component_t *component = (record_component_t *)rc->data;
+                if (component) {
+                    free(component->name);
+                    free(component->descriptor);
+                    free(component);
+                }
+            }
+            slist_free(sym->data.class_data.record_components);
             break;
         
         case SYM_METHOD:
@@ -6516,6 +6525,26 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
     if (rec) {
         rec->sym = sym;
         sym->shared_record = rec;
+    }
+
+    /* A record: remember its components, which a record pattern matches by position */
+    if (kind == SYM_CLASS && (cf->access_flags & ACC_FINAL)) {
+        record_component_info_t *components = classfile_get_record_components(cf);
+        for (record_component_info_t *ci = components; ci; ci = ci->next) {
+            record_component_t *component = calloc(1, sizeof(*component));
+            if (!component) {
+                break;
+            }
+            component->name = strdup(ci->name);
+            component->descriptor = strdup(ci->descriptor);
+            slist_t *entry = sym->data.class_data.record_components
+                ? slist_append(sym->data.class_data.record_components, component)
+                : slist_new(component);
+            if (!sym->data.class_data.record_components) {
+                sym->data.class_data.record_components = entry;
+            }
+        }
+        record_component_info_free(components);
     }
     
     /* Convert access flags to our modifiers */
@@ -15055,7 +15084,66 @@ static slist_t *ast_get_children(ast_node_t *node)
  * Handles type patterns, record patterns, and unnamed patterns.
  * ======================================================================== */
 
-static void semantic_define_pattern_vars(semantic_t *sem, ast_node_t *pattern, scope_t *scope)
+/**
+ * The name of the index'th component of a record, or NULL: from the declaration of a record
+ * written in source, from the Record attribute of one loaded from a class file.
+ */
+const char *record_component_name(symbol_t *record_sym, int index)
+{
+    if (!record_sym) {
+        return NULL;
+    }
+    if (record_sym->ast && record_sym->ast->type == AST_RECORD_DECL) {
+        int position = 0;
+        for (slist_t *rc = record_sym->ast->data.node.children; rc; rc = rc->next) {
+            ast_node_t *child = (ast_node_t *)rc->data;
+            if (child && child->type == AST_PARAMETER && (child->data.node.flags & MOD_RECORD_COMPONENT)) {
+                if (position++ == index) {
+                    return child->data.node.name;
+                }
+            }
+        }
+        return NULL;
+    }
+    int position = 0;
+    for (slist_t *rc = record_sym->data.class_data.record_components; rc; rc = rc->next) {
+        if (position++ == index) {
+            return ((record_component_t *)rc->data)->name;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * The type of the index'th component of a record pattern's record type, with the type
+ * arguments the pattern gives the record applied, or NULL when it cannot be found. The
+ * component is read through its accessor method, which has the component's name and type.
+ */
+static type_t *record_pattern_component_type(semantic_t *sem, type_t *record_type, int index)
+{
+    if (!record_type || record_type->kind != TYPE_CLASS) {
+        return NULL;
+    }
+    symbol_t *record_sym = record_type->data.class_type.symbol;
+    if (!record_sym) {
+        return NULL;
+    }
+    symbol_complete(record_sym);
+    const char *name = record_component_name(record_sym, index);
+    if (!name || !record_sym->data.class_data.members) {
+        return NULL;
+    }
+    symbol_t *accessor = scope_lookup_method_with_args(record_sym->data.class_data.members, name, 0);
+    type_t *type = ensure_method_result_type(sem, accessor, record_sym);
+    return type ? substitute_from_receiver(type, record_type) : NULL;
+}
+
+/**
+ * Define the variables a pattern binds. `component_type` is the type of the record component
+ * the pattern matches, when it is nested in a record pattern: "var" takes that type.
+ */
+static void define_pattern_vars_of(semantic_t *sem, ast_node_t *pattern, scope_t *scope,
+                                   type_t *component_type)
 {
     if (!pattern) {
         return;
@@ -15067,7 +15155,8 @@ static void semantic_define_pattern_vars(semantic_t *sem, ast_node_t *pattern, s
         slist_t *pattern_children = pattern->data.node.children;
         if (pattern_children) {
             ast_node_t *type_node = (ast_node_t *)pattern_children->data;
-            type_t *pattern_type = semantic_resolve_type(sem, type_node);
+            type_t *pattern_type = (type_node->type == AST_VAR_TYPE && component_type)
+                ? component_type : semantic_resolve_type(sem, type_node);
             
             /* Store type on pattern for codegen */
             pattern->sem_type = pattern_type;
@@ -15111,10 +15200,16 @@ static void semantic_define_pattern_vars(semantic_t *sem, ast_node_t *pattern, s
             }
             
             /* Recursively define variables from this component pattern */
-            semantic_define_pattern_vars(sem, comp_pattern, scope);
+            define_pattern_vars_of(sem, comp_pattern, scope,
+                                   record_pattern_component_type(sem, record_type, comp_index));
         }
     }
     /* AST_UNNAMED_PATTERN has no variables to define */
+}
+
+static void semantic_define_pattern_vars(semantic_t *sem, ast_node_t *pattern, scope_t *scope)
+{
+    define_pattern_vars_of(sem, pattern, scope, NULL);
 }
 
 /**
@@ -15124,23 +15219,34 @@ static void semantic_define_pattern_vars(semantic_t *sem, ast_node_t *pattern, s
  * semantic_define_pattern_vars() this leaves the pattern nodes untouched:
  * the analysis proper attaches their real symbols later.
  */
-static void define_pattern_vars_for_typing(semantic_t *sem, ast_node_t *pattern, scope_t *scope)
+static void define_pattern_vars_for_typing_of(semantic_t *sem, ast_node_t *pattern, scope_t *scope,
+                                              type_t *component_type)
 {
     slist_t *children = pattern->data.node.children;
     if (pattern->type == AST_TYPE_PATTERN) {
         const char *var_name = pattern->data.node.name;
         if (children && var_name) {
+            ast_node_t *type_node = (ast_node_t *)children->data;
             symbol_t *sym = symbol_new(SYM_LOCAL_VAR, var_name);
-            sym->type = semantic_resolve_type(sem, (ast_node_t *)children->data);
+            sym->type = (type_node->type == AST_VAR_TYPE && component_type)
+                ? component_type : semantic_resolve_type(sem, type_node);
             sym->modifiers = MOD_FINAL;
             scope_define(scope, sym);
         }
     } else if (pattern->type == AST_RECORD_PATTERN && children) {
         /* The first child is the record type; the rest are component patterns */
-        for (slist_t *c = children->next; c; c = c->next) {
-            define_pattern_vars_for_typing(sem, (ast_node_t *)c->data, scope);
+        type_t *record_type = semantic_resolve_type(sem, (ast_node_t *)children->data);
+        int index = 0;
+        for (slist_t *c = children->next; c; c = c->next, index++) {
+            define_pattern_vars_for_typing_of(sem, (ast_node_t *)c->data, scope,
+                                              record_pattern_component_type(sem, record_type, index));
         }
     }
+}
+
+static void define_pattern_vars_for_typing(semantic_t *sem, ast_node_t *pattern, scope_t *scope)
+{
+    define_pattern_vars_for_typing_of(sem, pattern, scope, NULL);
 }
 
 /**
