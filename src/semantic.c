@@ -3240,6 +3240,7 @@ static bool mref_applicable_to_functional_param(semantic_t *sem, ast_node_t *ref
  * "<E extends Throwable> E find(Class<E>)" is not the receiver's E, however the two are named */
 static __thread symbol_t *g_own_type_vars_of = NULL;
 static type_t *substitute_from_receiver(type_t *type, type_t *recv_type);
+static symbol_t *receiver_class_symbol(type_t *recv_type);
 static type_t *infer_array_return_from_args(semantic_t *sem, type_t *return_type,
                                             symbol_t *method, slist_t *args);
 static type_t *interface_extends_type_for_subst(semantic_t *sem, symbol_t *iface_sym);
@@ -15139,11 +15140,12 @@ static type_t *record_pattern_component_type(semantic_t *sem, type_t *record_typ
 }
 
 /**
- * Define the variables a pattern binds. `component_type` is the type of the record component
- * the pattern matches, when it is nested in a record pattern: "var" takes that type.
+ * Define the variables a pattern binds in `scope` (when it is not NULL), and add them to
+ * `symbols` (when it is not NULL). `component_type` is the type of the record component the
+ * pattern matches, when it is nested in a record pattern: "var" takes that type.
  */
 static void define_pattern_vars_of(semantic_t *sem, ast_node_t *pattern, scope_t *scope,
-                                   type_t *component_type)
+                                   type_t *component_type, slist_t **symbols)
 {
     if (!pattern) {
         return;
@@ -15160,18 +15162,39 @@ static void define_pattern_vars_of(semantic_t *sem, ast_node_t *pattern, scope_t
             
             /* Store type on pattern for codegen */
             pattern->sem_type = pattern_type;
+
+            /* Whether it matches every value of the component, null included: "var", the
+             * component's own type or a supertype of it. Otherwise it is a type test. */
+            if (component_type && pattern_type) {
+                bool total = type_node->type == AST_VAR_TYPE;
+                if (!total && type_is_reference(pattern_type) && type_is_reference(component_type)) {
+                    total = type_assignable(pattern_type, component_type);
+                } else if (!total && !type_is_reference(pattern_type)) {
+                    total = pattern_type->kind == component_type->kind;
+                }
+                if (total) {
+                    pattern->data.node.flags |= AST_PATTERN_TOTAL;
+                }
+            }
             
             if (var_name) {
-                /* Create pattern variable symbol */
-                symbol_t *sym = symbol_new(SYM_LOCAL_VAR, var_name);
-                sym->type = pattern_type;
-                sym->modifiers = MOD_FINAL;
-                sym->ast = pattern;
-                sym->line = pattern->line;
-                sym->column = pattern->column;
-                
-                pattern->sem_symbol = sym;
-                scope_define(scope, sym);
+                /* Create pattern variable symbol (once, when the caller keeps the symbols) */
+                symbol_t *sym = symbols ? pattern->sem_symbol : NULL;
+                if (!sym) {
+                    sym = symbol_new(SYM_LOCAL_VAR, var_name);
+                    sym->type = pattern_type;
+                    sym->modifiers = MOD_FINAL;
+                    sym->ast = pattern;
+                    sym->line = pattern->line;
+                    sym->column = pattern->column;
+                    pattern->sem_symbol = sym;
+                }
+                if (scope) {
+                    scope_define(scope, sym);
+                }
+                if (symbols) {
+                    *symbols = slist_prepend(*symbols, sym);
+                }
             }
         }
     } else if (pattern->type == AST_RECORD_PATTERN) {
@@ -15185,6 +15208,11 @@ static void define_pattern_vars_of(semantic_t *sem, ast_node_t *pattern, scope_t
         ast_node_t *type_node = (ast_node_t *)children->data;
         type_t *record_type = semantic_resolve_type(sem, type_node);
         pattern->sem_type = record_type;
+
+        /* A record loaded from a class file is found by name until something loads it */
+        if (record_type && record_type->kind == TYPE_CLASS && !record_type->data.class_type.symbol) {
+            record_type->data.class_type.symbol = receiver_class_symbol(record_type);
+        }
         
         /* Recursively process component patterns */
         int comp_index = 0;
@@ -15201,7 +15229,8 @@ static void define_pattern_vars_of(semantic_t *sem, ast_node_t *pattern, scope_t
             
             /* Recursively define variables from this component pattern */
             define_pattern_vars_of(sem, comp_pattern, scope,
-                                   record_pattern_component_type(sem, record_type, comp_index));
+                                   record_pattern_component_type(sem, record_type, comp_index),
+                                   symbols);
         }
     }
     /* AST_UNNAMED_PATTERN has no variables to define */
@@ -15209,7 +15238,7 @@ static void define_pattern_vars_of(semantic_t *sem, ast_node_t *pattern, scope_t
 
 static void semantic_define_pattern_vars(semantic_t *sem, ast_node_t *pattern, scope_t *scope)
 {
-    define_pattern_vars_of(sem, pattern, scope, NULL);
+    define_pattern_vars_of(sem, pattern, scope, NULL, NULL);
 }
 
 /**
@@ -15236,6 +15265,9 @@ static void define_pattern_vars_for_typing_of(semantic_t *sem, ast_node_t *patte
     } else if (pattern->type == AST_RECORD_PATTERN && children) {
         /* The first child is the record type; the rest are component patterns */
         type_t *record_type = semantic_resolve_type(sem, (ast_node_t *)children->data);
+        if (record_type && record_type->kind == TYPE_CLASS && !record_type->data.class_type.symbol) {
+            record_type->data.class_type.symbol = receiver_class_symbol(record_type);
+        }
         int index = 0;
         for (slist_t *c = children->next; c; c = c->next, index++) {
             define_pattern_vars_for_typing_of(sem, (ast_node_t *)c->data, scope,
@@ -17886,6 +17918,34 @@ static symbol_t *pattern_binding_symbol(semantic_t *sem, ast_node_t *inst)
     return sym;
 }
 
+/** The record pattern of "e instanceof R(...)", else NULL. */
+static ast_node_t *instanceof_record_pattern(ast_node_t *inst)
+{
+    if (!inst || inst->type != AST_INSTANCEOF_EXPR) {
+        return NULL;
+    }
+    slist_t *c = inst->data.node.children;
+    if (!c || !c->next) {
+        return NULL;
+    }
+    ast_node_t *pattern = (ast_node_t *)c->next->data;
+    return pattern && pattern->type == AST_RECORD_PATTERN ? pattern : NULL;
+}
+
+/** The symbols of the variables "e instanceof R(...)" binds, added to *out. */
+static void record_pattern_bindings(semantic_t *sem, ast_node_t *inst, slist_t **out)
+{
+    ast_node_t *pattern = instanceof_record_pattern(inst);
+    if (!pattern) {
+        return;
+    }
+    if (sem->source_version < 21 && !pattern->sem_type) {
+        semantic_error(sem, pattern->line, pattern->column,
+            "record patterns are not supported in -source %d (use 21 or higher)", sem->source_version);
+    }
+    define_pattern_vars_of(sem, pattern, NULL, NULL, out);
+}
+
 /**
  * The bindings expr introduces when it evaluates to when_true: appended to
  * *out as the symbols of the instanceof tests.
@@ -17923,6 +17983,10 @@ static void collect_pattern_bindings(semantic_t *sem, ast_node_t *expr, bool whe
         }
         case AST_INSTANCEOF_EXPR:
             if (when_true) {
+                if (instanceof_record_pattern(expr)) {
+                    record_pattern_bindings(sem, expr, out);
+                    return;
+                }
                 symbol_t *sym = pattern_binding_symbol(sem, expr);
                 if (sym) {
                     *out = slist_prepend(*out, sym);
@@ -23643,7 +23707,18 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                      * import and so is never otherwise looked up. */
                     if (children->next) {
                         ast_node_t *type_node = (ast_node_t *)children->next->data;
-                        semantic_resolve_type(sem, type_node);
+                        if (type_node->type == AST_RECORD_PATTERN) {
+                            /* The types of the pattern's parts are resolved when its bindings
+                             * are declared, which no other path guarantees for a test whose
+                             * bindings nothing uses */
+                            slist_t *ignored = NULL;
+                            if (!type_node->sem_type) {
+                                record_pattern_bindings(sem, expr, &ignored);
+                            }
+                            slist_free(ignored);
+                        } else {
+                            semantic_resolve_type(sem, type_node);
+                        }
                     }
                 }
                 /* instanceof always returns boolean */
@@ -32075,7 +32150,16 @@ define_local_var:
                     
                     case AST_INSTANCEOF_EXPR:
                         /* Declare the binding before its identifier child is walked. */
-                        pattern_binding_symbol(sem, node);
+                        if (instanceof_record_pattern(node)) {
+                            slist_t *ignored = NULL;
+                            if (!node->data.node.children->next->data ||
+                                !((ast_node_t *)node->data.node.children->next->data)->sem_type) {
+                                record_pattern_bindings(sem, node, &ignored);
+                            }
+                            slist_free(ignored);
+                        } else {
+                            pattern_binding_symbol(sem, node);
+                        }
                         break;
 
                     case AST_METHOD_REF:

@@ -142,6 +142,7 @@ check_source_rejected OldRecord "records are not supported" -source 11
 check_source_rejected OldRecord "records are not supported" -source 15
 check_source_rejected OldSealed "sealed classes are not supported" -source 8
 check_source_rejected OldSealed "sealed classes are not supported" -source 16
+check_source_rejected OldInstanceofRecordPattern "record patterns are not supported" -source 17
 
 echo
 echo "--- Lombok annotations (annotation processors are not run) ---"

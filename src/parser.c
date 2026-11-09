@@ -1150,6 +1150,42 @@ static ast_node_t *parse_new_expression_with_outer(parser_t *parser, ast_node_t 
     return node;
 }
 
+static ast_node_t *parse_pattern(parser_t *parser);
+
+/**
+ * Parse the component patterns of a record pattern, "(p1, p2, ...)", the record type having been
+ * parsed. Takes the type node; returns NULL on error.
+ */
+static ast_node_t *parse_record_pattern_rest(parser_t *parser, ast_node_t *type_node, int line, int col)
+{
+    parser_advance(parser);  /* consume ( */
+
+    ast_node_t *record_pattern = ast_new(AST_RECORD_PATTERN, line, col);
+    ast_add_child(record_pattern, type_node);  /* First child is the record type */
+
+    /* Parse component patterns */
+    if (!parser_check(parser, TOK_RPAREN)) {
+        do {
+            ast_node_t *component = parse_pattern(parser);
+            if (component) {
+                ast_add_child(record_pattern, component);
+            } else {
+                /* Failed to parse pattern - error */
+                parser_error(parser, "Expected pattern in record pattern");
+                ast_free(record_pattern);
+                return NULL;
+            }
+        } while (parser_match(parser, TOK_COMMA));
+    }
+
+    if (!parser_expect(parser, TOK_RPAREN)) {
+        ast_free(record_pattern);
+        return NULL;
+    }
+
+    return record_pattern;
+}
+
 /**
  * Parse a pattern for switch expressions (Java 21+).
  * Patterns can be:
@@ -1197,32 +1233,7 @@ static ast_node_t *parse_pattern(parser_t *parser)
     
     /* Check for record pattern: Type(...) */
     if (parser_check(parser, TOK_LPAREN)) {
-        parser_advance(parser);  /* consume ( */
-        
-        ast_node_t *record_pattern = ast_new(AST_RECORD_PATTERN, pattern_line, pattern_col);
-        ast_add_child(record_pattern, type_node);  /* First child is the record type */
-        
-        /* Parse component patterns */
-        if (!parser_check(parser, TOK_RPAREN)) {
-            do {
-                ast_node_t *component = parse_pattern(parser);
-                if (component) {
-                    ast_add_child(record_pattern, component);
-                } else {
-                    /* Failed to parse pattern - error */
-                    parser_error(parser, "Expected pattern in record pattern");
-                    ast_free(record_pattern);
-                    return NULL;
-                }
-            } while (parser_match(parser, TOK_COMMA));
-        }
-        
-        if (!parser_expect(parser, TOK_RPAREN)) {
-            ast_free(record_pattern);
-            return NULL;
-        }
-        
-        return record_pattern;
+        return parse_record_pattern_rest(parser, type_node, pattern_line, pattern_col);
     }
     
     /* Check for type pattern: Type varName */
@@ -2794,10 +2805,27 @@ static ast_node_t *parse_expression_prec(parser_t *parser, precedence_t min_prec
             /* "o instanceof final T t": the modifier changes nothing here. */
             parser_match(parser, TOK_FINAL);
             
+            int type_line = parser_current_line(parser);
+            int type_col = parser_current_column(parser);
             ast_node_t *type_node = parse_type(parser);
             if (!type_node) {
                 ast_free(left);
                 return NULL;
+            }
+
+            /* "o instanceof Point(int x, int y)": a record pattern (Java 21); the instanceof
+             * holds the pattern where it would hold the type */
+            if (parser_check(parser, TOK_LPAREN)) {
+                ast_node_t *record_pattern = parse_record_pattern_rest(parser, type_node, type_line, type_col);
+                if (!record_pattern) {
+                    ast_free(left);
+                    return NULL;
+                }
+                ast_node_t *inst = ast_new(AST_INSTANCEOF_EXPR, line, col);
+                ast_add_child(inst, left);
+                ast_add_child(inst, record_pattern);
+                left = inst;
+                continue;
             }
             
             ast_node_t *inst = ast_new(AST_INSTANCEOF_EXPR, line, col);

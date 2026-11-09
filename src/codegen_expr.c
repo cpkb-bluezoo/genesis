@@ -3735,6 +3735,9 @@ bool cond_has_binding(ast_node_t *expr)
         }
         case AST_INSTANCEOF_EXPR: {
             slist_t *c = expr->data.node.children;
+            if (c && c->next && ((ast_node_t *)c->next->data)->type == AST_RECORD_PATTERN) {
+                return true;
+            }
             return c && c->next && c->next->next &&
                    ((ast_node_t *)c->next->next->data)->type == AST_IDENTIFIER;
         }
@@ -3876,6 +3879,362 @@ static char *instanceof_class_ref(ast_node_t *type_node)
     return NULL;
 }
 
+/* ------------------------------------------------------------------------
+ * Record patterns: "src instanceof R(p1, p2, ...)"
+ *
+ * The test is a sequence of steps that each jump to `fail` when they do not
+ * hold: the instanceof test of the record, then for every component its
+ * accessor is called and the result matched against the component pattern.
+ * A pattern that covers every value of the component (a "var", or a type the
+ * component's type is assignable to) only stores it, null included; any other
+ * type pattern tests the value, and a nested record pattern tests it in turn.
+ * ------------------------------------------------------------------------ */
+
+/** The accessor of a record's index'th component: its name and descriptor (to be freed). */
+static bool record_accessor(symbol_t *record_sym, int index, const char **name, char **descriptor)
+{
+    *name = NULL;
+    *descriptor = NULL;
+    if (record_sym->ast) {
+        int position = 0;
+        for (slist_t *rc = record_sym->ast->data.node.children; rc; rc = rc->next) {
+            ast_node_t *child = (ast_node_t *)rc->data;
+            if (child->type != AST_PARAMETER || !(child->data.node.flags & MOD_RECORD_COMPONENT)) {
+                continue;
+            }
+            if (position++ == index) {
+                *name = child->data.node.name;
+                slist_t *param_children = child->data.node.children;
+                if (param_children) {
+                    ast_node_t *param_type = (ast_node_t *)param_children->data;
+                    *descriptor = param_type->sem_type ? type_to_descriptor(param_type->sem_type)
+                                                       : ast_type_to_descriptor(param_type);
+                }
+                return *name && *descriptor;
+            }
+        }
+        return false;
+    }
+    int position = 0;
+    for (slist_t *rc = record_sym->data.class_data.record_components; rc; rc = rc->next) {
+        if (position++ == index) {
+            record_component_t *component = (record_component_t *)rc->data;
+            *name = component->name;
+            *descriptor = strdup(component->descriptor);
+            return *descriptor != NULL;
+        }
+    }
+    return false;
+}
+
+/** Pushes the typed value a call returning `descriptor` leaves on the stack. */
+static void push_for_descriptor(method_gen_t *mg, const char *descriptor)
+{
+    switch (descriptor[0]) {
+        case 'J': mg_push_long(mg); break;
+        case 'D': mg_push_double(mg); break;
+        case 'F': mg_push_float(mg); break;
+        case 'I': case 'Z': case 'B': case 'C': case 'S': mg_push_int(mg); break;
+        case 'L': {
+            char *internal = strdup(descriptor + 1);
+            if (internal) {
+                char *semi = strchr(internal, ';');
+                if (semi) {
+                    *semi = '\0';
+                }
+                mg_push_object(mg, internal);
+                free(internal);
+            }
+            break;
+        }
+        default: mg_push_object(mg, descriptor); break;  /* an array */
+    }
+}
+
+/** The kind of a variable the descriptor's type is stored in. */
+static type_kind_t kind_of_descriptor(const char *descriptor)
+{
+    switch (descriptor[0]) {
+        case 'J': return TYPE_LONG;
+        case 'D': return TYPE_DOUBLE;
+        case 'F': return TYPE_FLOAT;
+        case 'I': case 'Z': case 'B': case 'C': case 'S': return TYPE_INT;
+        default: return TYPE_CLASS;
+    }
+}
+
+/** What a local of this descriptor's type is, for the stack map. */
+static void stackmap_local_for_descriptor(method_gen_t *mg, uint16_t slot, const char *descriptor)
+{
+    if (!mg->stackmap) {
+        return;
+    }
+    switch (descriptor[0]) {
+        case 'J': stackmap_set_local_long(mg->stackmap, slot); break;
+        case 'D': stackmap_set_local_double(mg->stackmap, slot); break;
+        case 'F': stackmap_set_local_float(mg->stackmap, slot); break;
+        case 'I': case 'Z': case 'B': case 'C': case 'S': stackmap_set_local_int(mg->stackmap, slot); break;
+        case 'L': {
+            char *internal = strdup(descriptor + 1);
+            if (internal) {
+                char *semi = strchr(internal, ';');
+                if (semi) {
+                    *semi = '\0';
+                }
+                stackmap_set_local_object(mg->stackmap, slot, mg->cp, internal);
+                free(internal);
+            }
+            break;
+        }
+        default: stackmap_set_local_object(mg->stackmap, slot, mg->cp, descriptor); break;
+    }
+}
+
+/** The class constant of a type pattern's type: an internal name, or an array descriptor. */
+static char *pattern_type_ref(type_t *type)
+{
+    if (!type) {
+        return NULL;
+    }
+    if (type->kind == TYPE_ARRAY) {
+        return type_to_descriptor(type);
+    }
+    if (type->kind != TYPE_CLASS) {
+        return NULL;
+    }
+    const char *name = type->data.class_type.symbol && type->data.class_type.symbol->qualified_name
+        ? type->data.class_type.symbol->qualified_name : type->data.class_type.name;
+    return name ? class_to_internal_name(resolve_java_lang_class(name)) : NULL;
+}
+
+/** Allocates the locals of the variables a pattern binds, unassigned until the test succeeds. */
+static void allocate_pattern_bindings(method_gen_t *mg, ast_node_t *pattern)
+{
+    if (pattern->type == AST_TYPE_PATTERN) {
+        if (pattern->data.node.name && pattern->sem_type) {
+            uint16_t slot = mg_allocate_local(mg, pattern->data.node.name, pattern->sem_type);
+            if (mg->stackmap) {
+                stackmap_set_local(mg->stackmap, slot, vtype_top());
+            }
+        }
+    } else if (pattern->type == AST_RECORD_PATTERN && pattern->data.node.children) {
+        for (slist_t *c = pattern->data.node.children->next; c; c = c->next) {
+            allocate_pattern_bindings(mg, (ast_node_t *)c->data);
+        }
+    }
+}
+
+/**
+ * Tests the value in local `oslot` against a record pattern, binding its variables, and jumps to
+ * `fail` if it does not match.
+ */
+static bool pattern_match_record(method_gen_t *mg, const_pool_t *cp, uint16_t oslot,
+                                 ast_node_t *pattern, slist_t **fail)
+{
+    slist_t *children = pattern->data.node.children;
+    symbol_t *record_sym = (pattern->sem_type && pattern->sem_type->kind == TYPE_CLASS)
+        ? pattern->sem_type->data.class_type.symbol : NULL;
+    if (!children || !record_sym || !record_sym->qualified_name) {
+        fprintf(stderr, "codegen: record pattern on a type that is not a known record\n");
+        return false;
+    }
+    char *record_internal = class_to_internal_name(record_sym->qualified_name);
+    uint16_t record_class = cp_add_class(cp, record_internal);
+
+    mg_emit_load_local(mg, oslot, TYPE_CLASS);
+    bc_emit(mg->code, OP_INSTANCEOF);
+    bc_emit_u2(mg->code, record_class);
+    mg_pop_typed(mg, 1);
+    mg_push_int(mg);
+    cond_emit_jump(mg, OP_IFEQ, 1, fail);
+
+    char tmp_name[32];
+    mg_emit_load_local(mg, oslot, TYPE_CLASS);
+    bc_emit(mg->code, OP_CHECKCAST);
+    bc_emit_u2(mg->code, record_class);
+    mg_pop_typed(mg, 1);
+    mg_push_object(mg, record_internal);
+    snprintf(tmp_name, sizeof(tmp_name), "$rec%d", (int)mg->next_slot);
+    uint16_t record_slot = mg_allocate_local(mg, tmp_name, type_object());
+    mg_emit_store_local(mg, record_slot, TYPE_CLASS);
+    if (mg->stackmap) {
+        stackmap_set_local_object(mg->stackmap, record_slot, mg->cp, record_internal);
+    }
+
+    bool ok = true;
+    int index = 0;
+    for (slist_t *c = children->next; c && ok; c = c->next, index++) {
+        ast_node_t *part = (ast_node_t *)c->data;
+        if (part->type == AST_UNNAMED_PATTERN) {
+            continue;
+        }
+
+        const char *accessor = NULL;
+        char *descriptor = NULL;
+        if (!record_accessor(record_sym, index, &accessor, &descriptor)) {
+            fprintf(stderr, "codegen: record pattern component %d of %s not found\n", index,
+                    record_sym->qualified_name);
+            ok = false;
+            break;
+        }
+        char method_desc[512];
+        snprintf(method_desc, sizeof(method_desc), "()%s", descriptor);
+        uint16_t accessor_ref = cp_add_methodref(cp, record_internal, accessor, method_desc);
+        bool wide = descriptor[0] == 'J' || descriptor[0] == 'D';
+        bool reference = descriptor[0] == 'L' || descriptor[0] == '[';
+
+        mg_emit_load_local(mg, record_slot, TYPE_CLASS);
+        bc_emit(mg->code, OP_INVOKEVIRTUAL);
+        bc_emit_u2(mg->code, accessor_ref);
+        mg_pop_typed(mg, 1);
+        push_for_descriptor(mg, descriptor);
+
+        if (part->type == AST_TYPE_PATTERN) {
+            const char *var_name = part->data.node.name;
+            local_var_info_t *info = var_name
+                ? (local_var_info_t *)hashtable_lookup(mg->locals, var_name) : NULL;
+            bool total = (part->data.node.flags & AST_PATTERN_TOTAL) != 0;
+
+            if (total) {
+                if (!info) {
+                    bc_emit(mg->code, wide ? OP_POP2 : OP_POP);
+                    mg_pop_typed(mg, wide ? 2 : 1);
+                } else {
+                    /* A generic component is returned as its erasure: narrow it to the type
+                     * the pattern gives it */
+                    char *type_ref = reference ? pattern_type_ref(part->sem_type) : NULL;
+                    if (type_ref) {
+                        char *erased = strdup(descriptor[0] == 'L' ? descriptor + 1 : descriptor);
+                        char *semi = erased ? strchr(erased, ';') : NULL;
+                        if (semi) {
+                            *semi = '\0';
+                        }
+                        if (erased && strcmp(erased, type_ref) != 0) {
+                            bc_emit(mg->code, OP_CHECKCAST);
+                            bc_emit_u2(mg->code, cp_add_class(cp, type_ref));
+                            mg_pop_typed(mg, 1);
+                            mg_push_object(mg, type_ref);
+                        }
+                        free(erased);
+                        free(type_ref);
+                    }
+                    mg_emit_store_local(mg, info->slot, kind_of_descriptor(descriptor));
+                    stackmap_local_for_descriptor(mg, info->slot, descriptor);
+                    if (reference && part->sem_type && part->sem_type->kind == TYPE_CLASS) {
+                        char *type_ref2 = pattern_type_ref(part->sem_type);
+                        if (type_ref2 && mg->stackmap) {
+                            stackmap_set_local_object(mg->stackmap, info->slot, mg->cp, type_ref2);
+                        }
+                        free(type_ref2);
+                    }
+                }
+            } else {
+                /* A type test: the value is kept, tested, and cast into the variable */
+                char *type_ref = reference ? pattern_type_ref(part->sem_type) : NULL;
+                if (!type_ref) {
+                    fprintf(stderr, "codegen: record pattern component pattern with no class type\n");
+                    free(descriptor);
+                    ok = false;
+                    break;
+                }
+                snprintf(tmp_name, sizeof(tmp_name), "$comp%d", (int)mg->next_slot);
+                uint16_t value_slot = mg_allocate_local(mg, tmp_name, type_object());
+                mg_emit_store_local(mg, value_slot, TYPE_CLASS);
+                stackmap_local_for_descriptor(mg, value_slot, descriptor);
+
+                uint16_t type_class = cp_add_class(cp, type_ref);
+                mg_emit_load_local(mg, value_slot, TYPE_CLASS);
+                bc_emit(mg->code, OP_INSTANCEOF);
+                bc_emit_u2(mg->code, type_class);
+                mg_pop_typed(mg, 1);
+                mg_push_int(mg);
+                cond_emit_jump(mg, OP_IFEQ, 1, fail);
+                if (info) {
+                    mg_emit_load_local(mg, value_slot, TYPE_CLASS);
+                    bc_emit(mg->code, OP_CHECKCAST);
+                    bc_emit_u2(mg->code, type_class);
+                    mg_pop_typed(mg, 1);
+                    mg_push_object(mg, type_ref);
+                    mg_emit_store_local(mg, info->slot, TYPE_CLASS);
+                    if (mg->stackmap) {
+                        stackmap_set_local_object(mg->stackmap, info->slot, mg->cp, type_ref);
+                    }
+                }
+                free(type_ref);
+            }
+        } else if (part->type == AST_RECORD_PATTERN) {
+            if (!reference) {
+                fprintf(stderr, "codegen: record pattern on a component that is a primitive\n");
+                free(descriptor);
+                ok = false;
+                break;
+            }
+            snprintf(tmp_name, sizeof(tmp_name), "$comp%d", (int)mg->next_slot);
+            uint16_t value_slot = mg_allocate_local(mg, tmp_name, type_object());
+            mg_emit_store_local(mg, value_slot, TYPE_CLASS);
+            stackmap_local_for_descriptor(mg, value_slot, descriptor);
+            ok = pattern_match_record(mg, cp, value_slot, part, fail);
+        } else {
+            bc_emit(mg->code, wide ? OP_POP2 : OP_POP);
+            mg_pop_typed(mg, wide ? 2 : 1);
+        }
+        free(descriptor);
+    }
+    free(record_internal);
+    return ok;
+}
+
+/**
+ * "src instanceof R(...)" as a jump: the variables the pattern binds are assigned on the edge
+ * where the test succeeds, and src is evaluated once.
+ */
+static bool cond_jump_record_pattern(method_gen_t *mg, const_pool_t *cp, ast_node_t *inst,
+                                     bool jump_when, slist_t **label)
+{
+    slist_t *c = inst->data.node.children;
+    ast_node_t *src = (ast_node_t *)c->data;
+    ast_node_t *pattern = (ast_node_t *)c->next->data;
+
+    allocate_pattern_bindings(mg, pattern);
+
+    /* The object: a local is read again, anything else is kept in a temporary. */
+    uint16_t oslot = 0;
+    bool in_local = false;
+    if (src->type == AST_IDENTIFIER) {
+        local_var_info_t *li = (local_var_info_t *)hashtable_lookup(mg->locals, src->data.leaf.name);
+        if (li && li->is_ref) {
+            oslot = li->slot;
+            in_local = true;
+        }
+    }
+    if (!in_local) {
+        if (!codegen_expr(mg, src, cp)) {
+            return false;
+        }
+        char tmp_name[32];
+        snprintf(tmp_name, sizeof(tmp_name), "$pat%d", (int)mg->next_slot);
+        oslot = mg_allocate_local(mg, tmp_name, type_object());
+        verification_type_t top = vtype_top();
+        if (mg->stackmap && mg->stackmap->current_stack_size > 0) {
+            top = mg->stackmap->current_stack[mg->stackmap->current_stack_size - 1];
+        }
+        mg_emit_store_local(mg, oslot, TYPE_CLASS);
+        if (mg->stackmap) {
+            stackmap_set_local(mg->stackmap, oslot, top);
+        }
+    }
+
+    slist_t *skip = NULL;
+    if (!pattern_match_record(mg, cp, oslot, pattern, jump_when ? &skip : label)) {
+        return false;
+    }
+    if (jump_when) {
+        cond_emit_jump(mg, OP_GOTO, 0, label);
+        cond_bind_label(mg, &skip, false);
+    }
+    return true;
+}
+
 /**
  * "src instanceof T t" as a jump: the cast and the store of t are on the edge
  * where the test succeeds, and src is evaluated once.
@@ -3884,6 +4243,9 @@ static bool cond_jump_instanceof(method_gen_t *mg, const_pool_t *cp, ast_node_t 
                                  bool jump_when, slist_t **label)
 {
     slist_t *c = inst->data.node.children;
+    if (((ast_node_t *)c->next->data)->type == AST_RECORD_PATTERN) {
+        return cond_jump_record_pattern(mg, cp, inst, jump_when, label);
+    }
     ast_node_t *src = (ast_node_t *)c->data;
     ast_node_t *type_node = (ast_node_t *)c->next->data;
     ast_node_t *var = (ast_node_t *)c->next->next->data;
