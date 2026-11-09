@@ -12107,200 +12107,46 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
         }
         uint16_t case_saved_slot = mg->next_slot;
         
-        /* instanceof check: if (selector instanceof Type) */
-        bc_emit(mg->code, OP_ALOAD);
-        bc_emit_u1(mg->code, (uint8_t)selector_slot);
-        mg_push(mg, 1);
-        
-        uint16_t type_class = cp_add_class(cp, type_internal);
-        bc_emit(mg->code, OP_INSTANCEOF);
-        bc_emit_u2(mg->code, type_class);
-        /* Stack: int (0 or 1) */
-        
-        size_t ifeq_pos = mg->code->length;
-        bc_emit(mg->code, OP_IFEQ);  /* Jump if not instanceof */
-        bc_emit_u2(mg->code, 0);  /* Placeholder */
-        mg_pop_typed(mg, 1);
-        
-        /* Record frame for TRUE path (pattern matched, entering case body).
-         * This is the target of the fall-through from the ifeq when instanceof returns true.
-         * At this point, stack is empty and we're about to set up pattern variables. */
-        mg_record_frame(mg);
-        
+        /* A record pattern is tested, and its components matched, by the same jump code as in
+         * instanceof; a pattern that fails to match jumps to the start of the next case. */
+        bool is_record = pattern->type == AST_RECORD_PATTERN;
+        slist_t *record_fail = NULL;
+        size_t ifeq_pos = 0;
+        uint16_t type_class = 0;
         uint16_t var_slot = 0;
-        
-        if (pattern->type == AST_RECORD_PATTERN) {
-            /* Record pattern: extract components using accessor methods */
-            /* First, checkcast and store in a temporary */
-            uint16_t record_slot = mg->next_slot++;
-            if (mg->next_slot > mg->max_locals) {
-                mg->max_locals = mg->next_slot;
+
+        if (is_record) {
+            allocate_pattern_bindings(mg, pattern);
+            if (!pattern_match_record(mg, cp, selector_slot, pattern, &record_fail)) {
+                free(type_internal);
+                return false;
             }
-            
+            /* The pattern matched: where the body starts */
+            mg_record_frame(mg);
+        } else {
+            /* instanceof check: if (selector instanceof Type) */
             bc_emit(mg->code, OP_ALOAD);
             bc_emit_u1(mg->code, (uint8_t)selector_slot);
             mg_push(mg, 1);
-            
-            bc_emit(mg->code, OP_CHECKCAST);
-            bc_emit_u2(mg->code, type_class);
-            
-            bc_emit(mg->code, OP_ASTORE);
-            bc_emit_u1(mg->code, (uint8_t)record_slot);
-            mg_pop_typed(mg, 1);
-            
-            /* Get record symbol to find component accessors */
-            symbol_t *record_sym = NULL;
-            if (pattern->sem_type && pattern->sem_type->kind == TYPE_CLASS) {
-                record_sym = pattern->sem_type->data.class_type.symbol;
-            }
-            
-            /* Process component patterns (skip first child which is the type) */
-            int comp_index = 0;
-            for (slist_t *comp = pattern_children->next; comp; comp = comp->next, comp_index++) {
-                ast_node_t *comp_pattern = (ast_node_t *)comp->data;
-                
-                if (comp_pattern->type == AST_UNNAMED_PATTERN) {
-                    /* Unnamed component - no variable to extract */
-                    continue;
-                }
-                
-                if (comp_pattern->type == AST_TYPE_PATTERN) {
-                    const char *comp_var_name = comp_pattern->data.node.name;
-                    
-                    if (!comp_var_name) {
-                        /* Unnamed type pattern (Type _) - no variable to extract */
-                        continue;
-                    }
-                    
-                    /* Get component type for accessor return type */
-                    type_t *comp_type = comp_pattern->sem_type;
-                    
-                    
-                    /* Find accessor method name from record components */
-                    const char *accessor_name = NULL;
-                    const char *accessor_desc = NULL;
-                    if (record_sym && record_sym->ast) {
-                        ast_node_t *record_decl = record_sym->ast;
-                        slist_t *record_children = record_decl->data.node.children;
-                        int param_idx = 0;
-                        for (slist_t *rc = record_children; rc; rc = rc->next) {
-                            ast_node_t *child = (ast_node_t *)rc->data;
-                            if (child->type == AST_PARAMETER) {
-                                if (param_idx == comp_index) {
-                                    accessor_name = child->data.node.name;
-                                    /* Determine accessor descriptor from component type */
-                                    slist_t *param_children = child->data.node.children;
-                                    if (param_children) {
-                                        ast_node_t *param_type = (ast_node_t *)param_children->data;
-                                        if (param_type->sem_type) {
-                                            char *ret_desc = type_to_descriptor(param_type->sem_type);
-                                            accessor_desc = ret_desc;
-                                        }
-                                    }
-                                    break;
-                                }
-                                param_idx++;
-                            }
-                        }
-                    }
-                    
-                    /* A record loaded from a class file: its Record attribute names the
-                     * component in this position, whatever the pattern variable is called */
-                    if (!accessor_name && record_sym) {
-                        int position = 0;
-                        for (slist_t *rc = record_sym->data.class_data.record_components; rc;
-                             rc = rc->next, position++) {
-                            if (position == comp_index) {
-                                record_component_t *component = (record_component_t *)rc->data;
-                                accessor_name = component->name;
-                                accessor_desc = component->descriptor;
-                                break;
-                            }
-                        }
-                    }
 
-                    /* Fallback when the record's components are not known: use the pattern
-                     * variable name as accessor name, which works when it is the component's. */
-                    if (!accessor_name && comp_var_name) {
-                        accessor_name = comp_var_name;
-                    }
-                    /* If accessor_desc wasn't set from record component, derive from pattern type */
-                    if (!accessor_desc && comp_type) {
-                        accessor_desc = type_to_descriptor(comp_type);
-                    }
-                    
-                    if (accessor_name && accessor_desc) {
-                        /* Allocate local for component variable; a long or double takes two */
-                        uint16_t comp_slot = mg->next_slot;
-                        mg->next_slot += (comp_type && (comp_type->kind == TYPE_LONG ||
-                                                        comp_type->kind == TYPE_DOUBLE)) ? 2 : 1;
-                        if (mg->next_slot > mg->max_locals) {
-                            mg->max_locals = mg->next_slot;
-                        }
-                        
-                        /* Generate: record.accessor() */
-                        bc_emit(mg->code, OP_ALOAD);
-                        bc_emit_u1(mg->code, (uint8_t)record_slot);
-                        mg_push(mg, 1);
-                        
-                        char desc_buf[256];
-                        snprintf(desc_buf, sizeof(desc_buf), "()%s", accessor_desc);
-                        uint16_t accessor_ref = cp_add_methodref(cp, type_internal, accessor_name, desc_buf);
-                        bc_emit(mg->code, OP_INVOKEVIRTUAL);
-                        bc_emit_u2(mg->code, accessor_ref);
-                        /* Stack: component value */
-                        
-                        /* Store in local */
-                        type_kind_t kind = TYPE_CLASS;
-                        if (comp_type) {
-                            kind = comp_type->kind;
-                        }
-                        
-                        if (kind == TYPE_INT || kind == TYPE_BOOLEAN || 
-                            kind == TYPE_CHAR || kind == TYPE_SHORT || kind == TYPE_BYTE) {
-                            bc_emit(mg->code, OP_ISTORE);
-                        } else if (kind == TYPE_LONG) {
-                            bc_emit(mg->code, OP_LSTORE);
-                        } else if (kind == TYPE_FLOAT) {
-                            bc_emit(mg->code, OP_FSTORE);
-                        } else if (kind == TYPE_DOUBLE) {
-                            bc_emit(mg->code, OP_DSTORE);
-                        } else {
-                            bc_emit(mg->code, OP_ASTORE);
-                        }
-                        bc_emit_u1(mg->code, (uint8_t)comp_slot);
-                        mg_pop_typed(mg, 1);
-                        
-                        /* Update stackmap for primitive types */
-                        if (mg->stackmap) {
-                            if (kind == TYPE_INT || kind == TYPE_BOOLEAN || 
-                                kind == TYPE_CHAR || kind == TYPE_SHORT || kind == TYPE_BYTE) {
-                                stackmap_set_local_int(mg->stackmap, comp_slot);
-                            } else if (kind == TYPE_LONG) {
-                                stackmap_set_local_long(mg->stackmap, comp_slot);
-                            } else if (kind == TYPE_FLOAT) {
-                                stackmap_set_local_float(mg->stackmap, comp_slot);
-                            } else if (kind == TYPE_DOUBLE) {
-                                stackmap_set_local_double(mg->stackmap, comp_slot);
-                            } else {
-                                /* The frame wants the JVM internal name ("java/lang/String",
-                                 * "Outer$Inner"), not the dotted source name */
-                                char *comp_internal = class_to_internal_name(
-                                    comp_type && comp_type->kind == TYPE_CLASS &&
-                                    comp_type->data.class_type.symbol ?
-                                    comp_type->data.class_type.symbol->qualified_name : "java.lang.Object");
-                                stackmap_set_local_object(mg->stackmap, comp_slot, mg->cp, comp_internal);
-                                free(comp_internal);
-                            }
-                        }
-                        
-                        /* Store in locals table for body access - always register */
-                        local_var_info_t *info = local_var_info_new(comp_slot, kind);
-                        hashtable_insert(mg->locals, comp_var_name, info);
-                    }
-                }
-                /* Nested record patterns would need recursive handling */
-            }
+            type_class = cp_add_class(cp, type_internal);
+            bc_emit(mg->code, OP_INSTANCEOF);
+            bc_emit_u2(mg->code, type_class);
+            /* Stack: int (0 or 1) */
+
+            ifeq_pos = mg->code->length;
+            bc_emit(mg->code, OP_IFEQ);  /* Jump if not instanceof */
+            bc_emit_u2(mg->code, 0);  /* Placeholder */
+            mg_pop_typed(mg, 1);
+
+            /* Record frame for TRUE path (pattern matched, entering case body).
+             * This is the target of the fall-through from the ifeq when instanceof returns true.
+             * At this point, stack is empty and we're about to set up pattern variables. */
+            mg_record_frame(mg);
+        }
+        
+        if (is_record) {
+            /* (bound by the matcher above) */
         } else {
             /* Type pattern: only allocate local if variable is named */
             if (var_name) {
@@ -12344,9 +12190,13 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                 return false;
             }
             size_t guard_ifeq_pos = mg->code->length;
-            bc_emit(mg->code, OP_IFEQ);
-            bc_emit_u2(mg->code, 0);
-            mg_pop_typed(mg, 1);
+            if (is_record) {
+                cond_emit_jump(mg, OP_IFEQ, 1, &record_fail);
+            } else {
+                bc_emit(mg->code, OP_IFEQ);
+                bc_emit_u2(mg->code, 0);
+                mg_pop_typed(mg, 1);
+            }
             
             /* Generate body */
             if (!switch_arm_body(mg, body, cp, stmt_mode)) {
@@ -12367,8 +12217,10 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
             
             /* Patch guard ifeq. Its target is where the next case starts, whose frame is recorded
              * below from the state at the case's entry: the stack here still holds the body's value. */
-            uint16_t guard_skip = (uint16_t)(mg->code->length - guard_ifeq_pos);
-            bc_patch_u2(mg->code, guard_ifeq_pos + 1, guard_skip);
+            if (!is_record) {
+                uint16_t guard_skip = (uint16_t)(mg->code->length - guard_ifeq_pos);
+                bc_patch_u2(mg->code, guard_ifeq_pos + 1, guard_skip);
+            }
         } else {
             /* Generate body */
             if (!switch_arm_body(mg, body, cp, stmt_mode)) {
@@ -12389,8 +12241,12 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
         }
         
         /* Patch ifeq to skip this case */
-        uint16_t skip_offset = (uint16_t)(mg->code->length - ifeq_pos);
-        bc_patch_u2(mg->code, ifeq_pos + 1, skip_offset);
+        if (is_record) {
+            cond_patch_label_back(mg, &record_fail, mg->code->length);
+        } else {
+            uint16_t skip_offset = (uint16_t)(mg->code->length - ifeq_pos);
+            bc_patch_u2(mg->code, ifeq_pos + 1, skip_offset);
+        }
         
         /* Restore stackmap state and slot counter to case entry state BEFORE recording frame.
          * This ensures the next case starts with the same state.

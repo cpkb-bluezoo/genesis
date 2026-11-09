@@ -12,11 +12,7 @@ Legend:
 PENDING FEATURES
 ================================================================================
 
-Java 21:
-  [ ] Nested record patterns in switch: case Line(Pt(var a, var b), var c).
-      Also a component pattern narrower than the component's type
-      (case Box(String s) for an Object component), which needs a type test:
-      codegen assumes each component pattern is total.
+  (none)
 
 ================================================================================
 DEFERRED / WILL NOT IMPLEMENT
