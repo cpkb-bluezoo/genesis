@@ -325,12 +325,12 @@ static int32_t string_hashcode(const char *str)
     if (!str) {
         return 0;
     }
-    int32_t h = 0;
+    uint32_t h = 0;     /* unsigned: String.hashCode() wraps, signed overflow is undefined */
     while (*str) {
         h = 31 * h + (unsigned char)*str;
         str++;
     }
-    return h;
+    return (int32_t)h;
 }
 
 /**

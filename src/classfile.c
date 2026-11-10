@@ -89,16 +89,16 @@ static int64_t read_s8(reader_t *r)
     if (!reader_has(r, 8)) {
         return 0;
     }
-    int64_t val = ((int64_t)r->data[r->pos] << 56) |
-                  ((int64_t)r->data[r->pos + 1] << 48) |
-                  ((int64_t)r->data[r->pos + 2] << 40) |
-                  ((int64_t)r->data[r->pos + 3] << 32) |
-                  ((int64_t)r->data[r->pos + 4] << 24) |
-                  ((int64_t)r->data[r->pos + 5] << 16) |
-                  ((int64_t)r->data[r->pos + 6] << 8) |
-                  ((int64_t)r->data[r->pos + 7]);
+    uint64_t val = ((uint64_t)r->data[r->pos] << 56) |
+                  ((uint64_t)r->data[r->pos + 1] << 48) |
+                  ((uint64_t)r->data[r->pos + 2] << 40) |
+                  ((uint64_t)r->data[r->pos + 3] << 32) |
+                  ((uint64_t)r->data[r->pos + 4] << 24) |
+                  ((uint64_t)r->data[r->pos + 5] << 16) |
+                  ((uint64_t)r->data[r->pos + 6] << 8) |
+                  ((uint64_t)r->data[r->pos + 7]);
     r->pos += 8;
-    return val;
+    return (int64_t)val;   /* unsigned shifts: a set top bit is not undefined */
 }
 
 static bool read_bytes(reader_t *r, uint8_t *dest, size_t count)

@@ -57,12 +57,10 @@ KNOWN BUGS
     parity figure. Iterate with SB_COMPILERS=genesis SB_KEEP=1. When a change
     loses a test, add the cause here until it is fixed, then remove it.
 
-12. Fixed-size buffers: the last two fixes (fi_build_substituted_sig and the
-    method-key builders) were overflows from snprintf return values
-    accumulated into a fixed buffer. CodeQL flagged only one of them, so
-    there may be more of the same kind. Grep for "+= snprintf" and similar
-    accumulations, and run the suite plus long-signature inputs under
-    AddressSanitizer.
+12. A method, constructor or lambda with more than 255 parameters is not
+    diagnosed: the class is written and fails to load with a
+    ClassFormatError ("Too many arguments in method signature"). javac
+    reports "too many parameters" at compile time.
 
 ================================================================================
 OPTIONAL IMPROVEMENTS
