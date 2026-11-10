@@ -14471,18 +14471,18 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 ast_node_t *params_node = children ? (ast_node_t *)children->data : NULL;
                 
                 /* Build a list of actual parameter types from the lambda params */
-                type_t *actual_param_types[16];
+                type_t *actual_param_types[MAX_LAMBDA_PARAMS];
                 int actual_param_count = 0;
                 
                 if (params_node) {
                     if (params_node->type == AST_IDENTIFIER) {
                         /* Single parameter - use its sem_type */
-                        if (params_node->sem_type && actual_param_count < 16) {
+                        if (params_node->sem_type && actual_param_count < MAX_LAMBDA_PARAMS) {
                             actual_param_types[actual_param_count++] = params_node->sem_type;
                         }
                     } else if (params_node->type == AST_BINARY_EXPR) {
                         /* Multiple comma-separated parameters */
-                        ast_node_t *stack[32];
+                        ast_node_t *stack[MAX_LAMBDA_PARAMS + 2];
                         int stack_top = 0;
                         stack[stack_top++] = params_node;
                         
@@ -14493,15 +14493,15 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             }
                             
                             if (node->type == AST_IDENTIFIER) {
-                                if (node->sem_type && actual_param_count < 16) {
+                                if (node->sem_type && actual_param_count < MAX_LAMBDA_PARAMS) {
                                     actual_param_types[actual_param_count++] = node->sem_type;
                                 }
                             } else if (node->type == AST_BINARY_EXPR) {
                                 slist_t *bc = node->data.node.children;
-                                if (bc && bc->next && stack_top < 32) {
+                                if (bc && bc->next && stack_top < MAX_LAMBDA_PARAMS + 2) {
                                     stack[stack_top++] = (ast_node_t *)bc->next->data;
                                 }
-                                if (bc && stack_top < 32) {
+                                if (bc && stack_top < MAX_LAMBDA_PARAMS + 2) {
                                     stack[stack_top++] = (ast_node_t *)bc->data;
                                 }
                             }
@@ -14514,7 +14514,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 actual_param_types[actual_param_count++] = inner->sem_type;
                             } else if (inner && inner->type == AST_BINARY_EXPR) {
                                 /* Multiple params in parens */
-                                ast_node_t *stack[32];
+                                ast_node_t *stack[MAX_LAMBDA_PARAMS + 2];
                                 int stack_top = 0;
                                 stack[stack_top++] = inner;
                                 
@@ -14525,15 +14525,15 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                     }
                                     
                                     if (node->type == AST_IDENTIFIER && node->sem_type) {
-                                        if (actual_param_count < 16) {
+                                        if (actual_param_count < MAX_LAMBDA_PARAMS) {
                                             actual_param_types[actual_param_count++] = node->sem_type;
                                         }
                                     } else if (node->type == AST_BINARY_EXPR) {
                                         slist_t *bc = node->data.node.children;
-                                        if (bc && bc->next && stack_top < 32) {
+                                        if (bc && bc->next && stack_top < MAX_LAMBDA_PARAMS + 2) {
                                             stack[stack_top++] = (ast_node_t *)bc->next->data;
                                         }
-                                        if (bc && stack_top < 32) {
+                                        if (bc && stack_top < MAX_LAMBDA_PARAMS + 2) {
                                             stack[stack_top++] = (ast_node_t *)bc->data;
                                         }
                                     }
@@ -14544,7 +14544,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         /* Typed lambda params - use their sem_type */
                         for (slist_t *node = params_node->data.node.children; node; node = node->next) {
                             ast_node_t *param = (ast_node_t *)node->data;
-                            if (param && param->sem_type && actual_param_count < 16) {
+                            if (param && param->sem_type && actual_param_count < MAX_LAMBDA_PARAMS) {
                                 actual_param_types[actual_param_count++] = param->sem_type;
                             }
                         }
@@ -14695,10 +14695,10 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     slot += size;
                 } else if (params_node && params_node->type == AST_BINARY_EXPR) {
                     /* Multiple comma-separated parameters (not wrapped in PARENTHESIZED) */
-                    ast_node_t *param_list[16];
+                    ast_node_t *param_list[MAX_LAMBDA_PARAMS];
                     int param_count = 0;
                     
-                    ast_node_t *stack[32];
+                    ast_node_t *stack[MAX_LAMBDA_PARAMS + 2];
                     int stack_top = 0;
                     stack[stack_top++] = params_node;
                     
@@ -14709,15 +14709,15 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                         }
                         
                         if (node->type == AST_IDENTIFIER) {
-                            if (param_count < 16) {
+                            if (param_count < MAX_LAMBDA_PARAMS) {
                                 param_list[param_count++] = node;
                             }
                         } else if (node->type == AST_BINARY_EXPR) {
                             slist_t *bc = node->data.node.children;
-                            if (bc && bc->next && stack_top < 32) {
+                            if (bc && bc->next && stack_top < MAX_LAMBDA_PARAMS + 2) {
                                 stack[stack_top++] = (ast_node_t *)bc->next->data;
                             }
-                            if (bc && stack_top < 32) {
+                            if (bc && stack_top < MAX_LAMBDA_PARAMS + 2) {
                                 stack[stack_top++] = (ast_node_t *)bc->data;
                             }
                         }
@@ -14761,10 +14761,10 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                             slot += size;
                         } else if (inner && inner->type == AST_BINARY_EXPR) {
                             /* Multiple comma-separated parameters inside parens */
-                            ast_node_t *param_list[16];
+                            ast_node_t *param_list[MAX_LAMBDA_PARAMS];
                             int param_count = 0;
                             
-                            ast_node_t *stack[32];
+                            ast_node_t *stack[MAX_LAMBDA_PARAMS + 2];
                             int stack_top = 0;
                             stack[stack_top++] = inner;
                             
@@ -14775,15 +14775,15 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                                 }
                                 
                                 if (node->type == AST_IDENTIFIER) {
-                                    if (param_count < 16) {
+                                    if (param_count < MAX_LAMBDA_PARAMS) {
                                         param_list[param_count++] = node;
                                     }
                                 } else if (node->type == AST_BINARY_EXPR) {
                                     slist_t *bc = node->data.node.children;
-                                    if (bc && bc->next && stack_top < 32) {
+                                    if (bc && bc->next && stack_top < MAX_LAMBDA_PARAMS + 2) {
                                         stack[stack_top++] = (ast_node_t *)bc->next->data;
                                     }
-                                    if (bc && stack_top < 32) {
+                                    if (bc && stack_top < MAX_LAMBDA_PARAMS + 2) {
                                         stack[stack_top++] = (ast_node_t *)bc->data;
                                     }
                                 }

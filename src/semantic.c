@@ -26634,11 +26634,11 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
     } else if (params->type == AST_BINARY_EXPR) {
         /* Multiple parameters separated by comma */
         /* Flatten the binary expression tree into a list of parameters using a stack */
-        ast_node_t *param_list[16];  /* Max 16 parameters should be enough */
+        ast_node_t *param_list[MAX_LAMBDA_PARAMS];
         int param_count = 0;
         
         /* Use a simple iterative approach with stack simulation */
-        ast_node_t *stack[32];
+        ast_node_t *stack[MAX_LAMBDA_PARAMS + 2];
         int stack_top = 0;
         stack[stack_top++] = params;
         
@@ -26649,16 +26649,16 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
             }
             
             if (node->type == AST_IDENTIFIER) {
-                if (param_count < 16) {
+                if (param_count < MAX_LAMBDA_PARAMS) {
                     param_list[param_count++] = node;
                 }
             } else if (node->type == AST_BINARY_EXPR) {
                 slist_t *bc = node->data.node.children;
                 /* Push right child first so left is processed first */
-                if (bc && bc->next && stack_top < 32) {
+                if (bc && bc->next && stack_top < MAX_LAMBDA_PARAMS + 2) {
                     stack[stack_top++] = (ast_node_t *)bc->next->data;
                 }
-                if (bc && stack_top < 32) {
+                if (bc && stack_top < MAX_LAMBDA_PARAMS + 2) {
                     stack[stack_top++] = (ast_node_t *)bc->data;
                 }
             }
@@ -26719,10 +26719,10 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                 inner->sem_type = param_type;
             } else if (inner && inner->type == AST_BINARY_EXPR) {
                 /* Multiple comma-separated parameters inside parens */
-                ast_node_t *param_list[16];
+                ast_node_t *param_list[MAX_LAMBDA_PARAMS];
                 int param_count = 0;
                 
-                ast_node_t *stack[32];
+                ast_node_t *stack[MAX_LAMBDA_PARAMS + 2];
                 int stack_top = 0;
                 stack[stack_top++] = inner;
                 
@@ -26733,15 +26733,15 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                     }
                     
                     if (node->type == AST_IDENTIFIER) {
-                        if (param_count < 16) {
+                        if (param_count < MAX_LAMBDA_PARAMS) {
                             param_list[param_count++] = node;
                         }
                     } else if (node->type == AST_BINARY_EXPR) {
                         slist_t *bc = node->data.node.children;
-                        if (bc && bc->next && stack_top < 32) {
+                        if (bc && bc->next && stack_top < MAX_LAMBDA_PARAMS + 2) {
                             stack[stack_top++] = (ast_node_t *)bc->next->data;
                         }
-                        if (bc && stack_top < 32) {
+                        if (bc && stack_top < MAX_LAMBDA_PARAMS + 2) {
                             stack[stack_top++] = (ast_node_t *)bc->data;
                         }
                     }
@@ -32678,7 +32678,7 @@ define_local_var:
                                     } else if (params && (params->type == AST_PARENTHESIZED || params->type == AST_BINARY_EXPR)) {
                                         /* "(x)" and "(x, y)" / "x, y": the identifiers inside, with the types
                                          * binding gave them */
-                                        ast_node_t *stack[32];
+                                        ast_node_t *stack[MAX_LAMBDA_PARAMS + 2];
                                         int top = 0;
                                         stack[top++] = params;
                                         while (top > 0) {

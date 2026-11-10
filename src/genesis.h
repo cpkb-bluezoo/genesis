@@ -520,6 +520,9 @@ static inline bool is_unnamed_name(const char *name)
 #define AST_METHOD_CALL_EXPLICIT_RECEIVER 0x10000  /* Method call has explicit receiver (obj.method()) */
 #define AST_SWITCH_IS_STATEMENT 0x20000  /* AST_SWITCH_EXPR that is a switch statement with pattern labels */
 #define AST_SWITCH_RULE_FALLS_THROUGH 0x40000  /* AST_SWITCH_RULE of a colon-form case that runs on into the next */
+/* The JVM allows at most 255 parameter slots in a method descriptor. */
+#define MAX_LAMBDA_PARAMS 255
+
 #define AST_PATTERN_TOTAL 0x200000  /* AST_TYPE_PATTERN of a record pattern that matches every value of its component, null too */
 
 /* Annotation retention policies */

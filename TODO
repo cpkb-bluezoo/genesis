@@ -57,12 +57,7 @@ KNOWN BUGS
     parity figure. Iterate with SB_COMPILERS=genesis SB_KEEP=1. When a change
     loses a test, add the cause here until it is fixed, then remove it.
 
-12. A lambda whose functional interface method has more than 16 parameters
-    compiles, but the synthetic lambda method is generated with only 16, so
-    it fails at run time with LambdaConversionException. Found while writing
-    FunctionalInterfaceLongSignatureTest. Cause not yet investigated.
-
-13. Fixed-size buffers: the last two fixes (fi_build_substituted_sig and the
+12. Fixed-size buffers: the last two fixes (fi_build_substituted_sig and the
     method-key builders) were overflows from snprintf return values
     accumulated into a fixed buffer. CodeQL flagged only one of them, so
     there may be more of the same kind. Grep for "+= snprintf" and similar
