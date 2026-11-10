@@ -1,3 +1,24 @@
+2026-11-10  Chris Burdess  <dog@gnu.org>
+
+	Release 1.2.0.
+
+	Record patterns from class files, in instanceof and nested in switch;
+	switch exhaustiveness; lambda and record fixes.
+	* src/classfile.c: Read the Record and PermittedSubclasses attributes.
+	(read_s8): Shift unsigned.
+	* src/semantic.c: Match record pattern components by position, type
+	"var" from the accessor, and check that a switch covers its selector.
+	* src/codegen_expr.c: Compile record patterns in instanceof and nested
+	or narrowing record patterns in switch.
+	* src/codegen.c: Patch the right jump in the generated equals() of a
+	record with a long, double or float component.
+	* src/codegen_stmt.c (string_hashcode): Hash unsigned.
+	* src/parser.c: Accept an annotation followed by final on a lambda
+	parameter, and a contextual keyword as a record component name.
+	* src/genesis.h (MAX_LAMBDA_PARAMS): New.  Lambdas may have up to 255
+	parameters.
+	* src/util.c (resolve_java_lang_class): Moved here from codegen_expr.c.
+
 2026-11-08  Chris Burdess  <dog@gnu.org>
 
 	Release 1.1.2.

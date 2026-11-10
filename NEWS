@@ -1,5 +1,51 @@
 GNU Genesis NEWS -- history of user-visible changes.
 
+* Noteworthy changes in release 1.2.0 (2026-11-10) [stable]
+
+** New features
+
+  Record patterns are complete.  A record pattern matches the components of
+  a record read from a class file, as well as one declared in source; it
+  works in instanceof as well as in switch; patterns nest, and a component
+  pattern may narrow its component's type.  "var" in a component pattern
+  takes the type of the component.
+
+  A switch expression, and a switch statement that uses patterns or null,
+  must now cover its selector (JLS 14.11.1.1).  A sealed hierarchy, an
+  enum and a record pattern are expanded to see whether every case is
+  handled; a missing case is reported where javac reports it.  A selector
+  the compiler cannot analyse is accepted rather than rejected.
+
+  Annotations are accepted on the parameters of a lambda whose parameters
+  are declared with "var" or with a type, including when "final" follows
+  the annotation.
+
+** Changes in behaviour
+
+  A switch that does not cover its selector, and used to compile, is now an
+  error.  Javac rejects the same programs.  Add the missing case or a
+  default.
+
+** Bugs fixed
+
+  A record with a long, double or float component got an equals() that
+  reported different values as equal.
+
+  A record component may be named "to", "with" or any other word that is a
+  keyword only in a module declaration.
+
+  A lambda may have up to 255 parameters.  Parameters beyond the sixteenth
+  were dropped, so the class failed verification.
+
+  Two cases of signed integer overflow, found by running the test sources
+  under the address and undefined-behaviour sanitizers, were removed.  None
+  changed the output.
+
+** Internal
+
+  List building uses slist_push throughout, and resolve_java_lang_class
+  moved to the utility module.
+
 * Noteworthy changes in release 1.1.2 (2026-11-08) [stable]
 
 ** Bugs fixed
