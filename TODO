@@ -73,7 +73,6 @@ Startup time:
 
 Refactoring:
   - Split codegen_expr.c (7600+ lines) into smaller modules
-  - Consider moving resolve_java_lang_class to a utility module
 
 Inner class synthetic accessors:
   - Nested classes reach each other's private members through nestmates

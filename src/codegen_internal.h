@@ -162,15 +162,6 @@ type_kind_t mg_local_array_elem_kind(method_gen_t *mg, const char *name);
 const char *mg_local_array_elem_class(method_gen_t *mg, const char *name);
 
 /**
- * Resolve a simple class name to its fully qualified internal name.
- * Handles common java.lang classes that may be used without import.
- *
- * @param name Simple class name (e.g., "String", "Object")
- * @return     Internal class name (e.g., "java/lang/String")
- */
-const char *resolve_java_lang_class(const char *name);
-
-/**
  * Get the dimension count of an array local variable.
  *
  * @param mg   Method generator

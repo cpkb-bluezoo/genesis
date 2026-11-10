@@ -260,5 +260,18 @@ void *pool_alloc(memory_pool_t *pool, size_t size);
  */
 void *pool_alloc_aligned(memory_pool_t *pool, size_t size, size_t alignment);
 
+/* ========================================================================
+ * Class name helpers
+ * ======================================================================== */
+
+/**
+ * Resolve a simple class name to its fully qualified internal name.
+ * Handles common java.lang classes that may be used without import.
+ *
+ * @param name Simple class name (e.g., "String", "Object")
+ * @return     Internal class name (e.g., "java/lang/String")
+ */
+const char *resolve_java_lang_class(const char *name);
+
 #endif /* UTIL_H */
 

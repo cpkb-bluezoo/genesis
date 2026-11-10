@@ -40,7 +40,7 @@
  * 5. codegen_boxing.c  - Boxing/unboxing helpers (~200 lines)
  * 
  * Dependencies to consider:
- * - Helper functions like resolve_java_lang_class, class_to_internal_name
+ * - Helper functions like class_to_internal_name
  * - Forward declarations for circular dependencies
  * - codegen_internal.h may need updating for shared declarations
  * ======================================================================== */
@@ -618,93 +618,6 @@ static symbol_t *lookup_method_in_interfaces(symbol_t *iface, const char *method
     }
     
     return NULL;
-}
-
-/**
- * Resolve a simple class name to its fully qualified internal name.
- * Handles common java.lang classes that may be used without import.
- */
-const char *resolve_java_lang_class(const char *name)
-{
-    if (!name) {
-        return "java/lang/Object";
-    }
-    
-    /* If already contains a package separator, use as-is */
-    if (strchr(name, '.') || strchr(name, '/')) {
-        return name;
-    }
-    
-    /* Check for common java.lang classes */
-    static const char *java_lang_classes[] = {
-        "Object",
-        "String",
-        "StringBuilder",
-        "StringBuffer",
-        "Integer",
-        "Long",
-        "Float",
-        "Double",
-        "Boolean",
-        "Byte",
-        "Short",
-        "Character",
-        "Number",
-        "Math",
-        "System",
-        "Class",
-        "ClassLoader",
-        "Thread",
-        "Runnable",
-        "Enum",
-        "Iterable",
-        "Comparable",
-        "Cloneable",
-        /* Exceptions and Errors */
-        "Throwable",
-        "Exception",
-        "RuntimeException",
-        "Error",
-        "ArithmeticException",
-        "ArrayIndexOutOfBoundsException",
-        "ArrayStoreException",
-        "ClassCastException",
-        "ClassNotFoundException",
-        "CloneNotSupportedException",
-        "IllegalAccessException",
-        "IllegalArgumentException",
-        "IllegalMonitorStateException",
-        "IllegalStateException",
-        "IllegalThreadStateException",
-        "IndexOutOfBoundsException",
-        "InstantiationException",
-        "InterruptedException",
-        "NegativeArraySizeException",
-        "NoSuchFieldException",
-        "NoSuchMethodException",
-        "NullPointerException",
-        "NumberFormatException",
-        "SecurityException",
-        "StringIndexOutOfBoundsException",
-        "UnsupportedOperationException",
-        "AssertionError",
-        "LinkageError",
-        "OutOfMemoryError",
-        "StackOverflowError",
-        "VirtualMachineError",
-        NULL
-    };
-    
-    for (const char **c = java_lang_classes; *c; c++) {
-        if (strcmp(name, *c) == 0) {
-            static __thread char buf[128];
-            snprintf(buf, sizeof(buf), "java/lang/%s", name);
-            return buf;
-        }
-    }
-    
-    /* Not a known java.lang class - return as-is */
-    return name;
 }
 
 /* ========================================================================
