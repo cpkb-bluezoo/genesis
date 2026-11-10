@@ -8160,16 +8160,19 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         mg_push(mg, 2);  /* 2 longs */
                         bc_emit(mg->code, OP_LCMP);
                         mg_pop(mg, 3);
+                        cmp_fail_pos = mg->code->length;  /* the IFNE, not the LCMP */
                         bc_emit(mg->code, OP_IFNE);
                     } else if (ptype && strcmp(ptype, "double") == 0) {
                         mg_push(mg, 2);
                         bc_emit(mg->code, OP_DCMPL);
                         mg_pop(mg, 3);
+                        cmp_fail_pos = mg->code->length;
                         bc_emit(mg->code, OP_IFNE);
                     } else if (ptype && strcmp(ptype, "float") == 0) {
                         mg_push(mg, 0);  /* 2 floats */
                         bc_emit(mg->code, OP_FCMPL);
                         mg_pop(mg, 1);
+                        cmp_fail_pos = mg->code->length;
                         bc_emit(mg->code, OP_IFNE);
                     } else {
                         mg_pop(mg, 1);
