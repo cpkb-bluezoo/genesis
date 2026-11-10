@@ -1018,11 +1018,7 @@ bool classpath_add_boot(classpath_t *cp, const char *path)
         return false;
     }
     /* slist_append returns the new node (tail), but we need to keep the head */
-    if (!cp->boot_entries) {
-        cp->boot_entries = slist_new(entry);
-    } else {
-        slist_append(cp->boot_entries, entry);
-    }
+    slist_push(&cp->boot_entries, entry);
     cp->entry_count++;
     return true;
 }
@@ -1042,11 +1038,7 @@ static bool classpath_add_boot_platform(classpath_t *cp, platform_image_t *image
     }
     entry->type = CP_PLATFORM;
     entry->platform = image;
-    if (!cp->boot_entries) {
-        cp->boot_entries = slist_new(entry);
-    } else {
-        slist_append(cp->boot_entries, entry);
-    }
+    slist_push(&cp->boot_entries, entry);
     cp->entry_count++;
     return true;
 }
@@ -1058,11 +1050,7 @@ bool classpath_add(classpath_t *cp, const char *path)
         return false;
     }
     /* slist_append returns the new node (tail), but we need to keep the head */
-    if (!cp->entries) {
-        cp->entries = slist_new(entry);
-    } else {
-        slist_append(cp->entries, entry);
-    }
+    slist_push(&cp->entries, entry);
     cp->entry_count++;
     return true;
 }

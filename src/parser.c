@@ -301,11 +301,7 @@ void ast_add_child(ast_node_t *parent, ast_node_t *child)
         return;
     }
     
-    if (!parent->data.node.children) {
-        parent->data.node.children = slist_new(child);
-    } else {
-        slist_append(parent->data.node.children, child);
-    }
+    slist_push(&parent->data.node.children, child);
 }
 
 /**
@@ -2412,11 +2408,7 @@ static ast_node_t *parse_postfix_operand(parser_t *parser, ast_node_t *expr)
                         do {
                             ast_node_t *type_arg = parse_type(parser);
                             if (type_arg) {
-                                if (!explicit_type_args) {
-                                    explicit_type_args = slist_new(type_arg);
-                                } else {
-                                    slist_append(explicit_type_args, type_arg);
-                                }
+                                slist_push(&explicit_type_args, type_arg);
                             }
                         } while (parser_match(parser, TOK_COMMA));
                         
@@ -2925,11 +2917,7 @@ static slist_t *parse_type_annotations(parser_t *parser)
         }
         ast_node_t *annot = parse_annotation(parser);
         if (annot) {
-            if (!annotations) {
-                annotations = slist_new(annot);
-            } else {
-                slist_append(annotations, annot);
-            }
+            slist_push(&annotations, annot);
         }
     }
     
@@ -3081,19 +3069,11 @@ ast_node_t *parse_type(parser_t *parser)
                             }
                         }
                         
-                        if (!parsed_type_args) {
-                            parsed_type_args = slist_new(wildcard);
-                        } else {
-                            slist_append(parsed_type_args, wildcard);
-                        }
+                        slist_push(&parsed_type_args, wildcard);
                     } else {
                         ast_node_t *type_arg = parse_type(parser);
                         if (type_arg) {
-                            if (!parsed_type_args) {
-                                parsed_type_args = slist_new(type_arg);
-                            } else {
-                                slist_append(parsed_type_args, type_arg);
-                            }
+                            slist_push(&parsed_type_args, type_arg);
                         }
                     }
                 } while (parser_match(parser, TOK_COMMA));
@@ -3832,11 +3812,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                                         ast_add_child(case_label, case_expr);
                                     }
                                 }
-                                if (labels) {
-                                    slist_append(labels, case_label);
-                                } else {
-                                    labels = slist_new(case_label);
-                                }
+                                slist_push(&labels, case_label);
                             } while (parser_match(parser, TOK_COMMA));
                         }
                         
@@ -4317,11 +4293,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                         if (!annot) {
                             break;
                         }
-                        if (!leading_annotations) {
-                            leading_annotations = slist_new(annot);
-                        } else {
-                            slist_append(leading_annotations, annot);
-                        }
+                        slist_push(&leading_annotations, annot);
                     }
                     
                     /* After modifiers, we can have type annotations or type name */
@@ -4336,10 +4308,7 @@ static ast_node_t *parse_statement(parser_t *parser)
                          * it's a variable declaration */
                         if (type_node && parser_check_identifier_or_contextual(parser)) {
                             for (slist_t *a = leading_annotations; a; a = a->next) {
-                                type_node->annotations = type_node->annotations
-                                    ? (slist_append(type_node->annotations, a->data),
-                                       type_node->annotations)
-                                    : slist_new(a->data);
+                                slist_push(&type_node->annotations, a->data);
                             }
                             slist_free(leading_annotations);
                             leading_annotations = NULL;
@@ -4591,11 +4560,7 @@ static uint32_t parse_modifiers_with_annotations(parser_t *parser, slist_t **ann
             }
             ast_node_t *annot = parse_annotation(parser);
             if (annot) {
-                if (!*annotations) {
-                    *annotations = slist_new(annot);
-                } else {
-                    slist_append(*annotations, annot);
-                }
+                slist_push(annotations, annot);
             }
             continue;
         }
@@ -4881,11 +4846,10 @@ static ast_node_t *parse_compact_constructor(parser_t *parser, uint32_t modifier
              * @Target lets reach a parameter (JLS 8.10.3). A list of its own: the component
              * keeps its list. */
             for (slist_t *a = comp->annotations; a; a = a->next) {
-                param->annotations = param->annotations ?
-                    (slist_append(param->annotations, a->data), param->annotations) : slist_new(a->data);
+                slist_push(&param->annotations, a->data);
             }
             ast_add_child(ctor, param);
-            components = components ? (slist_append(components, comp), components) : slist_new(comp);
+            slist_push(&components, comp);
         }
     }
 
@@ -5007,11 +4971,7 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
                     }
                 }
                 
-                if (!method_type_params) {
-                    method_type_params = slist_new(type_param);
-                } else {
-                    slist_append(method_type_params, type_param);
-                }
+                slist_push(&method_type_params, type_param);
             }
         } while (parser_match(parser, TOK_COMMA));
         parser_expect_gt(parser);
@@ -5063,8 +5023,7 @@ static ast_node_t *parse_class_member(parser_t *parser, const char *class_name)
     if (method_type_params && parser_check(parser, TOK_AT)) {
         slist_t *more = parse_type_annotations(parser);
         for (slist_t *a = more; a; a = a->next) {
-            annotations = annotations ? (slist_append(annotations, a->data), annotations)
-                                      : slist_new(a->data);
+            slist_push(&annotations, a->data);
         }
         slist_free(more);
     }
@@ -5296,11 +5255,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
                 while (parser_check(parser, TOK_AT)) {
                     ast_node_t *annot = parse_annotation(parser);
                     if (annot) {
-                        if (!comp_annotations) {
-                            comp_annotations = slist_new(annot);
-                        } else {
-                            slist_append(comp_annotations, annot);
-                        }
+                        slist_push(&comp_annotations, annot);
                     }
                 }
                 
@@ -5396,11 +5351,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
             while (parser_check(parser, TOK_AT)) {
                 ast_node_t *annot = parse_annotation(parser);
                 if (annot) {
-                    if (!const_annotations) {
-                        const_annotations = slist_new(annot);
-                    } else {
-                        slist_append(const_annotations, annot);
-                    }
+                    slist_push(&const_annotations, annot);
                 }
             }
             

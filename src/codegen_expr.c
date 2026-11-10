@@ -304,11 +304,7 @@ static const char *get_or_create_field_accessor(symbol_t *enclosing, symbol_t *f
     snprintf(name_buf, sizeof(name_buf), "access$%d", index);
     acc->accessor_name = strdup(name_buf);
 
-    if (!enclosing->data.class_data.pending_field_accessors) {
-        enclosing->data.class_data.pending_field_accessors = slist_new(acc);
-    } else {
-        slist_append(enclosing->data.class_data.pending_field_accessors, acc);
-    }
+    slist_push(&enclosing->data.class_data.pending_field_accessors, acc);
     return acc->accessor_name;
 }
 
@@ -335,11 +331,7 @@ static const char *get_or_create_method_accessor(symbol_t *enclosing, symbol_t *
     char name_buf[32];
     snprintf(name_buf, sizeof(name_buf), "access$m%d", index);
     acc->accessor_name = strdup(name_buf);
-    if (!enclosing->data.class_data.pending_method_accessors) {
-        enclosing->data.class_data.pending_method_accessors = slist_new(acc);
-    } else {
-        slist_append(enclosing->data.class_data.pending_method_accessors, acc);
-    }
+    slist_push(&enclosing->data.class_data.pending_method_accessors, acc);
     return acc->accessor_name;
 }
 
@@ -12044,11 +12036,7 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                     *goto_pos = mg->code->length;
                     bc_emit(mg->code, OP_GOTO);
                     bc_emit_u2(mg->code, 0);
-                    if (!end_gotos) {
-                        end_gotos = slist_new(goto_pos);
-                    } else {
-                        slist_append(end_gotos, goto_pos);
-                    }
+                    slist_push(&end_gotos, goto_pos);
                 }
                 
                 /* Patch ifnonnull. The next label is reached from the test alone: with the state
@@ -12208,11 +12196,7 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                 *goto_pos = mg->code->length;
                 bc_emit(mg->code, OP_GOTO);
                 bc_emit_u2(mg->code, 0);
-                if (!end_gotos) {
-                    end_gotos = slist_new(goto_pos);
-                } else {
-                    slist_append(end_gotos, goto_pos);
-                }
+                slist_push(&end_gotos, goto_pos);
             }
             
             /* Patch guard ifeq. Its target is where the next case starts, whose frame is recorded
@@ -12232,11 +12216,7 @@ static bool codegen_pattern_switch_expr(method_gen_t *mg, ast_node_t *expr, cons
                 *goto_pos = mg->code->length;
                 bc_emit(mg->code, OP_GOTO);
                 bc_emit_u2(mg->code, 0);
-                if (!end_gotos) {
-                    end_gotos = slist_new(goto_pos);
-                } else {
-                    slist_append(end_gotos, goto_pos);
-                }
+                slist_push(&end_gotos, goto_pos);
             }
         }
         
@@ -15073,11 +15053,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                 lambda_method->exception_handlers = lambda_mg->exception_handlers;
                 lambda_mg->exception_handlers = NULL;
                 
-                if (!cg->methods) {
-                    cg->methods = slist_new(lambda_method);
-                } else {
-                    slist_append(cg->methods, lambda_method);
-                }
+                slist_push(&cg->methods, lambda_method);
                 
                 /* Free the method generator locals */
                 hashtable_free(lambda_mg->locals);
@@ -15454,11 +15430,7 @@ bool codegen_expr(method_gen_t *mg, ast_node_t *expr, const_pool_t *cp)
                     synth_mg->code = NULL;
                     
                     /* Add to class methods */
-                    if (!cg->methods) {
-                        cg->methods = slist_new(synth_method);
-                    } else {
-                        slist_append(cg->methods, synth_method);
-                    }
+                    slist_push(&cg->methods, synth_method);
                     
                     method_gen_free(synth_mg);
                     

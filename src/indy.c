@@ -356,11 +356,7 @@ void lambda_info_add_capture(lambda_info_t *info, const char *name,
         info->is_instance_capture = true;
     }
     
-    if (!info->captures) {
-        info->captures = slist_new(cap);
-    } else {
-        slist_append(info->captures, cap);
-    }
+    slist_push(&info->captures, cap);
 }
 
 uint16_t indy_generate_lambda_callsite(const_pool_t *cp, bootstrap_methods_t *bsm,

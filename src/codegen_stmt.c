@@ -593,11 +593,7 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
         bc_emit_u2(mg->code, 0);  /* Will patch to default */
         
         /* Add to list of gotos to patch */
-        if (!goto_patches) {
-            goto_patches = slist_new((void *)(uintptr_t)goto_default_pos);
-        } else {
-            slist_append(goto_patches, (void *)(uintptr_t)goto_default_pos);
-        }
+        slist_push(&goto_patches, (void *)(uintptr_t)goto_default_pos);
     }
     
     /* Generate case bodies in original order */
@@ -723,11 +719,7 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
         if (has_body && (ends_in_break || (is_last_case && !ends_in_terminal)) && mg->stackmap) {
             stackmap_state_t *exit_snap = stackmap_save_state(mg->stackmap);
             if (exit_snap) {
-                if (!string_switch_exit_states) {
-                    string_switch_exit_states = slist_new(exit_snap);
-                } else {
-                    slist_append(string_switch_exit_states, exit_snap);
-                }
+                slist_push(&string_switch_exit_states, exit_snap);
             }
         }
     }
@@ -747,11 +739,7 @@ static bool codegen_string_switch(method_gen_t *mg, slist_t *children, int num_c
                 memcpy(entry_snap->locals, switch_entry_state->locals,
                        switch_entry_state->num_locals * sizeof(verification_type_t));
             }
-            if (!string_switch_exit_states) {
-                string_switch_exit_states = slist_new(entry_snap);
-            } else {
-                slist_append(string_switch_exit_states, entry_snap);
-            }
+            slist_push(&string_switch_exit_states, entry_snap);
         }
     }
 
@@ -4797,11 +4785,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                 if (mg->stackmap) {
                                     stackmap_state_t *exit_snap = stackmap_save_state(mg->stackmap);
                                     if (exit_snap) {
-                                        if (!switch_exit_states) {
-                                            switch_exit_states = slist_new(exit_snap);
-                                        } else {
-                                            slist_append(switch_exit_states, exit_snap);
-                                        }
+                                        slist_push(&switch_exit_states, exit_snap);
                                     }
                                 }
                             }
@@ -4889,11 +4873,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                     if (last_case_falls_through && mg->stackmap) {
                         stackmap_state_t *fallthrough_snap = stackmap_save_state(mg->stackmap);
                         if (fallthrough_snap) {
-                            if (!switch_exit_states) {
-                                switch_exit_states = slist_new(fallthrough_snap);
-                            } else {
-                                slist_append(switch_exit_states, fallthrough_snap);
-                            }
+                            slist_push(&switch_exit_states, fallthrough_snap);
                         }
                     }
                     if (default_code_pos == 0 && switch_entry_state) {
@@ -4910,11 +4890,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                                 memcpy(entry_snap->locals, switch_entry_state->locals,
                                        switch_entry_state->num_locals * sizeof(verification_type_t));
                             }
-                            if (!switch_exit_states) {
-                                switch_exit_states = slist_new(entry_snap);
-                            } else {
-                                slist_append(switch_exit_states, entry_snap);
-                            }
+                            slist_push(&switch_exit_states, entry_snap);
                         }
                     }
                     if (switch_exit_states && mg->stackmap) {
@@ -6413,11 +6389,7 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                 /* Local class declaration inside a method body */
                 /* Collect it for separate compilation like nested classes */
                 if (mg->class_gen) {
-                    if (!mg->class_gen->local_classes) {
-                        mg->class_gen->local_classes = slist_new(stmt);
-                    } else {
-                        slist_append(mg->class_gen->local_classes, stmt);
-                    }
+                    slist_push(&mg->class_gen->local_classes, stmt);
                     
                     /* Add InnerClasses attribute entry for the local class.
                      * For local classes, outer_class_info = 0 (no enclosing class
@@ -6435,21 +6407,13 @@ bool codegen_statement(method_gen_t *mg, ast_node_t *stmt)
                             stmt->data.node.flags,
                             stmt->type == AST_INTERFACE_DECL ? SYM_INTERFACE : SYM_CLASS);
                         
-                        if (!mg->class_gen->inner_class_entries) {
-                            mg->class_gen->inner_class_entries = slist_new(entry);
-                        } else {
-                            slist_append(mg->class_gen->inner_class_entries, entry);
-                        }
+                        slist_push(&mg->class_gen->inner_class_entries, entry);
                         
                         /* Also add to NestMembers if this class is the nest host */
                         if (mg->class_gen->nest_host == 0) {
                             uint16_t *nest_member_idx = malloc(sizeof(uint16_t));
                             *nest_member_idx = entry->inner_class_info;
-                            if (!mg->class_gen->nest_members) {
-                                mg->class_gen->nest_members = slist_new(nest_member_idx);
-                            } else {
-                                slist_append(mg->class_gen->nest_members, nest_member_idx);
-                            }
+                            slist_push(&mg->class_gen->nest_members, nest_member_idx);
                         }
                         
                         free(local_internal);

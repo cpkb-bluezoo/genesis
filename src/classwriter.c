@@ -1428,7 +1428,7 @@ static bool method_parameters_forced(const class_gen_t *cg, const method_info_ge
         for (slist_t *n = mi->ast->data.node.children; n; n = n->next) {
             ast_node_t *child = (ast_node_t *)n->data;
             if (child && child->type == AST_PARAMETER) {
-                params = params ? (slist_append(params, child), params) : slist_new(child);
+                slist_push(&params, child);
             }
         }
         bool same = true;

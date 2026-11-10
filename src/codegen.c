@@ -250,11 +250,7 @@ void label_emit_jump(label_t *label, bytecode_t *bc, uint8_t opcode)
         uint32_t fixup_pos = bc_offset(bc);
         bc_emit_u2(bc, 0);
         
-        if (!label->fixups) {
-            label->fixups = slist_new((void *)(uintptr_t)fixup_pos);
-        } else {
-            slist_append(label->fixups, (void *)(uintptr_t)fixup_pos);
-        }
+        slist_push(&label->fixups, (void *)(uintptr_t)fixup_pos);
     }
 }
 
@@ -400,7 +396,7 @@ slist_t *record_component_annotations(class_gen_t *cg, ast_node_t *comp, unsigne
     for (slist_t *n = comp ? comp->annotations : NULL; n; n = n->next) {
         ast_node_t *annot = (ast_node_t *)n->data;
         if (record_annotation_targets(cg, annot) & decl_bit) {
-            out = out ? (slist_append(out, annot), out) : slist_new(annot);
+            slist_push(&out, annot);
         }
     }
     return out;
@@ -495,19 +491,11 @@ void class_gen_register_anonymous_inner(class_gen_t *host, symbol_t *anon_sym)
     entry->outer_class_info = 0;
     entry->inner_name = 0;
     entry->access_flags = 0;
-    if (!host->inner_class_entries) {
-        host->inner_class_entries = slist_new(entry);
-    } else {
-        slist_append(host->inner_class_entries, entry);
-    }
+    slist_push(&host->inner_class_entries, entry);
     if (host->nest_host == 0) {
         uint16_t *nest_member_idx = malloc(sizeof(uint16_t));
         *nest_member_idx = nested_class_idx;
-        if (!host->nest_members) {
-            host->nest_members = slist_new(nest_member_idx);
-        } else {
-            slist_append(host->nest_members, nest_member_idx);
-        }
+        slist_push(&host->nest_members, nest_member_idx);
     }
     free(nested_internal);
 }
@@ -840,11 +828,7 @@ void mg_record_line(method_gen_t *mg, int line)
     entry->start_pc = pc;
     entry->line_number = (uint16_t)line;
     
-    if (!mg->line_numbers) {
-        mg->line_numbers = slist_new(entry);
-    } else {
-        slist_append(mg->line_numbers, entry);
-    }
+    slist_push(&mg->line_numbers, entry);
 }
 
 /**
@@ -870,11 +854,7 @@ void mg_record_local_var(method_gen_t *mg, const char *name, const char *descrip
     lv->length = 0;  /* Will be set when method ends */
     lv->type_ast = type_ast;  /* Store for type annotations */
     
-    if (!mg->local_var_table) {
-        mg->local_var_table = slist_new(lv);
-    } else {
-        slist_append(mg->local_var_table, lv);
-    }
+    slist_push(&mg->local_var_table, lv);
 }
 
 uint16_t mg_allocate_local(method_gen_t *mg, const char *name, type_t *type)
@@ -1700,7 +1680,7 @@ static slist_t *declared_interface_types(semantic_t *sem, ast_node_t *class_decl
         if (child && child->type == AST_CLASS_TYPE && child->data.node.flags == (is_interface ? 1 : 2)) {
             type_t *t = semantic_resolve_type(sem, child);
             if (t && t->kind == TYPE_CLASS) {
-                result = result ? (slist_append(result, t), result) : slist_new(t);
+                slist_push(&result, t);
             }
         }
     }
@@ -1789,11 +1769,7 @@ char *generate_class_signature(semantic_t *sem, ast_node_t *class_decl, symbol_t
         }
         
         if (child->type == AST_TYPE_PARAMETER) {
-            if (!type_params) {
-                type_params = slist_new(child);
-            } else {
-                slist_append(type_params, child);
-            }
+            slist_push(&type_params, child);
         }
     }
     
@@ -1908,11 +1884,7 @@ char *generate_method_signature(ast_node_t *method_decl, symbol_t *method_sym)
     for (slist_t *node = method_decl->data.node.children; node; node = node->next) {
         ast_node_t *child = (ast_node_t *)node->data;
         if (child && child->type == AST_TYPE_PARAMETER) {
-            if (!type_params) {
-                type_params = slist_new(child);
-            } else {
-                slist_append(type_params, child);
-            }
+            slist_push(&type_params, child);
         }
     }
     
@@ -2452,11 +2424,7 @@ static slist_t *extract_throws_types(ast_node_t *method_decl, semantic_t *sem)
             }
             
             if (internal_name) {
-                if (!throws_list) {
-                    throws_list = slist_new(internal_name);
-                } else {
-                    slist_append(throws_list, internal_name);
-                }
+                slist_push(&throws_list, internal_name);
             }
         }
     }
@@ -2668,11 +2636,7 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
                 free(iface_internal);
                 
                 /* Store as uintptr_t to fit in void* */
-                if (!cg->interfaces) {
-                    cg->interfaces = slist_new((void *)(uintptr_t)iface_index);
-                } else {
-                    slist_append(cg->interfaces, (void *)(uintptr_t)iface_index);
-                }
+                slist_push(&cg->interfaces, (void *)(uintptr_t)iface_index);
             }
             iface_list = iface_list->next;
         }
@@ -2687,11 +2651,7 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
                 }
             }
             if (!listed) {
-                if (!cg->interfaces) {
-                    cg->interfaces = slist_new((void *)(uintptr_t)annot_iface);
-                } else {
-                    slist_append(cg->interfaces, (void *)(uintptr_t)annot_iface);
-                }
+                slist_push(&cg->interfaces, (void *)(uintptr_t)annot_iface);
             }
         }
         
@@ -2740,11 +2700,7 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
                 this0->descriptor_index = cp_add_utf8(cg->cp, this0->descriptor);
                 
                 /* Add to field list */
-                if (!cg->fields) {
-                    cg->fields = slist_new(this0);
-                } else {
-                    slist_append(cg->fields, this0);
-                }
+                slist_push(&cg->fields, this0);
                 
                 hashtable_insert(cg->field_map, this0->name, this0);
                 
@@ -2783,11 +2739,7 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
                     
                     /* Add superclass's captured var to our list */
                     if (!already_captured) {
-                        if (!cg->captured_vars) {
-                            cg->captured_vars = slist_new(var_sym);
-                        } else {
-                            slist_append(cg->captured_vars, var_sym);
-                        }
+                        slist_push(&cg->captured_vars, var_sym);
                     }
                 }
             }
@@ -2820,11 +2772,7 @@ class_gen_t *class_gen_new(semantic_t *sem, symbol_t *class_sym)
                 cap_field->descriptor_index = cp_add_utf8(cg->cp, cap_field->descriptor);
                 
                 /* Add to field list */
-                if (!cg->fields) {
-                    cg->fields = slist_new(cap_field);
-                } else {
-                    slist_append(cg->fields, cap_field);
-                }
+                slist_push(&cg->fields, cap_field);
                 
                 hashtable_insert(cg->field_map, cap_field->name, cap_field);
                 
@@ -3114,11 +3062,7 @@ static bool codegen_interface_method(class_gen_t *cg, ast_node_t *method_decl)
     string_free(desc, true);
 
     /* Add to methods list */
-    if (!cg->methods) {
-        cg->methods = slist_new(mi);
-    } else {
-        slist_append(cg->methods, mi);
-    }
+    slist_push(&cg->methods, mi);
 
     return true;
 }
@@ -3233,11 +3177,7 @@ static bool codegen_abstract_method(class_gen_t *cg, ast_node_t *method_decl)
     string_free(desc, true);
     
     /* Add to methods list */
-    if (!cg->methods) {
-        cg->methods = slist_new(mi);
-    } else {
-        slist_append(cg->methods, mi);
-    }
+    slist_push(&cg->methods, mi);
     
     return true;
 }
@@ -3960,11 +3900,7 @@ bool codegen_method(class_gen_t *cg, ast_node_t *method_decl)
     }
     
     /* Add to class */
-    if (!cg->methods) {
-        cg->methods = slist_new(mi);
-    } else {
-        slist_append(cg->methods, mi);
-    }
+    slist_push(&cg->methods, mi);
     
     method_gen_free(mg);
     return true;
@@ -4128,11 +4064,7 @@ static bool codegen_bridge_method(class_gen_t *cg, symbol_t *method_sym)
     mg->code = NULL;
     
     /* Add to class */
-    if (!cg->methods) {
-        cg->methods = slist_new(mi);
-    } else {
-        slist_append(cg->methods, mi);
-    }
+    slist_push(&cg->methods, mi);
     
     method_gen_free(mg);
     return true;
@@ -4418,11 +4350,7 @@ static void generate_superclass_bridges(class_gen_t *cg)
                 free(desc_str);
                 
                 /* Add to methods list */
-                if (!cg->methods) {
-                    cg->methods = slist_new(mi);
-                } else {
-                    slist_append(cg->methods, mi);
-                }
+                slist_push(&cg->methods, mi);
             }
             entry = entry->next;
         }
@@ -4520,11 +4448,7 @@ static void collect_interface_closure(semantic_t *sem, symbol_t *iface, slist_t 
             return;
         }
     }
-    if (!*out) {
-        *out = slist_new(iface);
-    } else {
-        slist_append(*out, iface);
-    }
+    slist_push(out, iface);
     symbol_complete(iface);
     for (slist_t *n = iface->data.class_data.interfaces; n; n = n->next) {
         collect_interface_closure(sem, (symbol_t *)n->data, out);
@@ -4571,16 +4495,8 @@ static void generate_interface_bridges(class_gen_t *cg)
                     known = k->data == ci->data;
                 }
                 if (!known) {
-                    if (!all_ifaces) {
-                        all_ifaces = slist_new(ci->data);
-                    } else {
-                        slist_append(all_ifaces, ci->data);
-                    }
-                    if (!ancestor_only) {
-                        ancestor_only = slist_new(ci->data);
-                    } else {
-                        slist_append(ancestor_only, ci->data);
-                    }
+                    slist_push(&all_ifaces, ci->data);
+                    slist_push(&ancestor_only, ci->data);
                 }
             }
             slist_free(closure);
@@ -5066,11 +4982,7 @@ static void generate_interface_bridges(class_gen_t *cg)
                 string_free(concrete_desc, true);
                 
                 /* Add to methods list */
-                if (!cg->methods) {
-                    cg->methods = slist_new(mi);
-                } else {
-                    slist_append(cg->methods, mi);
-                }
+                slist_push(&cg->methods, mi);
                 
                 entry = entry->next;
             }
@@ -5544,11 +5456,7 @@ static void generate_covariant_override_bridges_for(class_gen_t *cg, symbol_t *s
             string_free(erased_desc, true);
             string_free(concrete_desc, true);
 
-            if (!cg->methods) {
-                cg->methods = slist_new(mi);
-            } else {
-                slist_append(cg->methods, mi);
-            }
+            slist_push(&cg->methods, mi);
 
             entry = entry->next;
         }
@@ -5664,11 +5572,7 @@ void generate_pending_field_accessors(class_gen_t *cg)
         mi->code = code;
         (void)close;
 
-        if (!cg->methods) {
-            cg->methods = slist_new(mi);
-        } else {
-            slist_append(cg->methods, mi);
-        }
+        slist_push(&cg->methods, mi);
         method_descriptor_free(md);
         free(owner_internal);
         free(descriptor);
@@ -5714,11 +5618,7 @@ void generate_pending_field_accessors(class_gen_t *cg)
         code->max_locals = 1;
         mi->code = code;
 
-        if (!cg->methods) {
-            cg->methods = slist_new(mi);
-        } else {
-            slist_append(cg->methods, mi);
-        }
+        slist_push(&cg->methods, mi);
 
         free(field_owner_internal);
         free(field_desc);
@@ -5897,11 +5797,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     
                     uint16_t *cp_idx = malloc(sizeof(uint16_t));
                     *cp_idx = cp_add_class(cg->cp, internal_name);
-                    if (!cg->permitted_subclasses) {
-                        cg->permitted_subclasses = slist_new(cp_idx);
-                    } else {
-                        slist_append(cg->permitted_subclasses, cp_idx);
-                    }
+                    slist_push(&cg->permitted_subclasses, cp_idx);
                     free(internal_name);
                 }
             }
@@ -5917,11 +5813,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             ast_node_t *member = (ast_node_t *)children_iter->data;
             if (member->type == AST_PARAMETER && 
                 (member->data.node.flags & MOD_RECORD_COMPONENT)) {
-                if (!record_components) {
-                    record_components = slist_new(member);
-                } else {
-                    slist_append(record_components, member);
-                }
+                slist_push(&record_components, member);
             }
             children_iter = children_iter->next;
         }
@@ -5976,11 +5868,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     fg->descriptor_index = cp_add_utf8(cg->cp, fg->descriptor);
                     
                     /* Add to field list */
-                    if (!cg->fields) {
-                        cg->fields = slist_new(fg);
-                    } else {
-                        slist_append(cg->fields, fg);
-                    }
+                    slist_push(&cg->fields, fg);
                     
                     /* Add to field lookup map */
                     hashtable_insert(cg->field_map, fg->name, fg);
@@ -6004,18 +5892,10 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         
                         if (is_static) {
                             /* Static field - add to <clinit> */
-                            if (!static_field_inits) {
-                                static_field_inits = slist_new(assign);
-                            } else {
-                                slist_append(static_field_inits, assign);
-                            }
+                            slist_push(&static_field_inits, assign);
                         } else {
                             /* Instance field - add to constructors */
-                            if (!cg->instance_field_inits) {
-                                cg->instance_field_inits = slist_new(assign);
-                            } else {
-                                slist_append(cg->instance_field_inits, assign);
-                            }
+                            slist_push(&cg->instance_field_inits, assign);
                         }
                     }
                 }
@@ -6113,18 +5993,10 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             case AST_INITIALIZER_BLOCK:
                 if (member->data.node.flags & MOD_STATIC) {
                     /* Collect static initializer blocks for <clinit> */
-                    if (!static_initializers) {
-                        static_initializers = slist_new(member);
-                    } else {
-                        slist_append(static_initializers, member);
-                    }
+                    slist_push(&static_initializers, member);
                 } else {
                     /* Collect instance initializer blocks for constructors */
-                    if (!cg->instance_initializers) {
-                        cg->instance_initializers = slist_new(member);
-                    } else {
-                        slist_append(cg->instance_initializers, member);
-                    }
+                    slist_push(&cg->instance_initializers, member);
                 }
                 break;
             
@@ -6153,11 +6025,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         fg->descriptor_index = cp_add_utf8(cg->cp, fg->descriptor);
                         
                         /* Add to field list */
-                        if (!cg->fields) {
-                            cg->fields = slist_new(fg);
-                        } else {
-                            slist_append(cg->fields, fg);
-                        }
+                        slist_push(&cg->fields, fg);
                         
                         /* Add to field lookup map */
                         hashtable_insert(cg->field_map, fg->name, fg);
@@ -6184,11 +6052,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     fg->descriptor_index = cp_add_utf8(cg->cp, fg->descriptor);
                     
                     /* Add to field list */
-                    if (!cg->fields) {
-                        cg->fields = slist_new(fg);
-                    } else {
-                        slist_append(cg->fields, fg);
-                    }
+                    slist_push(&cg->fields, fg);
                     
                     /* Add to field lookup map */
                     hashtable_insert(cg->field_map, fg->name, fg);
@@ -6205,11 +6069,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             case AST_ANNOTATION_DECL:
                 {
                     /* Nested class - collect for separate compilation */
-                    if (!cg->nested_classes) {
-                        cg->nested_classes = slist_new(member);
-                    } else {
-                        slist_append(cg->nested_classes, member);
-                    }
+                    slist_push(&cg->nested_classes, member);
                     
                     /* Add InnerClasses attribute entry for this nested class */
                     const char *nested_name = member->data.node.name;
@@ -6255,11 +6115,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                         if (cg->nest_host == 0) {
                             uint16_t *nest_member_idx = malloc(sizeof(uint16_t));
                             *nest_member_idx = nested_class_idx;
-                            if (!cg->nest_members) {
-                                cg->nest_members = slist_new(nest_member_idx);
-                            } else {
-                                slist_append(cg->nest_members, nest_member_idx);
-                            }
+                            slist_push(&cg->nest_members, nest_member_idx);
                         }
                         
                         free(nested_internal);
@@ -6976,11 +6832,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         method_gen_free(mg);
         
         /* Add to methods list */
-        if (!cg->methods) {
-            cg->methods = slist_new(init);
-        } else {
-            slist_append(cg->methods, init);
-        }
+        slist_push(&cg->methods, init);
     }
     
     /* Add synthetic $assertionsDisabled field if needed */
@@ -6992,11 +6844,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         fg->name_index = cp_add_utf8(cg->cp, fg->name);
         fg->descriptor_index = cp_add_utf8(cg->cp, fg->descriptor);
         
-        if (!cg->fields) {
-            cg->fields = slist_new(fg);
-        } else {
-            slist_append(cg->fields, fg);
-        }
+        slist_push(&cg->fields, fg);
         hashtable_insert(cg->field_map, fg->name, fg);
     }
     
@@ -7226,11 +7074,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                      * varargs position are collected and turned into one
                      * array after the loop. */
                     if (ctor_is_varargs && user_arg_index >= ctor_fixed_count) {
-                        if (!varargs_nodes) {
-                            varargs_nodes = slist_new(arg);
-                        } else {
-                            slist_append(varargs_nodes, arg);
-                        }
+                        slist_push(&varargs_nodes, arg);
                         user_arg_index++;
                         args = args->next;
                         continue;
@@ -7368,11 +7212,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             values_field->name_index = cp_add_utf8(cg->cp, values_field->name);
             values_field->descriptor_index = cp_add_utf8(cg->cp, values_field->descriptor);
 
-            if (!cg->fields) {
-                cg->fields = slist_new(values_field);
-            } else {
-                slist_append(cg->fields, values_field);
-            }
+            slist_push(&cg->fields, values_field);
             hashtable_insert(cg->field_map, values_field->name, values_field);
 
             /* Initialize $VALUES array with all enum constants */
@@ -7579,11 +7419,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
         }
         
         /* Add to methods list */
-        if (!cg->methods) {
-            cg->methods = slist_new(clinit);
-        } else {
-            slist_append(cg->methods, clinit);
-        }
+        slist_push(&cg->methods, clinit);
         
         /* Don't free mg->code since clinit owns it now */
         mg->code = NULL;
@@ -7647,11 +7483,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             values_method->code = mg->code;
             mg->code = NULL;
             
-            if (!cg->methods) {
-                cg->methods = slist_new(values_method);
-            } else {
-                slist_append(cg->methods, values_method);
-            }
+            slist_push(&cg->methods, values_method);
             
             method_gen_free(mg);
         }
@@ -7811,11 +7643,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                 cg->use_stackmap = true;
             }
             
-            if (!cg->methods) {
-                cg->methods = slist_new(valueof_method);
-            } else {
-                slist_append(cg->methods, valueof_method);
-            }
+            slist_push(&cg->methods, valueof_method);
             
             method_gen_free(mg);
         }
@@ -7905,11 +7733,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
             accessor->code = mg->code;
             mg->code = NULL;
             
-            if (!cg->methods) {
-                cg->methods = slist_new(accessor);
-            } else {
-                slist_append(cg->methods, accessor);
-            }
+            slist_push(&cg->methods, accessor);
             
             method_gen_free(mg);
             free(comp_desc);
@@ -8184,11 +8008,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     /* Record position to patch later */
                     size_t *pos = malloc(sizeof(size_t));
                     *pos = cmp_fail_pos;
-                    if (!fail_jumps) {
-                        fail_jumps = slist_new(pos);
-                    } else {
-                        slist_append(fail_jumps, pos);
-                    }
+                    slist_push(&fail_jumps, pos);
                 } else {
                     /* Use Objects.equals for references */
                     bc_emit(mg->code, OP_ALOAD_0);
@@ -8215,11 +8035,7 @@ bool codegen_class(class_gen_t *cg, ast_node_t *class_decl)
                     /* Record position to patch later */
                     size_t *pos = malloc(sizeof(size_t));
                     *pos = eq_fail_pos;
-                    if (!fail_jumps) {
-                        fail_jumps = slist_new(pos);
-                    } else {
-                        slist_append(fail_jumps, pos);
-                    }
+                    slist_push(&fail_jumps, pos);
                 }
                 
                 free(comp_desc);
@@ -8717,11 +8533,7 @@ static bool codegen_enum_constant_anon_constructor(class_gen_t *cg,
 
     method_gen_free(mg);
 
-    if (!cg->methods) {
-        cg->methods = slist_new(init);
-    } else {
-        slist_append(cg->methods, init);
-    }
+    slist_push(&cg->methods, init);
     return true;
 }
 
@@ -8896,11 +8708,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                             fg->descriptor_index = cp_add_utf8(cg->cp, fg->descriptor);
                             
                             /* Add to field list */
-                            if (!cg->fields) {
-                                cg->fields = slist_new(fg);
-                            } else {
-                                slist_append(cg->fields, fg);
-                            }
+                            slist_push(&cg->fields, fg);
                             
                             /* Add to field lookup map */
                             hashtable_insert(cg->field_map, fg->name, fg);
@@ -8920,17 +8728,9 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
                                 ast_add_child(assign, init_expr);
                                 
                                 if (is_static) {
-                                    if (!static_field_inits) {
-                                        static_field_inits = slist_new(assign);
-                                    } else {
-                                        slist_append(static_field_inits, assign);
-                                    }
+                                    slist_push(&static_field_inits, assign);
                                 } else {
-                                    if (!cg->instance_field_inits) {
-                                        cg->instance_field_inits = slist_new(assign);
-                                    } else {
-                                        slist_append(cg->instance_field_inits, assign);
-                                    }
+                                    slist_push(&cg->instance_field_inits, assign);
                                 }
                             }
                         }
@@ -8962,17 +8762,9 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             
             case AST_INITIALIZER_BLOCK:
                 if (member->data.node.flags & MOD_STATIC) {
-                    if (!static_initializers) {
-                        static_initializers = slist_new(member);
-                    } else {
-                        slist_append(static_initializers, member);
-                    }
+                    slist_push(&static_initializers, member);
                 } else {
-                    if (!cg->instance_initializers) {
-                        cg->instance_initializers = slist_new(member);
-                    } else {
-                        slist_append(cg->instance_initializers, member);
-                    }
+                    slist_push(&cg->instance_initializers, member);
                 }
                 break;
             
@@ -9567,11 +9359,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
         method_gen_free(mg);
         
         /* Add to methods list */
-        if (!cg->methods) {
-            cg->methods = slist_new(init);
-        } else {
-            slist_append(cg->methods, init);
-        }
+        slist_push(&cg->methods, init);
         }
     }
 
@@ -9658,11 +9446,7 @@ bool codegen_anonymous_class(class_gen_t *cg, symbol_t *anon_sym)
             cg->use_stackmap = true;
         }
         
-        if (!cg->methods) {
-            cg->methods = slist_new(clinit);
-        } else {
-            slist_append(cg->methods, clinit);
-        }
+        slist_push(&cg->methods, clinit);
         
         mg->code = NULL;
         method_gen_free(mg);
@@ -9736,39 +9520,19 @@ uint8_t *codegen_module(ast_node_t *module_decl, size_t *size_out)
         
         switch (directive->type) {
             case AST_REQUIRES_DIRECTIVE:
-                if (!requires_list) {
-                    requires_list = slist_new(directive);
-                } else  {
-                    slist_append(requires_list, directive);
-                }
+                slist_push(&requires_list, directive);
                 break;
             case AST_EXPORTS_DIRECTIVE:
-                if (!exports_list) {
-                    exports_list = slist_new(directive);
-                } else  {
-                    slist_append(exports_list, directive);
-                }
+                slist_push(&exports_list, directive);
                 break;
             case AST_OPENS_DIRECTIVE:
-                if (!opens_list) {
-                    opens_list = slist_new(directive);
-                } else  {
-                    slist_append(opens_list, directive);
-                }
+                slist_push(&opens_list, directive);
                 break;
             case AST_USES_DIRECTIVE:
-                if (!uses_list) {
-                    uses_list = slist_new(directive);
-                } else  {
-                    slist_append(uses_list, directive);
-                }
+                slist_push(&uses_list, directive);
                 break;
             case AST_PROVIDES_DIRECTIVE:
-                if (!provides_list) {
-                    provides_list = slist_new(directive);
-                } else  {
-                    slist_append(provides_list, directive);
-                }
+                slist_push(&provides_list, directive);
                 break;
             default:
                 break;
@@ -10274,11 +10038,7 @@ uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
     for (slist_t *child = package_decl->data.node.children; child; child = child->next) {
         ast_node_t *annot = (ast_node_t *)child->data;
         if (annot && annot->type == AST_ANNOTATION) {
-            if (!all_annotations) {
-                all_annotations = slist_new(annot);
-            } else  {
-                slist_append(all_annotations, annot);
-            }
+            slist_push(&all_annotations, annot);
         }
     }
     
@@ -10286,11 +10046,7 @@ uint8_t *codegen_package_info(ast_node_t *package_decl, slist_t *annotations,
     for (slist_t *node = annotations; node; node = node->next) {
         ast_node_t *annot = (ast_node_t *)node->data;
         if (annot && annot->type == AST_ANNOTATION) {
-            if (!all_annotations) {
-                all_annotations = slist_new(annot);
-            } else  {
-                slist_append(all_annotations, annot);
-            }
+            slist_push(&all_annotations, annot);
         }
     }
     

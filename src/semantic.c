@@ -445,11 +445,7 @@ unresolved_type_t *unresolved_type_from_ast(ast_node_t *type_node)
                 if (type_arg) {
                     unresolved_type_t *arg_ut = unresolved_type_from_ast(type_arg);
                     if (arg_ut) {
-                        if (!ut->type_args) {
-                            ut->type_args = slist_new(arg_ut);
-                        } else {
-                            slist_append(ut->type_args, arg_ut);
-                        }
+                        slist_push(&ut->type_args, arg_ut);
                     }
                 }
             }
@@ -722,11 +718,7 @@ static void enter_record_canonical_ctor(symbol_t *sym, ast_node_t *decl, type_re
         if (put) {
             param->type = resolve_unresolved_type_full(put, reg, cp, sym);
         }
-        if (!ctor->data.method_data.parameters) {
-            ctor->data.method_data.parameters = slist_new(param);
-        } else {
-            slist_append(ctor->data.method_data.parameters, param);
-        }
+        slist_push(&ctor->data.method_data.parameters, param);
         idx++;
     }
     ctor->scope = members;
@@ -999,11 +991,7 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
                         }
                     }
                 }
-                if (!method_sym->data.method_data.type_params) {
-                    method_sym->data.method_data.type_params = slist_new(tp_sym);
-                } else {
-                    slist_append(method_sym->data.method_data.type_params, tp_sym);
-                }
+                slist_push(&method_sym->data.method_data.type_params, tp_sym);
             }
             
             /* Extract return type with type arguments (stored in member->data.node.extra) */
@@ -1058,11 +1046,7 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
                                 method_sym->data.method_data.params[idx] = param_sym;
                                 
                                 /* Also add to parameters linked list for find_best_method_by_types */
-                                if (!method_sym->data.method_data.parameters) {
-                                    method_sym->data.method_data.parameters = slist_new(param_sym);
-                                } else {
-                                    slist_append(method_sym->data.method_data.parameters, param_sym);
-                                }
+                                slist_push(&method_sym->data.method_data.parameters, param_sym);
                                 
                                 /* Extract param type with type arguments (first child is the type) */
                                 if (param->data.node.children) {
@@ -1277,11 +1261,7 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
                 if (super_name) {
                     if (sym->kind == SYM_INTERFACE) {
                         /* For interfaces, extends is like implements - add to interfaces */
-                        if (!sym->data.class_data.unresolved_interfaces) {
-                            sym->data.class_data.unresolved_interfaces = slist_new(super_name);
-                        } else {
-                            slist_append(sym->data.class_data.unresolved_interfaces, super_name);
-                        }
+                        slist_push(&sym->data.class_data.unresolved_interfaces, super_name);
                         /* Parameterized extends (e.g. ServerSessionProvider<ClientConnected>) */
                         unresolved_type_t *super_ut = unresolved_type_from_ast(type_node);
                         if (super_ut && super_ut->type_args &&
@@ -1318,11 +1298,7 @@ static void enter_members_for_type(symbol_t *sym, ast_node_t *decl, type_registr
                 /* implements */
                 char *iface_name = extract_type_name_from_ast(type_node);
                 if (iface_name) {
-                    if (!sym->data.class_data.unresolved_interfaces) {
-                        sym->data.class_data.unresolved_interfaces = slist_new(iface_name);
-                    } else {
-                        slist_append(sym->data.class_data.unresolved_interfaces, iface_name);
-                    }
+                    slist_push(&sym->data.class_data.unresolved_interfaces, iface_name);
                 }
             }
         }
@@ -1494,11 +1470,7 @@ static void ensure_method_type_params(symbol_t *method_sym)
             tv->data.type_var.name = strdup(ch->data.node.name);
             tp_sym->type = tv;
         }
-        if (!method_sym->data.method_data.type_params) {
-            method_sym->data.method_data.type_params = slist_new(tp_sym);
-        } else {
-            slist_append(method_sym->data.method_data.type_params, tp_sym);
-        }
+        slist_push(&method_sym->data.method_data.type_params, tp_sym);
     }
 }
 
@@ -1599,11 +1571,7 @@ static type_t *resolve_unresolved_type_full_for_method(unresolved_type_t *ut,
         unresolved_type_t *arg_ut = (unresolved_type_t *)arg->data;
         type_t *arg_type = resolve_unresolved_type_full_for_method(arg_ut, reg, cp, class_ctx, method);
         if (arg_type) {
-            if (!result->data.class_type.type_args) {
-                result->data.class_type.type_args = slist_new(arg_type);
-            } else {
-                slist_append(result->data.class_type.type_args, arg_type);
-            }
+            slist_push(&result->data.class_type.type_args, arg_type);
         }
     }
 
@@ -1651,11 +1619,7 @@ static type_t *resolve_unresolved_type_full(unresolved_type_t *ut, type_registry
         unresolved_type_t *arg_ut = (unresolved_type_t *)arg->data;
         type_t *arg_type = resolve_unresolved_type_full(arg_ut, reg, cp, context);
         if (arg_type) {
-            if (!result->data.class_type.type_args) {
-                result->data.class_type.type_args = slist_new(arg_type);
-            } else {
-                slist_append(result->data.class_type.type_args, arg_type);
-            }
+            slist_push(&result->data.class_type.type_args, arg_type);
         }
     }
 
@@ -2767,11 +2731,7 @@ static symbol_t *symbol_from_classfile_minimal(classfile_t *cf, classpath_t *cp)
                     if (iface_cf) {
                         symbol_t *iface_sym = symbol_from_classfile_minimal(iface_cf, cp);
                         if (iface_sym) {
-                            if (!sym->data.class_data.interfaces) {
-                                sym->data.class_data.interfaces = slist_new(iface_sym);
-                            } else {
-                                slist_append(sym->data.class_data.interfaces, iface_sym);
-                            }
+                            slist_push(&sym->data.class_data.interfaces, iface_sym);
                         }
                     }
                     free(iface_binary);
@@ -2959,11 +2919,7 @@ void registry_resolve_types(type_registry_t *reg, classpath_t *cp)
                         }
                         
                         if (iface_sym) {
-                            if (!sym->data.class_data.interfaces) {
-                                sym->data.class_data.interfaces = slist_new(iface_sym);
-                            } else {
-                                slist_append(sym->data.class_data.interfaces, iface_sym);
-                            }
+                            slist_push(&sym->data.class_data.interfaces, iface_sym);
                         }
                         ifaces = ifaces->next;
                     }
@@ -4318,11 +4274,7 @@ static void collect_method_overloads(const char *key, void *value, void *user_da
         char next_char = key[ctx->name_len];
         if (next_char == '\0' || next_char == '(') {
             /* This is a matching method */
-            if (!ctx->candidates) {
-                ctx->candidates = slist_new(sym);
-            } else {
-                slist_append(ctx->candidates, sym);
-            }
+            slist_push(&ctx->candidates, sym);
         }
     }
 }
@@ -4841,11 +4793,7 @@ static void collect_methods_from_interfaces(semantic_t *sem, symbol_t *class_sym
                     }
                 }
                 if (!found) {
-                    if (!*candidates) {
-                        *candidates = slist_new(m->data);
-                    } else {
-                        slist_append(*candidates, m->data);
-                    }
+                    slist_push(candidates, m->data);
                 }
             }
             slist_free(iface_methods);
@@ -5385,11 +5333,7 @@ static void ensure_class_implements_prescanned(semantic_t *sem, symbol_t *sym)
                 if (i->data == type_sym) { dup = true; break; }
             }
             if (!dup) {
-                if (!sym->data.class_data.interfaces) {
-                    sym->data.class_data.interfaces = slist_new(type_sym);
-                } else {
-                    slist_append(sym->data.class_data.interfaces, type_sym);
-                }
+                slist_push(&sym->data.class_data.interfaces, type_sym);
             }
         }
     }
@@ -5443,11 +5387,7 @@ static symbol_t *lookup_method_in_interfaces_ex(semantic_t *sem, symbol_t *class
             const char *iface_name = (const char *)ifaces->data;
             symbol_t *iface_sym = load_external_class(sem, iface_name);
             if (iface_sym) {
-                if (!class_sym->data.class_data.interfaces) {
-                    class_sym->data.class_data.interfaces = slist_new(iface_sym);
-                } else {
-                    slist_append(class_sym->data.class_data.interfaces, iface_sym);
-                }
+                slist_push(&class_sym->data.class_data.interfaces, iface_sym);
             }
             ifaces = ifaces->next;
         }
@@ -5925,11 +5865,7 @@ void semantic_error(semantic_t *sem, int line, int col, const char *fmt, ...)
     const char *filename = sem->source ? sem->source->filename : NULL;
     diagnostic_t *diag = diagnostic_new(true, filename, line, col, message);
     
-    if (!sem->diagnostics) {
-        sem->diagnostics = slist_new(diag);
-    } else {
-        slist_append(sem->diagnostics, diag);
-    }
+    slist_push(&sem->diagnostics, diag);
     
     sem->error_count++;
 }
@@ -5957,11 +5893,7 @@ void semantic_warning(semantic_t *sem, int line, int col, const char *fmt, ...)
     bool is_error = sem->werror;
     diagnostic_t *diag = diagnostic_new(is_error, filename, line, col, message);
     
-    if (!sem->diagnostics) {
-        sem->diagnostics = slist_new(diag);
-    } else {
-        slist_append(sem->diagnostics, diag);
-    }
+    slist_push(&sem->diagnostics, diag);
     
     if (sem->werror) {
         sem->error_count++;
@@ -6069,11 +6001,7 @@ static type_t *generic_type_to_type(generic_type_t *gt)
                         if (arg_type) {
                             /* Append to type args list - slist_append returns the new node,
                              * so we only assign on first append */
-                            if (type->data.class_type.type_args == NULL) {
-                                type->data.class_type.type_args = slist_new(arg_type);
-                            } else {
-                                slist_append(type->data.class_type.type_args, arg_type);
-                            }
+                            slist_push(&type->data.class_type.type_args, arg_type);
                         }
                         arg = arg->next;
                     }
@@ -6682,11 +6610,7 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
                     tp_sym->type = type_var;
                     
                     /* Add to type_params list */
-                    if (sym->data.class_data.type_params == NULL) {
-                        sym->data.class_data.type_params = slist_new(tp_sym);
-                    } else {
-                        slist_append(sym->data.class_data.type_params, tp_sym);
-                    }
+                    slist_push(&sym->data.class_data.type_params, tp_sym);
                 }
             }
         }
@@ -6969,11 +6893,7 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
                                 patch_typevar_bound_from_class(type_var->data.type_var.bound, sym);
                             }
                             
-                            if (method_sym->data.method_data.type_params == NULL) {
-                                method_sym->data.method_data.type_params = slist_new(tp_sym);
-                            } else {
-                                slist_append(method_sym->data.method_data.type_params, tp_sym);
-                            }
+                            slist_push(&method_sym->data.method_data.type_params, tp_sym);
                         }
                     }
                 }
@@ -7104,20 +7024,12 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
                         if (rec) {
                             external_class_note_dep(sem, rec, iface_sym);
                         }
-                        if (!sym->data.class_data.interfaces) {
-                            sym->data.class_data.interfaces = slist_new(iface_sym);
-                        } else {
-                            slist_append(sym->data.class_data.interfaces, iface_sym);
-                        }
+                        slist_push(&sym->data.class_data.interfaces, iface_sym);
                     } else {
                         /* It could not be loaded just now (a nested class asks for its sibling while their
                          * outer class is still being loaded): it is looked for again when it is needed */
                         const char *pending = intern(iface_binary);
-                        if (!sym->data.class_data.unresolved_interfaces) {
-                            sym->data.class_data.unresolved_interfaces = slist_new((void *)pending);
-                        } else {
-                            slist_append(sym->data.class_data.unresolved_interfaces, (void *)pending);
-                        }
+                        slist_push(&sym->data.class_data.unresolved_interfaces, (void *)pending);
                     }
                     free(iface_binary);
                 }
@@ -7389,11 +7301,7 @@ static symbol_t *symbol_from_classfile_impl(semantic_t *sem, classfile_t *cf,
                                                                                             param_sym->type = type_new_array(param_sym->type, 1);
                                                                                         }
                                                                                     }
-                                                                                    if (!method_sym->data.method_data.parameters) {
-                                                                                        method_sym->data.method_data.parameters = slist_new(param_sym);
-                                                                                    } else {
-                                                                                        slist_append(method_sym->data.method_data.parameters, param_sym);
-                                                                                    }
+                                                                                    slist_push(&method_sym->data.method_data.parameters, param_sym);
                                                                                 }
                                                                             }
                                                                             
@@ -7553,11 +7461,7 @@ static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_n
             }
         }
         if (annotation && annotation != sym && !present) {
-            if (!sym->data.class_data.interfaces) {
-                sym->data.class_data.interfaces = slist_new(annotation);
-            } else {
-                slist_append(sym->data.class_data.interfaces, annotation);
-            }
+            slist_push(&sym->data.class_data.interfaces, annotation);
         }
     }
     for (slist_t *member = decl->data.node.children; member; member = member->next) {
@@ -7587,11 +7491,7 @@ static void add_interface_extends_from_ast(semantic_t *sem, symbol_t *sym, ast_n
             }
         }
         if (!dup) {
-            if (!sym->data.class_data.interfaces) {
-                sym->data.class_data.interfaces = slist_new(iface_sym);
-            } else {
-                slist_append(sym->data.class_data.interfaces, iface_sym);
-            }
+            slist_push(&sym->data.class_data.interfaces, iface_sym);
         }
         unresolved_type_t *super_ut = unresolved_type_from_ast(m);
         if (super_ut && super_ut->type_args &&
@@ -7753,11 +7653,7 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
             info->ast = nested;
             info->sym = nested_sym;
             info->scope = nested_scope;
-            if (!nested_infos) {
-                nested_infos = slist_new(info);
-            } else {
-                slist_append(nested_infos, info);
-            }
+            slist_push(&nested_infos, info);
             
         }
     }
@@ -7899,11 +7795,7 @@ static void preregister_nested_types(semantic_t *sem, ast_node_t *decl,
                                     param_sym->type = type_new_array(param_sym->type, 1);
                                 }
                             }
-                            if (!method_sym->data.method_data.parameters) {
-                                method_sym->data.method_data.parameters = slist_new(param_sym);
-                            } else {
-                                slist_append(method_sym->data.method_data.parameters, param_sym);
-                            }
+                            slist_push(&method_sym->data.method_data.parameters, param_sym);
                         }
                     }
                     
@@ -8361,11 +8253,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                     scope_define(class_scope, tp_sym);
                                     
                                     /* Add to class's type_params list */
-                                    if (!sym->data.class_data.type_params) {
-                                        sym->data.class_data.type_params = slist_new(tp_sym);
-                                    } else {
-                                        slist_append(sym->data.class_data.type_params, tp_sym);
-                                    }
+                                    slist_push(&sym->data.class_data.type_params, tp_sym);
                                     
                                     if (debug_getenv("GENESIS_DEBUG_LOAD")) {
                                         fprintf(stderr, "DEBUG load_class_from_source: registered class type param '%s' for '%s'\n",
@@ -8409,11 +8297,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                                 iface_name, (void*)iface_sym);
                                         }
                                         /* Add to interfaces list */
-                                        if (!sym->data.class_data.interfaces) {
-                                            sym->data.class_data.interfaces = slist_new(iface_sym);
-                                        } else {
-                                            slist_append(sym->data.class_data.interfaces, iface_sym);
-                                        }
+                                        slist_push(&sym->data.class_data.interfaces, iface_sym);
                                     }
                                     type_t *ext_type = semantic_resolve_type(sem, m);
                                     if (ext_type && ext_type->kind == TYPE_CLASS &&
@@ -8493,11 +8377,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                             iface_name, (void*)iface_sym);
                                     }
                                     /* Add to interfaces list */
-                                    if (!sym->data.class_data.interfaces) {
-                                        sym->data.class_data.interfaces = slist_new(iface_sym);
-                                    } else {
-                                        slist_append(sym->data.class_data.interfaces, iface_sym);
-                                    }
+                                    slist_push(&sym->data.class_data.interfaces, iface_sym);
                                 }
                             }
                         }
@@ -8553,11 +8433,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                             tp_sym->type = type_var;
                                             scope_define(method_scope, tp_sym);
                                             /* Also add to method's type_params list */
-                                            if (!method_sym->data.method_data.type_params) {
-                                                method_sym->data.method_data.type_params = slist_new(tp_sym);
-                                            } else {
-                                                slist_append(method_sym->data.method_data.type_params, tp_sym);
-                                            }
+                                            slist_push(&method_sym->data.method_data.type_params, tp_sym);
                                         }
                                     }
                                 }
@@ -8601,11 +8477,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                             }
                                         }
                                         
-                                        if (!method_sym->data.method_data.parameters) {
-                                            method_sym->data.method_data.parameters = slist_new(param_sym);
-                                        } else {
-                                            slist_append(method_sym->data.method_data.parameters, param_sym);
-                                        }
+                                        slist_push(&method_sym->data.method_data.parameters, param_sym);
                                     }
                                 }
                                 
@@ -8700,11 +8572,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                                                 param_sym->type = type_new_array(param_sym->type, 1);
                                                             }
                                                         }
-                                                        if (!nmethod_sym->data.method_data.parameters) {
-                                                            nmethod_sym->data.method_data.parameters = slist_new(param_sym);
-                                                        } else {
-                                                            slist_append(nmethod_sym->data.method_data.parameters, param_sym);
-                                                        }
+                                                        slist_push(&nmethod_sym->data.method_data.parameters, param_sym);
                                                     }
                                                 }
                                                 
@@ -8825,11 +8693,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                          * so of several -sourcepath dependencies only the
                          * last one loaded was ever compiled. */
                         char *dep_path = strdup(src->filename);
-                        if (!sem->source_dependencies) {
-                            sem->source_dependencies = slist_new(dep_path);
-                        } else {
-                            slist_append(sem->source_dependencies, dep_path);
-                        }
+                        slist_push(&sem->source_dependencies, dep_path);
 
                         /* Restore context */
                         if (dep_pkg) {
@@ -8950,11 +8814,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                                                 ast_node_t *ptype_node = (ast_node_t *)param->data.node.children->data;
                                                 param_sym->type = semantic_resolve_type(sem, ptype_node);
                                             }
-                                            if (!method_sym->data.method_data.parameters) {
-                                                method_sym->data.method_data.parameters = slist_new(param_sym);
-                                            } else {
-                                                slist_append(method_sym->data.method_data.parameters, param_sym);
-                                            }
+                                            slist_push(&method_sym->data.method_data.parameters, param_sym);
                                         }
                                     }
                                     
@@ -8969,11 +8829,7 @@ static symbol_t *load_class_from_source_impl(semantic_t *sem, const char *name)
                             
                             /* Track this source file as a dependency */
                             char *dep_path = strdup(src->filename);
-                            if (!sem->source_dependencies) {
-                                sem->source_dependencies = slist_new(dep_path);
-                            } else {
-                                slist_append(sem->source_dependencies, dep_path);
-                            }
+                            slist_push(&sem->source_dependencies, dep_path);
                         }
                     }
                 }
@@ -11227,11 +11083,7 @@ void resolve_types_in_compilation_unit_cached(ast_node_t *ast, classpath_t *clas
         if (decl->type == AST_PACKAGE_DECL) {
             package = decl->data.node.name;
         } else if (decl->type == AST_IMPORT_DECL) {
-            if (!imports) {
-                imports = slist_new(decl);
-            } else {
-                slist_append(imports, decl);
-            }
+            slist_push(&imports, decl);
         }
     }
     
@@ -12141,11 +11993,7 @@ static symbol_t *find_single_iterable_fixed_overload(semantic_t *sem, slist_t *c
         if (!param || !param_type_is_java_lang_iterable(param->type)) {
             continue;
         }
-        if (!fixed) {
-            fixed = slist_new(method);
-        } else {
-            slist_append(fixed, method);
-        }
+        slist_push(&fixed, method);
     }
     if (!fixed) {
         return NULL;
@@ -13842,11 +13690,7 @@ static type_t *with_written_type_args(semantic_t *sem, ast_node_t *type_node, sy
     param_type->data.class_type.symbol = sym ? sym : base->data.class_type.symbol;
     for (slist_t *c = children; c; c = c->next) {
         type_t *arg_type = semantic_resolve_type(sem, (ast_node_t *)c->data);
-        if (!param_type->data.class_type.type_args) {
-            param_type->data.class_type.type_args = slist_new(arg_type);
-        } else {
-            slist_append(param_type->data.class_type.type_args, arg_type);
-        }
+        slist_push(&param_type->data.class_type.type_args, arg_type);
     }
     return param_type;
 }
@@ -14030,11 +13874,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                 for (slist_t *c = children; c; c = c->next) {
                                     ast_node_t *arg = (ast_node_t *)c->data;
                                     type_t *arg_type = semantic_resolve_type(sem, arg);
-                                    if (param_type->data.class_type.type_args == NULL) {
-                                        param_type->data.class_type.type_args = slist_new(arg_type);
-                                    } else {
-                                        slist_append(param_type->data.class_type.type_args, arg_type);
-                                    }
+                                    slist_push(&param_type->data.class_type.type_args, arg_type);
                                 }
                                 
                                 type_node->sem_type = param_type;
@@ -14076,11 +13916,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                             param_type->data.class_type.symbol = inherited;
                             for (slist_t *c = children; c; c = c->next) {
                                 type_t *arg_type = semantic_resolve_type(sem, (ast_node_t *)c->data);
-                                if (!param_type->data.class_type.type_args) {
-                                    param_type->data.class_type.type_args = slist_new(arg_type);
-                                } else {
-                                    slist_append(param_type->data.class_type.type_args, arg_type);
-                                }
+                                slist_push(&param_type->data.class_type.type_args, arg_type);
                             }
                             type_node->sem_type = param_type;
                             return param_type;
@@ -14301,11 +14137,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                 for (slist_t *c = children; c; c = c->next) {
                                     ast_node_t *arg = (ast_node_t *)c->data;
                                     type_t *arg_type = semantic_resolve_type(sem, arg);
-                                    if (param_type->data.class_type.type_args == NULL) {
-                                        param_type->data.class_type.type_args = slist_new(arg_type);
-                                    } else {
-                                        slist_append(param_type->data.class_type.type_args, arg_type);
-                                    }
+                                    slist_push(&param_type->data.class_type.type_args, arg_type);
                                 }
                                 
                                 type_node->sem_type = param_type;
@@ -14332,11 +14164,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                             param_type->data.class_type.symbol = member_nested;
                             for (slist_t *c = children; c; c = c->next) {
                                 type_t *arg_type = semantic_resolve_type(sem, c->data);
-                                if (!param_type->data.class_type.type_args) {
-                                    param_type->data.class_type.type_args = slist_new(arg_type);
-                                } else {
-                                    slist_append(param_type->data.class_type.type_args, arg_type);
-                                }
+                                slist_push(&param_type->data.class_type.type_args, arg_type);
                             }
                             type_node->sem_type = param_type;
                             return param_type;
@@ -14379,11 +14207,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                     pkg_sym->type->data.class_type.symbol : pkg_sym;
                                 for (slist_t *c = children; c; c = c->next) {
                                     type_t *arg_type = semantic_resolve_type(sem, c->data);
-                                    if (!param_type->data.class_type.type_args) {
-                                        param_type->data.class_type.type_args = slist_new(arg_type);
-                                    } else {
-                                        slist_append(param_type->data.class_type.type_args, arg_type);
-                                    }
+                                    slist_push(&param_type->data.class_type.type_args, arg_type);
                                 }
                                 type_node->sem_type = param_type;
                                 return param_type;
@@ -14422,11 +14246,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                         /* Copy type arguments from target type */
                         for (slist_t *c = sem->target_type->data.class_type.type_args; c; c = c->next) {
                             type_t *arg_type = (type_t *)c->data;
-                            if (param_type->data.class_type.type_args == NULL) {
-                                param_type->data.class_type.type_args = slist_new(arg_type);
-                            } else {
-                                slist_append(param_type->data.class_type.type_args, arg_type);
-                            }
+                            slist_push(&param_type->data.class_type.type_args, arg_type);
                         }
                         
                         type_node->sem_type = param_type;
@@ -14447,11 +14267,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                         for (slist_t *c = children; c; c = c->next) {
                             ast_node_t *arg = (ast_node_t *)c->data;
                             type_t *arg_type = semantic_resolve_type(sem, arg);
-                            if (param_type->data.class_type.type_args == NULL) {
-                                param_type->data.class_type.type_args = slist_new(arg_type);
-                            } else {
-                                slist_append(param_type->data.class_type.type_args, arg_type);
-                            }
+                            slist_push(&param_type->data.class_type.type_args, arg_type);
                         }
                         
                         type_node->sem_type = param_type;
@@ -14506,11 +14322,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                             /* Copy type arguments from target type */
                             for (slist_t *c = sem->target_type->data.class_type.type_args; c; c = c->next) {
                                 type_t *arg_type = (type_t *)c->data;
-                                if (param_type->data.class_type.type_args == NULL) {
-                                    param_type->data.class_type.type_args = slist_new(arg_type);
-                                } else {
-                                    slist_append(param_type->data.class_type.type_args, arg_type);
-                                }
+                                slist_push(&param_type->data.class_type.type_args, arg_type);
                             }
 
                             type_node->sem_type = param_type;
@@ -14534,11 +14346,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                             for (slist_t *c = children; c; c = c->next) {
                                 ast_node_t *arg = (ast_node_t *)c->data;
                                 type_t *arg_type = semantic_resolve_type(sem, arg);
-                                if (param_type->data.class_type.type_args == NULL) {
-                                    param_type->data.class_type.type_args = slist_new(arg_type);
-                                } else {
-                                    slist_append(param_type->data.class_type.type_args, arg_type);
-                                }
+                                slist_push(&param_type->data.class_type.type_args, arg_type);
                             }
                             
                             type_node->sem_type = param_type;
@@ -14579,11 +14387,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                 /* Copy type arguments from target type */
                                 for (slist_t *c = sem->target_type->data.class_type.type_args; c; c = c->next) {
                                     type_t *arg_type = (type_t *)c->data;
-                                    if (param_type->data.class_type.type_args == NULL) {
-                                        param_type->data.class_type.type_args = slist_new(arg_type);
-                                    } else {
-                                        slist_append(param_type->data.class_type.type_args, arg_type);
-                                    }
+                                    slist_push(&param_type->data.class_type.type_args, arg_type);
                                 }
 
                                 type_node->sem_type = param_type;
@@ -14608,11 +14412,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                 for (slist_t *c = children; c; c = c->next) {
                                     ast_node_t *arg = (ast_node_t *)c->data;
                                     type_t *arg_type = semantic_resolve_type(sem, arg);
-                                    if (param_type->data.class_type.type_args == NULL) {
-                                        param_type->data.class_type.type_args = slist_new(arg_type);
-                                    } else {
-                                        slist_append(param_type->data.class_type.type_args, arg_type);
-                                    }
+                                    slist_push(&param_type->data.class_type.type_args, arg_type);
                                 }
                                 
                                 type_node->sem_type = param_type;
@@ -14659,9 +14459,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                                     result->data.class_type.symbol = inherited->data.class_type.symbol;
                                     for (slist_t *c = arg_nodes; c; c = c->next) {
                                         type_t *arg_type = semantic_resolve_type(sem, (ast_node_t *)c->data);
-                                        result->data.class_type.type_args = result->data.class_type.type_args ?
-                                            (slist_append(result->data.class_type.type_args, arg_type),
-                                             result->data.class_type.type_args) : slist_new(arg_type);
+                                        slist_push(&result->data.class_type.type_args, arg_type);
                                     }
                                 }
                                 type_node->sem_type = result;
@@ -14917,11 +14715,7 @@ type_t *semantic_resolve_type(semantic_t *sem, ast_node_t *type_node)
                     ast_node_t *child = (ast_node_t *)c->data;
                     type_t *component = semantic_resolve_type(sem, child);
                     
-                    if (!types) {
-                        types = slist_new(component);
-                    } else {
-                        slist_append(types, component);
-                    }
+                    slist_push(&types, component);
                 }
                 
                 type_t *intersection = type_new_intersection(types);
@@ -15372,11 +15166,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                         /* Store imports for later resolution */
                         if (node->data.node.flags & MOD_STATIC) {
                             /* Static import - store separately */
-                            if (!sem->static_imports) {
-                                sem->static_imports = slist_new(node);
-                            } else {
-                                slist_append(sem->static_imports, node);
-                            }
+                            slist_push(&sem->static_imports, node);
                         } else if (node->data.node.flags & MOD_MODULE_IMPORT) {
                             /* import module M; (JEP 511) - expand to package on-demand imports */
                             if (sem->source_version < 25) {
@@ -15403,11 +15193,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                             node->line, node->column);
                                         pkg_import->data.node.name = (char *)intern(wildcard);
                                         free(wildcard);
-                                        if (!sem->imports) {
-                                            sem->imports = slist_new(pkg_import);
-                                        } else {
-                                            slist_append(sem->imports, pkg_import);
-                                        }
+                                        slist_push(&sem->imports, pkg_import);
                                         free(exports[i]);
                                     }
                                     free(exports);
@@ -15415,11 +15201,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                             }
                         } else {
                             /* Regular import */
-                            if (!sem->imports) {
-                                sem->imports = slist_new(node);
-                            } else {
-                                slist_append(sem->imports, node);
-                            }
+                            slist_push(&sem->imports, node);
                         }
                         break;
                     
@@ -15745,11 +15527,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                             if (i->data == iface_sym) { dup = true; break; }
                                         }
                                         if (!dup) {
-                                            if (!sym->data.class_data.interfaces) {
-                                                sym->data.class_data.interfaces = slist_new(iface_sym);
-                                            } else {
-                                                slist_append(sym->data.class_data.interfaces, iface_sym);
-                                            }
+                                            slist_push(&sym->data.class_data.interfaces, iface_sym);
                                             if (debug_getenv("GENESIS_DEBUG_OVERRIDE")) {
                                                 fprintf(stderr, "DEBUG implements: added interface '%s' to '%s', interfaces now=%p\n",
                                                         iface_sym->name, sym->name, (void*)sym->data.class_data.interfaces);
@@ -15807,11 +15585,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                         type_param->column = child->column;
                                         
                                         /* Add to class's type parameters list */
-                                        if (!sym->data.class_data.type_params) {
-                                            sym->data.class_data.type_params = slist_new(type_param);
-                                        } else {
-                                            slist_append(sym->data.class_data.type_params, type_param);
-                                        }
+                                        slist_push(&sym->data.class_data.type_params, type_param);
                                         
                                         /* Define in class scope so it can be looked up */
                                         if (!reused_type_param) {
@@ -15985,11 +15759,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                                 }
                                             }
                                             if (!duplicate) {
-                                                if (!sym->data.class_data.interfaces) {
-                                                    sym->data.class_data.interfaces = slist_new(super_sym);
-                                                } else {
-                                                    slist_append(sym->data.class_data.interfaces, super_sym);
-                                                }
+                                                slist_push(&sym->data.class_data.interfaces, super_sym);
                                                 /* Also update the registry symbol if different */
                                                 /* Note: In parallel mode, we should NOT modify shared registry symbols.
                                                  * Interface info is populated in Phase 4 (registry_resolve_types). */
@@ -16102,11 +15872,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                                 }
                                             }
                                             if (!duplicate) {
-                                            if (!sym->data.class_data.interfaces) {
-                                                sym->data.class_data.interfaces = slist_new(iface_sym);
-                                            } else {
-                                                slist_append(sym->data.class_data.interfaces, iface_sym);
-                                                }
+                                            slist_push(&sym->data.class_data.interfaces, iface_sym);
                                             }
                                         }
                                     }
@@ -16827,11 +16593,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                                 break;
                                             }
                                         }
-                                        if (!seen_type_params) {
-                                            seen_type_params = slist_new((void*)param_name);
-                                        } else {
-                                            slist_append(seen_type_params, (void*)param_name);
-                                        }
+                                        slist_push(&seen_type_params, (void*)param_name);
                                         
                                         /* Create a type parameter symbol */
                                         symbol_t *type_param = symbol_new(SYM_TYPE_PARAM, param_name);
@@ -16970,11 +16732,7 @@ static void pass1_collect_declarations(semantic_t *sem, ast_node_t *ast)
                                     }
                                     child->sem_symbol = param;
                                     
-                                    if (!sym->data.method_data.parameters) {
-                                        sym->data.method_data.parameters = slist_new(param);
-                                    } else {
-                                        slist_append(sym->data.method_data.parameters, param);
-                                    }
+                                    slist_push(&sym->data.method_data.parameters, param);
                                 }
                                 children = children->next;
                             }
@@ -17381,11 +17139,7 @@ static void collect_value_stmts(ast_node_t *stmt, ast_node_type_t kind, slist_t 
         slist_t *children = stmt->data.node.children;
         if (children) {
             ast_node_t *expr = (ast_node_t *)children->data;
-            if (!*yields) {
-                *yields = slist_new(expr);
-            } else {
-                slist_append(*yields, expr);
-            }
+            slist_push(yields, expr);
         }
         return;
     }
@@ -17612,11 +17366,7 @@ static void collect_ancestor_symbols(symbol_t *sym, slist_t **out)
             return;
         }
     }
-    if (!*out) {
-        *out = slist_new(sym);
-    } else {
-        slist_append(*out, sym);
-    }
+    slist_push(out, sym);
     if (sym->kind == SYM_CLASS || sym->kind == SYM_INTERFACE || sym->kind == SYM_ENUM ||
         sym->kind == SYM_RECORD) {
         /* A classfile-loaded symbol (e.g. an external JAR type referenced
@@ -18541,11 +18291,7 @@ static slist_t *pack_anonymous_varargs(semantic_t *sem, ast_node_t *creation, as
 
     slist_t *new_args = NULL;
     for (slist_t *c = type_cell->next; c && c->data != anon_body; c = c->next) {
-        if (!new_args) {
-            new_args = slist_new(c->data);
-        } else {
-            slist_append(new_args, c->data);
-        }
+        slist_push(&new_args, c->data);
     }
     return new_args;
 }
@@ -18604,11 +18350,7 @@ static type_t *diamond_instantiation_via_supertype(type_t *raw_base, type_t *tar
         if (!found) {
             return raw_base;
         }
-        if (!diamond->data.class_type.type_args) {
-            diamond->data.class_type.type_args = slist_new(found);
-        } else {
-            slist_append(diamond->data.class_type.type_args, found);
-        }
+        slist_push(&diamond->data.class_type.type_args, found);
     }
     return diamond;
 }
@@ -18633,11 +18375,7 @@ static type_t *diamond_instantiation_type(semantic_t *sem, ast_node_t *type_node
     diamond->data.class_type.symbol = raw_base->data.class_type.symbol ?
         raw_base->data.class_type.symbol : sem->target_type->data.class_type.symbol;
     for (slist_t *ta = sem->target_type->data.class_type.type_args; ta; ta = ta->next) {
-        if (!diamond->data.class_type.type_args) {
-            diamond->data.class_type.type_args = slist_new(ta->data);
-        } else {
-            slist_append(diamond->data.class_type.type_args, ta->data);
-        }
+        slist_push(&diamond->data.class_type.type_args, ta->data);
     }
     return diamond;
 }
@@ -18678,11 +18416,7 @@ static type_t *diamond_type_from_arguments(semantic_t *sem, type_t *raw, symbol_
         if (fixed->kind != TYPE_CLASS && fixed->kind != TYPE_ARRAY && fixed->kind != TYPE_TYPEVAR) {
             fixed = type_boxed(fixed);
         }
-        if (!result->data.class_type.type_args) {
-            result->data.class_type.type_args = slist_new(fixed);
-        } else {
-            slist_append(result->data.class_type.type_args, fixed);
-        }
+        slist_push(&result->data.class_type.type_args, fixed);
     }
     return result;
 }
@@ -18905,11 +18639,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                                 }
                             }
                             if (!already_captured) {
-                                if (!lambda->lambda_captures) {
-                                    lambda->lambda_captures = slist_new(sym);
-                                } else {
-                                    slist_append(lambda->lambda_captures, sym);
-                                }
+                                slist_push(&lambda->lambda_captures, sym);
                             }
                         }
                     }
@@ -22789,11 +22519,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             if (child == anon_body) {
                                 break;
                             }
-                            if (!ctor_args) {
-                                ctor_args = slist_new(child);
-                            } else {
-                                slist_append(ctor_args, child);
-                            }
+                            slist_push(&ctor_args, child);
                         }
                         
                         /* Find and bind lambdas to superclass constructor parameters */
@@ -22979,11 +22705,7 @@ type_t *get_expression_type(semantic_t *sem, ast_node_t *expr)
                             break;
                         }  /* Stop at the body */
                         /* Add constructor argument */
-                        if (!ctor_args) {
-                            ctor_args = slist_new(child);
-                        } else {
-                            slist_append(ctor_args, child);
-                        }
+                        slist_push(&ctor_args, child);
                     }
                     anon_sym->data.class_data.super_ctor_args = ctor_args;
                     
@@ -24696,11 +24418,7 @@ static type_t *substitute_type_var(type_t *type, const char *var_name, type_t *r
             if (new_arg != orig_arg) {
                 changed = true;
             }
-            if (new_args == NULL) {
-                new_args = slist_new(new_arg);
-            } else {
-                slist_append(new_args, new_arg);
-            }
+            slist_push(&new_args, new_arg);
         }
         
         if (changed) {
@@ -24872,7 +24590,7 @@ static slist_t *class_implemented_types(semantic_t *sem, symbol_t *sym)
             if (child && child->type == AST_CLASS_TYPE && child->data.node.flags == (is_interface ? 1 : 2)) {
                 type_t *it = semantic_resolve_type(sem, child);
                 if (it && it->kind == TYPE_CLASS && (is_interface || it->data.class_type.type_args)) {
-                    result = result ? (slist_append(result, it), result) : slist_new(it);
+                    slist_push(&result, it);
                 }
             }
         }
@@ -24907,7 +24625,7 @@ static slist_t *class_implemented_types(semantic_t *sem, symbol_t *sym)
             free(iname);
             if (it) {
                 it->data.class_type.symbol = load_external_class(sem, it->data.class_type.name);
-                result = result ? (slist_append(result, it), result) : slist_new(it);
+                slist_push(&result, it);
             }
         }
         return result;
@@ -24923,7 +24641,7 @@ static slist_t *class_implemented_types(semantic_t *sem, symbol_t *sym)
             if (it->data.class_type.name && !it->data.class_type.symbol) {
                 it->data.class_type.symbol = load_external_class(sem, it->data.class_type.name);
             }
-            result = result ? (slist_append(result, it), result) : slist_new(it);
+            slist_push(&result, it);
         }
     }
     class_signature_free(csig);
@@ -25014,7 +24732,7 @@ static type_t *rename_clashing_typevars(type_t *type, symbol_t *method, int dept
         for (slist_t *a = type->data.class_type.type_args; a; a = a->next) {
             type_t *arg = rename_clashing_typevars((type_t *)a->data, method, depth + 1);
             changed = changed || arg != a->data;
-            renamed = renamed ? (slist_append(renamed, arg), renamed) : slist_new(arg);
+            slist_push(&renamed, arg);
         }
         if (changed) {
             type_t *copy = malloc(sizeof(type_t));
@@ -25288,11 +25006,7 @@ static type_t *substitute_from_receiver(type_t *type, type_t *recv_type)
                                                 }
                                             }
                                         }
-                                        if (!open->data.class_type.type_args) {
-                                            open->data.class_type.type_args = slist_new(arg);
-                                        } else {
-                                            slist_append(open->data.class_type.type_args, arg);
-                                        }
+                                        slist_push(&open->data.class_type.type_args, arg);
                                     }
                                     upper = open;
                                 }
@@ -25389,11 +25103,7 @@ static type_t *substitute_from_receiver(type_t *type, type_t *recv_type)
                 changed = true;
             }
             /* slist_append returns new node, only assign on first append */
-            if (new_args == NULL) {
-                new_args = slist_new(new_arg);
-            } else {
-                slist_append(new_args, new_arg);
-            }
+            slist_push(&new_args, new_arg);
         }
         
         if (changed) {
@@ -25547,11 +25257,7 @@ static type_t *substitute_type_args(type_t *type, symbol_t *iface_sym, slist_t *
             if (new_arg != orig_arg) {
                 changed = true;
             }
-            if (new_type_args == NULL) {
-                new_type_args = slist_new(new_arg);
-            } else {
-                slist_append(new_type_args, new_arg);
-            }
+            slist_push(&new_type_args, new_arg);
         }
         
         if (changed) {
@@ -25998,11 +25704,7 @@ static void scan_lambda_body_for_this_capture(semantic_t *sem, ast_node_t *node,
                                 }
                             }
                             if (!already) {
-                                if (!target_class->data.class_data.captured_vars) {
-                                    target_class->data.class_data.captured_vars = slist_new(cap->data);
-                                } else {
-                                    slist_append(target_class->data.class_data.captured_vars, cap->data);
-                                }
+                                slist_push(&target_class->data.class_data.captured_vars, cap->data);
                             }
                         }
                     }
@@ -26026,11 +25728,7 @@ static void scan_lambda_body_for_this_capture(semantic_t *sem, ast_node_t *node,
                         
                         /* Add to lambda captures if not already there */
                         if (!already_captured) {
-                            if (!lambda->lambda_captures) {
-                                lambda->lambda_captures = slist_new(captured_var);
-                            } else {
-                                slist_append(lambda->lambda_captures, captured_var);
-                            }
+                            slist_push(&lambda->lambda_captures, captured_var);
                         }
                     }
                 }
@@ -26118,11 +25816,7 @@ static void scan_lambda_body_for_this_capture(semantic_t *sem, ast_node_t *node,
                         }
                     }
                     if (!already_captured) {
-                        if (!lambda->lambda_captures) {
-                            lambda->lambda_captures = slist_new(sym);
-                        } else {
-                            slist_append(lambda->lambda_captures, sym);
-                        }
+                        slist_push(&lambda->lambda_captures, sym);
                     }
                 }
             }
@@ -26564,10 +26258,10 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                 arg = declared->data.type_var.bound;
                 any = true;
             }
-            replaced = replaced ? (slist_append(replaced, arg), replaced) : slist_new(arg);
+            slist_push(&replaced, arg);
         }
         for (; given; given = given->next) {
-            replaced = replaced ? (slist_append(replaced, given->data), replaced) : slist_new(given->data);
+            slist_push(&replaced, given->data);
         }
         if (any) {
             type_args = replaced;
@@ -26845,11 +26539,7 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
         
         /* Initialize new_type_args with existing type_args */
         for (slist_t *ta = type_args; ta; ta = ta->next) {
-            if (!new_type_args) {
-                new_type_args = slist_new(ta->data);
-            } else {
-                slist_append(new_type_args, ta->data);
-            }
+            slist_push(&new_type_args, ta->data);
         }
         
         /* For each explicitly typed parameter, try to infer type arguments */
@@ -26981,11 +26671,7 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                                             default: new_arg = body_type; break;
                                         }
                                     }
-                                    if (!new_args) {
-                                        new_args = slist_new(new_arg);
-                                    } else {
-                                        slist_append(new_args, new_arg);
-                                    }
+                                    slist_push(&new_args, new_arg);
                                     orig_args = orig_args->next;
                                 }
                                 new_type->data.class_type.type_args = new_args;
@@ -27156,11 +26842,7 @@ static bool bind_lambda_to_target_type(semantic_t *sem, ast_node_t *lambda, type
                                             break;
                                     }
                                 }
-                                if (!new_args) {
-                                    new_args = slist_new(new_arg);
-                                } else {
-                                    slist_append(new_args, new_arg);
-                                }
+                                slist_push(&new_args, new_arg);
                                 orig_args = orig_args->next;
                             }
                             new_type->data.class_type.type_args = new_args;
@@ -30149,12 +29831,12 @@ static void wrap_repeated_annotations(semantic_t *sem, ast_node_t *decl)
             }
             ast_add_child(pair, array);
             ast_add_child(wrapper, pair);
-            result = result ? (slist_append(result, wrapper), result) : slist_new(wrapper);
+            slist_push(&result, wrapper);
             free(container);
             changed = true;
         } else {
             taken[i] = true;
-            result = result ? (slist_append(result, items[i]), result) : slist_new(items[i]);
+            slist_push(&result, items[i]);
         }
     }
     if (changed) {
@@ -32116,11 +31798,7 @@ define_local_var:
                                                             }
                                                         }
                                                     if (iface_sym) {
-                                                        if (!act_sym->data.class_data.interfaces) {
-                                                            act_sym->data.class_data.interfaces = slist_new(iface_sym);
-                                                        } else {
-                                                            slist_append(act_sym->data.class_data.interfaces, iface_sym);
-                                                        }
+                                                        slist_push(&act_sym->data.class_data.interfaces, iface_sym);
                                                     }
                                                     ui = ui->next;
                                                 }

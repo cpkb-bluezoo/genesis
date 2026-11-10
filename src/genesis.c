@@ -1353,11 +1353,7 @@ static symbol_t *create_type_stub(const char *qname, ast_node_t *decl,
                     }
                     
                     /* Add to type_params list */
-                    if (!sym->data.class_data.type_params) {
-                        sym->data.class_data.type_params = slist_new(tparam_sym);
-                    } else {
-                        slist_append(sym->data.class_data.type_params, tparam_sym);
-                    }
+                    slist_push(&sym->data.class_data.type_params, tparam_sym);
                 }
             }
         }
@@ -2445,11 +2441,7 @@ static int compile_with_worker_processes(compiler_options_t *opts, int worker_co
                         }
                         mark_source_compiled(dep_path);
                         char *copy = strdup(dep_path);
-                        if (!new_dependencies) {
-                            new_dependencies = slist_new(copy);
-                        } else {
-                            slist_append(new_dependencies, copy);
-                        }
+                        slist_push(&new_dependencies, copy);
                     }
                 }
             }
@@ -2903,11 +2895,7 @@ static int compile_batch(compiler_options_t *opts, int thread_count,
                 }
                 mark_source_compiled(dep_path);
                 char *copy = strdup(dep_path);
-                if (!new_dependencies) {
-                    new_dependencies = slist_new(copy);
-                } else {
-                    slist_append(new_dependencies, copy);
-                }
+                slist_push(&new_dependencies, copy);
             }
         }
     }
