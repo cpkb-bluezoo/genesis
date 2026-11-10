@@ -5306,7 +5306,7 @@ static ast_node_t *parse_type_decl_with_annotations(parser_t *parser, uint32_t m
                 
                 ast_node_t *comp_type = parse_type(parser);
                 
-                if (!parser_check(parser, TOK_IDENTIFIER)) {
+                if (!parser_check_identifier_or_contextual(parser)) {
                     parser_error(parser, "Expected record component name");
                     ast_free(decl);
                     return NULL;

@@ -72,7 +72,3 @@ Inner class synthetic accessors:
     NestHost/NestMembers attributes are omitted, so private access between
     nested classes fails at run time. Full support for older targets would
     generate synthetic access$N methods, as javac does for -target 8.
-
-Records:
-  - A method or a record component named "to" (or "from") is a parse error:
-    record R(int to), r.to().  "to" is a contextual keyword.
