@@ -8,6 +8,8 @@
 	(read_s8): Shift unsigned.
 	* src/semantic.c: Match record pattern components by position, type
 	"var" from the accessor, and check that a switch covers its selector.
+	(enter_record_component_list): New.  Record the components of a record
+	entered from another file on its symbol, which has no AST.
 	* src/codegen_expr.c: Compile record patterns in instanceof and nested
 	or narrowing record patterns in switch.
 	* src/codegen.c: Patch the right jump in the generated equals() of a

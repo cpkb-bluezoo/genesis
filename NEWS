@@ -31,6 +31,11 @@ GNU Genesis NEWS -- history of user-visible changes.
   A record with a long, double or float component got an equals() that
   reported different values as equal.
 
+  A record pattern on a record declared in another source file of the same
+  compilation no longer fails in code generation with "record pattern
+  component 0 of X not found".  Only a record in the same file as the
+  pattern worked.
+
   A record component may be named "to", "with" or any other word that is a
   keyword only in a module declaration.
 
