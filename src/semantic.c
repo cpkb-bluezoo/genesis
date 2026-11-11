@@ -596,6 +596,50 @@ static void enter_record_canonical_ctor(symbol_t *sym, ast_node_t *decl, type_re
                                         classpath_t *cp);
 
 /**
+ * Records the components of a record entered from another file of the batch, in
+ * declaration order with their erased descriptors, as the Record attribute of a class
+ * file would be read. Code that matches a record pattern finds the accessors there:
+ * the symbol other files resolve to carries no AST.
+ */
+static void enter_record_component_list(symbol_t *sym, ast_node_t *decl, type_registry_t *reg,
+                                        classpath_t *cp)
+{
+    if (sym->ast || sym->data.class_data.record_components) {
+        return;
+    }
+    for (slist_t *c = decl->data.node.children; c; c = c->next) {
+        ast_node_t *comp = (ast_node_t *)c->data;
+        if (!comp || comp->type != AST_PARAMETER || !(comp->data.node.flags & MOD_RECORD_COMPONENT) ||
+            !comp->data.node.name || !comp->data.node.children) {
+            continue;
+        }
+        unresolved_type_t *put = unresolved_type_from_ast((ast_node_t *)comp->data.node.children->data);
+        type_t *ctype = put ? resolve_unresolved_type_full(put, reg, cp, sym) : NULL;
+        char *descriptor = ctype ? type_to_descriptor(ctype) : NULL;
+        record_component_t *component = calloc(1, sizeof(*component));
+        if (!component || !descriptor) {
+            free(component);
+            free(descriptor);
+            /* an incomplete list would match the wrong component: leave it unset */
+            slist_t *partial = sym->data.class_data.record_components;
+            sym->data.class_data.record_components = NULL;
+            for (slist_t *p = partial; p; p = p->next) {
+                record_component_t *rc = (record_component_t *)p->data;
+                free(rc->name);
+                free(rc->descriptor);
+                free(rc);
+            }
+            slist_free(partial);
+            return;
+        }
+        component->name = strdup(comp->data.node.name);
+        component->descriptor = descriptor;
+        slist_push(&sym->data.class_data.record_components, component);
+    }
+}
+
+
+/**
  * Enters the members a record has without declaring them, for a record
  * entered from another file of the batch: a private final field and an
  * accessor for each component, and the canonical constructor. (A record
@@ -649,6 +693,7 @@ static void enter_record_members(symbol_t *sym, ast_node_t *decl, type_registry_
     }
     (void)count;
     enter_record_canonical_ctor(sym, decl, reg, cp);
+    enter_record_component_list(sym, decl, reg, cp);
 }
 
 /**
@@ -14922,6 +14967,9 @@ const char *record_component_name(symbol_t *record_sym, int index)
             }
         }
         return NULL;
+    }
+    if (!record_sym->data.class_data.record_components) {
+        symbol_complete(record_sym);    /* a record entered from another file of the batch */
     }
     int position = 0;
     for (slist_t *rc = record_sym->data.class_data.record_components; rc; rc = rc->next) {

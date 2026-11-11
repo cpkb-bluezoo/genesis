@@ -3820,6 +3820,9 @@ static bool record_accessor(symbol_t *record_sym, int index, const char **name, 
         }
         return false;
     }
+    if (!record_sym->data.class_data.record_components) {
+        symbol_complete(record_sym);    /* a record entered from another file of the batch */
+    }
     int position = 0;
     for (slist_t *rc = record_sym->data.class_data.record_components; rc; rc = rc->next) {
         if (position++ == index) {

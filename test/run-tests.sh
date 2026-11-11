@@ -1770,6 +1770,27 @@ else
 fi
 
 echo
+echo "--- Record pattern on a record declared in another source file ---"
+# The record reaches the pattern as the registry stub of the other file, which
+# has no AST: its components must be recorded on the stub. Both orders.
+printf "%-30s ... " "RecordStubComponents"
+rsc_out="$TEST_BUILD/record-stub-components-out"
+rm -rf "$rsc_out"
+mkdir -p "$rsc_out"
+rsc_dir="$TEST_SRC/multifile/recordstub"
+if (cd "$rsc_out" && "$GENESIS" -d "$rsc_out" "$rsc_dir/Failure.java" "$rsc_dir/Demo.java" >/dev/null 2>&1) &&
+   "$JAVA" -cp "$rsc_out" Demo >/dev/null 2>&1 &&
+   rm -rf "$rsc_out" && mkdir -p "$rsc_out" &&
+   (cd "$rsc_out" && "$GENESIS" -j1 -d "$rsc_out" "$rsc_dir/Demo.java" "$rsc_dir/Failure.java" >/dev/null 2>&1) &&
+   "$JAVA" -cp "$rsc_out" Demo >/dev/null 2>&1; then
+    echo PASS
+    passed=$((passed + 1))
+else
+    echo FAIL
+    failed=$((failed + 1))
+fi
+
+echo
 echo "--- Field of a field inherited from a class-file superclass ---"
 # The library is compiled first, on its own, so that the test inherits
 # "kind" and "holder" from a class file. Own freshly emptied -d directory
